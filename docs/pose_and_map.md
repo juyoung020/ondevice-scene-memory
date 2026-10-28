@@ -72,29 +72,29 @@ YOLO-seg 를 **우리가 고른 물체로 직접 학습**하므로, 각 물체�
 | 부품 | 고른 것 |
 |---|---|
 | 카메라 | **이미 받은 일반 USB RGB 카메라** (모델 확인 필요, 롤링셔터로 가정) |
-| IMU | ICM-42688-P 기판 (3.3V, SPI·INT1·INT2 핀). 잡음 가장 낮음(자이로 2.8 mdps/√Hz, 가속도 70 µg/√Hz), 리눅스 기본 드라이버 `inv_icm42600`(2024 추가)가 FIFO·시각 기록 지원 |
+| IMU | SparkFun ISM330DHCX Qwiic (납땜 없음, 아래 연결) |
 
-## IMU ↔ Pi5 연결
+## IMU ↔ Pi5 연결 (납땜 없음)
 
-SPI 로 연결한다 (Pi5 40핀 헤더, SPI0).
+IMU: **SparkFun 9DoF IMU Breakout — ISM330DHCX + MMC5983MA (Qwiic, SEN-19895)**. 산업용 6축(자이로 약 5 mdps/√Hz, 가속도 약 60 µg/√Hz, FIFO 에 칩 시각 기록) + 지자기(안 씀). Qwiic 커넥터라 케이블만 꽂는다.
+케이블: Qwiic(JST-SH 1.0 4핀) → 듀폰 **암** 4가닥, Pi 40핀 헤더에 바로 꽂음.
 
-| IMU 기판 핀 | Pi5 핀 번호 | Pi5 신호 |
+| Qwiic 선 (표준 색) | Pi5 핀 번호 | Pi5 신호 |
 |---|---|---|
-| 3.3V | 1 | 3V3 |
-| GND | 6 | GND |
-| SDI | 19 | GPIO10 (SPI0 MOSI) |
-| SDO | 21 | GPIO9 (SPI0 MISO) |
-| CLK | 23 | GPIO11 (SPI0 SCLK) |
-| CS | 24 | GPIO8 (SPI0 CE0) |
-| INT1 | 22 | GPIO25 (데이터 준비 알림) |
-| INT2 | — | 안 씀 |
+| 검정 GND | 6 | GND |
+| 빨강 3.3V | 1 | 3V3 |
+| 파랑 SDA | 3 | GPIO2 (I2C1 SDA) |
+| 노랑 SCL | 5 | GPIO3 (I2C1 SCL) |
 
-- 켜기: `/boot/firmware/config.txt` 에 `dtparam=spi=on` → `/dev/spidev0.0`
-- 읽기: **우리 프로그램이 spidev 로 직접** FIFO 를 읽고, INT1 신호 시각(libgpiod, 커널 monotonic 시계)으로 시각을 붙인다.
-  - 이유: 라즈베리파이 커널 설정(`bcm2712_defconfig`)은 리눅스 기본 드라이버의 **SPI 판을 켜 두지 않았다** (rpi-6.12.y 는 아예 없음, rpi-6.18.y 는 I2C 판만 `CONFIG_INV_ICM42600_I2C=m`, 2026-10-28 확인). DX 런타임이 커널 판을 묶을 수 있어서 커널에 기대지 않는 쪽으로 간다.
-  - 다른 길: I2C 로 연결 + 커널 드라이버(6.18 이상이면 모듈 있음, 오버레이 몇 줄 직접 작성) 또는 SPI 판 모듈을 커널 헤더로 직접 빌드.
-- 받으면 먼저: WHO_AM_I 레지스터(0x75) = 0x47 확인(정품), 가만히 둔 채 몇 분 기록해 잡음 재기.
-- 실물 확인: DX-M1 M.2 HAT 가 40핀 헤더를 덮으면 핀 연장 헤더 필요. IMU 기판 핀헤더가 납땜 안 된 채 올 수 있음.
+색이 표준과 다를 수 있으니 Qwiic 커넥터 쪽 핀 순서(GND·3V3·SDA·SCL)로 확인.
+
+- 켜기: `/boot/firmware/config.txt` 에 `dtparam=i2c_arm=on`, `dtparam=i2c_arm_baudrate=400000` → `/dev/i2c-1`. 주소 ISM330DHCX 0x6B, MMC5983MA 0x30 (`i2cdetect -y 1` 로 확인).
+- 읽기: **우리 프로그램이 /dev/i2c-1 로 직접** FIFO 를 묶음으로 읽는다. 시각은 FIFO 안 칩 시각(타임스탬프 배칭)을 Pi monotonic 시계에 맞춰 붙인다 — 인터럽트 선이 없어도 됨.
+  - 라즈베리파이 커널에는 이 칩 드라이버(`st_lsm6dsx`)가 켜져 있지 않다(bcm2712_defconfig, 2026-10-28 확인) → 커널에 기대지 않는다.
+- 400 kHz I2C 로 6축 1 kHz(초당 약 14 KB)까지 여유.
+- 받으면 먼저: WHO_AM_I(0x0F) = 0x6B 확인, 가만히 둔 채 몇 분 기록해 잡음 재기.
+- 실물 확인: DX-M1 HAT 가 40핀 헤더를 덮으면 핀 연장 헤더 필요.
+- 처음 고른 ICM-42688-P(알리 범용 기판)는 핀헤더 납땜이 필요할 수 있어 뺐다.
 
 ## 일반 카메라 + IMU 로 포즈를 확실하게
 
@@ -103,7 +103,7 @@ SPI 로 연결한다 (Pi5 40핀 헤더, SPI0).
 | 1 | **롤링셔터를 모델로 보정** — VINS-Mono/VINS-Fusion 의 롤링셔터 설정(`rolling_shutter: 1`, 줄 읽는 시간 `rolling_shutter_tr`)을 켜고, 읽는 시간은 Kalibr 로 잼 | 화면 휨을 "버티기"가 아니라 계산에 넣음. 1순위 VIO 를 VINS 계열로 두는 이유 |
 | 2 | **노출 고정·짧게** (자동 노출·자동 화이트밸런스 끔, 노출 수 ms) | 흐림 감소 + 프레임마다 노출이 바뀌어 시각이 흔들리는 것 방지 |
 | 3 | **낮은 해상도·높은 fps** (카메라가 주는 가장 높은 fps, 예: 640×480) | 한 화면 읽는 시간이 짧아져 휨이 줄고, 추적이 촘촘해짐. 고해상도는 YOLO 용 키프레임에서만 |
-| 4 | **같은 시계**: 카메라 프레임(V4L2 버퍼 시각)과 IMU(IIO, FIFO + 인터럽트 시각) 둘 다 Pi 의 monotonic 시계 | 남는 고정 지연은 VIO 가 온라인 추정(VINS `estimate_td: 1`) |
+| 4 | **같은 시계**: 카메라 프레임(V4L2 버퍼 시각)과 IMU(FIFO 칩 시각을 Pi 시계에 맞춤) 둘 다 Pi 의 monotonic 시계 | 남는 고정 지연은 VIO 가 온라인 추정(VINS `estimate_td: 1`) |
 | 5 | **단단한 한 몸 거치** + Kalibr 보정 (카메라 내부값, 카메라-IMU 위치·방향, 시각 차이, 롤링셔터 읽는 시간) | 보정이 틀리면 나머지가 다 무너짐 |
 | 6 | **시작 동작 정하기** — 켜고 2~3초 이리저리 흔들어 IMU 초기화 | 단안 VIO 는 가속이 있어야 크기(m)가 잡힘 |
 | 7 | **루프 클로징 켜기** + 한 바퀴 돌아 시작점 다시 보기 | 오래 돌며 쌓인 오차를 영상으로 되돌림 |

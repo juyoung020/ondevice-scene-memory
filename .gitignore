@@ -1,0 +1,9 @@
+models/
+data/
+*.pt
+*.onnx
+*.dxnn
+*.db
+__pycache__/
+.venv/
+runs/

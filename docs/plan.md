@@ -89,3 +89,10 @@
 | 입력 크기(640 → 더 작게) | NPU 시간 ≈ 화소 수. 다시 변환 필요, mAP 와 함께 곡선으로 |
 | 키프레임만 NPU | 추적은 매 프레임 CPU, 분할·깊이·CLIP 은 키프레임만 |
 | 카메라 YUYV 로 받기 | Pi5 는 JPEG 하드웨어 해독이 없어 MJPEG 해독이 CPU 를 먹음 |
+
+### 학습기 (C++/CUDA, 2026-10-29)
+
+`train/ObjectSAM` (juyoung020/ObjectSAM, `yolo26` 브랜치)에 YOLO26s-seg 를 넣었다. 자세히 `train/ObjectSAM/docs/YOLO26_PORT.md`.
+- PyTorch 와 정방향·역방향 정합성 통과(변수 11,434,463 일치)
+- 학습 속도 46.4 ms/스텝 = 345 영상/초 (640, 배치 16, 윈도우 RTX 5070 Ti) — 지금 YOLOv8s-seg 학습기 37.9 ms
+- 본 학습(COCO + CropFormer 라벨)은 리눅스에서

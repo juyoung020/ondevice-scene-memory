@@ -64,3 +64,28 @@
 - YOLO26 으로 가는 이유: DEEPX 가 공식 지원(dx_app 예제, modelzoo `yolo26-seg`, 튜토리얼 T21 에 YOLO26s 검출·포즈·분할·깊이 동시 실행), NMS·DFL 없는 머리라 CPU 후처리가 가볍다(DEEPX 파이프라인은 머리 해독을 CPU 에서 ONNX Runtime 으로 돎).
 - 할 것: v21L 의 CropFormer 라벨을 YOLO-seg 형식으로 바꿔 Ultralytics 로 YOLO26-seg(n·s) 학습 → 같은 uHumans2 벤치마크로 v21L 과 비교 → .dxnn 변환해 NPU ms·INT8 손실 측정.
 - YOLO27 은 Ultralytics 문서에 미리보기만 있고 가중치·코드 미공개(2026-10-29), DEEPX 지원 없음.
+
+### 보드 실측 (DEEPX dx-benchmark, RPi5 + DX-M1, dx-all-suite v2.4.0, 2026-07-22)
+
+| 모델 (640) | 1장 지연 ms (단일 코어) | 최대 처리량 FPS (3코어 비동기) | 전체 파이프라인 FPS |
+|---|---|---|---|
+| YOLO26n-seg | 35.5 | 95.7 | 55.1 |
+| **YOLO26s-seg** | 43.6 | **95.7** | 55.2 |
+| YOLO26m-seg | 56.8 | 80.0 | 54.8 |
+| YOLO26l-seg | 65.0 | 64.3 | 53.1 |
+
+(ORT OFF 기준. ORT ON 이면 처리량 67 FPS — Pi5 에선 머리 해독을 ORT 대신 C++ 로 하는 쪽이 +42 %)
+- Pi5 에선 n 과 s 처리량이 같다(호스트 CPU 가 한계) → **s 를 고른다**(COCO 마스크 mAP 33.9 → 40.0 을 공짜로).
+- YOLO26s-seg vs YOLOv8s-seg(지금 ObjectSAM): 마스크 mAP 40.0 vs 36.8, 연산 34.5 vs 42.6 GFLOPs, 변수 10.4 M vs 11.8 M (Ultralytics 표).
+- 깊이(YOLO26-depth-s 768, 37.7 GMACs)·CLIP 은 이 벤치마크에 없음 → 보드에서 `dxrun --use-ort -t 3 -v` 로 직접 잰다.
+
+### 최적화 손잡이
+
+| 손잡이 | 효과 / 근거 |
+|---|---|
+| 머리 해독 ORT 끄기(C++ 후처리) | Pi5 분할 처리량 67 → 96 FPS (dx-benchmark) |
+| 비동기 + 3코어 + 버퍼 수 조정 | s-seg 단일 동기 22 FPS → 비동기 96 FPS, 최적 버퍼 6~9 |
+| 양자화 프로필 c-lite / q-lite(100장) / q-pro(1024장) | 정확도 ↔ 변환 시간. 보정 사진은 우리 카메라 사진으로 |
+| 입력 크기(640 → 더 작게) | NPU 시간 ≈ 화소 수. 다시 변환 필요, mAP 와 함께 곡선으로 |
+| 키프레임만 NPU | 추적은 매 프레임 CPU, 분할·깊이·CLIP 은 키프레임만 |
+| 카메라 YUYV 로 받기 | Pi5 는 JPEG 하드웨어 해독이 없어 MJPEG 해독이 CPU 를 먹음 |

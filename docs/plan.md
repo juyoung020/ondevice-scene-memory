@@ -13,9 +13,9 @@
 | 단계 | 방법 | 돌리는 곳 |
 |---|---|---|
 | 카메라 포즈 | 고민 중 — pose_and_map.md | CPU + NPU |
-| 깊이 | 단안 깊이 추정 모델 | NPU |
-| 물체 분할 | YOLO-seg, 우리가 찍은 데이터로 학습 | NPU |
-| 물체 벡터 | CLIP 계열 영상 인코더, 물체 부분만 잘라 벡터 1개 | NPU |
+| 깊이 | **YOLO26-depth** (DEEPX 모델 동물원에 n/s/m/l/x, 768×768, NYU 실내, max 10 m) | NPU |
+| 물체 분할 | **ObjectSAM 을 YOLO26-seg 로 다시 학습** (클래스 없이 물체만, 벽·천장·바닥 제외) + 우리 데이터로 미세조정 | NPU |
+| 물체 벡터 | CLIP 계열 영상 인코더, 물체 부분만 잘라 벡터 1개 (DEEPX 튜토리얼 T22 CLIP) | NPU |
 | 글 검색 벡터 | 같은 CLIP 의 글 인코더 | CPU 또는 NPU |
 | 3D 매핑 | 마스크 픽셀 × 깊이 → 3D 점, 3D 겹침 + 벡터 코사인으로 같은 물체 합치기 | CPU |
 | 저장 | SQLite | CPU |
@@ -56,3 +56,11 @@
 ## 참고
 
 기존 개인 프로젝트 `juyoung020/object-memory-robot` 의 물체 기억(같은 물체 합치기 규칙, 이름 + 벡터 검색, sgview 뷰어)을 GPU 없이 옮긴다.
+
+## 분할 모델: ObjectSAM → YOLO26
+
+- 지금 ObjectSAM v21L = YOLOv8s-seg(1클래스, 640, 1,180만 변수). CropFormer Hornet-L 선생이 COCO 11.8만 장에 만든 라벨로 증류, 직접 짠 C++/CUDA 학습기(YOLOv8s-seg 전용).
+- 예전 ObjectSAM v1.0 = YOLO26n-seg(416, FastSAM-s 라벨, Ultralytics 학습). 성능 차이(uHumans2 F1 42.9 vs 66.6)는 라벨·크기·입력이 다 달라 구조 비교가 아니다.
+- YOLO26 으로 가는 이유: DEEPX 가 공식 지원(dx_app 예제, modelzoo `yolo26-seg`, 튜토리얼 T21 에 YOLO26s 검출·포즈·분할·깊이 동시 실행), NMS·DFL 없는 머리라 CPU 후처리가 가볍다(DEEPX 파이프라인은 머리 해독을 CPU 에서 ONNX Runtime 으로 돎).
+- 할 것: v21L 의 CropFormer 라벨을 YOLO-seg 형식으로 바꿔 Ultralytics 로 YOLO26-seg(n·s) 학습 → 같은 uHumans2 벤치마크로 v21L 과 비교 → .dxnn 변환해 NPU ms·INT8 손실 측정.
+- YOLO27 은 Ultralytics 문서에 미리보기만 있고 가중치·코드 미공개(2026-10-29), DEEPX 지원 없음.

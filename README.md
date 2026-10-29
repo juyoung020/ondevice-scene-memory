@@ -29,7 +29,7 @@ USB 카메라 30fps ─▶ ① 카메라 포즈 추적
 | 폴더 | 내용 | 담당 |
 |---|---|---|
 | `docs/` | 설계·일정·측정 결과 ([plan.md](docs/plan.md)) | 같이 |
-| `train/` | YOLO-seg 자체 데이터 학습 (PC) | A |
+| `train/` | 분할 모델 학습 (PC). `train/ObjectSAM` = YOLO26s-seg C++/CUDA 학습기(원본 juyoung020/ObjectSAM 을 기록째로 합침, [docs/YOLO26_PORT.md](train/ObjectSAM/docs/YOLO26_PORT.md)) | A |
 | `compile/` | ONNX → `.dxnn` 변환 설정, 양자화 보정 이미지 목록 | A |
 | `board/` | 보드에서 도는 코드: 카메라, 위치 추적, NPU 실행, 3D 매핑, 씬그래프, 검색 | B |
 | `viewer/` | 3D 지도·씬그래프 웹 뷰어 | B |

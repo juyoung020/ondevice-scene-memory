@@ -94,11 +94,12 @@ inline int reg_max_of(const TensorMap& w, const std::string& prefix = "") {
 }
 
 struct ModelCfg {
-  int arch = 8;       // 8: YOLOv8s-seg(FastSAM-s 구조), 26: YOLO26s-seg (end2end, reg_max 1)
-  int nc = 1;         // 클래스 수(YOLO26 점수·semseg 출력)
   int batch = 2, imgsz = 256;
   int reg_max = 16;   // DFL 칸 수(FastSAM 논문 1024 설정은 26). 상자 가지 폭 = max(16, 128/4, 4·reg_max)
   float bn_momentum = 0.03f, bn_eps = 1e-3f;
+  // 뒤에 둔다: 기존 코드의 ModelCfg{batch, imgsz, reg_max} 순서 초기화를 깨지 않게
+  int arch = 8;       // 8: YOLOv8s-seg(FastSAM-s 구조), 26: YOLO26s-seg (end2end, reg_max 1)
+  int nc = 1;         // 클래스 수(YOLO26 점수·semseg 출력)
 };
 
 class Model {

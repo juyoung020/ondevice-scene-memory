@@ -7,4 +7,3 @@ data/
 __pycache__/
 .venv/
 runs/
-train/ObjectSAM/

@@ -9,6 +9,7 @@ struct ConvGeom {
   int N, H, W, C;   // 입력
   int K, R, S;      // 출력 채널, 커널
   int stride, pad;
+  int groups = 1;   // 그룹 conv(깊이별이면 C). 필터 (K, C/groups, R, S)
   int P() const { return (H + 2 * pad - R) / stride + 1; }
   int Q() const { return (W + 2 * pad - S) / stride + 1; }
 };

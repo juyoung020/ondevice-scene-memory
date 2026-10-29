@@ -88,3 +88,52 @@
 - 학습 PC: RTX 5070 Ti 16 GB(sm_120). 원래 빌드는 리눅스(`/usr/local/cuda-12.8`, cuDNN, turbojpeg).
 - 데이터: COCO train2017(약 19 GB) + `juyoung020/objectsam-labels` 릴리스 v1(`train2017.ftl` 1.2 GB, `.plan` 210 MB, `.siglip` 4 MB).
 - 정합성 시험용 파이썬: Ultralytics 8.4.192 + torch(CUDA).
+
+## 진행 상황 (2026-10-29, 윈도우 RTX 5070 Ti, CUDA 13.4, cuDNN 9.27)
+
+| 항목 | 상태 | 파일 |
+|---|---|---|
+| S1 활성화 끔, S2 그룹(깊이별) conv, 목적지 4배 업샘플·더하기, 목적지 8 개 | 완료 | `conv.*`, `bn.*`, `model.*` |
+| S5 Attention (cuBLAS 묶음 GEMM + softmax 앞·뒤) | 완료 | `attn.cuh`, `attn.cu` |
+| S3·S4·S6~S10 YOLO26s-seg 그래프 | 완료 | `model26.cpp` |
+| 정방향·역방향 정합성 | **통과** (아래) | `tests/parity26.cpp`, `pytools/ref26.py` |
+| L1~L5 손실 (E2E, SegTaskAlignedAssigner, topk2, L1, semseg BCE+Dice) | 완료, **Ultralytics 와 값 비교는 아직** | `loss26.*` |
+| 학습 속도 | 측정 (아래) | `tests/bench26.cpp` |
+| `train.cpp` 에 arch 26 연결 | 완료, **윈도우에선 빌드 안 됨(데이터 읽기가 리눅스 전용) → 리눅스에서 첫 빌드 확인** | `src/train.cpp` |
+| fsow → .pt → ONNX | 확인 (출력 37×8400 + proto 32×160×160) | `pytools/fsow_to_pt.py` |
+| MuSGD | 안 함 (지금은 기존 SGD) | |
+
+### 정합성 (`parity26_fp32`, 입력 256, 배치 2, 학습 모드)
+
+- 변수 수 11,434,463 — Ultralytics nc=1 과 같음
+- 층 23 개·머리 6 개·proto·semseg 정방향 relL2 ≤ 2.4e-5
+- 기울기 442 개 텐서 전부 통과(전체 relL2 1.2e-4). BN 뒤에 다시 BN 이 오는 자리의 β 기울기 7 개는 수학적으로 0 이라 절대오차(≤ 1e-4)로 판정
+- BN running 통계 relL2 5.9e-8
+
+### 학습 속도 (`bench26_fp16`, 640, 배치 16, 합성 정답 40 개/장, CUDA graph)
+
+| | ms/스텝 | 영상/초 | 정방향 | 손실 | 역방향 | 메모리 |
+|---|---|---|---|---|---|---|
+| YOLOv8s-seg (지금 학습기) | 37.7 | 424 | 11.6 | 0.6 | 22.6 | 4.5 GB |
+| **YOLO26s-seg** | **46.9** | **341** | 14.6 | 2.3 | 28.4 | 6.2 GB |
+
+- conv 합 약 30 ms, 대부분 80~100 TFLOPS. 가장 큰 층은 proto.cv2(160×160, 128→128, 3.8 ms 앞·뒤 합)
+- 깊이별 conv(14 개)·Attention 은 합쳐 2 ms 안쪽. 나머지는 BN·활성화(대역폭 한계)
+- 손실 2.3 ms 중 대부분이 예측 마스크 IoU(정답마다 후보 30 개)
+
+### 빌드·실행 (윈도우)
+
+```
+build_win.bat bench26_fp16 parity26_fp32      (CUDNN_ROOT 기본 C:/tools/cudnn)
+python pytools/ref26.py weights --pt yolo26s-seg.pt --out yolo26s-seg-nc1.fsow
+python pytools/ref26.py ref --weights yolo26s-seg-nc1.fsow --out ref26.fsow
+build/parity26_fp32 yolo26s-seg-nc1.fsow ref26.fsow
+build/bench26_fp16 yolo26s-seg-nc1.fsow 16 640 30
+```
+(실행 때 PATH 에 cuDNN bin/x64)
+
+### 리눅스에서 본 학습 전에 남은 것
+
+1. `train` 빌드 확인(arch 26 분기)
+2. 손실 정합성: 같은 머리 출력·같은 정답으로 Ultralytics E2ELoss(SegmentLoss26) 값·기울기와 비교
+3. (선택) MuSGD

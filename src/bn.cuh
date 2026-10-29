@@ -6,14 +6,15 @@
 #pragma once
 #include "core.h"
 
-constexpr int kMaxDest = 4;
+constexpr int kMaxDest = 8;
 struct Dest {
   act_t* p = nullptr;   // 목적지 버퍼(NHWC packed, 채널 ctot)
   act_t* g = nullptr;   // 같은 모양의 기울기 버퍼
   int ctot = 0;         // 목적지 채널 수
   int choff = 0;        // 목적지 안 시작 채널
   int c0 = 0, c1 = 0;   // 이 층 출력 중 보낼 채널 [c0, c1)
-  int up = 1;           // 1 그대로, 2 최근접 2배 업샘플
+  int up = 1;           // 1 그대로, 2·4 최근접 업샘플
+  bool acc = false;     // 정방향에서 덮어쓰지 않고 더한다(앞 층이 먼저 썼어야 함). 역방향은 같다.
 };
 struct DestList {
   Dest d[kMaxDest];

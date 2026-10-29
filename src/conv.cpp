@@ -73,10 +73,13 @@ void ConvOp::init(cudnnHandle_t h, const ConvGeom& g, bool transposed, cudnnData
   if (!tr_) {
     nhwc(xd_, dt_, g.N, g.C, g.H, g.W);
     nhwc(yd_, dt_, g.N, g.K, g.P(), g.Q());
-    CUDNN_CHECK(cudnnSetFilter4dDescriptor(wd_, dt_, CUDNN_TENSOR_NHWC, g.K, g.C, g.R, g.S));
+    FSO_ASSERT(g.C % g.groups == 0 && g.K % g.groups == 0, "groups");
+    CUDNN_CHECK(cudnnSetFilter4dDescriptor(wd_, dt_, CUDNN_TENSOR_NHWC, g.K, g.C / g.groups, g.R, g.S));
     CUDNN_CHECK(cudnnSetConvolution2dDescriptor(cd_, g.pad, g.pad, g.stride, g.stride, 1, 1, CUDNN_CROSS_CORRELATION,
                                                 CUDNN_DATA_FLOAT));
+    if (g.groups > 1) CUDNN_CHECK(cudnnSetConvolutionGroupCount(cd_, g.groups));
   } else {
+    FSO_ASSERT(g.groups == 1, "transposed conv: groups 1 only");
     FSO_ASSERT(g.pad == 0 && g.R == g.stride && g.S == g.stride, "transposed conv: k == stride only");
     // 내부 conv: big(N, K, H*s, W*s) → small(N, C, H, W), 필터 (C, K, R, S).
     nhwc(xd_, dt_, g.N, g.C, g.H, g.W);                                  // small = 이 층 입력
@@ -170,7 +173,7 @@ float ConvOp::be_tune(int op, void* in, void* out, void* w, float beta, void* ws
   if (!tr_) { ci = g.C; hi = g.H; wi = g.W; co = g.K; ho = g.P(); wo = g.Q(); pad = g.pad; }
   else { ci = g.K; hi = g.H * s; wi = g.W * s; co = g.C; ho = g.H; wo = g.W; pad = 0; }
   auto IN = be_tensor(kUidIn, dt_, g.N, ci, hi, wi), OUT = be_tensor(kUidOut, dt_, g.N, co, ho, wo),
-       W = be_tensor(kUidW, dt_, co, ci, g.R, g.S);
+       W = be_tensor(kUidW, dt_, co, ci / g.groups, g.R, g.S);  // 그룹 수는 필터 채널로 정해진다
   auto cv = be_make(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR);
   {
     int64_t sd = 2, dil[2] = {1, 1}, fs[2] = {s, s}, pp[2] = {pad, pad};

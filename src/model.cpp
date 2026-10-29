@@ -93,7 +93,7 @@ Act* Model::new_act(const std::string& n, int C, int H, int W) {
 }
 
 void Model::conv_bn(const std::string& name, Act* in, int K, int k, int s, std::vector<DestSpec> dests, Act* res,
-                    std::vector<std::string> fused, std::vector<int> fused_k) {
+                    std::vector<std::string> fused, std::vector<int> fused_k, bool act, int groups) {
   auto nd = std::make_unique<Node>();
   nd->kind = Node::CONVBN;
   nd->name = name;
@@ -103,13 +103,15 @@ void Model::conv_bn(const std::string& name, Act* in, int K, int k, int s, std::
   std::vector<int> ks;
   if (fused.empty()) ks = {K};
   else {
-    // 합친 머리 conv: 상자 c2, 점수 128, 마스크 계수 32 (YOLOv8s-seg 머리)
+    // 합친 머리 conv: 같은 입력의 conv 여럿을 출력 채널로 이어 붙인다(예: YOLOv8s-seg 상자 c2·점수 128·계수 32)
     ks = fused_k;
-    FSO_ASSERT(ks.size() == pre.size() && ks[0] + ks[1] + ks[2] == K, "fused head K");
+    int sum = 0;
+    for (int v : ks) sum += v;
+    FSO_ASSERT(ks.size() == pre.size() && sum == K, "fused head K");
   }
   int tc = in->name == "in" ? 3 : in->C;  // 입력 영상은 3 채널을 8 로 채워 둔다
   for (size_t i = 0; i < pre.size(); i++) {
-    params.add(pre[i] + ".conv.weight", P_W, {ks[i], tc, k, k}, 1, tc != in->C ? in->C : 0);
+    params.add(pre[i] + ".conv.weight", P_W, {ks[i], tc / groups, k, k}, 1, tc != in->C ? in->C : 0);
     nd->wnames.push_back(pre[i] + ".conv.weight");
     nd->bnnames.push_back(pre[i] + ".bn");
   }
@@ -117,8 +119,9 @@ void Model::conv_bn(const std::string& name, Act* in, int K, int k, int s, std::
   for (auto& p : pre) params.add(p + ".bn.bias", P_BIAS, {(int64_t)ks[&p - &pre[0]]});
   for (auto& p : pre) params.add(p + ".bn.running_mean", P_RUN, {(int64_t)ks[&p - &pre[0]]});
   for (auto& p : pre) params.add(p + ".bn.running_var", P_RUN, {(int64_t)ks[&p - &pre[0]]});
-  ConvGeom g{cfg.batch, in->H, in->W, in->C, K, k, k, s, k / 2};
+  ConvGeom g{cfg.batch, in->H, in->W, in->C, K, k, k, s, k / 2, groups};
   nd->conv.init(h_, g);
+  nd->act = act;
   for (auto& d : dests) {
     if (d.c1 == 0) d.c1 = K;
     int P = g.P() * d.up, Q = g.Q() * d.up;
@@ -126,6 +129,7 @@ void Model::conv_bn(const std::string& name, Act* in, int K, int k, int s, std::
                d.a->H, d.a->W);
     FSO_ASSERT(d.choff + d.c1 - d.c0 <= d.a->C, "%s dest channels", name.c_str());
   }
+  FSO_ASSERT(int(dests.size()) <= kMaxDest, "%s: too many dests", name.c_str());
   nd->dests = dests;
   nd->res = res;
   nodes_.push_back(std::move(nd));
@@ -170,6 +174,13 @@ void Model::build(const ModelCfg& c, cudnnHandle_t h, cudaStream_t st) {
   h_ = h;
   st_ = st;
   bn_init();
+  FSO_ASSERT(cfg.imgsz % 32 == 0, "imgsz must be a multiple of 32");
+  if (cfg.arch == 26) build26();
+  else build8();
+  finalize();
+}
+
+void Model::build8() {
   const int S = cfg.imgsz;
   FSO_ASSERT(S % 32 == 0, "imgsz must be a multiple of 32");
   auto M = [](int i) { return "model." + std::to_string(i); };
@@ -273,7 +284,9 @@ void Model::build(const ModelCfg& c, cudnnHandle_t h, cudaStream_t st) {
   conv_bn(hd + ".proto.cv2", pru, 128, 3, 1, {{pr2, 0, 0, 0, 1}});
   proto_ = new_act("out.proto", 32, S / 4, S / 4);
   conv_bn(hd + ".proto.cv3", pr2, 32, 1, 1, {{proto_, 0, 0, 0, 1}});
+}
 
+void Model::finalize() {
   // ---- 할당
   params.allocate();
   const int64_t N = cfg.batch;
@@ -304,9 +317,26 @@ void Model::build(const ModelCfg& c, cudnnHandle_t h, cudaStream_t st) {
   sums_ = dalloc<float>(2 * max_c);
   rgb_tmp_ = dalloc<float>(32 * 27);
   {
-    int64_t e = N * sp->H * sp->W * 256;
+    int64_t e = 0;  // SPPF 풀링 작업 공간(fp32)
+    for (auto& nd : nodes_)
+      if (nd->kind == Node::POOL) e = std::max<int64_t>(e, N * nd->cat->H * nd->cat->W * nd->pc);
     pool_a_ = dalloc<float>(e);
     pool_b_ = dalloc<float>(e);
+  }
+  bool any_attn = false;
+  for (auto& nd : nodes_) any_attn |= nd->kind == Node::ATTN;
+  if (any_attn) {
+    CUBLAS_CHECK(cublasCreate(&blas_));
+    const size_t wsb = size_t(32) << 20;  // graph 캡처 중 cuBLAS 가 할당하지 않게 작업 공간을 미리 준다
+    blas_ws_ = DevMem::alloc(wsb);
+    CUBLAS_CHECK(cublasSetWorkspace(blas_, blas_ws_, wsb));
+    CUBLAS_CHECK(cublasSetStream(blas_, st_));
+    for (auto& nd : nodes_)
+      if (nd->kind == Node::ATTN) {
+        const AttnOp& a = nd->attn;  // build 때 모양만 정해 둔 것
+        nd->attn.init(blas_, cfg.batch, nd->in->H * nd->in->W, a.heads, a.kd, a.hd, nd->in->p, nd->out->p, nd->in->g,
+                      nd->out->g);
+      }
   }
   plan_backward();
 
@@ -316,12 +346,12 @@ void Model::build(const ModelCfg& c, cudnnHandle_t h, cudaStream_t st) {
   CUDA_CHECK(cudaMalloc(&tws, lim));
   act_t* scratch_dx = nullptr;
   for (auto& nd : nodes_) {
-    if (nd->kind == Node::POOL) continue;
+    if (nd->kind == Node::POOL || nd->kind == Node::ATTN) continue;
     act_t* w = params.wact(nd->wnames[0]);
     act_t* gw = params.gwact(nd->wnames[0]);
     act_t* y = nd->kind == Node::CONVBN ? nd->z : nd->out->p;
     act_t* dy = nd->kind == Node::CONVBN ? dz_[0] : nd->out->g;
-    act_t* dx = nd->in->g;
+    act_t* dx = nd->detach ? nullptr : nd->in->g;
     if (!dx) {
       if (!scratch_dx) CUDA_CHECK(cudaMalloc(&scratch_dx, N * nd->in->H * nd->in->W * nd->in->C * sizeof(act_t)));
       dx = scratch_dx;
@@ -349,12 +379,22 @@ void Model::build(const ModelCfg& c, cudnnHandle_t h, cudaStream_t st) {
 void Model::plan_backward() {
   std::set<const Act*> written;
   for (int l = 0; l < 3; l++)
-    for (int k = 0; k < 3; k++) written.insert(head_[k][l]);
+    for (int k = 0; k < 3; k++) {
+      written.insert(head_[k][l]);
+      if (head2_[k][l]) written.insert(head2_[k][l]);
+    }
   written.insert(proto_);
+  if (sem_) written.insert(sem_);
   for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
     Node& nd = **it;
     if (nd.kind == Node::POOL) {
       FSO_ASSERT(written.count(nd.cat), "pool grad before cat grad");
+      continue;
+    }
+    if (nd.kind == Node::ATTN) {  // 역방향이 qkv 기울기(q·k·v 채널 전부)를 덮어쓴다: qkv 의 다른 소비자 없음
+      FSO_ASSERT(written.count(nd.out), "%s: out grad not ready", nd.name.c_str());
+      FSO_ASSERT(!written.count(nd.in), "%s: qkv has another consumer", nd.name.c_str());
+      written.insert(nd.in);
       continue;
     }
     if (nd.kind == Node::CONVBN)
@@ -362,7 +402,7 @@ void Model::plan_backward() {
     else
       FSO_ASSERT(written.count(nd.out), "%s: out grad not ready", nd.name.c_str());
     if (nd.res) { nd.res_accum = written.count(nd.res) > 0; written.insert(nd.res); }
-    if (nd.in->need_grad) { nd.dgrad_accum = written.count(nd.in) > 0; written.insert(nd.in); }
+    if (nd.in->need_grad && !nd.detach) { nd.dgrad_accum = written.count(nd.in) > 0; written.insert(nd.in); }
   }
 }
 
@@ -374,7 +414,7 @@ DestList mk_dl(const Node& nd, bool grads) {
   for (auto& d : nd.dests) {
     Dest& o = dl.d[dl.n++];
     o.p = d.a->p; o.g = grads ? d.a->g : nullptr;
-    o.ctot = d.a->C; o.choff = d.choff; o.c0 = d.c0; o.c1 = d.c1; o.up = d.up;
+    o.ctot = d.a->C; o.choff = d.choff; o.c0 = d.c0; o.c1 = d.c1; o.up = d.up; o.acc = d.acc;
   }
   return dl;
 }
@@ -397,7 +437,7 @@ void Model::forward(bool train) {
                            nd.shift, st_);
         else
           bn_eval_scale(nd.K, g, be, rm, rv, cfg.bn_eps, nd.scale, nd.shift, st_);
-        bn_forward_apply(nd.z, s, nd.scale, nd.shift, nd.res ? nd.res->p : nullptr, mk_dl(nd, false), true, st_);
+        bn_forward_apply(nd.z, s, nd.scale, nd.shift, nd.res ? nd.res->p : nullptr, mk_dl(nd, false), nd.act, st_);
         break;
       }
       case Node::HEADCONV:
@@ -408,6 +448,9 @@ void Model::forward(bool train) {
       }
       case Node::POOL:
         sppf_pool_fwd(nd.cat->p, cfg.batch, nd.cat->H, nd.cat->W, nd.pc, st_);
+        break;
+      case Node::ATTN:
+        nd.attn.fwd(st_);
         break;
     }
   }
@@ -439,12 +482,12 @@ void Model::backward(bool accum) {
         BnShape s{cfg.batch, nd.conv.geom().P(), nd.conv.geom().Q(), nd.K};
         const std::string& b = nd.bnnames[0];
         if (busy[buf]) CUDA_CHECK(cudaStreamWaitEvent(st_, ev_wg_[buf], 0));
-        bn_backward(nd.z, s, params.ptr(b + ".weight"), nd.mean, nd.istd, nd.scale, nd.shift, mk_dl(nd, true), true,
+        bn_backward(nd.z, s, params.ptr(b + ".weight"), nd.mean, nd.istd, nd.scale, nd.shift, mk_dl(nd, true), nd.act,
                     sums_, dz_[buf], params.gptr(b + ".weight"), params.gptr(b + ".bias"), accum,
                     nd.res ? nd.res->g : nullptr, nd.res_accum, st_);
         wgrad_side(nd, dz_[buf], buf);
         busy[buf] = true;
-        if (nd.in->need_grad)
+        if (nd.in->need_grad && !nd.detach)
           nd.conv.dgrad(dz_[buf], params.wact(nd.wnames[0]), nd.in->g, ws_, ws_bytes, nd.dgrad_accum ? 1.f : 0.f);
         buf ^= 1;
         break;
@@ -459,12 +502,15 @@ void Model::backward(bool accum) {
         CUDNN_CHECK(cudnnSetStream(h_, side_));
         nd.conv.wgrad(nd.in->p, nd.out->g, params.gwact(nd.wnames[0]), ws_side_, ws_bytes);
         CUDNN_CHECK(cudnnSetStream(h_, st_));
-        if (nd.in->need_grad)
+        if (nd.in->need_grad && !nd.detach)
           nd.conv.dgrad(nd.out->g, params.wact(nd.wnames[0]), nd.in->g, ws_, ws_bytes, nd.dgrad_accum ? 1.f : 0.f);
         break;
       }
       case Node::POOL:
         sppf_pool_bwd(nd.cat->p, nd.cat->g, cfg.batch, nd.cat->H, nd.cat->W, nd.pc, pool_a_, pool_b_, st_);
+        break;
+      case Node::ATTN:
+        nd.attn.bwd(st_);
         break;
     }
   }
@@ -478,9 +524,9 @@ void Model::print_convs() const {
   printf("%-34s %4s %4s %4s %4s %2s %2s | %7s %7s %7s ms | TFLOPS f/d/w\n", "conv", "H", "W", "C", "K", "k", "s", "fwd",
          "dgrad", "wgrad");
   for (auto& n : nodes_) {
-    if (n->kind == Node::POOL) continue;
+    if (n->kind == Node::POOL || n->kind == Node::ATTN) continue;
     auto& g = n->conv.geom();
-    double fl = 2.0 * g.N * double(n->kind == Node::CONVT ? g.H * g.W : g.P() * g.Q()) * g.K * g.C * g.R * g.S;
+    double fl = 2.0 * g.N * double(n->kind == Node::CONVT ? g.H * g.W : g.P() * g.Q()) * g.K * g.C * g.R * g.S / g.groups;
     const float* t = n->conv.tuned_ms;
     printf("%-34s %4d %4d %4d %4d %2d %2d | %7.3f %7.3f %7.3f    | %5.1f %5.1f %5.1f\n", n->name.c_str(), g.H, g.W, g.C,
            g.K, g.R, g.stride, t[0], t[1], t[2], fl / t[0] / 1e9, fl / t[1] / 1e9, fl / t[2] / 1e9);
@@ -491,7 +537,7 @@ void Model::print_convs() const {
 
 void Model::print_plan() const {
   int nconv = 0;
-  for (auto& n : nodes_) nconv += n->kind != Node::POOL;
+  for (auto& n : nodes_) nconv += n->kind != Node::POOL && n->kind != Node::ATTN;
   printf("model: %zu nodes (%d conv), params W %ld γ %ld β/bias %ld run %ld, workspace %.1f MB, device total %.1f MB\n",
          nodes_.size(), nconv, params.size[P_W], params.size[P_GAMMA], params.size[P_BIAS], params.size[P_RUN],
          ws_bytes / 1e6, DevMem::total() / 1e6);

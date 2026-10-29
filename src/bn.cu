@@ -35,10 +35,10 @@ __device__ __forceinline__ void ld8f(const float* p, float o[8]) { ld8(p, o); }
 __device__ __forceinline__ float sigm(float y) { return 1.f / (1.f + __expf(-y)); }
 
 // 화소 row(n,h,w) 의 업샘플 목적지 첫 화소 번호
-__device__ __forceinline__ int up_base(int row, int H, int W) {
+__device__ __forceinline__ int up_base(int row, int H, int W, int u) {
   int hw = H * W;
   int n = row / hw, rem = row - n * hw, h = rem / W, w = rem - h * W;
-  return (n * 2 * H + 2 * h) * (2 * W) + 2 * w;
+  return (n * u * H + u * h) * (u * W) + u * w;
 }
 
 // dA 모으기(채널 c..c+7)
@@ -55,12 +55,12 @@ __device__ __forceinline__ void gather8(const DestList& dl, int row, int c, int 
       ld8(d.g + int64_t(row) * d.ctot + cc, t);
       for (int i = 0; i < 8; i++) dA[i] += t[i];
     } else {
-      int b = up_base(row, H, W), W2 = 2 * W;
-      int q[4] = {b, b + 1, b + W2, b + W2 + 1};
-      for (int u = 0; u < 4; u++) {
-        ld8(d.g + int64_t(q[u]) * d.ctot + cc, t);
-        for (int i = 0; i < 8; i++) dA[i] += t[i];
-      }
+      const int u = d.up, b = up_base(row, H, W, u), Wu = u * W;
+      for (int y = 0; y < u; y++)
+        for (int x = 0; x < u; x++) {
+          ld8(d.g + int64_t(b + y * Wu + x) * d.ctot + cc, t);
+          for (int i = 0; i < 8; i++) dA[i] += t[i];
+        }
     }
   }
 }
@@ -224,15 +224,19 @@ __global__ void __launch_bounds__(kT) k_apply(const act_t* __restrict__ z, BnSha
       const Dest& d = dl.d[k];
       if (c < d.c0 || c >= d.c1) continue;
       int cc = d.choff + c - d.c0;
-      if (d.up == 1) {
-        st8(d.p + int64_t(row) * d.ctot + cc, v);
-      } else {
-        int b = up_base(row, s.H, s.W), W2 = 2 * s.W;
-        st8(d.p + int64_t(b) * d.ctot + cc, v);
-        st8(d.p + int64_t(b + 1) * d.ctot + cc, v);
-        st8(d.p + int64_t(b + W2) * d.ctot + cc, v);
-        st8(d.p + int64_t(b + W2 + 1) * d.ctot + cc, v);
-      }
+      const int u = d.up, b = u == 1 ? row : up_base(row, s.H, s.W, u), Wu = u * s.W;
+      for (int y = 0; y < u; y++)
+        for (int x = 0; x < u; x++) {
+          act_t* q = d.p + int64_t(b + y * Wu + x) * d.ctot + cc;
+          if (d.acc) {
+            float o[8];
+            ld8(q, o);
+            for (int k2 = 0; k2 < 8; k2++) o[k2] += v[k2];
+            st8(q, o);
+          } else {
+            st8(q, v);
+          }
+        }
     }
   }
 }

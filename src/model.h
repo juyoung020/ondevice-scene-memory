@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "bn.cuh"
+#include "attn.cuh"
 #include "conv.h"
 #include "fsow.h"
 
@@ -56,10 +57,14 @@ struct Act {
 struct DestSpec {
   Act* a;
   int choff, c0, c1, up;
+  bool acc = false;  // 정방향에서 더하기(먼저 쓴 층 뒤에서만)
 };
 
 struct Node {
-  enum Kind { CONVBN, HEADCONV, CONVT, POOL } kind;
+  enum Kind { CONVBN, HEADCONV, CONVT, POOL, ATTN } kind;
+  bool act = true;      // CONVBN: SiLU (false 면 BN 만)
+  bool detach = false;  // 입력으로 기울기를 보내지 않는다(YOLO26 one2one 머리)
+  AttnOp attn;          // ATTN: in = qkv, out = 어텐션 출력
   std::string name;  // PyTorch 접두사 (예: model.2.m.0.cv1)
   Act* in = nullptr;
   ConvOp conv;
@@ -89,6 +94,8 @@ inline int reg_max_of(const TensorMap& w, const std::string& prefix = "") {
 }
 
 struct ModelCfg {
+  int arch = 8;       // 8: YOLOv8s-seg(FastSAM-s 구조), 26: YOLO26s-seg (end2end, reg_max 1)
+  int nc = 1;         // 클래스 수(YOLO26 점수·semseg 출력)
   int batch = 2, imgsz = 256;
   int reg_max = 16;   // DFL 칸 수(FastSAM 논문 1024 설정은 26). 상자 가지 폭 = max(16, 128/4, 4·reg_max)
   float bn_momentum = 0.03f, bn_eps = 1e-3f;
@@ -103,7 +110,9 @@ class Model {
   void sync_weights();                 // fp32 → act_t
   Act* input() { return acts_.at("in").get(); }
   Act* head(int kind, int lvl) { return head_[kind][lvl]; }   // kind 0 box(64) 1 cls(1) 2 coef(32)
+  Act* head2(int kind, int lvl) { return head2_[kind][lvl]; } // YOLO26 one2one 머리(같은 순서)
   Act* proto() { return proto_; }
+  Act* sem() { return sem_; }                                 // YOLO26 semseg(학습 때만, nc 채널, 입력/8)
   Act* act(const std::string& n) { return acts_.at(n).get(); }
   bool has_act(const std::string& n) const { return acts_.count(n) > 0; }
   Params params;
@@ -115,7 +124,21 @@ class Model {
  private:
   Act* new_act(const std::string& n, int C, int H, int W);
   void conv_bn(const std::string& name, Act* in, int K, int k, int s, std::vector<DestSpec> dests, Act* res = nullptr,
-               std::vector<std::string> fused = {}, std::vector<int> fused_k = {});
+               std::vector<std::string> fused = {}, std::vector<int> fused_k = {}, bool act = true, int groups = 1);
+  void build8();
+  void build26();
+  void finalize();   // 버퍼 할당·역방향 계획·알고리즘 재기
+  // YOLO26 블록(Ultralytics 이름·순서 그대로)
+  void bottleneck(const std::string& name, Act* in, int c2, int hidden, bool shortcut, std::vector<DestSpec> out);
+  void c3k(const std::string& name, Act* in, int c2, bool shortcut, std::vector<DestSpec> out);
+  void psa(const std::string& name, Act* in, std::vector<DestSpec> out);
+  void c3k2(const std::string& name, Act* in, int c2, int n, bool c3k_, float e, bool attn, bool shortcut,
+            std::vector<DestSpec> out);
+  void head26(const std::string& pre, Act* x, int lvl, bool o2o);
+  cublasHandle_t blas_ = nullptr;
+  void* blas_ws_ = nullptr;
+  Act* head2_[3][3] = {};
+  Act* sem_ = nullptr;
   Act* c2f(const std::string& name, Act* in, int c2, int n, bool shortcut, std::vector<DestSpec> out_dests);
   void head_conv(const std::string& name, Act* in, int K, Act* out);
   void plan_backward();

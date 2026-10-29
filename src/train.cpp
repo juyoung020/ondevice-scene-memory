@@ -22,6 +22,7 @@
 #include "loss.cuh"
 #include "misc.cuh"
 #include "model.h"
+#include "loss26.cuh"
 #include "optim.cuh"
 
 namespace {
@@ -43,6 +44,7 @@ struct Args {
   std::string extra_shards;
   std::string oversample; int oversample_k = 2; float cls_gain = -1; int nbs = 64;  // --nbs: 명목 배치(누적 = nbs/batch)  // 2 배로 뽑을 image_id 목록 파일  // 선생 라벨과 함께 섞을 샤드(FSR3, 예: 옛 ADE·시뮬 data/old_shards/*.bin)
   float score_thr = 0.5f, siglip_thr = 0.8f;
+  int arch = 0;  // 0: 시작 가중치에서 판단(one2one 머리가 있으면 26), 8 또는 26
 };
 
 Args parse(int argc, char** argv) {
@@ -77,6 +79,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--nbs") a.nbs = std::stoi(v());
     else if (k == "--score-thr") a.score_thr = std::stof(v());
     else if (k == "--siglip-thr") a.siglip_thr = std::stof(v());
+    else if (k == "--arch") a.arch = std::stoi(v());
     else FSO_ASSERT(false, "unknown arg %s", k.c_str());
   }
   return a;
@@ -148,7 +151,15 @@ int main(int argc, char** argv) {
   // ---- 모델·손실·옵티마이저
   Model m;
   auto W0 = fsow_load(a.init);
-  m.build(ModelCfg{B, S, reg_max_of(W0)}, h, cs);
+  const int arch = a.arch ? a.arch : (W0.count("model.23.one2one_cv2.0.2.weight") ? 26 : 8);
+  {
+    ModelCfg mc;
+    mc.arch = arch; mc.nc = 1; mc.batch = B; mc.imgsz = S;
+    mc.reg_max = arch == 26 ? 1 : reg_max_of(W0);
+    m.build(mc, h, cs);
+  }
+  printf("arch: YOLO%s-seg
+", arch == 26 ? "26s" : "v8s");
   m.params.load(W0);
   W0.clear();
   m.sync_weights();
@@ -158,7 +169,17 @@ int main(int argc, char** argv) {
   for (int l = 0; l < 3; l++) { lc.lvl_h[l] = m.head(0, l)->H; lc.lvl_w[l] = m.head(0, l)->W; }
   lc.Hp = m.proto()->H; lc.Wp = m.proto()->W;
   SegLoss sl;
-  sl.init(lc);
+  Loss26 l26;
+  if (arch == 26) {
+    Loss26Cfg c;
+    c.B = B; c.imgsz = S; c.G = a.G;
+    for (int l = 0; l < 3; l++) { c.lvl_h[l] = lc.lvl_h[l]; c.lvl_w[l] = lc.lvl_w[l]; }
+    c.Hp = lc.Hp; c.Wp = lc.Wp; c.Hs = m.sem()->H; c.Ws = m.sem()->W;
+    if (a.cls_gain > 0) c.cls_gain = a.cls_gain;
+    l26.init(c);
+  } else {
+    sl.init(lc);
+  }
   OptCfg oc;
   oc.lr0 = a.lr0; oc.lrf = a.lrf; oc.warmup_epochs = a.warmup_epochs; oc.cos_lr = a.cos_lr; oc.epochs = a.epochs; oc.nb = nb; oc.batch = B; oc.nbs = a.nbs;
 #ifdef FSO_FP32
@@ -204,6 +225,22 @@ int main(int argc, char** argv) {
     io.dbox[l] = m.head(0, l)->g; io.dcls[l] = m.head(1, l)->g; io.dcoef[l] = m.head(2, l)->g;
   }
   io.proto = m.proto()->p; io.dproto = m.proto()->g;
+  Head26IO io26[2];
+  if (arch == 26)
+    for (int k = 0; k < 2; k++)
+      for (int l = 0; l < 3; l++) {
+        Act* bx = k ? m.head2(0, l) : m.head(0, l);
+        Act* cl = k ? m.head2(1, l) : m.head(1, l);
+        Act* cf = k ? m.head2(2, l) : m.head(2, l);
+        io26[k].box[l] = bx->p; io26[k].cls[l] = cl->p; io26[k].coef[l] = cf->p;
+        io26[k].dbox[l] = bx->g; io26[k].dcls[l] = cl->g; io26[k].dcoef[l] = cf->g;
+      }
+  int cur_epoch = -1;
+  auto set_epoch = [&](int64_t i) {  // E2ELoss.update(): epoch 마다 one2many 가중 w 갱신(그래프는 장치 값을 읽는다)
+    int e = int(i / nb);
+    if (arch == 26 && e != cur_epoch) { l26.set_epoch(e, a.epochs); cur_epoch = e; }
+  };
+  set_epoch(ni0);
   m.print_plan();
 
   // ---- graph: 옵티마이저 스텝 하나(마이크로 배치 L 개 + 옵티마이저 + 손실 기록 합)를 graph 하나로.
@@ -220,20 +257,25 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGraphDestroy(g));
     return e;
   };
-  float* logacc = dalloc<float>(8);  // 손실 items[0..5] 합, [6] 마이크로 배치 수
-  CUDA_CHECK(cudaMemset(logacc, 0, 8 * sizeof(float)));
+  // 손실 기록 합: v8 items[0..5] (+[6] 마이크로 배치 수), 26 items[0..12] (+[13])
+  const int nlog = arch == 26 ? 13 : 6;
+  float* logacc = dalloc<float>(16);
+  CUDA_CHECK(cudaMemset(logacc, 0, 16 * sizeof(float)));
   auto micro = [&](int s, bool accum) {
     augment(dev[s], B, S, ao, cs);
     m.forward(true);
-    sl.run(io, ao.gt, opt.scale(), cs);
+    if (arch == 26)
+      l26.run(io26[0], io26[1], m.proto()->p, m.proto()->g, m.sem()->p, m.sem()->g, ao.gt, opt.scale(), cs);
+    else
+      sl.run(io, ao.gt, opt.scale(), cs);
     m.backward(accum);
     opt.tick(cs);
-    accum_items(sl.items(), logacc, 6, cs);
+    accum_items(arch == 26 ? l26.items() : sl.items(), logacc, nlog, cs);
   };
 
   // ---- 기록
   float* logh;
-  CUDA_CHECK(cudaHostAlloc(&logh, 8 * sizeof(float), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&logh, 16 * sizeof(float), cudaHostAllocDefault));
   OptState* ost;
   CUDA_CHECK(cudaHostAlloc(&ost, sizeof(OptState), cudaHostAllocDefault));
   cudaEvent_t ev_copied[kSlots], ev_used[kSlots];
@@ -311,26 +353,37 @@ int main(int argc, char** argv) {
         for (int k = 0; k < L; k++) micro(int((s0 + k) % kSlots), k > 0);
         if (step) opt.step(cs);
       });
+    set_epoch(ni);
     CUDA_CHECK(cudaGraphLaunch(g_group[key], cs));
     for (int k = 0; k < L; k++) CUDA_CHECK(cudaEventRecord(ev_used[(s0 + k) % kSlots], cs));
     ni += L;
     if (step) last_opt = ni - 1;
     if (ni >= next_log) {
-      CUDA_CHECK(cudaMemcpyAsync(logh, logacc, 8 * sizeof(float), cudaMemcpyDeviceToHost, cs));
+      CUDA_CHECK(cudaMemcpyAsync(logh, logacc, 16 * sizeof(float), cudaMemcpyDeviceToHost, cs));
       CUDA_CHECK(cudaMemcpyAsync(ost, opt.state(), sizeof(OptState), cudaMemcpyDeviceToHost, cs));
-      CUDA_CHECK(cudaMemsetAsync(logacc, 0, 8 * sizeof(float), cs));
+      CUDA_CHECK(cudaMemsetAsync(logacc, 0, 16 * sizeof(float), cs));
       CUDA_CHECK(cudaStreamSynchronize(cs));
       double t = now_s();
       double ips = double(ni - logged_at) * B / (t - tlog);
       tlog = t;
       double eta = (total - ni) * B / ips / 3600.0;
-      float n = std::max(logh[6], 1.f);
-      char line[512];
-      snprintf(line, sizeof(line),
-               "ep %ld it %ld/%ld | box %.4f seg %.4f cls %.4f dfl %.4f | fg %.0f | lr %.5f mom %.3f scale %.0f skip %ld "
-               "norm %.2f | %.1f img/s, data wait %.1f ms/it, eta %.2f h",
-               (ni - 1) / nb, ni, total, logh[0] / n, logh[1] / n, logh[2] / n, logh[3] / n, logh[4] / n, ost->lr[0],
-               ost->mom, ost->scale, ost->skipped, ost->grad_norm, ips, ds.wait_ms / double(ni - logged_at), eta);
+      float n = std::max(logh[nlog], 1.f);
+      char line[640];
+      if (arch == 26)
+        snprintf(line, sizeof(line),
+                 "ep %ld it %ld/%ld | total %.4f | o2m box %.4f seg %.4f cls %.4f l1 %.4f | o2o box %.4f seg %.4f "
+                 "cls %.4f l1 %.4f | sem %.4f | fg %.0f/%.0f w %.2f | lr %.5f mom %.3f scale %.0f skip %ld norm %.2f | "
+                 "%.1f img/s, data wait %.1f ms/it, eta %.2f h",
+                 (ni - 1) / nb, ni, total, logh[9] / n, logh[0] / n, logh[1] / n, logh[2] / n, logh[3] / n, logh[4] / n,
+                 logh[5] / n, logh[6] / n, logh[7] / n, logh[8] / n, logh[10] / n, logh[11] / n, logh[12] / n,
+                 ost->lr[0], ost->mom, ost->scale, ost->skipped, ost->grad_norm, ips,
+                 ds.wait_ms / double(ni - logged_at), eta);
+      else
+        snprintf(line, sizeof(line),
+                 "ep %ld it %ld/%ld | box %.4f seg %.4f cls %.4f dfl %.4f | fg %.0f | lr %.5f mom %.3f scale %.0f skip %ld "
+                 "norm %.2f | %.1f img/s, data wait %.1f ms/it, eta %.2f h",
+                 (ni - 1) / nb, ni, total, logh[0] / n, logh[1] / n, logh[2] / n, logh[3] / n, logh[4] / n, ost->lr[0],
+                 ost->mom, ost->scale, ost->skipped, ost->grad_norm, ips, ds.wait_ms / double(ni - logged_at), eta);
       ds.wait_ms = 0;
       logged_at = ni;
       next_log = (ni / a.log_every + 1) * a.log_every;

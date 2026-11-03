@@ -71,8 +71,10 @@ YOLO-seg 를 **우리가 고른 물체로 직접 학습**하므로, 각 물체�
 
 | 부품 | 고른 것 |
 |---|---|
-| 카메라 | **이미 받은 일반 USB RGB 카메라** (모델 확인 필요, 롤링셔터로 가정) |
-| IMU | SparkFun ISM330DHCX Qwiic (납땜 없음, 아래 연결) |
+| 카메라 | **ABKO APC930 QHD WEBCAM** (USB, `/dev/video0`, MJPEG 640×480 에서 실측 24.4 fps, 2026-11-04 Pi5 에서 확인; 롤링셔터로 가정) |
+| IMU | **구매: ICM-42688-P 6축 모듈**(알리, "저드리프트 자세 센서" 기판) — 2026-11-04 기준 **배송 대기**. 아래 ISM330DHCX 연결안은 이전 후보 |
+
+> **ICM-42688-P 받으면 확인할 것**: 핀헤더가 납땜돼 있는지(사용자 납땜 불가 — 안 돼 있으면 납땜된 판으로 바꾸거나 핀 압착 커넥터), 인터페이스(I2C 주소 0x68/0x69, SPI 겸용), 전원 3.3 V. Pi5 I2C1(핀 1·3·5·6)에 연결, WHO_AM_I(0x75) = 0x47, FIFO 20 비트 모드 + 칩 시각으로 읽기. 리눅스 커널 드라이버 `inv_icm42600` 은 SPI/I2C 둘 다 있으나 Pi 기본 커널 설정에 켜져 있는지 확인 필요 → 안 되면 사용자 공간에서 `/dev/i2c-1` 직접 읽기(Rust).
 
 ## IMU ↔ Pi5 연결 (납땜 없음)
 
@@ -95,6 +97,23 @@ IMU: **SparkFun 9DoF IMU Breakout — ISM330DHCX + MMC5983MA (Qwiic, SEN-19895)*
 - 받으면 먼저: WHO_AM_I(0x0F) = 0x6B 확인, 가만히 둔 채 몇 분 기록해 잡음 재기.
 - 실물 확인: DX-M1 HAT 가 40핀 헤더를 덮으면 핀 연장 헤더 필요.
 - 처음 고른 ICM-42688-P(알리 범용 기판)는 핀헤더 납땜이 필요할 수 있어 뺐다.
+
+## 카메라만으로 포즈 (IMU 오기 전, 딥러닝) — 2026-11-04 조사
+
+지금 파이프라인(`pipeline/`)은 포즈를 밖에서 받는다(TUM 은 모션캡처 정답). 실제 카메라에는 포즈를 만들 모듈이 필요하다.
+
+| 후보 | 방식 | 보드(Pi5+DX-M1) 적합 | 메모 |
+|---|---|---|---|
+| **SuperPoint(NPU) + 짝 맞추기 + NPU 깊이 + PnP** | 딥러닝 특징점·기술자 → 이전 장면과 짝 → 이전 장면 깊이로 3D-2D → 위치 | **보드에 공식 `superpoint_480x640.dxnn` 있음**: 입력 흑백 480×640 u8, 출력 `semi` [65,60,80]·`desc` [256,60,80], NPU 27.7 ms | 크기(m)는 깊이 모델 → 배율 흔들림은 삼각측량·IMU 로 보정. 가장 빨리 해 볼 수 있음 |
+| SuperPoint + LightGlue | 짝 맞추기도 딥러닝(트랜스포머) | LightGlue 는 NPU 변환 미확인 → CPU | 짝 품질 ↑, 속도 ↓ |
+| XFeat (CVPR 2024) | 아주 가벼운 특징점·짝 | ONNX 있음, DX 변환 필요(우리 변환기 버전 문제) | 대안 |
+| DPVO / DINO-VO | 패치 기반 딥러닝 VO(번들 조정 포함) | GPU 전제, Pi CPU·NPU 로는 무거움 | 정확도 기준선(PC) |
+| DROID-SLAM, MASt3R, VGGT | 밀집 딥러닝 SLAM·복원 | 보드 불가(PC 비교용) | |
+| SC-Depth(+PoseNet) | 자기지도 깊이·포즈 망 | 보드에 `scdepthv3_256x320.dxnn`(깊이만) — 포즈 망 없음 | |
+
+계획: ① SuperPoint(NPU) → 이전 키프레임과 기술자 상호 최근접 짝(Rust) → 이전 장면 NPU 깊이로 3D 점 → PnP RANSAC 으로 현재 포즈, ② TUM 으로 정답 대비 ATE 재기, ③ 웹캠 실시간, ④ IMU 가 오면 자이로로 회전을 잡아 VIO 로.
+
+참고: [DINO-VO 2026](https://arxiv.org/pdf/2604.04055), [DeepDCT-VO 2025](https://avesis.atauni.edu.tr/yayin/e51e0899-000f-4844-b000-ab7302d87185/deepdct-vo-3d-directional-coordinate-transformation-for-low-complexity-monocular-visual-odometry-using-deep-learning), [엣지 기기 딥러닝 VO(ALIKE+OpenVINS, 2025)](https://er.ucu.edu.ua/items/2b13a548-ee68-48ee-8adc-76e733ed7a83), [딥러닝 위치·지도 조사 논문](https://arxiv.org/pdf/2308.14039), [DEEPX DXNN 앱 개요](https://developer.deepx.ai/tech-docs/DXNN-SDK/DX-APP/DXNN_Application_Overview).
 
 ## 일반 카메라 + IMU 로 포즈를 확실하게
 

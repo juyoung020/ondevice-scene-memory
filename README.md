@@ -35,6 +35,7 @@ USB 카메라 30fps ─▶ ① 카메라 포즈 추적
 | `docs/` | 설계·일정·측정 결과 ([plan.md](docs/plan.md)) | 같이 |
 | `train/` | 분할 모델 학습 (PC). `train/ObjectSAM` = YOLO26s-seg C++/CUDA 학습기(원본 juyoung020/ObjectSAM 을 기록째로 합침, [docs/YOLO26_PORT.md](train/ObjectSAM/docs/YOLO26_PORT.md)) | A |
 | `compile/` | ONNX → `.dxnn` 변환 설정, 양자화 보정 이미지 목록 | A |
+| `pipeline/` | **지도·물체 기억 파이프라인(Rust)**: 영상+포즈 → 분할 → 누적 점유 지도·3D 점 지도·물체 트래커 → 방·엣지 → `view.json`. PC 는 ONNX Runtime, Pi5 는 DX-M1 NPU(DXRT C API) | B |
 | `board/` | 보드에서 도는 코드: 카메라, 위치 추적, NPU 실행, 3D 매핑, 씬그래프, 검색 | B |
 | `viewer/` | 3D 지도·씬그래프 웹 뷰어 | B |
 | `tools/` | 속도·정확도 측정 스크립트 | 같이 |
@@ -42,6 +43,30 @@ USB 카메라 30fps ─▶ ① 카메라 포즈 추적
 | `data/` | 촬영 영상·라벨·기억 저장본 (git 밖) | |
 
 A = 모델·컴파일러, B = 보드·앱 (수업 지정 분담).
+
+## 실행 (pipeline)
+
+```bash
+# PC (Windows, ONNX Runtime): models/yolo26s-seg.onnx
+cargo build --release --manifest-path pipeline/Cargo.toml
+pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg3_long_office_household --out data/memory/tum_rust [--live 1 --loop]
+
+# Pi5 + DX-M1 (NPU, DXRT 3.4)
+cargo build --release --no-default-features --features dxrt --manifest-path pipeline/Cargo.toml
+pipeline/target/release/memmap --tum <seq> --out data/memory/tum_pi --seg ~/dx-all-suite_my/workspace/res/models/yolo26-s-seg_640x640.dxnn
+
+# 보기
+viewer/sgview/target/release/sgview data/memory/tum_rust --port 8091 --bind 127.0.0.1
+```
+
+TUM fr3/long_office_household(516 키프레임, 깊이는 Kinect 실측) 측정:
+
+| | 키프레임/초 | 분할 ms | 지도·물체·기록 ms | 물체 |
+|---|---|---|---|---|
+| PC (RTX 5070 Ti, ONNX CPU) | 16.7 | 55 | 17 | 68 |
+| Pi 5 + DX-M1 NPU | 11.8 | 70 (NPU 54) | 36 | 74 |
+
+분할은 작업 스레드에서 한 장 앞서 돌려 지도 갱신과 겹친다. 같은 시점 비교: [docs/results/pc_vs_pi.png](docs/results/pc_vs_pi.png), 속도 개선 기록: [docs/performance_log.md](docs/performance_log.md). 앞으로의 정확도·속도 평가는 [docs/evaluation_plan.md](docs/evaluation_plan.md).
 
 ## 보드 접속
 

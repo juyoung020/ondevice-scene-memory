@@ -52,7 +52,7 @@ def slerp_pose(tab, t):
 def load_advio(d):
     fr = read_csv(os.path.join(d, 'iphone', 'frames.csv'))
     ark = read_csv(os.path.join(d, 'iphone', 'arkit.csv'))
-    gt = read_csv(os.path.join(d, 'ground-truth', 'poses.csv'))
+    gt = read_csv(os.path.join(d, 'ground-truth', 'pose.csv') if os.path.exists(os.path.join(d, 'ground-truth', 'pose.csv')) else os.path.join(d, 'ground-truth', 'poses.csv'))
     return fr, ark, gt
 
 
@@ -102,18 +102,21 @@ class Grid:
         self.free = {}
 
     def add(self, cam_xy, occ_xy, floor_xy):
+        """키프레임마다 칸 하나에 한 번씩만 센다(막힘·빔 둘 다) — 점 수가 많은 쪽이 이기지 않게."""
         r = self.res
-        for x, y in np.floor(occ_xy / r).astype(np.int64):
-            self.hit[(x, y)] = self.hit.get((x, y), 0) + 1
-        for x, y in np.floor(floor_xy / r).astype(np.int64):
-            self.free[(x, y)] = self.free.get((x, y), 0) + 1
-        # 카메라 → 장애물 사이는 빈칸(Bresenham, 점 수를 줄여서)
+        occ = {tuple(c) for c in np.floor(occ_xy / r).astype(np.int64).tolist()}
+        free = {tuple(c) for c in np.floor(floor_xy / r).astype(np.int64).tolist()}
+        # 카메라 → 장애물 칸 사이는 빈칸(장애물 칸 자체는 빼고)
         cx, cy = np.floor(cam_xy / r).astype(np.int64)
-        for x, y in np.floor(occ_xy[:: max(1, len(occ_xy) // 300)] / r).astype(np.int64):
+        for x, y in occ:
             n = max(abs(x - cx), abs(y - cy))
-            for k in range(n):
-                c = (int(cx + (x - cx) * k / n), int(cy + (y - cy) * k / n))
-                self.free[c] = self.free.get(c, 0) + 1
+            for k in range(n - 1):
+                free.add((int(cx + (x - cx) * k / n), int(cy + (y - cy) * k / n)))
+        free -= occ
+        for c in occ:
+            self.hit[c] = self.hit.get(c, 0) + 1
+        for c in free:
+            self.free[c] = self.free.get(c, 0) + 1
 
     def write(self, out):
         keys = list(self.hit) + list(self.free)
@@ -127,7 +130,7 @@ class Grid:
         for (x, y), n in self.free.items():
             img[h - 1 - (y - y0), x - x0] = 254
         for (x, y), n in self.hit.items():
-            if n >= 2 and n >= 0.3 * self.free.get((x, y), 0):
+            if n >= 2 and n >= self.free.get((x, y), 0):  # 막힘으로 본 키프레임이 빔으로 본 것 이상
                 img[h - 1 - (y - y0), x - x0] = 0
         with open(os.path.join(out, 'map.pgm.tmp'), 'wb') as f:
             f.write(f'P5\n{w} {h}\n255\n'.encode())

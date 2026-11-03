@@ -197,11 +197,13 @@ class Memory:
             u, v = K[0, 0] * pc[0] / pc[2] + K[0, 2], K[1, 1] * pc[1] / pc[2] + K[1, 2]
             if not (0.1 * w < u < 0.9 * w and 0.1 * h < v < 0.9 * h):
                 continue
+            if o['n_obs'] < 5:  # 몇 번 못 본 물체(검출 흔들림)는 사라짐 판정에서 뺀다
+                continue
             dz = depth[int(v), int(u)]
-            if dz < pc[2] - 0.4:  # 앞에 다른 것이 가림
+            if abs(dz - pc[2]) > 0.3:  # 그 자리 깊이가 물체 거리와 다르면(가림·깊이 잡음) 판단 보류
                 continue
             o['miss'] += 1
-            if o['miss'] >= 3:
+            if o['miss'] >= 8:   # 연속 8 키프레임(약 1.3 s) 보여야 할 자리에서 안 보이면
                 o['state'] = 'gone'
 
     def write(self, stamp, pose, traj, grid):
@@ -265,6 +267,8 @@ def main():
     to_view = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)
     cv2gl = np.diag([1.0, -1.0, -1.0])
     floor_z = None
+    hist_h = []
+    z0 = None
     t0 = time.time()
     nkf = 0
     fi = -1
@@ -297,10 +301,18 @@ def main():
         good = (z > 0.2) & (z < 6.0)
         Pc = np.stack([(xs.ravel() - cx) / fx * z, (ys.ravel() - cy) / fy * z, z], 1)[good]
         Pw = Pc @ Rwc.T + pwc
-        if floor_z is None:
-            floor_z = float(np.percentile(Pw[:, 2], 3))
-        else:
-            floor_z = 0.95 * floor_z + 0.05 * float(np.percentile(Pw[:, 2], 3))
+        # 바닥: 이 키프레임에서 카메라 아래로 얼마나 떨어진 점까지 있나(중력 방향, 화면 아래쪽 점의 95 %)를
+        # 카메라 높이로 보고 floor = 카메라 z − 높이. 짧게 평활(ARKit 높이 떠밀림을 따라가도록 세계 z 를 직접 쓰지 않음)
+        low = Pc[:, 1] > 0  # 화면 아래 절반
+        cam_h = float(np.percentile(-(Pc[low] @ (Rwc.T @ np.array([0, 0, 1.0]))), 95)) if low.sum() > 50 else None
+        if cam_h is not None and 0.5 < cam_h < 2.5:
+            hist_h.append(cam_h)
+        h_now = float(np.median(hist_h[-15:])) if hist_h else 1.4
+        if z0 is None:  # 첫 키프레임의 바닥을 높이 0 으로(뷰어는 지도를 z = 0 에 그린다)
+            z0 = float(pwc[2]) - h_now
+        pwc = pwc - np.array([0, 0, z0])
+        Pw = Pw - np.array([0, 0, z0])
+        floor_z = float(pwc[2]) - h_now
         hgt = Pw[:, 2] - floor_z
         grid.add(pwc[:2], Pw[(hgt > 0.15) & (hgt < 1.8)][:, :2], Pw[hgt < 0.08][:, :2])
         # 물체

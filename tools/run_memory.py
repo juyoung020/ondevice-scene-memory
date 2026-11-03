@@ -18,8 +18,13 @@ import math
 import os
 import time
 
+import shutil
+import sys
+
 import cv2
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------- ADVIO 읽기
 
@@ -139,6 +144,9 @@ class Grid:
         return {'width': w, 'height': h, 'resolution': self.res, 'origin': [float(x0 * self.res), float(y0 * self.res)]}
 
 
+VOX = 0.03  # 물체 점 칸(m)
+
+
 class Memory:
     def __init__(self, out):
         self.out = out
@@ -146,35 +154,52 @@ class Memory:
         self.objs = []
         self.next_id = 0
 
-    def match(self, name, c, ext):
-        best, bd = None, 1e9
+    def match(self, name, c, ext, keys):
+        """같은 이름 물체 중: 새 관측 점 칸의 25 % 이상이 기억 속 칸과 겹치거나(3D 겹침),
+        중심 거리가 크기에 맞춘 문턱 안이면 같은 물체. 여럿이면 겹침이 큰(같으면 가까운) 쪽."""
+        best, bscore = None, -1.0
+        kset = set(map(tuple, keys.tolist()))
         for o in self.objs:
-            if o['name'] != name:
+            if o['name'] != name or o['state'] == 'gone':
                 continue
-            d = np.linalg.norm(o['pos'] - c)
-            gate = max(0.35, 0.5 * float(np.linalg.norm(np.maximum(o['extent'], ext))))
-            if d < gate and d < bd:
-                best, bd = o, d
+            d = float(np.linalg.norm(o['pos'] - c))
+            if d > 2.0:
+                continue
+            ov = sum(1 for k in kset if k in o['vox']) / max(len(kset), 1)
+            gate = max(0.5, 0.6 * float(np.linalg.norm(np.maximum(o['extent'], ext))))
+            if ov >= 0.25 or d < gate:
+                score = ov + (1.0 - d / 2.0) * 0.1
+                if score > bscore:
+                    best, bscore = o, score
         return best
 
     def update(self, name, score, pts, cols, crop, stamp):
         c = np.median(pts, 0)
         lo, hi = np.percentile(pts, 5, 0), np.percentile(pts, 95, 0)
         ext = np.maximum(hi - lo, 0.05)
-        o = self.match(name, c, ext)
+        keys = np.unique(np.floor(pts / VOX).astype(np.int64), axis=0)
+        o = self.match(name, c, ext, keys)
         if o is None:
             o = {'id': self.next_id, 'name': name, 'first_pos': c.copy(), 'n_obs': 0, 'score': 0.0, 'miss': 0,
-                 'pts': np.zeros((0, 3)), 'cols': np.zeros((0, 3), np.uint8), 'crop_area': 0, 'state': 'seen'}
+                 'vox': {}, 'crop_area': 0, 'state': 'seen'}
             self.next_id += 1
             self.objs.append(o)
-        p, cl = voxel_down(np.vstack([o['pts'], pts]), np.vstack([o['cols'], cols]), 0.02)
-        if len(p) > 4000:
-            sel = np.random.default_rng(0).choice(len(p), 4000, replace=False)
-            p, cl = p[sel], cl[sel]
-        o['pts'], o['cols'] = p, cl
-        o['pos'] = np.median(p, 0)
-        o['extent'] = np.maximum(np.percentile(p, 95, 0) - np.percentile(p, 5, 0), 0.05)
+        # 3 cm 칸마다 "몇 번의 관측에서 점이 찍혔나"를 센다(관측 하나에서는 칸당 한 번)
+        k = np.floor(pts / VOX).astype(np.int64)
+        uk, inv = np.unique(k, axis=0, return_inverse=True)
+        inv = inv.ravel()
+        n = np.bincount(inv).astype(np.float64)
+        ps = np.stack([np.bincount(inv, pts[:, j]) for j in range(3)], 1) / n[:, None]
+        cs = np.stack([np.bincount(inv, cols[:, j].astype(np.float64)) for j in range(3)], 1) / n[:, None]
+        vox = o['vox']
+        for key, pm, cm in zip(map(tuple, uk.tolist()), ps, cs):
+            e = vox.get(key)
+            if e is None:
+                vox[key] = [1, pm, cm]
+            else:
+                e[0] += 1; e[1] = e[1] + (pm - e[1]) / e[0]; e[2] = e[2] + (cm - e[2]) / e[0]
         o['n_obs'] += 1
+        self.refresh(o)
         o['score'] = max(o['score'], score)
         o['last_seen'] = stamp
         o['miss'] = 0
@@ -184,6 +209,28 @@ class Memory:
             o['crop_area'] = crop[0].shape[0] * crop[0].shape[1]
             o['crop'] = crop
         return o
+
+    def refresh(self, o):
+        """보여 줄 점: 여러 관측에서 찍힌 칸만(한두 번 스친 배경·번짐은 버림), 중심에서 크게 벗어난 점도 버림."""
+        vals = list(o['vox'].values())
+        cnt = np.array([v[0] for v in vals])
+        P = np.array([v[1] for v in vals])
+        C = np.array([v[2] for v in vals])
+        thr = 1 if o['n_obs'] < 3 else min(10, max(2, int(np.ceil(0.15 * o['n_obs']))))
+        keep = cnt >= thr
+        if keep.sum() < 20:  # 너무 적으면 가장 많이 찍힌 칸부터
+            keep = cnt >= np.sort(cnt)[-min(len(cnt), 20)]
+        P, C, cnt = P[keep], C[keep], cnt[keep]
+        med = np.median(P, 0)
+        dist = np.linalg.norm(P - med, axis=1)
+        ok = dist <= 3 * np.median(dist) + 0.05
+        P, C, cnt = P[ok], C[ok], cnt[ok]
+        if len(P) > 4000:
+            sel = np.argsort(-cnt)[:4000]
+            P, C = P[sel], C[sel]
+        o['pts'], o['cols'] = P, np.clip(C, 0, 255).astype(np.uint8)
+        o['pos'] = np.median(P, 0)
+        o['extent'] = np.maximum(np.percentile(P, 95, 0) - np.percentile(P, 5, 0), 0.05)
 
     def check_missing(self, seen_ids, K, Rwc, pwc, depth, shape):
         """화면 안, 앞에 가린 것 없는 거리인데 이번에 못 본 물체 → miss, 3 번이면 gone."""
@@ -223,7 +270,7 @@ class Memory:
             e = {'id': oid, 'name': o['name'], 'state': o['state'], 'pos': o['pos'].tolist(),
                  'first_pos': o['first_pos'].tolist(), 'extent': o['extent'].tolist(), 'n_obs': o['n_obs'],
                  'score': float(o['score']), 'last_seen': float(o['last_seen']), 'structural': False,
-                 'points': {'path': base + '_points.ply', 'stamp': o['stamp'], 'n': int(len(o['pts'])), 'voxel': 0.02}}
+                 'points': {'path': base + '_points.ply', 'stamp': o['stamp'], 'n': int(len(o['pts'])), 'voxel': VOX}}
             if 'crop' in o:
                 e['rgbd'] = {'rgb': base + '_rgb.png', 'mask': base + '_mask.png', 'depth': base + '_depth.png'}
             objs.append(e)
@@ -243,9 +290,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--advio', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--pose', default='arkit', choices=['arkit', 'gt'])
+    ap.add_argument('--pose', default='arkit', choices=['arkit', 'gt', 'vio'])
+    ap.add_argument('--pose-file', default='', help='--pose vio: ORB-SLAM3 EuRoC 형식 궤적(ns x y z qx qy qz qw, 몸통=IMU, 세계 z 위)')
     ap.add_argument('--every', type=int, default=10, help='키프레임 간격(프레임, 60 fps 기준 10 = 6 Hz)')
     ap.add_argument('--max', type=int, default=0, help='키프레임 수 상한(0 = 끝까지)')
+    ap.add_argument('--snaps', default='', help='이 키프레임 번호들에서 기억 폴더를 <out>_snap/kf<n> 으로 복사(쉼표)')
     ap.add_argument('--seg', default='models/yolo26s-seg.pt')
     ap.add_argument('--depth', default='models/yolo26s-depth.pt')
     ap.add_argument('--conf', type=float, default=0.35)
@@ -256,9 +305,16 @@ def main():
     dep = YOLO(a.depth)
     fr, ark, gt = load_advio(a.advio)
     track = ark if a.pose == 'arkit' else gt
+    if a.pose == 'vio':
+        v = np.loadtxt(a.pose_file, ndmin=2)
+        tsec = v[:, 0] * (1e-9 if v[0, 0] > 1e6 else 1.0)
+        track = np.column_stack([tsec, v[:, 1:4], v[:, 7], v[:, 4:7]])  # → t, x, y, z, qw, qx, qy, qz
+        from advio_to_euroc import CALIB, batch_of
+        T_bc = np.linalg.inv(np.array(CALIB[batch_of(a.advio)][2]))  # 카메라(OpenCV) → 몸통(IMU)
     fx, fy, cx, cy = (map(float, a.calib.split(',')) if a.calib else (1082.4, 1084.4, 364.68, 643.31))
     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
     os.makedirs(a.out, exist_ok=True)
+    snaps = {int(x) for x in a.snaps.split(',') if x}
     mem, grid = Memory(a.out), Grid()
     cap = cv2.VideoCapture(os.path.join(a.advio, 'iphone', 'frames.mov'))
     traj, est, ref = [], [], []
@@ -286,8 +342,12 @@ def main():
             img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
         H, W = img.shape[:2]
         p, R = slerp_pose(track, t)
-        Rwc = to_view @ R @ cv2gl            # OpenCV 카메라 → 뷰어 세계
-        pwc = to_view @ p
+        if a.pose == 'vio':                  # ORB-SLAM3: 세계 z 위(중력), 몸통 자세 → 카메라 자세
+            Rwc = R @ T_bc[:3, :3]
+            pwc = p + R @ T_bc[:3, 3]
+        else:
+            Rwc = to_view @ R @ cv2gl        # OpenCV 카메라 → 뷰어 세계
+            pwc = to_view @ p
         pg, Rg = slerp_pose(gt, t)
         est.append(pwc)
         ref.append(to_view @ pg)
@@ -357,6 +417,13 @@ def main():
             mem.write(t, [float(pwc[0]), float(pwc[1]), yaw], traj, g)
             print(f'kf {nkf} t {t:.1f}s objects {len(mem.objs)} ({sum(o["state"] == "gone" for o in mem.objs)} gone) '
                   f'{(time.time() - t0) / nkf:.2f} s/kf', flush=True)
+        if nkf in snaps:  # 그 순간의 기억 폴더 + 카메라 영상
+            g = grid.write(a.out)
+            mem.write(t, [float(pwc[0]), float(pwc[1]), yaw], traj, g)
+            sd = os.path.join(a.out + '_snap', f'kf{nkf:04d}')
+            shutil.rmtree(sd, ignore_errors=True)
+            shutil.copytree(a.out, sd)
+            cv2.imwrite(os.path.join(sd, 'frame.jpg'), img)
         if a.max and nkf >= a.max:
             break
     g = grid.write(a.out)

@@ -308,6 +308,7 @@ def main():
     if a.pose == 'vio':
         v = np.loadtxt(a.pose_file, ndmin=2)
         tsec = v[:, 0] * (1e-9 if v[0, 0] > 1e6 else 1.0)
+        tsec = tsec + 0.318  # IMU 시계 → frames.csv 시계(advio_to_euroc --cam-offset 의 반대)
         track = np.column_stack([tsec, v[:, 1:4], v[:, 7], v[:, 4:7]])  # → t, x, y, z, qw, qx, qy, qz
         from advio_to_euroc import CALIB, batch_of
         T_bc = np.linalg.inv(np.array(CALIB[batch_of(a.advio)][2]))  # 카메라(OpenCV) → 몸통(IMU)

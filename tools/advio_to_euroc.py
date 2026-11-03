@@ -1,4 +1,4 @@
-"""ADVIO 한 시퀀스(아이폰 카메라 + IMU) → EuRoC 형식(ORB-SLAM3·OpenVINS 등 VIO 입력) + ORB-SLAM3 보정 YAML.
+﻿"""ADVIO 한 시퀀스(아이폰 카메라 + IMU) → EuRoC 형식(ORB-SLAM3·OpenVINS 등 VIO 입력) + ORB-SLAM3 보정 YAML.
 
   python tools/advio_to_euroc.py data/advio/advio-15 data/euroc/advio15 [--every 2]
 
@@ -24,6 +24,7 @@ CALIB = {  # fx, fy, cx, cy, k1, k2, p1, p2 (세로 720×1280 화소), T_cam_imu
                    [0, 0, 0, 1]]),
 }
 # ADVIO README: 아이폰 IMU 잡음(연속 시간)·바이어스 걸음
+NL = chr(10)  # 리눅스 VIO 가 읽을 파일은 LF
 IMU_NOISE = dict(NoiseGyro=2.4e-3, NoiseAcc=4.8e-3, GyroWalk=5.1e-5, AccWalk=2.1e-4, Frequency=100.0)
 
 
@@ -32,11 +33,11 @@ def batch_of(seq):
     return 'iphone-02' if n <= 12 else 'iphone-03' if n <= 17 else 'iphone-01' if n <= 19 else 'iphone-04'
 
 
-def write_yaml(path, calib, fps):
+def write_yaml(path, calib, fps, imu_hz=100.0):
     (fx, fy, cx, cy), (k1, k2, p1, p2), T_cam_imu = calib
     T_b_c = np.linalg.inv(np.array(T_cam_imu))  # ORB-SLAM3 IMU.T_b_c1: 카메라 → 몸통(IMU)
     rows = ', '.join(f'{v:.10f}' for v in T_b_c.ravel())
-    with open(path, 'w') as f:
+    with open(path, 'w', newline=NL) as f:
         f.write(f"""%YAML:1.0
 File.version: "1.0"
 Camera.type: "PinHole"
@@ -63,12 +64,12 @@ IMU.NoiseGyro: {IMU_NOISE['NoiseGyro']}
 IMU.NoiseAcc: {IMU_NOISE['NoiseAcc']}
 IMU.GyroWalk: {IMU_NOISE['GyroWalk']}
 IMU.AccWalk: {IMU_NOISE['AccWalk']}
-IMU.Frequency: {IMU_NOISE['Frequency']}
-ORBextractor.nFeatures: 1500
+IMU.Frequency: {imu_hz}
+ORBextractor.nFeatures: 2500
 ORBextractor.scaleFactor: 1.2
 ORBextractor.nLevels: 8
-ORBextractor.iniThFAST: 20
-ORBextractor.minThFAST: 7
+ORBextractor.iniThFAST: 12
+ORBextractor.minThFAST: 5
 Viewer.KeyFrameSize: 0.05
 Viewer.KeyFrameLineWidth: 1.0
 Viewer.GraphLineWidth: 0.9
@@ -87,6 +88,9 @@ def main():
     ap.add_argument('seq')
     ap.add_argument('out')
     ap.add_argument('--every', type=int, default=2)
+    ap.add_argument('--imu-hz', type=float, default=200.0, help='IMU 를 고른 간격으로 보간(원본은 약 100 Hz, 간격이 고르지 않아 프레임 사이가 빌 수 있음)')
+    ap.add_argument('--cam-offset', type=float, default=-0.318,
+                    help='영상 시각 보정(초). advio-15 실측: 영상 회전과 자이로를 맞춰 보면 frames.csv 가 IMU 보다 0.318 s 늦다')
     a = ap.parse_args()
     cam = os.path.join(a.out, 'mav0', 'cam0', 'data')
     os.makedirs(cam, exist_ok=True)
@@ -103,28 +107,31 @@ def main():
             continue
         if img.shape[1] > img.shape[0]:
             img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        ns = int(round(fr[i, 0] * 1e9))
+        ns = int(round((fr[i, 0] + a.cam_offset) * 1e9))
+        if ns < 50_000_000:  # IMU 첫 샘플보다 앞선 프레임은 버림
+            continue
         cv2.imwrite(os.path.join(cam, f'{ns}.png'), cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
         names.append(ns)
-    with open(os.path.join(a.out, 'mav0', 'cam0', 'data.csv'), 'w') as f:
+    with open(os.path.join(a.out, 'mav0', 'cam0', 'data.csv'), 'w', newline=NL) as f:
         f.write('#timestamp [ns],filename\n')
         f.writelines(f'{n},{n}.png\n' for n in names)
-    with open(os.path.join(a.out, 'times.txt'), 'w') as f:
+    with open(os.path.join(a.out, 'times.txt'), 'w', newline=NL) as f:
         f.writelines(f'{n}\n' for n in names)
     gy = np.loadtxt(os.path.join(a.seq, 'iphone', 'gyro.csv'), delimiter=',', ndmin=2)
     ac = np.loadtxt(os.path.join(a.seq, 'iphone', 'accelerometer.csv'), delimiter=',', ndmin=2)
     if np.median(np.linalg.norm(ac[:, 1:4], axis=1)) < 3:  # g 단위면 m/s² 로(README 는 g, 실제 파일은 m/s²)
         ac[:, 1:4] *= 9.80665
-    t = gy[(gy[:, 0] >= ac[0, 0]) & (gy[:, 0] <= ac[-1, 0]), 0]
+    t0, t1 = max(gy[0, 0], ac[0, 0]), min(gy[-1, 0], ac[-1, 0])
+    t = np.arange(t0, t1, 1.0 / a.imu_hz)
     g = np.stack([np.interp(t, gy[:, 0], gy[:, k]) for k in (1, 2, 3)], 1)
     acc = np.stack([np.interp(t, ac[:, 0], ac[:, k]) for k in (1, 2, 3)], 1)
-    with open(os.path.join(a.out, 'mav0', 'imu0', 'data.csv'), 'w') as f:
+    with open(os.path.join(a.out, 'mav0', 'imu0', 'data.csv'), 'w', newline=NL) as f:
         f.write('#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],'
                 'a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\n')
         for k in range(len(t)):
             f.write(f'{int(round(t[k] * 1e9))},' + ','.join(f'{v:.6f}' for v in (*g[k], *acc[k])) + '\n')
     b = batch_of(a.seq)
-    write_yaml(os.path.join(a.out, 'orbslam3_advio.yaml'), CALIB[b], 60.0 / a.every)
+    write_yaml(os.path.join(a.out, 'orbslam3_advio.yaml'), CALIB[b], 60.0 / a.every, a.imu_hz)
     print(f'{a.out}: {len(names)} frames, {len(t)} IMU samples, calibration {b}')
 
 

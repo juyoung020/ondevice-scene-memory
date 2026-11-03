@@ -1,97 +1,97 @@
-# 온디바이스 AI 기말 프로젝트 — 물체 공간 기억
+# 물체 공간 기억 — 손카메라로 훑으면 보드가 방을 3D로 기억한다
 
-손에 든 USB 카메라로 공간을 훑으면, 라즈베리파이 5 + DEEPX DX-M1 보드 안에서 본 물체를 **경량 3D 씬그래프**로 기억한다.
-나중에 "텀블러"를 검색하면 3D 좌표, 주변 관계(책상 위·노트북 옆), 마지막으로 본 시각과 사진을 돌려준다. 모든 계산은 보드 안에서 하고, LLM 은 쓰지 않는다.
+[변경 기록(CHANGELOG)](CHANGELOG.md)
 
-![손카메라로 책상 주위를 돌며 3D 점 지도·물체 노드·엣지·방 노드가 쌓이는 모습](docs/cover-slam.gif)
+USB 카메라를 손에 들고 방을 한 바퀴 훑으면, 라즈베리파이 5와 DEEPX DX-M1 NPU 보드가 다음 세 가지를 실시간으로 만들어 기억합니다.
 
-*TUM RGB-D fr3/long_office_household(22 m), 위치는 카메라만으로 추정(SuperPoint 특징점 + 랜드마크 평균, 정답 대비 오차 0.17 m), 깊이는 Kinect 실측. 약 2.4배속. 아래 = 3D 점 지도와 손에 든 카메라(파란 원뿔)·궤적, 가운데 = 물체 노드층(사진·상태색), 위 = 방 노드(물체 수), 회색 선 = 방→물체 엣지. 분할 COCO YOLO26s-seg. 고화질 [cover-slam.mp4](docs/cover-slam.mp4).*
+- **3D 지도:** 방 전체의 점 지도와 바닥 점유 지도
+- **물체 목록:** 무엇이 어디에 있는지(3D 위치, 사진, 마지막으로 본 시각)
+- **씬그래프:** 방 → 물체, 물체 ↔ 물체 관계(위·옆)
 
-## 흐름
+계산은 모두 보드 안에서 합니다. 입력은 **일반 RGB 카메라 한 대**이고, 깊이와 카메라 위치도 영상에서 추정합니다.
 
-```
-USB 카메라 30fps ─▶ ① 카메라 포즈 추적
-                         │ 키프레임
-                         ▼
-                   ② NPU: YOLO-seg ─ 깊이 추정 ─ CLIP 임베딩
-                         ▼
-                   ③ 3D 매핑 (CPU): 마스크 + 깊이 → 물체 3D 점 → 같은 물체 합치기
-                         ▼
-                   ④ 씬그래프 저장 → 검색 + 웹 뷰어
-```
+![손카메라로 책상 주위를 돌며 3D 지도·물체·방이 쌓이는 모습](docs/cover-slam.gif)
 
-## 하드웨어
+*공개 영상(TUM RGB-D 사무실)을 넣은 모습. 아래는 3D 지도와 손에 든 카메라(파란 원뿔), 가운데는 찾은 물체, 위는 방입니다. 고화질: [cover-slam.mp4](docs/cover-slam.mp4)*
 
-| 부품 | 사양 |
-|---|---|
-| 보드 | Raspberry Pi 5 (8 GB) |
-| NPU | DEEPX DX-M1 (4 GB) |
-| 카메라 | USB RGB 카메라 (깊이·IMU 없음), 손에 들고 움직임 |
+## 되는 것
 
-## 폴더
+- 물체 찾기(COCO 80종: 의자·컵·노트북·책 …) — 보드 NPU
+- 화면 전체 깊이 추정 — 보드 NPU
+- 카메라 위치 추정(영상만으로) — 보드 NPU 특징점 + CPU
+- 3D 지도, 물체 기억(옮겨짐·사라짐 표시)
+- 방 나누기, 방↔물체·물체↔물체 연결
+- 보드 웹캠 실시간, PC·폰 브라우저 뷰어
 
-| 폴더 | 내용 | 담당 |
+다음 단계: 물체 검색("텀블러 어디 있어?"), 방 이름 붙이기, IMU 더한 위치 추정, 웹캠 보정, 직접 학습한 분할 모델(ObjectSAM).
+
+## 빠른 시작 — PC(Windows)
+
+보드 없이 PC에서 같은 과정을 그대로 돌려 볼 수 있습니다. 그래픽카드가 있으면 더 빠릅니다(RTX 5070 Ti에서 22.8 키프레임/초).
+
+**1. 모델 받기** — `models/` 폴더에 둡니다.
+
+| 파일 | 하는 일 | 받는 곳 |
 |---|---|---|
-| `docs/` | 설계·일정·측정 결과 ([plan.md](docs/plan.md)) | 같이 |
-| `train/` | 분할 모델 학습 (PC). `train/ObjectSAM` = YOLO26s-seg C++/CUDA 학습기(원본 juyoung020/ObjectSAM 을 기록째로 합침, [docs/YOLO26_PORT.md](train/ObjectSAM/docs/YOLO26_PORT.md)) | A |
-| `compile/` | ONNX → `.dxnn` 변환 설정, 양자화 보정 이미지 목록 | A |
-| `pipeline/` | **지도·물체 기억 파이프라인(Rust)**: 영상+포즈 → 분할 → 누적 점유 지도·3D 점 지도·물체 트래커 → 방·엣지 → `view.json`. PC 는 ONNX Runtime, Pi5 는 DX-M1 NPU(DXRT C API) | B |
-| `board/` | 보드에서 도는 코드: 카메라, 위치 추적, NPU 실행, 3D 매핑, 씬그래프, 검색 | B |
-| `viewer/` | 3D 지도·씬그래프 웹 뷰어 | B |
-| `tools/` | 속도·정확도 측정 스크립트 | 같이 |
-| `models/` | `.pt` `.onnx` `.dxnn` (git 밖) | |
-| `data/` | 촬영 영상·라벨·기억 저장본 (git 밖) | |
+| `yolo26s-seg.onnx` | 물체 찾기(분할) | Hugging Face `prithivMLmods/YOLO26-ONNX` |
+| `yolo26s-depth.onnx` | 깊이 추정 | [mobilint/YOLO26s-depth](https://huggingface.co/mobilint/YOLO26s-depth/resolve/main/yolo26s-depth.onnx) |
+| `superpoint.onnx` | 위치 추정용 특징점 | [EclipseAidge/SuperPoint](https://huggingface.co/EclipseAidge/SuperPoint/resolve/main/superpoint.onnx) |
 
-A = 모델·컴파일러, B = 보드·앱 (수업 지정 분담).
+**2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 `freiburg1_desk`(책상, 23초) 또는 `freiburg3_long_office_household`(사무실, 87초)를 받아 `data/tum/`에 풉니다.
 
-## 실행 (pipeline)
+**3. 빌드하고 실행**
 
 ```bash
-# PC (Windows, ONNX Runtime + 그래픽카드 DirectML) — 보드와 같은 구성: 분할·깊이·SuperPoint 모두 모델, 위치는 카메라만으로
-#   models/yolo26s-seg.onnx, models/yolo26s-depth.onnx(HF mobilint/YOLO26s-depth), models/superpoint.onnx(HF EclipseAidge/SuperPoint)
 cargo build --release --features directml --manifest-path pipeline/Cargo.toml
-pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/pc_fr1 --every 3 \
-    --depth models/yolo26s-depth.onnx --pose vo [--live 1 --loop]
-#   Kinect 실측 깊이·정답 위치로: --depth kinect (--pose 생략)
+cargo build --release --manifest-path viewer/sgview/Cargo.toml
 
-# Pi5 + DX-M1 (NPU, DXRT 3.4) — 모델 셋 모두 NPU
+# 영상을 실제 속도로 넣으며 기억을 쌓는다(끝나면 처음부터 반복)
+pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/desk \
+    --every 3 --depth models/yolo26s-depth.onnx --pose vo --live 1 --loop
+
+# 다른 창에서 뷰어 → 브라우저로 http://127.0.0.1:8091
+viewer/sgview/target/release/sgview data/memory/desk --port 8091 --bind 127.0.0.1
+```
+
+`--live`를 빼면 영상을 최대 속도로 한 번 돌리고 끝에 요약(속도, 물체 수, 위치 오차)을 출력합니다.
+
+## 보드에서 실행 — Raspberry Pi 5 + DX-M1
+
+모델 세 개를 모두 NPU에서 돌립니다. 모델은 DX-M1 공식 모델 묶음에 들어 있습니다.
+
+```bash
 cargo build --release --no-default-features --features dxrt,cam --manifest-path pipeline/Cargo.toml
 M=~/dx-all-suite_my/workspace/res/models
-pipeline/target/release/memmap --tum <seq> --out data/memory/tum_pi --seg $M/yolo26-s-seg_640x640.dxnn \
-    --depth $M/yolo26-depth-s_768x768.dxnn --pose vo --superpoint $M/superpoint_480x640.dxnn
+NPU="--seg $M/yolo26-s-seg_640x640.dxnn --depth $M/yolo26-depth-s_768x768.dxnn --pose vo --superpoint $M/superpoint_480x640.dxnn"
 
-# 보기
-viewer/sgview/target/release/sgview data/memory/tum_rust --port 8091 --bind 127.0.0.1
+# 시험 영상으로
+pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/live --every 3 $NPU --live 1 --loop
+# 웹캠으로(실시간)
+pipeline/target/release/memmap --cam /dev/video0 --out data/memory/live $NPU --live 1
+
+# 뷰어: 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
+sgview data/memory/live --port 8091 --bind 0.0.0.0
 ```
 
-TUM fr3/long_office_household(516 키프레임, 깊이는 Kinect 실측) 측정:
+- **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'memmap --'`.
+- 웹캠은 첫 장면을 "바닥에서 1.3 m 높이, 수평으로 앞을 봄"으로 놓고 시작합니다. 카메라 보정값이 다르면 `--k fx,fy,cx,cy`로 줍니다(기본 450,450,320,240).
 
-| | 키프레임/초 | 분할 ms | 지도·물체·기록 ms | 물체 |
-|---|---|---|---|---|
-| PC (RTX 5070 Ti, ONNX CPU) | 16.7 | 55 | 17 | 68 |
-| Pi 5 + DX-M1 NPU | 11.8 | 70 (NPU 54) | 36 | 74 |
+## 주요 옵션
 
-카메라만으로 위치(분할·딥러닝 깊이·SuperPoint, TUM fr1/desk 9.4 m):
+| 옵션 | 뜻 |
+|---|---|
+| `--tum <폴더>` / `--cam <장치>` | 입력: TUM 영상 폴더 또는 웹캠 |
+| `--out <폴더>` | 기억을 저장할 폴더(뷰어가 이 폴더를 읽음) |
+| `--depth kinect \| <모델>` | 깊이: `kinect`면 TUM의 실측 깊이(비교 기준), 모델 파일이면 딥러닝 추정 |
+| `--pose vo` | 카메라 위치를 영상만으로 추정. 빼면 TUM의 정답 위치를 씀 |
+| `--every N` | N장마다 한 장씩 처리(기본 5) |
+| `--live 1` / `--loop` | 실제 속도로 재생하며 뷰어에 계속 갱신 / 끝나면 반복 |
+| `--conf 0.35` | 물체로 인정할 확신도 |
+| `--snaps 150,500` | 해당 키프레임 시점의 기억을 따로 저장(비교용) |
 
-| | 키프레임/초 | 위치 오차(ATE) |
-|---|---|---|
-| PC (RTX 5070 Ti, ONNX DirectML) | 22.8 | 0.57 m (Kinect 깊이면 0.15 m) |
-| Pi 5 + DX-M1 NPU | 5.1–6.3 | 0.30 m (Kinect 깊이면 0.08 m) |
+## 뷰어 보는 법
 
-PC 와 보드의 SuperPoint 는 가중치 출처가 달라(PC rpautrat, 보드 DeepX 공식) 위치 오차가 다르다. PC 그림: [docs/results/pc_fr1desk_onnx.png](docs/results/pc_fr1desk_onnx.png).
-
-분할은 작업 스레드에서 한 장 앞서 돌려 지도 갱신과 겹친다. 같은 시점 비교: [docs/results/pc_vs_pi.png](docs/results/pc_vs_pi.png), 속도 개선 기록: [docs/performance_log.md](docs/performance_log.md). 앞으로의 정확도·속도 평가는 [docs/evaluation_plan.md](docs/evaluation_plan.md).
-
-## 보드 접속
-
-```bash
-ssh a2024130045@kau
-source ~/dx-all-suite_my/dx-runtime/venv-dx-runtime/bin/activate
-```
-
-측정 방법은 `Desktop\kau-2026-2\온디바이스 AI\기말프로젝트\벤치마킹 가이드.md`.
-
-## 규칙
-
-- 경로에 공백·한글을 넣지 않는다 (DX 툴체인이 깨짐). 그래서 이 폴더가 `C:\ondevice` 다.
-- 가중치·데이터는 git 에 넣지 않는다.
+- **마우스:** 끌면 돌리기, 휠은 확대·축소, 오른쪽 끌기는 이동. 왼쪽 위 `Top view`(위에서 보기)·`Fit`(전체 맞추기).
+- **화면 구성:** 바닥의 흰색·검은색 칸이 점유 지도(갈 수 있는 곳·막힌 곳), 색 점이 3D 지도, 파란 원뿔이 지금 카메라입니다.
+- **물체 색:** 초록 = 지금 보임, 주황 = 옮겨짐, 회색 = 그 자리에서 사라짐.
+- **오른쪽 패널에서 켜고 끄기:** `3D map points`(지도), `Object name labels`(이름표), `Show graph layers`(위쪽 물체·방 층), `Objects as`(점 또는 표면).

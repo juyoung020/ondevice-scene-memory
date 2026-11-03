@@ -1,5 +1,24 @@
 # 실행 결과
 
+## 현재 파이프라인 (Rust, 위치는 카메라만으로) — 2026-11-04
+
+| | 처리 속도 | 위치 오차(TUM 책상 9.4 m) | 위치 오차(TUM 사무실 22 m) |
+|---|---|---|---|
+| Pi 5 + DX-M1, 모델 셋 모두 NPU | 6.2 키프레임/초 | 0.30 m (Kinect 깊이 0.08 m) | 0.77 m (Kinect 깊이 0.17 m) |
+| PC (RTX 5070 Ti, DirectML) | 22.8 키프레임/초 | 0.57 m (Kinect 깊이 0.15 m) | — |
+
+- PC 와 보드는 특징점 모델의 가중치 출처가 달라 위치 오차가 다르다.
+- 깊이를 카메라 한 대로 추정한 지도는 Kinect 실측 깊이 지도보다 흐리다.
+
+| 그림 | 내용 |
+|---|---|
+| ![](one_scene_compare.png) | 같은 시점: 실제 사진 · Kinect 깊이 지도 · NPU 깊이 지도 |
+| ![](vo_stable_compare.png) | 위치 추정 안정화 전후(위: 사진 · Kinect · 전 NPU 위에서 / 아래: 전 NPU · 후 NPU · 후 NPU 위에서) |
+| ![](pi_webcam_live.png) | 보드 웹캠 실시간 |
+| ![](pc_vs_pi.png) | PC 와 보드 같은 시점 |
+| ![](pc_fr1desk_onnx.png) | PC 판(ONNX) 책상 영상 |
+
+속도 개선 단계: [../performance_log.md](../performance_log.md).
 ## ADVIO 15 (사무실 52 초, 아이폰 카메라 + IMU) — 포즈: ARKit, 2026-11-03
 
 학습 없이 추론만: YOLO26s-seg(분할) + YOLO26s-depth(깊이, m) + 포즈 → 점유 지도 갱신 + 물체 기억, 뷰어 sgview.

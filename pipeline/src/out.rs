@@ -12,7 +12,29 @@ pub fn replace(tmp: &Path, dst: &Path) {
     std::fs::rename(tmp, dst).expect("replace");
 }
 
+/// 비동기 기록: 켜 두면 파일 쓰기를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜)
+static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(std::path::PathBuf, Vec<u8>)>> = std::sync::OnceLock::new();
+
+pub fn start_writer() {
+    WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(std::path::PathBuf, Vec<u8>)>(256);
+        std::thread::spawn(move || {
+            for (p, b) in rx {
+                write_now(&p, &b);
+            }
+        });
+        tx
+    });
+}
+
 pub fn write_atomic(dst: &Path, bytes: &[u8]) {
+    match WRITER.get() {
+        Some(tx) => tx.send((dst.to_path_buf(), bytes.to_vec())).expect("writer"),
+        None => write_now(dst, bytes),
+    }
+}
+
+fn write_now(dst: &Path, bytes: &[u8]) {
     let tmp = dst.with_extension("tmp");
     std::fs::write(&tmp, bytes).expect("write");
     replace(&tmp, dst);

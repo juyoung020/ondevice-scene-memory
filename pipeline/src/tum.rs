@@ -71,7 +71,10 @@ impl Tum {
             up = up.map(|x| -x);
         }
         let level = rot_between(&up, &[0.0, 0.0, 1.0]);
-        Tum { dir: dir.to_path_buf(), rgb, depth, ts, ps, qs, level, k: [535.4, 539.2, 320.1, 247.6] }
+        // 시퀀스별 카메라 보정(TUM 문서): freiburg1 · freiburg2 · freiburg3
+        let name = dir.to_string_lossy();
+        let k = if name.contains("freiburg1") { [517.3, 516.5, 318.6, 255.3] } else if name.contains("freiburg2") { [520.9, 521.0, 325.1, 249.7] } else { [535.4, 539.2, 320.1, 247.6] };
+        Tum { dir: dir.to_path_buf(), rgb, depth, ts, ps, qs, level, k }
     }
 
     /// 시각 t 의 카메라 포즈(수평 세계): (위치, OpenCV 카메라 → 세계 회전)

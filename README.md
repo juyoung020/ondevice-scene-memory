@@ -3,9 +3,9 @@
 손에 든 USB 카메라로 공간을 훑으면, 라즈베리파이 5 + DEEPX DX-M1 보드 안에서 본 물체를 **경량 3D 씬그래프**로 기억한다.
 나중에 "텀블러"를 검색하면 3D 좌표, 주변 관계(책상 위·노트북 옆), 마지막으로 본 시각과 사진을 돌려준다. 모든 계산은 보드 안에서 하고, LLM 은 쓰지 않는다.
 
-![손카메라로 책상 주위를 돌며 3D 점 지도·물체 노드·엣지·방 노드가 실시간으로 쌓이는 모습](docs/cover-graph.gif)
+![손카메라로 책상 주위를 돌며 3D 점 지도·물체 노드·엣지·방 노드가 쌓이는 모습](docs/cover-slam.gif)
 
-*TUM RGB-D fr3/long_office_household 를 실제 속도로 재생(2배속 GIF). 아래 = 3D 점 지도와 손에 든 카메라(파란 원뿔)·궤적, 가운데 = 물체 노드층(사진·상태색), 위 = 방 노드(SigLIP 2 로 정한 방 종류·물체 수), 회색 선 = 방→물체 엣지. 분할 COCO YOLO26s-seg, 깊이는 Kinect 실측(딥러닝 깊이 배율 보정 전 기준판). 고화질 [cover-graph.mp4](docs/cover-graph.mp4).*
+*TUM RGB-D fr3/long_office_household(22 m), 위치는 카메라만으로 추정(SuperPoint 특징점 + 랜드마크 평균, 정답 대비 오차 0.17 m), 깊이는 Kinect 실측. 약 2.4배속. 아래 = 3D 점 지도와 손에 든 카메라(파란 원뿔)·궤적, 가운데 = 물체 노드층(사진·상태색), 위 = 방 노드(물체 수), 회색 선 = 방→물체 엣지. 분할 COCO YOLO26s-seg. 고화질 [cover-slam.mp4](docs/cover-slam.mp4).*
 
 ## 흐름
 
@@ -47,13 +47,18 @@ A = 모델·컴파일러, B = 보드·앱 (수업 지정 분담).
 ## 실행 (pipeline)
 
 ```bash
-# PC (Windows, ONNX Runtime): models/yolo26s-seg.onnx
-cargo build --release --manifest-path pipeline/Cargo.toml
-pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg3_long_office_household --out data/memory/tum_rust [--live 1 --loop]
+# PC (Windows, ONNX Runtime + 그래픽카드 DirectML) — 보드와 같은 구성: 분할·깊이·SuperPoint 모두 모델, 위치는 카메라만으로
+#   models/yolo26s-seg.onnx, models/yolo26s-depth.onnx(HF mobilint/YOLO26s-depth), models/superpoint.onnx(HF EclipseAidge/SuperPoint)
+cargo build --release --features directml --manifest-path pipeline/Cargo.toml
+pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/pc_fr1 --every 3 \
+    --depth models/yolo26s-depth.onnx --pose vo [--live 1 --loop]
+#   Kinect 실측 깊이·정답 위치로: --depth kinect (--pose 생략)
 
-# Pi5 + DX-M1 (NPU, DXRT 3.4)
-cargo build --release --no-default-features --features dxrt --manifest-path pipeline/Cargo.toml
-pipeline/target/release/memmap --tum <seq> --out data/memory/tum_pi --seg ~/dx-all-suite_my/workspace/res/models/yolo26-s-seg_640x640.dxnn
+# Pi5 + DX-M1 (NPU, DXRT 3.4) — 모델 셋 모두 NPU
+cargo build --release --no-default-features --features dxrt,cam --manifest-path pipeline/Cargo.toml
+M=~/dx-all-suite_my/workspace/res/models
+pipeline/target/release/memmap --tum <seq> --out data/memory/tum_pi --seg $M/yolo26-s-seg_640x640.dxnn \
+    --depth $M/yolo26-depth-s_768x768.dxnn --pose vo --superpoint $M/superpoint_480x640.dxnn
 
 # 보기
 viewer/sgview/target/release/sgview data/memory/tum_rust --port 8091 --bind 127.0.0.1
@@ -65,6 +70,15 @@ TUM fr3/long_office_household(516 키프레임, 깊이는 Kinect 실측) 측정:
 |---|---|---|---|---|
 | PC (RTX 5070 Ti, ONNX CPU) | 16.7 | 55 | 17 | 68 |
 | Pi 5 + DX-M1 NPU | 11.8 | 70 (NPU 54) | 36 | 74 |
+
+카메라만으로 위치(분할·딥러닝 깊이·SuperPoint, TUM fr1/desk 9.4 m):
+
+| | 키프레임/초 | 위치 오차(ATE) |
+|---|---|---|
+| PC (RTX 5070 Ti, ONNX DirectML) | 22.8 | 0.57 m (Kinect 깊이면 0.15 m) |
+| Pi 5 + DX-M1 NPU | 5.1–6.3 | 0.30 m (Kinect 깊이면 0.08 m) |
+
+PC 와 보드의 SuperPoint 는 가중치 출처가 달라(PC rpautrat, 보드 DeepX 공식) 위치 오차가 다르다. PC 그림: [docs/results/pc_fr1desk_onnx.png](docs/results/pc_fr1desk_onnx.png).
 
 분할은 작업 스레드에서 한 장 앞서 돌려 지도 갱신과 겹친다. 같은 시점 비교: [docs/results/pc_vs_pi.png](docs/results/pc_vs_pi.png), 속도 개선 기록: [docs/performance_log.md](docs/performance_log.md). 앞으로의 정확도·속도 평가는 [docs/evaluation_plan.md](docs/evaluation_plan.md).
 

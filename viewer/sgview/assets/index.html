@@ -58,9 +58,10 @@
     <label class="row">Point colour
       <select id="s_pcolor"><option>true colour</option><option>state colour</option></select></label>
     <label class="row"><input type="checkbox" id="c_scene" checked> 3D map points</label>
-    <div class="num">3D map opacity <input type="number" id="n_sop" value="0.55" min="0.05" max="1" step="0.05"></div>
+    <div class="num">3D map opacity <input type="number" id="n_sop" value="1" min="0.05" max="1" step="0.05"></div>
+    <div class="num" title="splat size / voxel: above 1.4 neighbouring points overlap into a surface">3D map splat × voxel <input type="number" id="n_ssize" value="1.35" min="0.3" max="4" step="0.1"></div>
     <div class="num">Objects as <select id="s_odraw"><option>points</option><option>surface</option></select></div>
-    <div class="num">Point size × voxel <input type="number" id="n_psize" value="0.8" min="0.2" max="5" step="0.1"></div>
+    <div class="num">Point size × voxel <input type="number" id="n_psize" value="1.1" min="0.2" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_boxes"> Boxes (objects w/o points)</label>
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
     <label class="row"><input type="checkbox" id="c_gone" checked> Gone objects</label>
@@ -358,7 +359,7 @@ function drawObjects() {
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor): pale so objects stand out
     const so = { id:"scene", points:view.scene_points };
     ensurePoints(so); const se = plyCache.get("pscene");
-    if (se && se.geom) { const sp = new THREE.Points(se.geom, pointMat({ size:(view.scene_points.voxel || 0.02) * opt("n_psize"), vertexColors:true, square:false, opacity:opt("n_sop") })); sp.userData.shared = true; gObjs.add(sp); }
+    if (se && se.geom) { const sp = new THREE.Points(se.geom, pointMat({ size:(view.scene_points.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") })); sp.userData.shared = true; gObjs.add(sp); }
   }
   for (const o of objs.values()) {
     if (!objVisible(o)) continue;
@@ -1128,7 +1129,7 @@ async function startLive() {
 }
 
 // controls
-for (const id of ["c_points", "c_scene", "n_sop", "s_odraw", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { drawObjects(); drawGraph(); };
+for (const id of ["c_points", "c_scene", "n_sop", "n_ssize", "s_odraw", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { drawObjects(); drawGraph(); };
 for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra", "g_inter", "n_objz", "n_h", "n_thumb"]) $(id).onchange = drawGraph;
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };
 $("c_map").onchange = () => { gMap.visible = $("c_map").checked; invalidate(); };

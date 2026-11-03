@@ -1,5 +1,5 @@
 //! 카메라만으로 포즈(시각 오도메트리): SuperPoint 특징점(NPU) → 이전 키프레임과 기술자 상호 최근접 짝 →
-//! 이전 장면 깊이로 3D(세계) → 현재 장면 깊이로 3D(카메라) 3점 RANSAC(Horn 쿼터니언 정렬)로 초기값 →
+//! 기준 장면 랜드마크(여러 장면 관측 평균)로 3D(세계) → 현재 장면 깊이로 3D(카메라) 3점 RANSAC(Horn 쿼터니언 정렬)로 초기값 →
 //! 맞는 짝들의 재투영 오차를 가우스-뉴턴(후버 가중)으로 줄여 현재 카메라 포즈.
 use crate::geom::*;
 
@@ -9,6 +9,7 @@ pub struct Feat {
 }
 
 /// SuperPoint 출력(semi [65,Hc,Wc], desc [256,Hc,Wc]) → 칸마다 가장 센 점 하나, 점수 상위 n 개
+#[cfg_attr(not(feature = "dxrt"), allow(dead_code))]
 pub fn superpoint_decode(semi: &[f32], desc: &[f32], hc: usize, wc: usize, n: usize, thr: f32) -> Feat {
     let cells = hc * wc;
     let mut cand: Vec<(f32, f32, f32)> = vec![];
@@ -65,6 +66,18 @@ pub fn superpoint_decode(semi: &[f32], desc: &[f32], hc: usize, wc: usize, n: us
     Feat { kp, desc: d }
 }
 
+/// 256 차원 내적(8 갈래 누산 → 컴파일러가 SIMD 로)
+#[inline]
+fn dot256(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        for k in 0..8 {
+            acc[k] += ca[k] * cb[k];
+        }
+    }
+    acc.iter().sum()
+}
+
 /// 상호 최근접 + 유사도 문턱: (a 번호, b 번호)
 pub fn match_mutual(a: &Feat, b: &Feat, min_sim: f32) -> Vec<(usize, usize)> {
     let (na, nb) = (a.kp.len(), b.kp.len());
@@ -74,7 +87,7 @@ pub fn match_mutual(a: &Feat, b: &Feat, min_sim: f32) -> Vec<(usize, usize)> {
         let da = &a.desc[i * 256..i * 256 + 256];
         for j in 0..nb {
             let db = &b.desc[j * 256..j * 256 + 256];
-            let s: f32 = da.iter().zip(db).map(|(x, y)| x * y).sum();
+            let s = dot256(da, db);
             if s > best_a[i].1 {
                 best_a[i] = (j, s);
             }
@@ -175,106 +188,6 @@ fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
         x[r] = s / a[r][r];
     }
     Some(x)
-}
-
-/// 두 장면 기하(깊이 안 씀)로 상대 회전·이동 방향: 정규화 좌표 8점 RANSAC → 에센셜 행렬 → 네 해 중 앞쪽에 점이 많은 것.
-/// 반환: (R, t̂, 정상 짝 번호들, 삼각측량 깊이(이전 장면, t̂ 단위)) — 이전 카메라 좌표 X0 를 현재로: X1 = R·X0 + t̂·s
-pub fn relative_pose(x0: &[(f64, f64)], x1: &[(f64, f64)]) -> Option<(M3, V3, Vec<usize>, Vec<f64>)> {
-    use nalgebra::{Matrix3, SMatrix, Vector3};
-    let n = x0.len();
-    if n < 20 {
-        return None;
-    }
-    let mut seed = 0x2545F4914F6CDD1Du64;
-    let mut rnd = |m: usize| {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        (seed % m as u64) as usize
-    };
-    let fit = |idx: &[usize]| -> Option<Matrix3<f64>> {
-        let mut a = nalgebra::DMatrix::<f64>::zeros(idx.len().max(9), 9);
-        for (r, &i) in idx.iter().enumerate() {
-            let ((u0, v0), (u1, v1)) = (x0[i], x1[i]);
-            let row = [u1 * u0, u1 * v0, u1, v1 * u0, v1 * v0, v1, u0, v0, 1.0];
-            for c in 0..9 {
-                a[(r, c)] = row[c];
-            }
-        }
-        let svd = a.svd(false, true);
-        let vt = svd.v_t?;
-        let e = vt.row(vt.nrows() - 1);
-        let em = Matrix3::new(e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
-        let s = em.svd(true, true);
-        let (u, vt) = (s.u?, s.v_t?);
-        Some(u * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, 0.0)) * vt)
-    };
-    let sampson = |e: &Matrix3<f64>, i: usize| -> f64 {
-        let (p0, p1) = (Vector3::new(x0[i].0, x0[i].1, 1.0), Vector3::new(x1[i].0, x1[i].1, 1.0));
-        let (ep0, etp1) = (e * p0, e.transpose() * p1);
-        let num = p1.dot(&ep0);
-        num * num / (ep0[0] * ep0[0] + ep0[1] * ep0[1] + etp1[0] * etp1[0] + etp1[1] * etp1[1]).max(1e-18)
-    };
-    let thr = (1.5f64 / 530.0).powi(2); // 약 1.5 화소
-    let (mut best, mut bin) = (None, vec![]);
-    for _ in 0..300 {
-        let mut s = [0usize; 8];
-        for k in 0..8 {
-            s[k] = rnd(n);
-        }
-        let Some(e) = fit(&s) else { continue };
-        let inl: Vec<usize> = (0..n).filter(|&i| sampson(&e, i) < thr).collect();
-        if inl.len() > bin.len() {
-            bin = inl;
-            best = Some(e);
-        }
-    }
-    if bin.len() < 20 {
-        return None;
-    }
-    let e = fit(&bin).or(best)?;
-    let inl: Vec<usize> = (0..n).filter(|&i| sampson(&e, i) < thr).collect();
-    let s = e.svd(true, true);
-    let (mut u, mut vt) = (s.u?, s.v_t?);
-    if u.determinant() < 0.0 {
-        u = -u;
-    }
-    if vt.determinant() < 0.0 {
-        vt = -vt;
-    }
-    let w = Matrix3::new(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
-    let cands = [(u * w * vt, u.column(2).into_owned()), (u * w * vt, -u.column(2).into_owned()),
-                 (u * w.transpose() * vt, u.column(2).into_owned()), (u * w.transpose() * vt, -u.column(2).into_owned())];
-    // 삼각측량(중점법)으로 앞쪽 점 수가 가장 많은 해
-    let tri = |r: &Matrix3<f64>, t: &Vector3<f64>, i: usize| -> Option<f64> {
-        let d0 = Vector3::new(x0[i].0, x0[i].1, 1.0);
-        let d1 = Vector3::new(x1[i].0, x1[i].1, 1.0);
-        // X1 = R X0 + t, X0 = z0 d0, X1 = z1 d1 → z0 R d0 - z1 d1 = -t
-        let a = SMatrix::<f64, 3, 2>::from_columns(&[r * d0, -d1]);
-        let ata = a.transpose() * a;
-        let z = ata.try_inverse()? * (a.transpose() * (-t));
-        (z[0] > 0.0 && z[1] > 0.0).then_some(z[0])
-    };
-    let mut bestc = None;
-    let mut bestn = 0;
-    for (r, t) in &cands {
-        let c = inl.iter().filter(|&&i| tri(r, t, i).is_some()).count();
-        if c > bestn {
-            bestn = c;
-            bestc = Some((*r, *t));
-        }
-    }
-    let (r, t) = bestc?;
-    let mut ids = vec![];
-    let mut zs = vec![];
-    for &i in &inl {
-        if let Some(z) = tri(&r, &t, i) {
-            ids.push(i);
-            zs.push(z);
-        }
-    }
-    let rm = [[r[(0, 0)], r[(0, 1)], r[(0, 2)]], [r[(1, 0)], r[(1, 1)], r[(1, 2)]], [r[(2, 0)], r[(2, 1)], r[(2, 2)]]];
-    Some((rm, [t[0], t[1], t[2]], ids, zs))
 }
 
 /// world: 이전 장면 점(세계), cam: 같은 짝의 현재 장면 점(카메라, 깊이 있으면), uv: 현재 화소.

@@ -144,7 +144,7 @@ class Grid:
         return {'width': w, 'height': h, 'resolution': self.res, 'origin': [float(x0 * self.res), float(y0 * self.res)]}
 
 
-VOX = 0.03  # 물체 점 칸(m)
+VOX = 0.02  # 물체 점 칸(m)
 
 
 class Memory:
@@ -225,8 +225,8 @@ class Memory:
         dist = np.linalg.norm(P - med, axis=1)
         ok = dist <= 3 * np.median(dist) + 0.05
         P, C, cnt = P[ok], C[ok], cnt[ok]
-        if len(P) > 4000:
-            sel = np.argsort(-cnt)[:4000]
+        if len(P) > 12000:
+            sel = np.argsort(-cnt)[:12000]
             P, C = P[sel], C[sel]
         o['pts'], o['cols'] = P, np.clip(C, 0, 255).astype(np.uint8)
         o['pos'] = np.median(P, 0)
@@ -292,6 +292,7 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--pose', default='arkit', choices=['arkit', 'gt', 'vio'])
     ap.add_argument('--pose-file', default='', help='--pose vio: ORB-SLAM3 EuRoC 형식 궤적(ns x y z qx qy qz qw, 몸통=IMU, 세계 z 위)')
+    ap.add_argument('--level', default='traj', choices=['traj', 'imu'], help='--pose vio 수평 기준: 경로 평면(한 층 보행) 또는 IMU 평균 중력')
     ap.add_argument('--every', type=int, default=10, help='키프레임 간격(프레임, 60 fps 기준 10 = 6 Hz)')
     ap.add_argument('--max', type=int, default=0, help='키프레임 수 상한(0 = 끝까지)')
     ap.add_argument('--snaps', default='', help='이 키프레임 번호들에서 기억 폴더를 <out>_snap/kf<n> 으로 복사(쉼표)')
@@ -308,6 +309,25 @@ def main():
     if a.pose == 'vio':
         v = np.loadtxt(a.pose_file, ndmin=2)
         tsec = v[:, 0] * (1e-9 if v[0, 0] > 1e6 else 1.0)
+        # ORB-SLAM3 가 저장한 세계 z 가 중력과 안 맞는다(advio-15: 59° 기울어짐) → IMU 가속도로 위 방향을 재서 z 로 돌린다
+        imu_csv = os.path.join(os.path.dirname(a.pose_file), 'mav0', 'imu0', 'data.csv')
+        if os.path.exists(imu_csv):
+            from scipy.spatial.transform import Rotation as Rot
+            im = np.loadtxt(imu_csv, delimiter=',', skiprows=1)
+            acc = np.stack([np.interp(v[:, 0], im[:, 0], im[:, k]) for k in (4, 5, 6)], 1)
+            u = Rot.from_quat(v[:, 4:8]).apply(acc).mean(0)
+            u /= np.linalg.norm(u)
+            if a.level == 'traj':  # 한 층을 들고 걸음 → 경로 평면 법선이 위(IMU 중력은 부호만). advio-15: 중력과 13° 차, GT 높이 변화 0.18 m
+                c = v[:, 1:4] - v[:, 1:4].mean(0)
+                n = np.linalg.eigh(c.T @ c)[1][:, 0]
+                print(f'경로 평면 vs IMU 중력: {np.degrees(np.arccos(abs(n @ u))):.1f}°')
+                u = n * np.sign(n @ u)
+            ax = np.cross(u, [0, 0, 1.0])
+            Rl = Rot.from_rotvec(ax / (np.linalg.norm(ax) + 1e-12) * np.arccos(np.clip(u[2], -1, 1)))
+            print(f'VIO 수평 맞춤: 중력이 z 에서 {np.degrees(np.arccos(u[2])):.1f}° 기울어 있었음')
+            v = v.copy()
+            v[:, 1:4] = Rl.apply(v[:, 1:4])
+            v[:, 4:8] = (Rl * Rot.from_quat(v[:, 4:8])).as_quat()
         tsec = tsec + 0.318  # IMU 시계 → frames.csv 시계(advio_to_euroc --cam-offset 의 반대)
         track = np.column_stack([tsec, v[:, 1:4], v[:, 7], v[:, 4:7]])  # → t, x, y, z, qw, qx, qy, qz
         from advio_to_euroc import CALIB, batch_of

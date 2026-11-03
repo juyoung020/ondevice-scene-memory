@@ -53,6 +53,7 @@
 
   <details open><summary>Display</summary>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
+    <label class="row"><input type="checkbox" id="c_olabels" checked> Object name labels</label>
     <label class="row"><input type="checkbox" id="c_points" checked> Segment points</label>
     <label class="row">Point colour
       <select id="s_pcolor"><option>true colour</option><option>state colour</option></select></label>
@@ -569,14 +570,14 @@ function updateLabels() {
       const e = ensureLabel(key, text, cls); want.add(key);
       e.style.left = ((_v.x + 1) / 2 * w) + "px"; e.style.top = ((1 - _v.y) / 2 * h) + "px";
     };
-    for (const o of view.objects) if (objVisible(o)) {
+    if (opt("c_olabels")) for (const o of view.objects) if (objVisible(o)) {
       put("o" + o.id, `${o.name}#${o.id}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.1], "obj");
       const e = labelEls.get("o" + o.id); if (e) e.style.setProperty("--c", "#" + new THREE.Color(STATE_COL[o.state] ?? 0xc83cc8).getHexString());
     }
     if (opt("g_on")) {
       if (trajInfo && opt("g_agents")) put("traj", `${robotLabel()} ${trajInfo.len.toFixed(1)} m`, trajInfo.last, "traj");
     }
-    if (opt("g_on") && opt("g_rooms")) for (const r of view.rooms || []) put("r" + r.id, r.name || ("room " + r.id), [r.centroid[0], r.centroid[1], zOf("room") + 0.6], "room");
+    if (opt("g_on") && opt("g_rooms")) for (const r of view.rooms || []) put("r" + r.id, (r.name || ("room " + r.id)) + (r.objects ? ` · ${r.objects.length} objects` : ""), [r.centroid[0], r.centroid[1], zOf("room") + 0.6], "room");
   }
   for (const [k, e] of labelEls) if (!want.has(k)) { e.remove(); labelEls.delete(k); }
 }
@@ -1132,7 +1133,7 @@ for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra"
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };
 $("c_map").onchange = () => { gMap.visible = $("c_map").checked; invalidate(); };
 $("c_robot").onchange = () => { gRobot.visible = $("c_robot").checked; invalidate(); };
-$("c_labels").onchange = invalidate;
+$("c_labels").onchange = invalidate; $("c_olabels").onchange = invalidate;
 $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar(opt("n_rscale")); invalidate(); };
 
 // render only when something changed (camera moved, data/options changed): an idle viewer costs nothing

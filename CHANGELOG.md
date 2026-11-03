@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### Added
+- 실시간 재생 `run_memory --live 1 [--loop]`: 영상 촬영 시각에 맞춰 키프레임마다 기억을 기록(처리가 밀리면 장면을 건너뜀), 뷰어가 파일 변화를 읽어 궤적·지도·물체가 자라는 모습을 생중계. 끝나면 처음부터 반복.
+- TUM 실측 깊이 기준판 `--depth kinect`: 매핑이 정상(주사위·책·잡지가 사진과 같은 자리)으로 나와, 딥러닝 깊이 판의 어긋남이 깊이 배율 탓임을 확인. 같은 장면 물체 COCO+Kinect 69 / COCO+DA2 114.
+- 분할 점검 도구 `tools/seg_overlay.py`, 비교 `docs/results/seg_overlay_compare.png`(ObjectSAM v1.0 은 장당 38–66 조각·SigLIP 이름 확신 0.04–0.2, COCO 는 5–12 개로 깔끔).
+- README 표지 `docs/cover-graph.gif`·`docs/cover-graph.mp4`: 실제 속도 재생(2배속)에서 3D 점 지도·궤적·물체 노드·엣지·방 노드(이름·물체 수)가 자라는 모습.
+- 뷰어: 'Object name labels' 따로 끄기(방 이름표는 남김), 방 이름표에 물체 수.
+
+### Changed
+- **호환 변경:** 분할 기본값 `--seg` 를 다시 COCO YOLO26s-seg 로(ObjectSAM v1.0 은 재학습 전까지 선택 사항).
+- 3D 점 지도 1 cm(3 화소 간격, 최대 150만 점), 지도·물체 점 색은 가장 가까이서 본 관측의 색(평균 색은 뿌옇게 번짐).
+
+### Fixed
+- 뷰어가 읽는 동안 기억 파일 교체가 윈도우 파일 잠금에 막혀 재생이 죽던 문제: 임시 파일에 쓰고 잠기면 잠깐 기다렸다 교체.
+
 ## [0.3.0] - 2026-11-03
 
 ### Added

@@ -29,6 +29,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------- ADVIO 읽기
 
 
+def safe_replace(src, dst, tries=50):
+    """윈도우: 뷰어가 파일을 읽는 순간에는 바꾸기가 막힌다 → 잠깐 기다렸다 다시."""
+    for i in range(tries):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            time.sleep(0.02)
+    os.replace(src, dst)
+
+
 def read_csv(path):
     return np.loadtxt(path, delimiter=',', ndmin=2)
 
@@ -105,13 +115,14 @@ def voxel_down(pts, cols, v):
 
 
 def write_ply(path, pts, cols):
-    with open(path, 'wb') as f:
+    with open(path + '.tmp', 'wb') as f:
         f.write((f'ply\nformat binary_little_endian 1.0\nelement vertex {len(pts)}\n'
                  'property float x\nproperty float y\nproperty float z\n'
                  'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n').encode())
         rec = np.zeros(len(pts), dtype=[('p', '<f4', 3), ('c', 'u1', 3)])
         rec['p'], rec['c'] = pts, cols
         f.write(rec.tobytes())
+    safe_replace(path + '.tmp', path)
 
 
 # ---------------------------------------------------------------- 지도·물체 기억
@@ -159,7 +170,7 @@ class Grid:
         with open(os.path.join(out, 'map.pgm.tmp'), 'wb') as f:
             f.write(f'P5\n{w} {h}\n255\n'.encode())
             f.write(img.tobytes())
-        os.replace(os.path.join(out, 'map.pgm.tmp'), os.path.join(out, 'map.pgm'))
+        safe_replace(os.path.join(out, 'map.pgm.tmp'), os.path.join(out, 'map.pgm'))
         self.img = img
         return {'width': w, 'height': h, 'resolution': self.res, 'origin': [float(x0 * self.res), float(y0 * self.res)]}
 
@@ -173,9 +184,9 @@ class SceneCloud:
     """장면 전체 3D 점 지도(벽·책상·바닥 포함): 키프레임마다 깊이 화면을 성기게 올려 쌓고, 기록할 때 2 cm 칸으로 모은다.
     여러 키프레임(SUP 굵은 칸 기준 2 번 이상)에서 본 칸만 남겨 한 번 스친 번짐을 뺀다."""
 
-    def __init__(self, vox=0.02, stride=4, min_frames=2, cap=400000):
+    def __init__(self, vox=0.01, stride=3, min_frames=2, cap=1500000):
         self.vox, self.stride, self.min_frames, self.cap = vox, stride, min_frames, cap
-        self.keys, self.pts, self.cols, self.sup = [], [], [], []
+        self.keys, self.pts, self.cols, self.sup, self.dist = [], [], [], [], []
 
     def add(self, img, d, K, Rwc, pwc, zmax=4.0):
         H, W = d.shape
@@ -187,6 +198,7 @@ class SceneCloud:
         P = np.stack([(xs - K[0, 2]) / K[0, 0] * z, (ys - K[1, 2]) / K[1, 1] * z, z], 1) @ Rwc.T + pwc
         self.pts.append(P.astype(np.float32))
         self.cols.append(img[ys, xs][:, ::-1].astype(np.uint8))
+        self.dist.append(z.astype(np.float32))  # 칸 색은 가장 가까이서 본 관측 것(평균 내면 번진다)
         self.sup.append(np.unique(np.floor(P / SUP).astype(np.int64), axis=0))  # 이 키프레임이 지지한 굵은 칸
 
     def write(self, path):
@@ -198,7 +210,10 @@ class SceneCloud:
         inv = inv.ravel()
         n = np.bincount(inv).astype(np.float64)
         Pm = np.stack([np.bincount(inv, P[:, j]) for j in range(3)], 1) / n[:, None]
-        Cm = np.stack([np.bincount(inv, C[:, j].astype(np.float64)) for j in range(3)], 1) / n[:, None]
+        Dz = np.concatenate(self.dist)
+        order = np.lexsort((Dz, inv))  # 칸별로 가까운 관측이 먼저
+        first = order[np.r_[0, np.flatnonzero(np.diff(inv[order])) + 1]]
+        Cm = C[first].astype(np.float64)
         su, sc = np.unique(np.concatenate(self.sup), axis=0, return_counts=True)  # 굵은 칸마다 본 키프레임 수
         ck = np.floor(Pm / SUP).astype(np.int64)
         # 정렬된 su 에서 ck 찾기(행 단위 사전순 → 하나의 정수로 묶어 searchsorted)
@@ -318,13 +333,18 @@ class Memory:
         sup = o.setdefault('sup', {})
         for key in map(tuple, np.unique(np.floor(pts / SUP).astype(np.int64), axis=0).tolist()):
             sup[key] = sup.get(key, 0) + 1
+        # 칸 색은 가장 가까이서 본 관측의 색(평균 내면 여러 장면 색이 섞여 뿌옇게 됨)
+        cam = mesh_src[7] if mesh_src is not None else c
+        dist = float(np.linalg.norm(c - cam))
         vox = o['vox']
         for key, pm, cm in zip(map(tuple, uk.tolist()), ps, cs):
             e = vox.get(key)
             if e is None:
-                vox[key] = [1, pm, cm]
+                vox[key] = [1, pm, cm, dist]
             else:
-                e[0] += 1; e[1] = e[1] + (pm - e[1]) / e[0]; e[2] = e[2] + (cm - e[2]) / e[0]
+                e[0] += 1; e[1] = e[1] + (pm - e[1]) / e[0]
+                if dist < e[3]:
+                    e[2], e[3] = cm, dist
         o['n_obs'] += 1
         votes = o.setdefault('votes', {})
         votes[name] = votes.get(name, 0) + score
@@ -435,7 +455,7 @@ class Memory:
         tmp = os.path.join(self.out, 'view.json.tmp')
         with open(tmp, 'w') as f:
             json.dump(view, f)
-        os.replace(tmp, os.path.join(self.out, 'view.json'))
+        safe_replace(tmp, os.path.join(self.out, 'view.json'))
 
 
 # ---------------------------------------------------------------- 실행
@@ -452,9 +472,10 @@ def main():
     ap.add_argument('--every', type=int, default=10, help='키프레임 간격(프레임, 60 fps 기준 10 = 6 Hz)')
     ap.add_argument('--max', type=int, default=0, help='키프레임 수 상한(0 = 끝까지)')
     ap.add_argument('--snaps', default='', help='이 키프레임 번호들에서 기억 폴더를 <out>_snap/kf<n> 으로 복사(쉼표)')
-    ap.add_argument('--seg', default='models/ObjectSAM-416.pt', help='분할 모델. ObjectSAM(종류 없음)이면 이름은 SigLIP 2')
+    ap.add_argument('--seg', default='models/yolo26s-seg.pt', help='분할 모델. ObjectSAM(종류 없음)이면 이름은 SigLIP 2')
     ap.add_argument('--seg-imgsz', type=int, default=0, help='0 = ObjectSAM 416, 그 밖 640')
     ap.add_argument('--depth', default='models/yolo26s-depth.pt', help='YOLO 깊이 .pt 또는 Hugging Face 깊이 모델 폴더')
+    ap.add_argument('--live', type=float, default=0, help='>0: 이 배속으로 실제 시간에 맞춰 재생하며 키프레임마다 기록(뷰어로 생중계)')
     ap.add_argument('--mesh', type=int, default=0, help='1 = 물체 표면 그물도 만든다')
     ap.add_argument('--graph', type=int, default=1, help='1 = 방·엣지 층(SigLIP 2 방 이름)')
     ap.add_argument('--embed', default='models/siglip2-base-patch32-256')
@@ -465,7 +486,15 @@ def main():
     MESH = bool(a.mesh)
     from ultralytics import YOLO
     seg = YOLO(a.seg)
-    if os.path.isdir(a.depth):  # Hugging Face 깊이 모델 폴더(예: models/depth-anything-v2-metric-indoor-small)
+    if a.depth == 'kinect':  # TUM 실측 깊이(비교 기준): rgb 시각에 가장 가까운 depth 영상, 5000 = 1 m
+        _dl = [l.split() for l in open(os.path.join(a.tum, 'depth.txt')) if l[0] != '#']
+        _dt = np.array([float(x[0]) for x in _dl])
+        _cur = {}
+
+        def depth_fn(im):
+            j = int(np.argmin(np.abs(_dt - _cur['t'])))
+            return cv2.imread(os.path.join(a.tum, _dl[j][1]), -1).astype(np.float32) / 5000.0
+    elif os.path.isdir(a.depth):  # Hugging Face 깊이 모델 폴더(예: models/depth-anything-v2-metric-indoor-small)
         import torch
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
         _proc = AutoImageProcessor.from_pretrained(a.depth)
@@ -543,6 +572,7 @@ def main():
     t0 = time.time()
     nkf = 0
     n_wall = 0
+    t_start = w_start = None
     fi = -1
     while True:
         if a.tum:
@@ -562,6 +592,8 @@ def main():
         t = fr[fi, 0]
         if t < track[0, 0] or t > track[-1, 0]:
             continue
+        if a.live and t_start is not None and (float(t) - t_start) / a.live < time.time() - w_start - 0.1:
+            continue  # 처리가 밀렸으면 이 장면은 건너뛰어 실제 시간에 맞춘다(실기기 실시간과 같은 동작)
         if not a.tum and img.shape[1] > img.shape[0]:  # 가로로 읽히면 세로로(보정값은 세로 화소)
             img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
         H, W = img.shape[:2]
@@ -576,6 +608,8 @@ def main():
         est.append(pwc)
         ref.append(to_view @ pg)
         # 깊이(미터)·분할
+        if a.depth == 'kinect':
+            _cur['t'] = float(t)
         d = depth_fn(img)
         d = cv2.resize(d, (W, H), interpolation=cv2.INTER_LINEAR)
         r = seg(img, imgsz=seg_imgsz, conf=a.conf, retina_masks=True, verbose=False)[0]
@@ -667,6 +701,16 @@ def main():
         if a.graph:
             kf_embs.append((pwc[:2].copy(), emb.image(img)))
         nkf += 1
+        if a.live:  # 실제 속도로 재생: 키프레임마다 기억을 써서 뷰어에서 궤적·지도가 자라는 걸 본다
+            if t_start is None:
+                t_start, w_start = float(t), time.time()
+            lag = (float(t) - t_start) / a.live - (time.time() - w_start)
+            if lag > 0:
+                time.sleep(lag)
+            if nkf % 10 == 1:
+                mem.scene = {'path': 'scene_points.ply', 'stamp': nkf, 'voxel': scene.vox,
+                             'n': scene.write(os.path.join(a.out, 'scene_points.ply'))}
+            mem.write(t, [float(pwc[0]), float(pwc[1]), yaw], traj, grid.write(a.out))
         if nkf % 5 == 0 or nkf == 1:
             g = grid.write(a.out)
             mem.write(t, [float(pwc[0]), float(pwc[1]), yaw], traj, g)
@@ -701,4 +745,9 @@ def main():
 
 
 if __name__ == '__main__':
+    if '--loop' in sys.argv:  # 끝없이 반복 재생(뷰어 생중계용): 끝나면 3 초 쉬고 처음부터
+        sys.argv.remove('--loop')
+        while True:
+            main()
+            time.sleep(3)
     main()

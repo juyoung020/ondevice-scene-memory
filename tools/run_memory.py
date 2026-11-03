@@ -54,6 +54,25 @@ def slerp_pose(tab, t):
     return p, quat_to_R(q)
 
 
+def load_tum(d):
+    # rgb.txt: t path, groundtruth.txt: t tx ty tz qx qy qz qw (OpenCV 카메라 → 세계). 손에 들고 한 높이로 돌았다고 보고 경로 평면을 수평으로
+    from scipy.spatial.transform import Rotation as Rot
+    rows = [l.split() for l in open(os.path.join(d, 'rgb.txt')) if l[0] != '#']
+    fr = np.array([[float(r[0])] for r in rows])
+    imgs = [os.path.join(d, r[1]) for r in rows]
+    g = np.loadtxt(os.path.join(d, 'groundtruth.txt'), comments='#')
+    c = g[:, 1:4] - g[:, 1:4].mean(0)
+    n = np.linalg.eigh(c.T @ c)[1][:, 0]
+    Rg = Rot.from_quat(g[:, 4:8])
+    down = Rg.apply([0, 1.0, 0]).mean(0)  # 카메라 y(아래)가 대체로 아래
+    n = -n * np.sign(n @ down)
+    ax = np.cross(n, [0, 0, 1.0])
+    Rl = Rot.from_rotvec(ax / (np.linalg.norm(ax) + 1e-12) * np.arccos(np.clip(n[2], -1, 1)))
+    q = (Rl * Rg).as_quat()
+    gt = np.column_stack([g[:, 0], Rl.apply(g[:, 1:4]), q[:, 3], q[:, :3]])
+    return fr, gt, imgs
+
+
 def load_advio(d):
     fr = read_csv(os.path.join(d, 'iphone', 'frames.csv'))
     ark = read_csv(os.path.join(d, 'iphone', 'arkit.csv'))
@@ -141,10 +160,110 @@ class Grid:
             f.write(f'P5\n{w} {h}\n255\n'.encode())
             f.write(img.tobytes())
         os.replace(os.path.join(out, 'map.pgm.tmp'), os.path.join(out, 'map.pgm'))
+        self.img = img
         return {'width': w, 'height': h, 'resolution': self.res, 'origin': [float(x0 * self.res), float(y0 * self.res)]}
 
 
-VOX = 0.02  # 물체 점 칸(m)
+VOX = 0.012  # 물체 점 칸(m) — 보여 줄 점의 촘촘함
+MESH = False  # 물체 표면 그물(한 장면 깊이라 어긋나서 기본 끔, --mesh 1)
+SUP = 0.04   # 여러 관측 지지를 세는 굵은 칸(m) — 깊이 흔들림보다 커야 고운 점이 살아남는다
+
+
+class SceneCloud:
+    """장면 전체 3D 점 지도(벽·책상·바닥 포함): 키프레임마다 깊이 화면을 성기게 올려 쌓고, 기록할 때 2 cm 칸으로 모은다.
+    여러 키프레임(SUP 굵은 칸 기준 2 번 이상)에서 본 칸만 남겨 한 번 스친 번짐을 뺀다."""
+
+    def __init__(self, vox=0.02, stride=4, min_frames=2, cap=400000):
+        self.vox, self.stride, self.min_frames, self.cap = vox, stride, min_frames, cap
+        self.keys, self.pts, self.cols, self.sup = [], [], [], []
+
+    def add(self, img, d, K, Rwc, pwc, zmax=4.0):
+        H, W = d.shape
+        s = self.stride
+        ys, xs = np.mgrid[s // 2:H:s, s // 2:W:s]
+        z = d[ys, xs]
+        ok = (z > 0.2) & (z < zmax)
+        ys, xs, z = ys[ok], xs[ok], z[ok]
+        P = np.stack([(xs - K[0, 2]) / K[0, 0] * z, (ys - K[1, 2]) / K[1, 1] * z, z], 1) @ Rwc.T + pwc
+        self.pts.append(P.astype(np.float32))
+        self.cols.append(img[ys, xs][:, ::-1].astype(np.uint8))
+        self.sup.append(np.unique(np.floor(P / SUP).astype(np.int64), axis=0))  # 이 키프레임이 지지한 굵은 칸
+
+    def write(self, path):
+        if not self.pts:
+            return None
+        P, C = np.concatenate(self.pts), np.concatenate(self.cols)
+        k = np.floor(P / self.vox).astype(np.int64)
+        uk, inv = np.unique(k, axis=0, return_inverse=True)
+        inv = inv.ravel()
+        n = np.bincount(inv).astype(np.float64)
+        Pm = np.stack([np.bincount(inv, P[:, j]) for j in range(3)], 1) / n[:, None]
+        Cm = np.stack([np.bincount(inv, C[:, j].astype(np.float64)) for j in range(3)], 1) / n[:, None]
+        su, sc = np.unique(np.concatenate(self.sup), axis=0, return_counts=True)  # 굵은 칸마다 본 키프레임 수
+        ck = np.floor(Pm / SUP).astype(np.int64)
+        # 정렬된 su 에서 ck 찾기(행 단위 사전순 → 하나의 정수로 묶어 searchsorted)
+        off = np.minimum(su.min(0), ck.min(0))
+        span = np.maximum(su.max(0), ck.max(0)) - off + 1
+        enc = lambda a: ((a[:, 0] - off[0]) * span[1] + (a[:, 1] - off[1])) * span[2] + (a[:, 2] - off[2])
+        es, ec = enc(su), enc(ck)
+        order = np.argsort(es)
+        pos = np.clip(np.searchsorted(es[order], ec), 0, len(es) - 1)
+        frames = np.where(es[order][pos] == ec, sc[order][pos], 0)
+        keep = frames >= self.min_frames
+        Pm, Cm, frames = Pm[keep], Cm[keep], frames[keep]
+        if len(Pm) > self.cap:
+            sel = np.argsort(-frames)[:self.cap]
+            Pm, Cm = Pm[sel], Cm[sel]
+        write_ply(path, Pm.astype(np.float32), np.clip(Cm, 0, 255).astype(np.uint8))
+        return len(Pm)
+
+
+def surface_mesh(src, max_grid=140):
+    """가장 크게 본 장면의 마스크 + 깊이로 물체 표면(삼각형 그물): 격자 꼭짓점을 3D 로 올리고, 네 꼭짓점이 모두
+    마스크 안이고 깊이 차가 작은 칸만 삼각형 두 개로 잇는다(앞뒤 물체 경계에서 막이 생기지 않게). 꼭짓점 색 = 영상."""
+    rgb, mask, dep, x1, y1, (fx, fy, cx, cy), Rwc, pwc = src
+    h, w = mask.shape
+    s = max(1, int(np.ceil(max(h, w) / max_grid)))
+    dep = cv2.medianBlur(dep.astype(np.float32), 5)
+    ys, xs = np.arange(0, h, s), np.arange(0, w, s)
+    gy, gx = np.meshgrid(ys, xs, indexing='ij')
+    z = dep[gy, gx]
+    ok = (mask[gy, gx] > 0) & (z > 0.1)
+    idx = -np.ones(z.shape, np.int64)
+    idx[ok] = np.arange(ok.sum())
+    u, v, zz = gx[ok] + x1, gy[ok] + y1, z[ok]
+    P = np.stack([(u - cx) / fx * zz, (v - cy) / fy * zz, zz], 1) @ Rwc.T + pwc
+    C = rgb[gy[ok], gx[ok]][:, ::-1]
+    a, b, c, d = idx[:-1, :-1], idx[:-1, 1:], idx[1:, :-1], idx[1:, 1:]
+    za, zb, zc, zd = z[:-1, :-1], z[:-1, 1:], z[1:, :-1], z[1:, 1:]
+    zs = np.stack([za, zb, zc, zd])
+    good = (a >= 0) & (b >= 0) & (c >= 0) & (d >= 0) & (zs.max(0) < zs.min(0) * 1.06 + 0.02)
+    F = np.concatenate([np.stack([a[good], c[good], b[good]], 1), np.stack([b[good], c[good], d[good]], 1)])
+    return P.astype(np.float32), C.astype(np.uint8), F.astype(np.int32)
+
+
+def write_mesh_ply(path, P, C, F):
+    with open(path, 'wb') as f:
+        f.write((f'ply\nformat binary_little_endian 1.0\nelement vertex {len(P)}\nproperty float x\nproperty float y\n'
+                 f'property float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\n'
+                 f'element face {len(F)}\nproperty list uchar int vertex_indices\nend_header\n').encode())
+        vt = np.zeros(len(P), dtype=[('p', '<f4', 3), ('c', 'u1', 3)])
+        vt['p'], vt['c'] = P, C
+        f.write(vt.tobytes())
+        ft = np.zeros(len(F), dtype=[('n', 'u1'), ('i', '<i4', 3)])
+        ft['n'], ft['i'] = 3, F
+        f.write(ft.tobytes())
+
+
+def is_wall(pw, thick=0.08, span=0.8):
+    """마스크 점이 얇고 넓은 수직 평면이면 벽(물체가 아님): 가장 얇은 축 두께 < thick, 나머지 두 축 폭 > span,
+    면 법선이 수평(|n_z| < 0.35). 책상 윗면 같은 수평면은 법선이 위라서 남는다."""
+    if len(pw) < 100:
+        return False
+    c = pw - pw.mean(0)
+    w, V = np.linalg.eigh(c.T @ c / len(c))
+    sd = np.sqrt(np.maximum(w, 0))
+    return sd[0] * 2 < thick and sd[1] * 4 > span and abs(V[2, 0]) < 0.35
 
 
 class Memory:
@@ -153,6 +272,10 @@ class Memory:
         os.makedirs(os.path.join(out, 'objects'), exist_ok=True)
         self.objs = []
         self.next_id = 0
+        self.graph = None  # (grid meta, view 물체) → (rooms, edges)
+        self.cam = None
+        self.scene = None  # 장면 전체 점 지도(scene_points.ply)
+        self.agnostic = False  # True: 종류 없는 분할(ObjectSAM) — 이름은 SigLIP 투표
 
     def match(self, name, c, ext, keys):
         """같은 이름 물체 중: 새 관측 점 칸의 25 % 이상이 기억 속 칸과 겹치거나(3D 겹침),
@@ -160,7 +283,7 @@ class Memory:
         best, bscore = None, -1.0
         kset = set(map(tuple, keys.tolist()))
         for o in self.objs:
-            if o['name'] != name or o['state'] == 'gone':
+            if o['state'] == 'gone' or (not self.agnostic and o['name'] != name):  # ObjectSAM: 이름은 흔들리니 3D 겹침만
                 continue
             d = float(np.linalg.norm(o['pos'] - c))
             if d > 2.0:
@@ -173,7 +296,7 @@ class Memory:
                     best, bscore = o, score
         return best
 
-    def update(self, name, score, pts, cols, crop, stamp):
+    def update(self, name, score, pts, cols, crop, stamp, mesh_src=None):
         c = np.median(pts, 0)
         lo, hi = np.percentile(pts, 5, 0), np.percentile(pts, 95, 0)
         ext = np.maximum(hi - lo, 0.05)
@@ -191,6 +314,10 @@ class Memory:
         n = np.bincount(inv).astype(np.float64)
         ps = np.stack([np.bincount(inv, pts[:, j]) for j in range(3)], 1) / n[:, None]
         cs = np.stack([np.bincount(inv, cols[:, j].astype(np.float64)) for j in range(3)], 1) / n[:, None]
+        # 지지 횟수는 굵은 칸(SUP)으로 센다: 깊이가 몇 cm 흔들려도 같은 표면이면 같은 칸 → 고운 점이 버려지지 않음
+        sup = o.setdefault('sup', {})
+        for key in map(tuple, np.unique(np.floor(pts / SUP).astype(np.int64), axis=0).tolist()):
+            sup[key] = sup.get(key, 0) + 1
         vox = o['vox']
         for key, pm, cm in zip(map(tuple, uk.tolist()), ps, cs):
             e = vox.get(key)
@@ -199,7 +326,12 @@ class Memory:
             else:
                 e[0] += 1; e[1] = e[1] + (pm - e[1]) / e[0]; e[2] = e[2] + (cm - e[2]) / e[0]
         o['n_obs'] += 1
-        self.refresh(o)
+        votes = o.setdefault('votes', {})
+        votes[name] = votes.get(name, 0) + score
+        o['name'] = max(votes, key=votes.get)
+        if o['n_obs'] == 1 or o['n_obs'] % 8 == 0:  # 점 정리는 무거워서 가끔만(기록할 때는 항상)
+            self.refresh(o)
+        o['stale'] = True
         o['score'] = max(o['score'], score)
         o['last_seen'] = stamp
         o['miss'] = 0
@@ -208,12 +340,18 @@ class Memory:
         if crop is not None and crop[0].shape[0] * crop[0].shape[1] > o['crop_area']:
             o['crop_area'] = crop[0].shape[0] * crop[0].shape[1]
             o['crop'] = crop
+            o['mesh_src'] = mesh_src  # 가장 크게 본 장면에서 표면을 만든다
         return o
 
     def refresh(self, o):
         """보여 줄 점: 여러 관측에서 찍힌 칸만(한두 번 스친 배경·번짐은 버림), 중심에서 크게 벗어난 점도 버림."""
-        vals = list(o['vox'].values())
-        cnt = np.array([v[0] for v in vals])
+        keys = list(o['vox'])
+        vals = [o['vox'][k] for k in keys]
+        # 고운 칸이 속한 굵은 칸의 지지 횟수(굵은 칸 수만큼만 사전 조회)
+        ck = np.floor(np.array(keys, np.float64) * (VOX / SUP)).astype(np.int64)
+        uc, inv = np.unique(ck, axis=0, return_inverse=True)
+        sup = o['sup']
+        cnt = np.array([sup.get(tuple(c), 1) for c in uc.tolist()])[inv.ravel()]
         P = np.array([v[1] for v in vals])
         C = np.array([v[2] for v in vals])
         thr = 1 if o['n_obs'] < 3 else min(10, max(2, int(np.ceil(0.15 * o['n_obs']))))
@@ -225,8 +363,8 @@ class Memory:
         dist = np.linalg.norm(P - med, axis=1)
         ok = dist <= 3 * np.median(dist) + 0.05
         P, C, cnt = P[ok], C[ok], cnt[ok]
-        if len(P) > 12000:
-            sel = np.argsort(-cnt)[:12000]
+        if len(P) > 40000:
+            sel = np.argsort(-cnt)[:40000]
             P, C = P[sel], C[sel]
         o['pts'], o['cols'] = P, np.clip(C, 0, 255).astype(np.uint8)
         o['pos'] = np.median(P, 0)
@@ -258,6 +396,9 @@ class Memory:
         for o in self.objs:
             oid = o['id']
             base = f'objects/O{oid}'
+            if o.get('stale'):
+                self.refresh(o)
+                o['stale'] = False
             if o.get('dirty'):
                 write_ply(os.path.join(self.out, base + '_points.ply'), o['pts'].astype(np.float32), o['cols'])
                 if 'crop' in o:
@@ -265,18 +406,32 @@ class Memory:
                     cv2.imwrite(os.path.join(self.out, base + '_rgb.png'), rgb)
                     cv2.imwrite(os.path.join(self.out, base + '_mask.png'), mask)
                     cv2.imwrite(os.path.join(self.out, base + '_depth.png'), dep)
+                if MESH and o.get('mesh_src') is not None:
+                    Pm, Cm, Fm = surface_mesh(o['mesh_src'])
+                    if len(Fm):
+                        write_mesh_ply(os.path.join(self.out, base + '_mesh.ply'), Pm, Cm, Fm)
+                        o['has_mesh'] = True
                 o['dirty'] = False
                 o['stamp'] = o.get('stamp', 0) + 1
             e = {'id': oid, 'name': o['name'], 'state': o['state'], 'pos': o['pos'].tolist(),
                  'first_pos': o['first_pos'].tolist(), 'extent': o['extent'].tolist(), 'n_obs': o['n_obs'],
                  'score': float(o['score']), 'last_seen': float(o['last_seen']), 'structural': False,
                  'points': {'path': base + '_points.ply', 'stamp': o['stamp'], 'n': int(len(o['pts'])), 'voxel': VOX}}
+            if o.get('has_mesh'):
+                e['mesh'] = {'path': base + '_mesh.ply', 'stamp': o['stamp']}
             if 'crop' in o:
-                e['rgbd'] = {'rgb': base + '_rgb.png', 'mask': base + '_mask.png', 'depth': base + '_depth.png'}
+                e['rgbd'] ={'rgb': base + '_rgb.png', 'mask': base + '_mask.png', 'depth': base + '_depth.png'}
             objs.append(e)
         nodes = [{'id': f'A{i}', 'kind': 'agent', 'pos': p, 't': t} for i, (t, p) in enumerate(traj)]
-        view = {'stamp': float(stamp), 'pose': pose, 'grid': grid, 'objects': objs, 'rooms': [],
-                'graph': {'nodes': nodes, 'edges': []}, 'robot': 'handheld camera'}
+        rooms, edges = [], []
+        if self.graph is not None and grid is not None:  # 방·엣지 층(tools/scene_graph.py)
+            rooms, edges = self.graph(grid, objs)
+        view = {'stamp': float(stamp), 'pose': pose, 'grid': grid, 'objects': objs, 'rooms': rooms,
+                'graph': {'nodes': nodes, 'edges': edges}, 'robot': 'handheld camera'}
+        if self.scene is not None:
+            view['scene_points'] = self.scene
+        if self.cam is not None:  # 카메라 실제 자세(위치 + OpenCV 카메라 → 세계 회전): 뷰어가 높이·기울기 그대로 그림
+            view['cam'] = self.cam
         tmp = os.path.join(self.out, 'view.json.tmp')
         with open(tmp, 'w') as f:
             json.dump(view, f)
@@ -288,7 +443,8 @@ class Memory:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--advio', required=True)
+    ap.add_argument('--advio', default='')
+    ap.add_argument('--tum', default='', help='TUM RGB-D 시퀀스 폴더(rgb.txt, groundtruth.txt). 포즈 = 모션캡처 정답(수평은 경로 평면)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--pose', default='arkit', choices=['arkit', 'gt', 'vio'])
     ap.add_argument('--pose-file', default='', help='--pose vio: ORB-SLAM3 EuRoC 형식 궤적(ns x y z qx qy qz qw, 몸통=IMU, 세계 z 위)')
@@ -296,16 +452,41 @@ def main():
     ap.add_argument('--every', type=int, default=10, help='키프레임 간격(프레임, 60 fps 기준 10 = 6 Hz)')
     ap.add_argument('--max', type=int, default=0, help='키프레임 수 상한(0 = 끝까지)')
     ap.add_argument('--snaps', default='', help='이 키프레임 번호들에서 기억 폴더를 <out>_snap/kf<n> 으로 복사(쉼표)')
-    ap.add_argument('--seg', default='models/yolo26s-seg.pt')
-    ap.add_argument('--depth', default='models/yolo26s-depth.pt')
+    ap.add_argument('--seg', default='models/ObjectSAM-416.pt', help='분할 모델. ObjectSAM(종류 없음)이면 이름은 SigLIP 2')
+    ap.add_argument('--seg-imgsz', type=int, default=0, help='0 = ObjectSAM 416, 그 밖 640')
+    ap.add_argument('--depth', default='models/yolo26s-depth.pt', help='YOLO 깊이 .pt 또는 Hugging Face 깊이 모델 폴더')
+    ap.add_argument('--mesh', type=int, default=0, help='1 = 물체 표면 그물도 만든다')
+    ap.add_argument('--graph', type=int, default=1, help='1 = 방·엣지 층(SigLIP 2 방 이름)')
+    ap.add_argument('--embed', default='models/siglip2-base-patch32-256')
     ap.add_argument('--conf', type=float, default=0.35)
     ap.add_argument('--calib', default='', help='fx,fy,cx,cy (세로 영상 화소). 비우면 ADVIO 13-17 묶음 값')
     a = ap.parse_args()
+    global MESH
+    MESH = bool(a.mesh)
     from ultralytics import YOLO
     seg = YOLO(a.seg)
-    dep = YOLO(a.depth)
-    fr, ark, gt = load_advio(a.advio)
-    track = ark if a.pose == 'arkit' else gt
+    if os.path.isdir(a.depth):  # Hugging Face 깊이 모델 폴더(예: models/depth-anything-v2-metric-indoor-small)
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+        _proc = AutoImageProcessor.from_pretrained(a.depth)
+        _da = AutoModelForDepthEstimation.from_pretrained(a.depth).cuda().eval()
+
+        def depth_fn(im):
+            with torch.no_grad():
+                x = _proc(images=cv2.cvtColor(im, cv2.COLOR_BGR2RGB), return_tensors='pt').to('cuda')
+                return _da(**x).predicted_depth[0].float().cpu().numpy()
+    else:
+        _yd = YOLO(a.depth)
+
+        def depth_fn(im):
+            return _yd(im, imgsz=768, verbose=False)[0].depth.data.cpu().numpy()
+    tum_imgs = None
+    if a.tum:
+        fr, gt, tum_imgs = load_tum(a.tum)
+        track = gt
+    else:
+        fr, ark, gt = load_advio(a.advio)
+        track = ark if a.pose == 'arkit' else gt
     if a.pose == 'vio':
         v = np.loadtxt(a.pose_file, ndmin=2)
         tsec = v[:, 0] * (1e-9 if v[0, 0] > 1e6 else 1.0)
@@ -332,34 +513,56 @@ def main():
         track = np.column_stack([tsec, v[:, 1:4], v[:, 7], v[:, 4:7]])  # → t, x, y, z, qw, qx, qy, qz
         from advio_to_euroc import CALIB, batch_of
         T_bc = np.linalg.inv(np.array(CALIB[batch_of(a.advio)][2]))  # 카메라(OpenCV) → 몸통(IMU)
-    fx, fy, cx, cy = (map(float, a.calib.split(',')) if a.calib else (1082.4, 1084.4, 364.68, 643.31))
+    fx, fy, cx, cy = (map(float, a.calib.split(',')) if a.calib else
+                      (535.4, 539.2, 320.1, 247.6) if a.tum else (1082.4, 1084.4, 364.68, 643.31))
     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
     os.makedirs(a.out, exist_ok=True)
     snaps = {int(x) for x in a.snaps.split(',') if x}
     mem, grid = Memory(a.out), Grid()
-    cap = cv2.VideoCapture(os.path.join(a.advio, 'iphone', 'frames.mov'))
+    scene = SceneCloud()
+    kf_embs = []
+    mem.agnostic = len(seg.names) == 1  # ObjectSAM: {0: 'object'}
+    seg_imgsz = a.seg_imgsz or (416 if mem.agnostic else 640)
+    if a.graph or mem.agnostic:
+        import scene_graph as SG
+        emb = SG.Embedder(a.embed)
+        emb.set_labels(SG.OBJECT_NAMES, SG.STRUCTURAL_NAMES)
+    if a.graph:
+        mem.graph = lambda meta, objs: SG.build(grid.img, meta, objs, kf_embs, emb)
+    cap = None if a.tum else cv2.VideoCapture(os.path.join(a.advio, 'iphone', 'frames.mov'))
     traj, est, ref = [], [], []
     # 좌표: ARKit/ADVIO 세계는 y 위(중력 반대). 카메라는 OpenGL(x 오른쪽, y 위, −z 앞).
     # 뷰어는 z 위 → W = (x, −z, y). 우리 역투영은 OpenCV 카메라(x 오른쪽, y 아래, z 앞) → GL = diag(1, −1, −1)·CV.
     to_view = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)
     cv2gl = np.diag([1.0, -1.0, -1.0])
+    if a.tum:  # TUM: 정답이 OpenCV 카메라 자세, load_tum 에서 이미 z 위로 맞춤
+        to_view, cv2gl = np.eye(3), np.eye(3)
     floor_z = None
     hist_h = []
     z0 = None
     t0 = time.time()
     nkf = 0
+    n_wall = 0
     fi = -1
     while True:
-        ok, img = cap.read()
-        if not ok:
-            break
-        fi += 1
+        if a.tum:
+            fi += 1
+            if fi >= len(tum_imgs):
+                break
+            if fi % a.every:
+                continue
+            img = cv2.imread(tum_imgs[fi])
+        else:
+            ok, img = cap.read()
+            if not ok:
+                break
+            fi += 1
         if fi % a.every or fi >= len(fr):
             continue
         t = fr[fi, 0]
         if t < track[0, 0] or t > track[-1, 0]:
             continue
-        if img.shape[1] > img.shape[0]:  # 가로로 읽히면 세로로(보정값은 세로 화소)
+        if not a.tum and img.shape[1] > img.shape[0]:  # 가로로 읽히면 세로로(보정값은 세로 화소)
             img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
         H, W = img.shape[:2]
         p, R = slerp_pose(track, t)
@@ -373,9 +576,9 @@ def main():
         est.append(pwc)
         ref.append(to_view @ pg)
         # 깊이(미터)·분할
-        d = dep(img, imgsz=768, verbose=False)[0].depth.data.cpu().numpy()
+        d = depth_fn(img)
         d = cv2.resize(d, (W, H), interpolation=cv2.INTER_LINEAR)
-        r = seg(img, imgsz=640, conf=a.conf, retina_masks=True, verbose=False)[0]
+        r = seg(img, imgsz=seg_imgsz, conf=a.conf, retina_masks=True, verbose=False)[0]
         # 지도: 성긴 깊이 점
         ys, xs = np.mgrid[8:H:16, 8:W:16]
         z = d[ys, xs].ravel()
@@ -400,6 +603,17 @@ def main():
         seen = set()
         if r.masks is not None:
             names = r.names
+            if mem.agnostic:  # 이 장면 물체 이름을 SigLIP 2 한 번(배치)에
+                crops = []
+                for k in range(len(r.boxes)):
+                    bx1, by1, bx2, by2 = r.boxes.xyxy[k].cpu().numpy().astype(int)
+                    bx1, by1 = max(bx1, 0), max(by1, 0)
+                    bx2, by2 = max(min(bx2, W), bx1 + 1), max(min(by2, H), by1 + 1)
+                    mk = r.masks.data[k].cpu().numpy() > 0.5
+                    if mk.shape != (H, W):
+                        mk = cv2.resize(mk.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+                    crops.append((img[by1:by2, bx1:bx2], mk[by1:by2, bx1:bx2]))
+                labs = emb.labels(crops)
             for k in range(len(r.boxes)):
                 name = names[int(r.boxes.cls[k])]
                 if name == 'person':
@@ -407,6 +621,17 @@ def main():
                 m = r.masks.data[k].cpu().numpy() > 0.5
                 if m.shape != (H, W):
                     m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+                score = float(r.boxes.conf[k])
+                if mem.agnostic:  # ObjectSAM: 이름은 SigLIP 2 로 붙이고, 벽·바닥 같은 구조물이면 버린다
+                    bx1, by1, bx2, by2 = r.boxes.xyxy[k].cpu().numpy().astype(int)
+                    bx1, by1, bx2, by2 = max(bx1, 0), max(by1, 0), min(bx2, W), min(by2, H)
+                    if (bx2 - bx1) < 12 or (by2 - by1) < 12:
+                        continue
+                    name, p, struct = labs[k]
+                    if struct or m.mean() > 0.35:  # 구조물 이름이거나 화면 35 % 넘게 덮으면 물체 아님
+                        n_wall += 1
+                        continue
+                    score *= p
                 m = cv2.erode(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0  # 가장자리 깊이 번짐 제거
                 vv, uu = np.nonzero(m)
                 if len(vv) < 80:
@@ -422,24 +647,34 @@ def main():
                 vv, uu, zz = vv[keep], uu[keep], zz[keep]
                 pc = np.stack([(uu - cx) / fx * zz, (vv - cy) / fy * zz, zz], 1)
                 pw = pc @ Rwc.T + pwc
+                if is_wall(pw):  # 칸막이·벽면을 냉장고·TV 등으로 잘못 잡은 것
+                    n_wall += 1
+                    continue
                 cols = img[vv, uu][:, ::-1].copy()
                 x1, y1, x2, y2 = r.boxes.xyxy[k].cpu().numpy().astype(int)
                 x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, W), min(y2, H)
                 crop = (img[y1:y2, x1:x2].copy(), (m[y1:y2, x1:x2] * 255).astype(np.uint8),
                         np.clip(d[y1:y2, x1:x2] * 1000, 0, 65535).astype(np.uint16))
-                o = mem.update(name, float(r.boxes.conf[k]), pw, cols, crop, t)
+                msrc = (img[y1:y2, x1:x2].copy(), m[y1:y2, x1:x2].astype(np.uint8), d[y1:y2, x1:x2].copy(), x1, y1,
+                        (fx, fy, cx, cy), Rwc.copy(), pwc.copy())
+                o = mem.update(name, score, pw, cols, crop, t, msrc)
                 seen.add(o['id'])
         mem.check_missing(seen, K, Rwc, pwc, d, (H, W))
+        scene.add(img, d, K, Rwc, pwc)
         yaw = math.atan2(Rwc[1, 2], Rwc[0, 2])  # 카메라 앞(z)의 바닥 방향
         traj.append((float(t), [float(pwc[0]), float(pwc[1]), float(floor_z)]))
+        mem.cam = {'pos': [float(v) for v in pwc], 'R': Rwc.tolist()}  # 물체·지도와 같은 좌표(첫 바닥 = 0)
+        if a.graph:
+            kf_embs.append((pwc[:2].copy(), emb.image(img)))
         nkf += 1
         if nkf % 5 == 0 or nkf == 1:
             g = grid.write(a.out)
             mem.write(t, [float(pwc[0]), float(pwc[1]), yaw], traj, g)
-            print(f'kf {nkf} t {t:.1f}s objects {len(mem.objs)} ({sum(o["state"] == "gone" for o in mem.objs)} gone) '
+            print(f'kf {nkf} t {t:.1f}s objects {len(mem.objs)} ({sum(o["state"] == "gone" for o in mem.objs)} gone, wall rejects {n_wall}) '
                   f'{(time.time() - t0) / nkf:.2f} s/kf', flush=True)
         if nkf in snaps:  # 그 순간의 기억 폴더 + 카메라 영상
             g = grid.write(a.out)
+            mem.scene = {'path': 'scene_points.ply', 'stamp': nkf, 'voxel': scene.vox, 'n': scene.write(os.path.join(a.out, 'scene_points.ply'))}
             mem.write(t, [float(pwc[0]), float(pwc[1]), yaw], traj, g)
             sd = os.path.join(a.out + '_snap', f'kf{nkf:04d}')
             shutil.rmtree(sd, ignore_errors=True)
@@ -448,6 +683,8 @@ def main():
         if a.max and nkf >= a.max:
             break
     g = grid.write(a.out)
+    mem.scene = {'path': 'scene_points.ply', 'stamp': nkf, 'voxel': scene.vox, 'n': scene.write(os.path.join(a.out, 'scene_points.ply'))}
+    print('scene points', mem.scene['n'])
     mem.write(traj[-1][0], [float(pwc[0]), float(pwc[1]), yaw], traj, g)
     est, ref = np.array(est), np.array(ref)
     s, Rr, tr = umeyama(est, ref)

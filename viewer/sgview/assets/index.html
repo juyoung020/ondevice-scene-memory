@@ -56,7 +56,10 @@
     <label class="row"><input type="checkbox" id="c_points" checked> Segment points</label>
     <label class="row">Point colour
       <select id="s_pcolor"><option>true colour</option><option>state colour</option></select></label>
-    <div class="num">Point size × voxel <input type="number" id="n_psize" value="1.1" min="0.2" max="5" step="0.1"></div>
+    <label class="row"><input type="checkbox" id="c_scene" checked> 3D map points</label>
+    <div class="num">3D map opacity <input type="number" id="n_sop" value="0.55" min="0.05" max="1" step="0.05"></div>
+    <div class="num">Objects as <select id="s_odraw"><option>points</option><option>surface</option></select></div>
+    <div class="num">Point size × voxel <input type="number" id="n_psize" value="0.8" min="0.2" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_boxes"> Boxes (objects w/o points)</label>
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
     <label class="row"><input type="checkbox" id="c_gone" checked> Gone objects</label>
@@ -110,7 +113,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const STATE_COL = { seen:0x2ea043, moved:0xf58c14, held:0x286ee6, gone:0x8c8c8c };
-const EDGE_COL = { place:0x5a5a5a, door:0xe67814, agent:0x286ee6, inter:0x969696 };
+const EDGE_COL = { place:0x5a5a5a, door:0xe67814, agent:0x286ee6, inter:0x969696, near:0x9aa3ad, on:0xe0a020 };
 
 // ---------------- three.js ----------------
 const host = $("view");
@@ -292,13 +295,18 @@ function drawAligned() {
 }
 
 // ---------------- object point clouds ----------------
+function surfaceMode() {   // ?draw=points opens with point clouds
+  const e = document.getElementById("s_odraw"); if (!e) return true;
+  if (!e.dataset.init) { e.dataset.init = 1; const q = new URLSearchParams(location.search).get("draw"); if (q) e.value = q; }
+  return e.value === "surface";
+}
 function parsePly(buf) {
   const u8 = new Uint8Array(buf);
   let end = 0; const dec = new TextDecoder();
   for (let i = 0; i < Math.min(u8.length, 2048); i++) if (u8[i] === 10 && dec.decode(u8.subarray(Math.max(0, i - 10), i + 1)).includes("end_header")) { end = i + 1; break; }
   const head = dec.decode(u8.subarray(0, end)).split("\n");
-  let n = 0; const props = [];
-  for (const l of head) { const t = l.trim().split(/\s+/); if (t[0] === "element" && t[1] === "vertex") n = +t[2]; else if (t[0] === "property") props.push({ type:t[1], name:t[2] }); }
+  let n = 0, nf = 0, cur = ""; const props = [];
+  for (const l of head) { const t = l.trim().split(/\s+/); if (t[0] === "element") { cur = t[1]; if (cur === "vertex") n = +t[2]; else if (cur === "face") nf = +t[2]; } else if (t[0] === "property" && cur === "vertex") props.push({ type:t[1], name:t[2] }); }
   const size = { float:4, float32:4, double:8, uchar:1, uint8:1, char:1, int8:1, ushort:2, uint16:2, short:2, int16:2, int:4, int32:4, uint:4, uint32:4 };
   let stride = 0; const off = {};
   for (const p of props) { off[p.name] = { o:stride, t:p.type }; stride += size[p.type] || 4; }
@@ -313,19 +321,25 @@ function parsePly(buf) {
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
   g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
+  if (nf) {   // triangle faces (list uchar int): object surface mesh
+    const idx = new Uint32Array(nf * 3); let b = n * stride;
+    for (let i = 0; i < nf; i++) { const k = dv.getUint8(b); b += 1; for (let j = 0; j < 3 && j < k; j++) idx[3*i+j] = dv.getInt32(b + 4*j, true); b += 4 * k; }
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+  }
   g.computeBoundingSphere();
   return g;
 }
 
 async function ensurePoints(o) {
-  if (!o.points || !o.points.path) return null;
-  const c = plyCache.get(o.id);
-  if (c && c.stamp === o.points.stamp && !(c.failedAt && performance.now() - c.failedAt > 1500)) return c;
-  if (c && c.loading === o.points.stamp) return c;
-  const entry = { stamp:o.points.stamp, loading:o.points.stamp, geom:c ? c.geom : null, failedAt:0 };
-  plyCache.set(o.id, entry); pendingLoads++;
+  const src = surfaceMode() && o.mesh ? o.mesh : o.points, key = (surfaceMode() && o.mesh ? "m" : "p") + o.id;
+  if (!src || !src.path) return null;
+  const c = plyCache.get(key);
+  if (c && c.stamp === src.stamp && !(c.failedAt && performance.now() - c.failedAt > 1500)) return c;
+  if (c && c.loading === src.stamp) return c;
+  const entry = { stamp:src.stamp, loading:src.stamp, geom:c ? c.geom : null, failedAt:0 };
+  plyCache.set(key, entry); pendingLoads++;
   try {
-    const r = await fetch("/file/" + o.points.path + "?v=" + o.points.stamp);
+    const r = await fetch("/file/" + src.path + "?v=" + src.stamp);
     if (!r.ok) throw 0;
     const g = parsePly(await r.arrayBuffer());
     if (entry.geom) entry.geom.dispose();
@@ -340,15 +354,24 @@ function drawObjects() {
   invalidate();
   disposeGroup(gObjs);
   gObjs.visible = true;
+  if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor): pale so objects stand out
+    const so = { id:"scene", points:view.scene_points };
+    ensurePoints(so); const se = plyCache.get("pscene");
+    if (se && se.geom) { const sp = new THREE.Points(se.geom, pointMat({ size:(view.scene_points.voxel || 0.02) * opt("n_psize"), vertexColors:true, square:false, opacity:opt("n_sop") })); sp.userData.shared = true; gObjs.add(sp); }
+  }
   for (const o of objs.values()) {
     if (!objVisible(o)) continue;
     const st = STATE_COL[o.state] ?? 0xc83cc8;
     if (o.points) ensurePoints(o);
-    const ent = plyCache.get(o.id);
+    const ent = plyCache.get((surfaceMode() && o.mesh ? "m" : "p") + o.id);
     const sel = selected === o.id;
-    if (o.points && ent && ent.geom && opt("c_points")) {
+    if (surfaceMode() && o.mesh && ent && ent.geom && ent.geom.index && opt("c_points")) {   // surface: textured triangle mesh
+      const mesh = new THREE.Mesh(ent.geom, new THREE.MeshBasicMaterial({ vertexColors:opt("s_pcolor") === "true colour", color:opt("s_pcolor") === "true colour" ? 0xffffff : st, side:THREE.DoubleSide }));
+      mesh.userData.shared = true; gObjs.add(mesh);
+      if (sel) { const w = new THREE.Mesh(ent.geom, new THREE.MeshBasicMaterial({ color:0xffe14a, wireframe:true, transparent:true, opacity:0.35 })); w.userData.shared = true; gObjs.add(w); }
+    } else if (o.points && ent && ent.geom && opt("c_points")) {
       const true_ = opt("s_pcolor") === "true colour";
-      const m = pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * (sel ? 1.25 : 1), vertexColors:true_, color:st, square:true });
+      const m = pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * (sel ? 1.25 : 1), vertexColors:true_, color:st, square:false });
       const pts = new THREE.Points(ent.geom, m); pts.userData.shared = true;   // geometry belongs to plyCache
       gObjs.add(pts);
       if (sel) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
@@ -411,8 +434,12 @@ function drawGraph() {
   const shown = k => ({ object:opt("g_objs"), agent:opt("g_agents"), room:opt("g_rooms") })[k] || false;   // places are backend-only
   const xyz = n => [n.pos[0], n.pos[1], zOf(n.kind)];
 
-  for (const [kind, size, rim] of [["object", 0.26, 1], ["agent", 0.12, 1], ["room", 0.70, 1]]) {
-    const ns = [...nodes.values()].filter(n => n.kind === kind && shown(kind) && (kind !== "object" || objVisible(n.o)));
+  for (const [kind, size, rim] of [["object", 0.26, 1], ["agent", 0.045, 1], ["room", 0.70, 1]]) {
+    let ns = [...nodes.values()].filter(n => n.kind === kind && shown(kind) && (kind !== "object" || objVisible(n.o)));
+    if (kind === "agent") {   // dense poses piled up into a thick tube: keep one small dot every 0.4 m along the line
+      ns.sort((a, b) => a.t - b.t); let last = null;
+      ns = ns.filter(n => { if (last && Math.hypot(n.pos[0] - last[0], n.pos[1] - last[1]) < 0.4) return false; last = n.pos; return true; });
+    }
     if (!ns.length) continue;
     const p = new Float32Array(ns.length * 3), c = new Float32Array(ns.length * 3);
     ns.forEach((n, i) => {
@@ -432,7 +459,7 @@ function drawGraph() {
   for (const [a, b, rel] of (view.graph && view.graph.edges) || []) {
     const na = nodes.get(a), nb = nodes.get(b);
     if (!na || !nb || !shown(na.kind) || !shown(nb.kind)) continue;
-    if (rel === "on" || rel === "in" || rel === "near") continue;
+    if (rel === "in") continue;
     if (na.kind === "object" && !objVisible(na.o) || nb.kind === "object" && !objVisible(nb.o)) continue;
     const same = na.kind === nb.kind || (na.kind === "object" && nb.kind === "agent") || (na.kind === "agent" && nb.kind === "object");
     let key;
@@ -480,9 +507,9 @@ function drawGraph() {
 function drawRobot() {
   invalidate();
   if (!view || !view.pose) return;   // keep the robot where it was; never drop the model for a view without a pose
-  if (!robotGrp) buildRobot();
-  const [x, y, yaw] = view.pose;
-  robotGrp.position.set(x, y, 0); robotGrp.rotation.z = yaw;
+  if (!robotGrp || (isHandheld() && view.cam)) buildRobot();   // handheld with a full pose: rebuilt so height and tilt follow the camera
+  const [x, y, yaw] = view.cam ? view.cam.pos : view.pose;
+  robotGrp.position.set(x, y, 0); robotGrp.rotation.z = view.cam && isHandheld() ? 0 : yaw;
 }
 
 let wallKey = "", lastWalls = null, wallSegKey = "", wallTextT = 0;
@@ -1007,7 +1034,7 @@ function onPoseEvent(d) {
 // instead of the LIMO model.
 const isHandheld = () => /handheld/.test((view && view.robot) || "");
 function buildHandheld() {
-  const H = (view && view.cam_h) || 1.4, g = new THREE.Group(), ACC = 0x2f81f7;
+  const vc = view && view.cam, H = vc ? Math.max(vc.pos[2], 0.05) : ((view && view.cam_h) || 1.4), g = new THREE.Group(), ACC = 0x2f81f7;
   const phone = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.09, 0.17), new THREE.MeshBasicMaterial({ color:0x1c1f26 }));
 
   const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.006, 20), new THREE.MeshBasicMaterial({ color:ACC }));
@@ -1029,7 +1056,13 @@ function buildHandheld() {
   const head = new THREE.Mesh(new THREE.ShapeGeometry(arrow), new THREE.MeshBasicMaterial({ color:ACC, side:THREE.DoubleSide }));
   head.position.z = 0.013;
   const cam = new THREE.Group(); cam.add(phone, lens, faces, edges); cam.position.z = H; cam.scale.setScalar(1.6);   // the phone is tiny at room scale
-  g.add(cam, drop, ring, dot, head);
+  const floorMark = new THREE.Group(); floorMark.add(ring, dot, head);
+  if (vc) {   // real camera pose (view.cam: pos, R = OpenCV camera -> world): the frustum tilts with the camera; the floor arrow keeps the heading
+    const R = vc.R, f = [R[0][2], R[1][2], R[2][2]], l = [-R[0][0], -R[1][0], -R[2][0]], u = [-R[0][1], -R[1][1], -R[2][1]];
+    cam.quaternion.setFromRotationMatrix(new THREE.Matrix4().set(f[0], l[0], u[0], 0, f[1], l[1], u[1], 0, f[2], l[2], u[2], 0, 0, 0, 0, 1));
+    floorMark.rotation.z = Math.atan2(f[1], f[0]);
+  }
+  g.add(cam, drop, floorMark);
   return g;
 }
 function buildRobot() {
@@ -1094,7 +1127,7 @@ async function startLive() {
 }
 
 // controls
-for (const id of ["c_points", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { drawObjects(); drawGraph(); };
+for (const id of ["c_points", "c_scene", "n_sop", "s_odraw", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { drawObjects(); drawGraph(); };
 for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra", "g_inter", "n_objz", "n_h", "n_thumb"]) $(id).onchange = drawGraph;
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };
 $("c_map").onchange = () => { gMap.visible = $("c_map").checked; invalidate(); };

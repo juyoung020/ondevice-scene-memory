@@ -849,7 +849,7 @@ function buildJointPanel() {
     panel.appendChild(row);
     $("js_" + n).oninput = e => { jointVal[n] = +e.target.value; setJoints({ [n]: jointVal[n] }); };
   }
-  $("jdetails").style.display = "";
+  if (!isHandheld()) $("jdetails").style.display = "";
   $("j_home").onclick = () => setJoints(robotModel.home);
 }
 function syncJointPanel() {
@@ -907,7 +907,7 @@ $("c_follow").onchange = () => {
 $("j_clear").onclick = clearEE;
 
 function attachRobotModel() {
-  if (!robotModel || !robotGrp) return;
+  if (!robotModel || !robotGrp || isHandheld()) return;
   robotGrp.remove(...robotGrp.children.filter(c => c.userData.fallback));   // the box/cone stand-in goes away
   if (!robotModel.root.parent) robotGrp.add(robotModel.root);
   robotModel.root.scale.setScalar(opt("n_rscale"));
@@ -1003,9 +1003,39 @@ function onPoseEvent(d) {
   invalidate();
 }
 
+// Handheld camera (view.json "robot": "handheld"): a phone with a view frustum at hand height, a drop line and a floor ring,
+// instead of the LIMO model.
+const isHandheld = () => /handheld/.test((view && view.robot) || "");
+function buildHandheld() {
+  const H = (view && view.cam_h) || 1.4, g = new THREE.Group(), ACC = 0x2f81f7;
+  const phone = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.09, 0.17), new THREE.MeshBasicMaterial({ color:0x1c1f26 }));
+
+  const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.006, 20), new THREE.MeshBasicMaterial({ color:ACC }));
+  lens.rotation.z = Math.PI / 2; lens.position.set(0.013, 0.025, 0.06);
+  const L = 0.35, hw = L * Math.tan(Math.PI / 6), hh = hw * 16 / 9 * 0.56;   // portrait frustum, ~60° wide
+  const apex = new THREE.Vector3(0.012, 0, 0), c = [[L, -hw, -hh], [L, hw, -hh], [L, hw, hh], [L, -hw, hh]].map(p => new THREE.Vector3(...p));
+  const fg = new THREE.BufferGeometry(); fg.setFromPoints([apex, c[0], c[1], apex, c[1], c[2], apex, c[2], c[3], apex, c[3], c[0]]);
+  const faces = new THREE.Mesh(fg, new THREE.MeshBasicMaterial({ color:ACC, transparent:true, opacity:0.10, side:THREE.DoubleSide, depthWrite:false }));
+  const eg = new THREE.BufferGeometry(); eg.setFromPoints([apex, c[0], apex, c[1], apex, c[2], apex, c[3], c[0], c[1], c[1], c[2], c[2], c[3], c[3], c[0]]);
+  const edges = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color:ACC }));
+  const dg = new THREE.BufferGeometry(); dg.setFromPoints([new THREE.Vector3(0, 0, H - 0.09), new THREE.Vector3(0, 0, 0.01)]);
+  const drop = new THREE.Line(dg, new THREE.LineDashedMaterial({ color:ACC, dashSize:0.06, gapSize:0.05, transparent:true, opacity:0.7 }));
+  drop.computeLineDistances();
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.13, 0.17, 40), new THREE.MeshBasicMaterial({ color:ACC, transparent:true, opacity:0.55, side:THREE.DoubleSide, depthWrite:false }));
+  ring.position.z = 0.012;
+  const dot = new THREE.Mesh(new THREE.CircleGeometry(0.05, 24), new THREE.MeshBasicMaterial({ color:ACC }));
+  dot.position.z = 0.013;
+  const arrow = new THREE.Shape(); arrow.moveTo(0.21, 0); arrow.lineTo(0.17, 0.035); arrow.lineTo(0.17, -0.035); arrow.lineTo(0.21, 0);
+  const head = new THREE.Mesh(new THREE.ShapeGeometry(arrow), new THREE.MeshBasicMaterial({ color:ACC, side:THREE.DoubleSide }));
+  head.position.z = 0.013;
+  const cam = new THREE.Group(); cam.add(phone, lens, faces, edges); cam.position.z = H; cam.scale.setScalar(1.6);   // the phone is tiny at room scale
+  g.add(cam, drop, ring, dot, head);
+  return g;
+}
 function buildRobot() {
   if (robotModel && robotModel.root.parent) robotModel.root.parent.remove(robotModel.root);   // keep the loaded model alive across rebuilds
   disposeGroup(gRobot);
+  if (isHandheld()) { robotGrp = buildHandheld(); gRobot.add(robotGrp); gRobot.visible = opt("c_robot"); return; }
   const body = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.22, 0.1), new THREE.MeshBasicMaterial({ color:0x2a2a30 }));
   body.position.set(0, 0, 0.07);
   const nose = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.16, 16), new THREE.MeshBasicMaterial({ color:0xe03030 }));

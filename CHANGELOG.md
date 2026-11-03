@@ -16,6 +16,9 @@
 - **호환 변경:** 분할 기본값 `--seg` 를 다시 COCO YOLO26s-seg 로(ObjectSAM v1.0 은 재학습 전까지 선택 사항).
 - 3D 점 지도 1 cm(3 화소 간격, 최대 150만 점), 지도·물체 점 색은 가장 가까이서 본 관측의 색(평균 색은 뿌옇게 번짐).
 
+### Removed
+- **호환 변경:** 저장소의 파이썬 코드 전부 삭제(규칙: Rust 와 C++/CUDA 만) — `tools/*.py`(run_memory·scene_graph·advio_to_euroc·depth_compare·seg_overlay) 5 개, `train/ObjectSAM` 의 pytools·teacher·scripts·analysis 파이썬 66 개. 기록은 git 에 남음. 파이프라인은 C++/CUDA 로 다시 짠다(그 전까지 실행 경로 없음).
+
 ### Fixed
 - 뷰어가 읽는 동안 기억 파일 교체가 윈도우 파일 잠금에 막혀 재생이 죽던 문제: 임시 파일에 쓰고 잠기면 잠깐 기다렸다 교체.
 

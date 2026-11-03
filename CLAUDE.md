@@ -1,5 +1,10 @@
 # 작업 규칙 (ondevice-scene-memory)
 
+## 언어 — Rust 와 C++/CUDA 만
+- 이 저장소의 코드(파이프라인·도구·뷰어·학습기)는 **Rust 또는 C++/CUDA 로만** 짠다. 파이썬으로 새 코드를 짜지 않는다.
+- 2026-11-04 기준 남아 있는 파이썬(`tools/*.py`)은 C++/CUDA 로 옮기는 중이며, 옮기면 지운다.
+- 예외(외부 도구 자체가 파이썬인 것)는 사용자 확인을 받은 것만: 확인 전에는 쓰지 않는다.
+
 ## 버전 관리 — Keep a Changelog + Semantic Versioning
 
 변경 기록은 [Keep a Changelog 1.1.0](https://keepachangelog.com/ko/1.1.0/) 모범 사례를, 버전 번호는 [Semantic Versioning 2.0.0](https://semver.org/lang/ko/)을 따른다.

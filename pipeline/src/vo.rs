@@ -139,7 +139,7 @@ fn horn(p: &[V3], q: &[V3]) -> (M3, V3) {
     (r, t)
 }
 
-fn so3_exp(w: V3) -> M3 {
+pub(crate) fn so3_exp(w: V3) -> M3 {
     let th = norm(&w);
     if th < 1e-12 {
         return [[1.0, -w[2], w[1]], [w[2], 1.0, -w[0]], [-w[1], w[0], 1.0]];
@@ -164,7 +164,7 @@ fn reproj(r: &M3, t: &V3, x: &V3, k: [f64; 4]) -> Option<(f64, f64)> {
 }
 
 /// 6×6 선형계 풀기(부분 피벗 가우스)
-fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
+pub(crate) fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
     for c in 0..6 {
         let p = (c..6).max_by(|&i, &j| a[i][c].abs().partial_cmp(&a[j][c].abs()).unwrap())?;
         if a[p][c].abs() < 1e-12 {

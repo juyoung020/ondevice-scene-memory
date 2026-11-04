@@ -67,8 +67,8 @@ NPU="--seg $M/yolo26-s-seg_640x640.dxnn --depth $M/yolo26-depth-s_768x768.dxnn -
 # 시험 영상으로
 pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/live --every 3 $NPU --live 1 --loop
 # 웹캠으로(실시간, 모델 셋을 NPU 에서 동시에, 찍은 영상은 data/rec/cam1 에 남김)
-pipeline/target/release/memmap --cam /dev/video0 --out data/memory/live $NPU --live 1 --npu-par --seg-every 2 \
-    --scene-vox 0.02 --max-depth 3 --rec data/rec/cam1
+pipeline/target/release/memmap --cam /dev/video0 --out data/memory/live --seg $M/yolo26-s-seg_640x640.dxnn \
+    --depth $M/yolo26-depth-s_768x768.dxnn --pose dvo --live 1 --npu-par --seg-every 2 --max-depth 3.5 --rec data/rec/cam1
 # 남긴 영상을 같은 조건으로 다시(PC·보드 모두)
 pipeline/target/release/memmap --cam data/rec/cam1 --out data/memory/replay $NPU --npu-par --seg-every 2
 
@@ -90,7 +90,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | `--scene-vox` / `--max-depth` | 3D 지도 칸 크기(m, 기본 0.01) / 지도에 넣을 최대 거리(m, 기본 4) |
 | `--out <폴더>` | 기억을 저장할 폴더(뷰어가 이 폴더를 읽음) |
 | `--depth kinect \| <모델>` | 깊이: `kinect`면 TUM의 실측 깊이(비교 기준), 모델 파일이면 딥러닝 추정 |
-| `--pose vo` | 카메라 위치를 영상만으로 추정. 빼면 TUM의 정답 위치를 씀 |
+| `--pose vo` / `--pose dvo` | 카메라 위치를 영상만으로 추정: 특징점(SuperPoint) 방식 / 특징점 없는 RGB-D 직접 방식(무늬 적은 장면에 강함). 빼면 TUM의 정답 위치를 씀 |
 | `--every N` | N장마다 한 장씩 처리(기본 5) |
 | `--live 1` / `--loop` | 실제 속도로 재생하며 뷰어에 계속 갱신 / 끝나면 반복 |
 | `--conf 0.35` | 물체로 인정할 확신도 |

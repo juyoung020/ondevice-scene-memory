@@ -79,27 +79,52 @@ fn dot256(a: &[f32], b: &[f32]) -> f32 {
     acc.iter().sum()
 }
 
-/// 상호 최근접 + 유사도 문턱: (a 번호, b 번호)
+/// 상호 최근접 + 유사도 문턱: (a 번호, b 번호). a 의 행을 코어마다 나눠 계산하고 b 쪽 최댓값은 합친다.
 pub fn match_mutual(a: &Feat, b: &Feat, min_sim: f32) -> Vec<(usize, usize)> {
     let (na, nb) = (a.kp.len(), b.kp.len());
-    let mut best_a = vec![(usize::MAX, -1.0f32); na];
+    if na == 0 || nb == 0 {
+        return vec![];
+    }
+    let nth = std::thread::available_parallelism().map_or(4, |x| x.get()).min(8);
+    let per = na.div_ceil(nth).max(1);
+    let parts: Vec<(Vec<(usize, f32)>, Vec<(usize, f32)>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..na)
+            .step_by(per)
+            .map(|s0| {
+                sc.spawn(move || {
+                    let e0 = (s0 + per).min(na);
+                    let mut ba = vec![(usize::MAX, -1.0f32); e0 - s0];
+                    let mut bb = vec![(usize::MAX, -1.0f32); nb];
+                    for i in s0..e0 {
+                        let da = &a.desc[i * 256..i * 256 + 256];
+                        for j in 0..nb {
+                            let s = dot256(da, &b.desc[j * 256..j * 256 + 256]);
+                            if s > ba[i - s0].1 {
+                                ba[i - s0] = (j, s);
+                            }
+                            if s > bb[j].1 {
+                                bb[j] = (i, s);
+                            }
+                        }
+                    }
+                    (ba, bb)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut best_a = Vec::with_capacity(na);
     let mut best_b = vec![(usize::MAX, -1.0f32); nb];
-    for i in 0..na {
-        let da = &a.desc[i * 256..i * 256 + 256];
-        for j in 0..nb {
-            let db = &b.desc[j * 256..j * 256 + 256];
-            let s = dot256(da, db);
-            if s > best_a[i].1 {
-                best_a[i] = (j, s);
-            }
-            if s > best_b[j].1 {
-                best_b[j] = (i, s);
+    for (ba, bb) in parts {
+        best_a.extend(ba);
+        for (j, x) in bb.into_iter().enumerate() {
+            if x.1 > best_b[j].1 {
+                best_b[j] = x;
             }
         }
     }
     (0..na).filter(|&i| best_a[i].0 != usize::MAX && best_b[best_a[i].0].0 == i && best_a[i].1 > min_sim).map(|i| (i, best_a[i].0)).collect()
 }
-
 /// Horn: 카메라 점 q 를 세계 점 p 로 보내는 (R, t) — p ≈ R q + t
 fn horn(p: &[V3], q: &[V3]) -> (M3, V3) {
     let n = p.len() as f64;

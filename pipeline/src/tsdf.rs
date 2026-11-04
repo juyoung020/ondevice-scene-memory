@@ -54,11 +54,18 @@ impl Tsdf {
                 }
             }
         }
-        // 2) 잡은 블록의 칸마다: 칸 중심을 이번 장면에 투영해 깊이와 비교
+        // 2) 잡은 블록의 칸마다: 칸 중심을 이번 장면에 투영해 깊이와 비교. 블록끼리 독립이라 코어마다 나눠 돌린다.
         let rt = [0, 1, 2].map(|i| [0, 1, 2].map(|j| r[j][i]));
         let n = (B * B * B) as usize;
-        for key in touch {
-            let blk = self.blocks.entry(key).or_insert_with(|| Block { d: vec![1.0; n], w: vec![0.0; n], c: vec![[0.0; 3]; n] });
+        let trunc = self.trunc;
+        let mut work: Vec<((i32, i32, i32), Block, bool)> = touch
+            .into_iter()
+            .map(|key| {
+                let blk = self.blocks.remove(&key).unwrap_or_else(|| Block { d: vec![1.0; n], w: vec![0.0; n], c: vec![[0.0; 3]; n] });
+                (key, blk, false)
+            })
+            .collect();
+        let one = |key: (i32, i32, i32), blk: &mut Block| -> bool {
             let mut changed = false;
             for i in 0..n {
                 let (ix, iy, iz) = ((i as i32) % B, (i as i32 / B) % B, i as i32 / (B * B));
@@ -82,39 +89,57 @@ impl Tsdf {
                     continue;
                 }
                 let sdf = z - pc[2];
-                if sdf < -self.trunc {
+                if sdf < -trunc {
                     continue; // 표면 뒤 멀리: 모름
                 }
-                let t = (sdf / self.trunc).min(1.0) as f32;
-                let wt = 1.0f32;
+                let t = (sdf / trunc).min(1.0) as f32;
                 let w0 = blk.w[i];
-                blk.d[i] = (blk.d[i] * w0 + t * wt) / (w0 + wt);
+                blk.d[i] = (blk.d[i] * w0 + t) / (w0 + 1.0);
                 if t.abs() < 1.0 {
                     let o = (v * w + u) * 3;
-                    let col = [rgb[o] as f32, rgb[o + 1] as f32, rgb[o + 2] as f32];
                     for q in 0..3 {
-                        blk.c[i][q] = (blk.c[i][q] * w0 + col[q] * wt) / (w0 + wt);
+                        blk.c[i][q] = (blk.c[i][q] * w0 + rgb[o + q] as f32) / (w0 + 1.0);
                     }
                 }
-                blk.w[i] = (w0 + wt).min(64.0);
+                blk.w[i] = (w0 + 1.0).min(64.0);
                 changed = true;
             }
-            if changed {
+            changed
+        };
+        let nth = std::thread::available_parallelism().map_or(4, |x| x.get()).min(8);
+        let per = work.len().div_ceil(nth).max(1);
+        std::thread::scope(|sc| {
+            for part in work.chunks_mut(per) {
+                sc.spawn(|| {
+                    for (key, blk, ch) in part.iter_mut() {
+                        *ch = one(*key, blk);
+                    }
+                });
+            }
+        });
+        for (key, blk, ch) in work {
+            if ch {
                 self.dirty.insert((div_floor(key.0, R), div_floor(key.1, R), div_floor(key.2, R)));
             }
+            self.blocks.insert(key, blk);
         }
     }
-
     /// 바뀐 구역의 면(꼭짓점: 위치·색, 삼각형)을 뽑아 돌려준다(구역 → 면). 판 번호도 올린다.
     #[allow(clippy::type_complexity)]
     pub fn take_dirty_meshes(&mut self) -> Vec<((i32, i32, i32), Vec<([f32; 3], [u8; 3])>, Vec<[u32; 3]>)> {
         let regions: Vec<(i32, i32, i32)> = self.dirty.drain().collect();
-        let mut out = vec![];
-        for reg in regions {
-            let (verts, tris) = self.mesh_region(reg);
-            *self.ver.entry(reg).or_insert(0) += 1;
-            out.push((reg, verts, tris));
+        // 구역끼리 독립: 코어마다 나눠 뽑는다(읽기만)
+        let nth = std::thread::available_parallelism().map_or(4, |x| x.get()).min(8);
+        let per = regions.len().div_ceil(nth).max(1);
+        let this = &*self;
+        let mut out: Vec<_> = std::thread::scope(|sc| {
+            let hs: Vec<_> = regions.chunks(per).map(|part| sc.spawn(move || part.iter().map(|&reg| { let (v, t) = this.mesh_region(reg); (reg, v, t) }).collect::<Vec<_>>())).collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        for (reg, _, _) in &out {
+            *self.ver.entry(*reg).or_insert(0) += 1;
         }
+        out.sort_by_key(|x| x.0);
         out
     }
 

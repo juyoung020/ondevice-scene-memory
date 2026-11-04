@@ -137,6 +137,7 @@ fn is_wall(p: &[(V3, [u8; 3])]) -> bool {
 struct Clock {
     load: f64,
     seg: f64,
+    vo: f64,
     map: f64,
     obj: f64,
     write: f64,
@@ -528,6 +529,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut vo_dvo = 0u32; // 직접 방식으로 메운 장면 수
     let mut leveled = a.cam.is_none() || !a.vo;
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat }) = rx.recv() {
+        let c_vo = Instant::now();
         let (p_gt, _r_gt) = (p, r);
         // 카메라만으로 포즈(--pose vo): 이전 키프레임과 SuperPoint 짝 → 이전 장면 깊이로 3D → 재투영 최소화. 첫 장면만 정답 포즈로 시작.
         if a.vo {
@@ -954,15 +956,16 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             out::png_rgb(&sd.join("frame.png"), w as u32, h as u32, &rgb);
         }
         let c5 = Instant::now();
+        clock.vo += (c2 - c_vo).as_secs_f64();
         clock.map += (c3 - c2).as_secs_f64();
         clock.obj += (c4 - c3).as_secs_f64();
         clock.write += (c5 - c4).as_secs_f64();
         clock.n += 1;
         if nkf % 25 == 0 {
             let n = clock.n as f64;
-            println!("kf {nkf} objects {} ({} gone) | ms/kf load {:.0} seg {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | vo fail {vo_fail} dvo {vo_dvo} reject {vo_reject} ref {vo_nref} pos ({:.2},{:.2},{:.2})",
+            println!("kf {nkf} objects {} ({} gone) | ms/kf load {:.0} seg {:.0} vo {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | vo fail {vo_fail} dvo {vo_dvo} reject {vo_reject} ref {vo_nref} pos ({:.2},{:.2},{:.2})",
                      mem.objs.len(), mem.objs.iter().filter(|o| o.state == "gone").count(),
-                     clock.load / n * 1e3, clock.seg / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
+                     clock.load / n * 1e3, clock.seg / n * 1e3, clock.vo / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
                      n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);
         }
     }
@@ -990,7 +993,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         *by.entry(o.name.as_str()).or_default() += 1;
     }
     println!("{}", json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
-        "scene_points": pts.len(), "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "map": clock.map / n * 1e3,
+        "scene_points": pts.len(), "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
         "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "merged": mem.merged}));
     seg
 }

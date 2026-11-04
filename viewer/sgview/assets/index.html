@@ -78,7 +78,7 @@
     <label class="row"><input type="checkbox" id="c_follow"> Follow the robot (close-up)</label>
     <label class="row" title="viewer camera flies behind the handheld camera and looks where it looks"><input type="checkbox" id="c_chase"> Follow the handheld camera (behind)</label>
     <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
-    <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl" checked> Depth shading (EDL)</label>
+    <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl"> Depth shading (EDL)</label>
     <div class="num">EDL strength <input type="number" id="n_edl" value="1" min="0" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_eetrace" checked> Gripper path</label>
     <button id="j_home">Home pose</button> <button id="j_clear">Clear path</button>
@@ -1285,6 +1285,8 @@ $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar
 })();
 loadRobotModel();
 loadRobotKind().then(invalidate);
+// 주소 뒤 ?c_surf=0&c_edl=1 처럼 체크 상자 초기값을 정할 수 있음(시험·시연용)
+for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); }
 startLive().then(live => { if (!live) { $("boot").classList.add("gone"); poll(); pollPose(); } });
 </script>
 </body>

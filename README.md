@@ -76,6 +76,7 @@ pipeline/target/release/memmap --cam data/rec/cam1 --out data/memory/replay $NPU
 sgview data/memory/live --port 8091 --bind 0.0.0.0
 ```
 
+- **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게).
 - **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'memmap --'`.
 - 웹캠은 첫 장면을 "바닥에서 1.3 m 높이, 수평으로 앞을 봄"으로 놓고 시작합니다. 카메라 보정값이 다르면 `--k fx,fy,cx,cy`로 줍니다(기본 450,450,320,240).
 
@@ -102,5 +103,5 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 - **마우스:** 끌면 돌리기, 휠은 확대·축소, 오른쪽 끌기는 이동. 왼쪽 위 `Top view`(위에서 보기)·`Fit`(전체 맞추기).
 - **화면 구성:** 바닥의 흰색·검은색 칸이 점유 지도(갈 수 있는 곳·막힌 곳), 색 점이 3D 지도, 파란 원뿔이 지금 카메라입니다.
 - **물체 색:** 초록 = 지금 보임, 주황 = 옮겨짐, 회색 = 그 자리에서 사라짐.
-- **오른쪽 패널에서 켜고 끄기:** `3D map points`(지도), `Object name labels`(이름표), `Show graph layers`(위쪽 물체·방 층), `Objects as`(점 또는 표면), `Depth shading (EDL)`(입체 음영).
+- **오른쪽 패널에서 켜고 끄기:** `3D map points`(지도), `Object name labels`(이름표), `Show graph layers`(위쪽 물체·방 층), `Objects as`(점 또는 표면), `Depth shading (EDL)`(입체 음영, PC용 — 보드 화면에서는 무거움).
 - **시연할 때:** `Follow the handheld camera (behind)`를 켜면 시점이 손카메라 뒤에서 따라갑니다(마우스로 돌리면 꺼짐).

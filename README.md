@@ -20,14 +20,14 @@ USB 카메라를 손에 들고 방을 한 바퀴 훑으면, 라즈베리파이 5
 - 화면 전체 깊이 추정 — 보드 NPU
 - 카메라 위치 추정(영상만으로) — 보드 NPU 특징점 + CPU
 - 3D 지도, 물체 기억(옮겨짐·사라짐 표시)
-- 방 나누기, 방↔물체·물체↔물체 연결
+- 방 나누기와 방 종류(물체 구성으로: 사무실·주방·거실 …), 방↔물체·물체↔물체 연결
 - 보드 웹캠 실시간, PC·폰 브라우저 뷰어
 
-다음 단계: 물체 검색("텀블러 어디 있어?"), 방 이름 붙이기, IMU 더한 위치 추정, 웹캠 보정, 직접 학습한 분할 모델(ObjectSAM).
+다음 단계: 물체 검색("텀블러 어디 있어?"), IMU 더한 위치 추정, 웹캠 보정, 직접 학습한 분할 모델(ObjectSAM).
 
 ## 빠른 시작 — PC(Windows)
 
-보드 없이 PC에서 같은 과정을 그대로 돌려 볼 수 있습니다. 그래픽카드가 있으면 더 빠릅니다(RTX 5070 Ti에서 22.8 키프레임/초).
+보드 없이 PC에서 같은 과정을 그대로 돌려 볼 수 있습니다. 그래픽카드가 있으면 더 빠릅니다(RTX 5070 Ti에서 30 키프레임/초).
 
 **1. 모델 받기** — `models/` 폴더에 둡니다.
 
@@ -66,11 +66,11 @@ NPU="--seg $M/yolo26-s-seg_640x640.dxnn --depth $M/yolo26-depth-s_768x768.dxnn -
 
 # 시험 영상으로
 pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/live --every 3 $NPU --live 1 --loop
-# 웹캠으로(실시간, 모델 셋을 NPU 에서 동시에, 찍은 영상은 data/rec/cam1 에 남김)
+# 웹캠으로(실시간, 찍은 영상은 data/rec/cam1 에 남김)
 pipeline/target/release/memmap --cam /dev/video0 --out data/memory/live --seg $M/yolo26-s-seg_640x640.dxnn \
-    --depth $M/yolo26-depth-s_768x768.dxnn --pose dvo --live 1 --npu-par --seg-every 2 --max-depth 3.5 --rec data/rec/cam1
+    --depth $M/yolo26-depth-s_768x768.dxnn --pose dvo --live 1 --seg-every 2 --max-depth 3.5 --rec data/rec/cam1
 # 남긴 영상을 같은 조건으로 다시(PC·보드 모두)
-pipeline/target/release/memmap --cam data/rec/cam1 --out data/memory/replay $NPU --npu-par --seg-every 2
+pipeline/target/release/memmap --cam data/rec/cam1 --out data/memory/replay $NPU --seg-every 2
 
 # 뷰어: 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
 sgview data/memory/live --port 8091 --bind 0.0.0.0
@@ -78,7 +78,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게).
 - **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'memmap --'`.
-- 웹캠은 첫 장면을 "바닥에서 1.3 m 높이, 수평으로 앞을 봄"으로 놓고 시작합니다. 카메라 보정값이 다르면 `--k fx,fy,cx,cy`로 줍니다(기본 450,450,320,240).
+- 웹캠은 처음 몇 초 동안 여러 장면에서 찾은 수평면(바닥·책상)으로 위쪽을 정한 뒤 지도를 쌓습니다(IMU 없이). 카메라 보정값이 다르면 `--k fx,fy,cx,cy`로 줍니다(기본 450,450,320,240).
 
 ## 주요 옵션
 
@@ -86,8 +86,9 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 |---|---|
 | `--tum <폴더>` / `--cam <장치 또는 녹화 폴더>` | 입력: TUM 영상, 웹캠, 또는 `--rec` 로 남긴 녹화 |
 | `--rec <폴더>` | 웹캠 영상을 그대로 남김(나중에 `--cam <폴더>` 로 다시) |
-| `--npu-par` | 모델 셋을 NPU 에서 동시에(보드에서 약 2 배 빠름) |
+| `--npu-par` | 모델 셋을 NPU 에서 동시에(보드에서 약 2 배 빠름, NPU 연결이 PCIe 2 세대 이상일 때) |
 | `--seg-every N` | 물체 분할은 N 장마다(위치 추정은 매 장) |
+| `--sp-every N` | `--pose vo` 의 특징점(SuperPoint)은 N 장마다, 사이 장면은 직접 방식(NPU 작업 줄임) |
 | `--surface` / `--tsdf-vox` | 3D 지도를 점 대신 면(3D 스캔처럼)으로 / 면 격자 크기(m, 기본 0.02) |
 | `--scene-vox` / `--max-depth` | 3D 지도 칸 크기(m, 기본 0.01) / 지도에 넣을 최대 거리(m, 기본 4) |
 | `--out <폴더>` | 기억을 저장할 폴더(뷰어가 이 폴더를 읽음) |

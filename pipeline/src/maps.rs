@@ -184,6 +184,8 @@ pub struct Obj {
     pub dirty: bool,
     pub stamp: u32,
     pub n_pts: usize, // 마지막으로 내보낸 점 수
+    pub crop_saved: u32, // 파일로 쓴 사진의 crop_ver(같으면 다시 안 씀)
+    pub cells_saved: usize, // 점 파일을 쓸 때의 칸 수(5 % 넘게 늘어야 다시 씀)
 }
 
 pub struct Memory {
@@ -191,11 +193,12 @@ pub struct Memory {
     next: u32,
     pub vox: f64,
     pub sup: f64,
+    pub merged: u32, // 병합 후처리로 합친 수(누적)
 }
 
 impl Memory {
     pub fn new(vox: f64, sup: f64) -> Memory {
-        Memory { objs: vec![], next: 0, vox, sup }
+        Memory { objs: vec![], next: 0, vox, sup, merged: 0 }
     }
 
     /// 같은 이름(살아 있는) 물체 중 굵은 칸 겹침 25 % 이상이거나 중심이 크기에 맞춘 문턱 안이면 같은 물체
@@ -246,7 +249,7 @@ impl Memory {
                 self.objs.push(Obj {
                     id: self.next, name: name.into(), votes: HashMap::new(), score: 0.0, n_obs: 0, first_pos: c, pos: c,
                     extent: ext, last_seen: stamp, miss: 0, state: "seen", cells: HashMap::new(), support: HashMap::new(),
-                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0,
+                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0, crop_saved: 0, cells_saved: 0,
                 });
                 self.next += 1;
                 self.objs.len() - 1
@@ -287,6 +290,92 @@ impl Memory {
             }
         }
         o.id
+    }
+
+    /// 병합 후처리(HOV-SG·ConceptGraphs 방식): 따로 생긴 두 물체가 같은 것이면 합친다.
+    /// 기하: 굵은 칸(4 cm) 3D IoU, 작은 쪽 기준 겹침 비율. 의미: 이름 투표 분포 코사인. 생김새: 점 색 히스토그램 코사인.
+    /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8). 반환: 합친 수
+    pub fn merge_pass(&mut self) -> usize {
+        let hist = |o: &Obj| -> Vec<f32> {
+            let mut h = vec![0f32; 64];
+            for v in o.cells.values() {
+                h[(v.col[0] as usize >> 6) * 16 + (v.col[1] as usize >> 6) * 4 + (v.col[2] as usize >> 6)] += 1.0;
+            }
+            let n = h.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            h.iter().map(|x| x / n).collect()
+        };
+        let votes_cos = |a: &Obj, b: &Obj| -> f32 {
+            let na = a.votes.values().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            let nb = b.votes.values().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            a.votes.iter().map(|(k, v)| v * b.votes.get(k).copied().unwrap_or(0.0)).sum::<f32>() / (na * nb)
+        };
+        let mut merged = 0;
+        loop {
+            let alive: Vec<usize> = (0..self.objs.len()).filter(|&i| self.objs[i].state != "gone").collect();
+            let mut pair = None;
+            'outer: for (ai, &i) in alive.iter().enumerate() {
+                for &j in &alive[ai + 1..] {
+                    let (a, b) = (&self.objs[i], &self.objs[j]);
+                    // 중심이 크기에 비해 아주 멀면 건너뜀(pos·extent 는 점 파일을 쓸 때만 다시 재므로 넉넉하게)
+                    if crate::geom::norm(&crate::geom::sub(&a.pos, &b.pos)) > (crate::geom::norm(&a.extent) + crate::geom::norm(&b.extent)) / 2.0 + 0.5 {
+                        continue;
+                    }
+                    let (sa, sb) = if a.support.len() <= b.support.len() { (&a.support, &b.support) } else { (&b.support, &a.support) };
+                    let inter = sa.keys().filter(|k| sb.contains_key(k)).count() as f32;
+                    if inter == 0.0 {
+                        continue;
+                    }
+                    let iou = inter / ((sa.len() + sb.len()) as f32 - inter).max(1.0);
+                    let ovl = inter / sa.len().max(1) as f32;
+                    let sem = votes_cos(a, b);
+                    let app = if ovl >= 0.6 { hist(a).iter().zip(hist(b)).map(|(x, y)| x * y).sum::<f32>() } else { 0.0 };
+                    if iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) {
+                        pair = Some((i, j));
+                        break 'outer;
+                    }
+                }
+            }
+            let Some((i, j)) = pair else { break };
+            // 관측이 많은 쪽으로 합침
+            let (keep, drop) = if self.objs[i].n_obs >= self.objs[j].n_obs { (i, j) } else { (j, i) };
+            let b = self.objs.remove(drop);
+            let keep = if drop < keep { keep - 1 } else { keep };
+            let a = &mut self.objs[keep];
+            for (k, v) in b.cells {
+                let e = a.cells.entry(k).or_insert(OV { sum: [0.0; 3], n: 0, col: v.col, best: f32::MAX });
+                for c in 0..3 {
+                    e.sum[c] += v.sum[c];
+                }
+                e.n += v.n;
+                if v.best < e.best {
+                    e.best = v.best;
+                    e.col = v.col;
+                }
+            }
+            for (k, v) in b.support {
+                *a.support.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in b.votes {
+                *a.votes.entry(k).or_insert(0.0) += v;
+            }
+            a.n_obs += b.n_obs;
+            a.score = a.score.max(b.score);
+            if b.last_seen > a.last_seen {
+                a.last_seen = b.last_seen;
+                a.miss = b.miss;
+                a.state = b.state;
+            }
+            if b.crop_area > a.crop_area {
+                a.crop_area = b.crop_area;
+                a.crop = b.crop;
+                a.crop_ver = a.crop_ver.max(b.crop_ver) + 1;
+            }
+            a.dirty = true;
+            a.cells_saved = 0; // 합쳤으면 점 파일을 다시
+            merged += 1;
+        }
+        self.merged += merged as u32;
+        merged
     }
 
     /// 보여 줄 점: 여러 관측에서 지지받은 칸만, 중심에서 크게 벗어난 점 제외. pos·extent 도 다시 잰다.

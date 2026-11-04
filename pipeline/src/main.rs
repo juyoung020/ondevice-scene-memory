@@ -289,6 +289,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut nkf: u32 = 0;
     let mut cam_json = json!(null);
     let mut last_view = Instant::now();
+    let mut last_merge = 0u32;
     let mut scene_json = json!(null);
     // 3D 지도 조각: 이번 실행 번호(뷰어가 새 실행이면 받은 조각을 비움), 조각 수, 보낸 점 수
     let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
@@ -893,6 +894,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": !a.vo || vo_ok}).to_string().as_bytes());
         }
         let write_now = if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= 0.4 || nkf == 1 } else { nkf % 5 == 0 || nkf == 1 } || a.snaps.contains(&nkf);
+        if !write_now && nkf >= last_merge + 15 {
+            last_merge = nkf;
+            mem.merge_pass();
+        }
         if write_now {
             last_view = Instant::now();
             if nkf % a.scene_every == 1 || a.scene_every == 1 || a.snaps.contains(&nkf) || a.live == 0.0 && nkf % 50 == 0 {
@@ -905,7 +910,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
                 scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
             }
-            write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json);
+            // 병합 후처리는 키프레임 15 장마다(물체 쌍을 매번 다 보지 않게, 중복이 자라기 전에 합침)
+            let merge = nkf >= last_merge + 15;
+            if merge {
+                last_merge = nkf;
+            }
+            write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, merge);
         }
         if a.snaps.contains(&nkf) {
             let sd = PathBuf::from(format!("{}_snap", a.out.display())).join(format!("kf{nkf:04}"));
@@ -935,7 +945,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
     let pts = scene.points();
     let t_end = traj.last().map_or(0.0, |x| x.0);
-    write_view(&a.out, &grid, &mut mem, &traj, t_end, last_pose, &cam_json, &scene_json);
+    for o in mem.objs.iter_mut().filter(|o| o.dirty) {
+        o.cells_saved = 0; // 마지막 기록은 바뀐 물체를 모두 내보냄
+    }
+    write_view(&a.out, &grid, &mut mem, &traj, t_end, last_pose, &cam_json, &scene_json, true);
     let n = clock.n.max(1) as f64;
     let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
     for o in &mem.objs {
@@ -943,29 +956,42 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     println!("{}", json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
         "scene_points": pts.len(), "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "map": clock.map / n * 1e3,
-        "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo}));
+        "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "merged": mem.merged}));
     seg
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])], stamp: f64, pose: [f64; 3],
-              cam: &serde_json::Value, scene: &serde_json::Value) {
+              cam: &serde_json::Value, scene: &serde_json::Value, merge: bool) {
+    if merge {
+        mem.merge_pass();
+    }
     let gi = grid.image();
     let mut objs = vec![];
     for i in 0..mem.objs.len() {
-        let pts = if mem.objs[i].dirty { Some(mem.refresh(i)) } else { None };
+        // 점 파일은 점(칸)이 5 % 넘게 늘었을 때만 다시 쓴다(관측마다 통째로 다시 쓰지 않게). 그 사이 바뀐 것은 다음 기록 때 함께.
+        let grown = {
+            let o = &mem.objs[i];
+            o.dirty && (o.cells_saved == 0 || o.cells.len() * 20 > o.cells_saved * 21)
+        };
+        let pts = if grown { Some(mem.refresh(i)) } else { None };
         let o = &mut mem.objs[i];
         let base = format!("objects/O{}", o.id);
         if let Some(pts) = pts {
             out::ply(&dir.join(format!("{base}_points.ply")), &pts);
             o.n_pts = pts.len();
+            o.cells_saved = o.cells.len();
+            o.dirty = false;
+            o.stamp += 1;
+        }
+        // 사진은 더 크게 본 장면으로 바뀌었을 때만
+        if o.crop_ver != o.crop_saved {
             if let Some(c) = &o.crop {
                 out::png_rgb(&dir.join(format!("{base}_rgb.png")), c.w, c.h, &c.rgb);
                 out::png_gray(&dir.join(format!("{base}_mask.png")), c.w, c.h, &c.mask);
                 out::png_u16(&dir.join(format!("{base}_depth.png")), c.w, c.h, &c.depth);
             }
-            o.dirty = false;
-            o.stamp += 1;
+            o.crop_saved = o.crop_ver;
         }
         let mut e = json!({"id": o.id, "name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
             "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": false,

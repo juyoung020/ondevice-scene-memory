@@ -46,12 +46,13 @@ fn samp(img: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f3
 
 /// 앞 장면(밝기 피라미드·깊이) → 이번 장면 움직임. init: (R, t) 앞 카메라 좌표 → 이번 카메라 좌표의 첫 추정.
 /// 반환: (R, t, 쓰인 화소 수, 평균 밝기 오차, 깊이 배율 = 앞 깊이로 옮긴 거리 / 이번 깊이 중앙값)
-pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f64; 4], init: (M3, V3)) -> Option<(M3, V3, usize, f64, f64)> {
+/// minlv: 가장 고운 단계 번호(딥러닝 깊이는 1: 640×480 단계는 깊이가 흐려 도움이 안 되고 시간만 40 % 더 듦)
+pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f64; 4], init: (M3, V3), minlv: usize) -> Option<(M3, V3, usize, f64, f64)> {
     let (w0, h0) = (prev.lv[0].0, prev.lv[0].1);
     let (mut r, mut t) = init;
     let mut last_n = 0;
     let mut last_err = 1.0;
-    for l in (0..prev.lv.len()).rev() {
+    for l in (minlv..prev.lv.len()).rev() {
         let s = (1usize << l) as f64;
         let (fx, fy) = (k[0] / s, k[1] / s);
         let (cx, cy) = ((k[2] + 0.5) / s - 0.5, (k[3] + 0.5) / s - 0.5);

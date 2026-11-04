@@ -16,6 +16,7 @@
 - 실제 속도 재생과 반복(`--live`, `--loop`).
 - PC 그래픽카드 실행(`--features directml`).
 - 속도 개선 기록 `docs/performance_log.md`, 평가 계획 `docs/evaluation_plan.md`.
+- 표면 지도 비교 도구 `surfcmp`(정확도·완전도).
 - 위치 추정 방법 문서 `docs/pose_and_map.md`, 동작 원리 문서 `docs/architecture.md`.
 - 쓴 데이터 목록과 받는 주소 `data/README.md`(영상은 올리지 않음).
 - 새 README 표지 `docs/cover-slam.gif`.
@@ -25,7 +26,7 @@
 - 웹캠 녹화와 재생(`--rec`, `--cam <녹화 폴더>`).
 - 물체 병합 후처리: 따로 생긴 같은 물체를 3D 겹침·이름·색 분포로 합침(TUM 책상 41 → 35 개).
 - 모델 셋을 NPU 에서 동시에 실행(`--npu-par`).
-- 물체 분할 간격(`--seg-every`), 3D 지도 칸 크기·최대 거리(`--scene-vox`, `--max-depth`).
+- SuperPoint 간격(`--sp-every`, 사이 장면은 RGB-D 직접 방식), 물체 분할 간격(`--seg-every`), 3D 지도 칸 크기·최대 거리(`--scene-vox`, `--max-depth`).
 - 웹캠 지도를 바로 세우기: 여러 장면에서 찾은 수평면(바닥·책상) 방향의 합의로 위쪽을 정함(IMU 없이).
 
 ### Changed
@@ -39,6 +40,7 @@
 - 뷰어가 3D 지도 조각을 쌓아 두고 새 조각만 덧붙임(물체가 바뀔 때마다 지도 전체를 다시 그리지 않음).
 - 웹캠 기본 초점거리를 477 화소로(사양 시야각 80°).
 - 웹캠 데모의 위치 추정을 RGB-D 직접 방식으로(무늬 적은 장면에서도 위치를 잡음).
+- 직접 방식을 5 단계 피라미드·시작값 둘로(빠른 움직임에서 실패 13 → 0).
 
 ### Removed
 - **호환 변경:** 파이썬 코드 전부(`tools/*.py`, `train/ObjectSAM` 의 파이썬). 실행은 `pipeline/` 으로.

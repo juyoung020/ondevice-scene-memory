@@ -47,6 +47,7 @@ struct Args {
     rec: Option<PathBuf>,
     seg_every: usize,
     npu_par: bool,
+    sp_every: usize, // SuperPoint 는 N 장마다(사이 장면은 RGB-D 직접 방식으로 위치)
     scene_vox: f64,
     max_depth: f64,
     scene_step: usize, // 3D 지도에 쓸 화소 간격
@@ -78,6 +79,7 @@ fn args() -> Args {
         rec: get("--rec").map(PathBuf::from),
         seg_every: get("--seg-every").map_or(1, |s| s.parse().unwrap()),
         npu_par: v.iter().any(|x| x == "--npu-par"),
+        sp_every: get("--sp-every").map_or(1, |s| s.parse().unwrap()),
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
@@ -176,18 +178,18 @@ fn make_sp(path: &str) -> Box<dyn seg::FeatNet> {
 /// 모델 셋 실행: 깊이·특징점·분할(do_seg 일 때). par 면 셋을 동시에(DX-M1 NPU 코어 3 개), 아니면 차례대로.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_models(dnet: &mut Option<Box<dyn seg::DepthNet>>, seg: &mut Box<dyn seg::Segmenter + Send>, spnet: &mut Option<Box<dyn seg::FeatNet>>,
-              rgb: &[u8], w: usize, h: usize, conf: f32, do_seg: bool, par: bool) -> (Option<Vec<f32>>, Option<Vec<seg::Det>>, Option<vo::Feat>) {
+              rgb: &[u8], w: usize, h: usize, conf: f32, do_seg: bool, par: bool, do_sp: bool) -> (Option<Vec<f32>>, Option<Vec<seg::Det>>, Option<vo::Feat>) {
     if par {
         std::thread::scope(|sc| {
             let hd = sc.spawn(|| dnet.as_mut().map(|n| n.run(rgb, w, h)));
-            let hf = sc.spawn(|| spnet.as_mut().map(|n| n.run(rgb, w, h)));
+            let hf = sc.spawn(|| spnet.as_mut().filter(|_| do_sp).map(|n| n.run(rgb, w, h)));
             let dets = do_seg.then(|| seg.run(rgb, w, h, conf));
             (hd.join().unwrap(), dets, hf.join().unwrap())
         })
     } else {
         let pd = dnet.as_mut().map(|n| n.run(rgb, w, h));
         let dets = do_seg.then(|| seg.run(rgb, w, h, conf));
-        (pd, dets, spnet.as_mut().map(|n| n.run(rgb, w, h)))
+        (pd, dets, spnet.as_mut().filter(|_| do_sp).map(|n| n.run(rgb, w, h)))
     }
 }
 
@@ -328,7 +330,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(1);
     let worker = {
         let seq = seq.clone();
-        let (every, conf, live, no_skip, seg_every, npu_par) = (a.every, a.conf, a.live, a.no_skip, a.seg_every.max(1), a.npu_par);
+        let (every, conf, live, no_skip, seg_every, npu_par, sp_every) = (a.every, a.conf, a.live, a.no_skip, a.seg_every.max(1), a.npu_par, a.sp_every.max(1));
         let mut dnet = make_depth(&a.depth);
         let mut spnet = (a.vo && !a.dvo).then(|| make_sp(&a.sp));
         let cam_path = a.cam.clone();
@@ -394,7 +396,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     // 물체 분할은 N 장마다(위치에는 깊이·특징점만 필요 → 위치를 더 자주 갱신)
                     nf += 1;
                     let do_seg = (nf - 1) % seg_every == 0;
-                    let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, do_seg, npu_par);
+                    let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, do_seg, npu_par, (nf - 1) % sp_every == 0);
                     let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
                     let c2 = Instant::now();
                     let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat };
@@ -434,7 +436,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 assert_eq!((dw as usize, dh as usize), (w, h));
                 let c1 = Instant::now();
                 // 모델 셋은 차례대로(보드 NPU 는 동시에 던지면 불안정했다)
-                let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, true, npu_par);
+                let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, true, npu_par, fi / every % sp_every == 0);
                 // 딥러닝 깊이 / Kinect 중앙값(비교용)
                 let (depth, scale) = match pd {
                     Some(d) => {
@@ -526,6 +528,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 수평 합의(웹캠·녹화): 처음 장면들의 수평면 법선(세계 좌표)을 모아 다수결로 '위'를 정하면 세계를 한 번 바로 세운다
     let mut grav_obs: Vec<V3> = vec![];
     let mut dvo_prev: Option<(dvo::Pyr, Vec<f32>)> = None;
+    let mut dvo_rel: (M3, V3) = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]); // 직전 장면 사이 움직임
+    // 직접 방식: 5 단계 피라미드(큰 움직임), 시작값 둘(움직임 없음 / 직전 움직임) 중 나은 쪽 → TUM 책상 Kinect 0.333 → 0.092 m, 실패 13 → 0
+    let (dvo_dual, dvo_levels) = (true, 5usize);
+    let dvo_minlv = if a.depth == "kinect" { 0 } else { 1 }; // 딥러닝 깊이는 640×480 단계 생략(정확도 같고 40 % 빠름)
     let mut vo_dvo = 0u32; // 직접 방식으로 메운 장면 수
     let mut leveled = a.cam.is_none() || !a.vo;
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat }) = rx.recv() {
@@ -533,6 +539,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let (p_gt, _r_gt) = (p, r);
         // 카메라만으로 포즈(--pose vo): 이전 키프레임과 SuperPoint 짝 → 이전 장면 깊이로 3D → 재투영 최소화. 첫 장면만 정답 포즈로 시작.
         if a.vo {
+            let prev_pose = vo_pose;
             // 등속 예측: 직전 위치 + 속도 × 시간(IMU 없이 쓰는 움직임 사전 지식)
             let dt = vo_last_t.map(|t0| (t - t0).clamp(0.0, 1.0)).unwrap_or(0.0);
             let pred = vo_pose.map(|(r0, p0)| (r0, add(&p0, &vo_vel.map(|x| x * dt))));
@@ -558,11 +565,21 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             // RGB-D 직접 방식(DVO): --pose dvo 면 이것만, 아니면 특징점이 실패한 장면을 메운다(무늬 적은 장면·흐린 장면)
-            let pyr = dvo::pyramid(&rgb, w, h, 4);
+            let pyr = dvo::pyramid(&rgb, w, h, dvo_levels);
             let mut dvo_used = false;
             if est.is_none() {
                 if let (Some((pp, pd)), Some((r0, p0))) = (&dvo_prev, vo_pose) {
-                    if let Some((rr, tt, n, _, sc)) = dvo::track(pp, pd, &pyr, &depth, seq.k, ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3])) {
+                    // 시작값: '움직임 없음'으로 먼저, 밝기 오차가 크거나 실패하면 '직전 움직임(등속)'으로도 풀어 더 나은 쪽
+                    let id3 = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]);
+                    let mut best = dvo::track(pp, pd, &pyr, &depth, seq.k, id3, dvo_minlv);
+                    if dvo_dual && best.as_ref().is_none_or(|b| b.3 > 0.05) {
+                        if let Some(b2) = dvo::track(pp, pd, &pyr, &depth, seq.k, dvo_rel, dvo_minlv) {
+                            if best.as_ref().is_none_or(|b| b2.3 < b.3) {
+                                best = Some(b2);
+                            }
+                        }
+                    }
+                    if let Some((rr, tt, n, _, sc)) = best {
                         let rt = [0, 1, 2].map(|i| [0, 1, 2].map(|j| rr[j][i]));
                         let r1 = mm(&r0, &rt);
                         // 손으로 들고는 불가능한 움직임(2 m/s, 180°/s 초과)이면 버림
@@ -634,6 +651,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             // 직접 방식용: 이번 장면을 다음 장면의 '앞 장면'으로(시작값은 '움직임 없음': 등속 시작값은 한 번 틀리면 계속 엉뚱하게 수렴했음)
+            if let (Some((r0, p0)), Some((r1, p1)), true) = (prev_pose, vo_pose, vo_ok) {
+                let r1t = [0, 1, 2].map(|i| [0, 1, 2].map(|j| r1[j][i]));
+                dvo_rel = (mm(&r1t, &r0), mv(&r1t, &sub(&p0, &p1)));
+            }
             dvo_prev = Some((pyr, depth.clone()));
             vo_last_t = Some(t);
             let (r2, p2) = vo_pose.unwrap();

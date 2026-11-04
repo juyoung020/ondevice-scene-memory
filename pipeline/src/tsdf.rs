@@ -89,19 +89,22 @@ impl Tsdf {
                     continue;
                 }
                 let sdf = z - pc[2];
-                if sdf < -trunc {
+                let tr = trunc;
+                if sdf < -tr {
                     continue; // 표면 뒤 멀리: 모름
                 }
-                let t = (sdf / trunc).min(1.0) as f32;
+                let t = (sdf / tr).min(1.0) as f32;
+                // 균일 가중: 1/거리² 가중은 먼 면을 덜 만들어 걸러낼 뿐, 정확도·완전도를 합친 F 는 오히려 낮았다(책상 0.40 → 0.30, surfcmp)
+                let wt = 1.0f32;
                 let w0 = blk.w[i];
-                blk.d[i] = (blk.d[i] * w0 + t) / (w0 + 1.0);
+                blk.d[i] = (blk.d[i] * w0 + t * wt) / (w0 + wt);
                 if t.abs() < 1.0 {
                     let o = (v * w + u) * 3;
                     for q in 0..3 {
-                        blk.c[i][q] = (blk.c[i][q] * w0 + rgb[o + q] as f32) / (w0 + 1.0);
+                        blk.c[i][q] = (blk.c[i][q] * w0 + rgb[o + q] as f32 * wt) / (w0 + wt);
                     }
                 }
-                blk.w[i] = (w0 + 1.0).min(64.0);
+                blk.w[i] = (w0 + wt).min(64.0);
                 changed = true;
             }
             changed

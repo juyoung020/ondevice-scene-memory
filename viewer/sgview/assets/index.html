@@ -425,22 +425,30 @@ const surfMat = new THREE.MeshLambertMaterial({ vertexColors:true, side:THREE.Do
 async function loadSurface(s) {
   if (surf.run !== s.run) { disposeGroup(gSurf); surf.have.clear(); surf.run = s.run; }
   if (surf.busy) return;
+  const todo = s.regions.filter(([x, y, z, ver]) => { const c = surf.have.get(x + "_" + y + "_" + z); return !c || c.ver !== ver; });
+  if (!todo.length) return;
   surf.busy = true; pendingLoads++;
-  try {
-    for (const [x, y, z, ver] of s.regions) {
-      const key = x + "_" + y + "_" + z, cur = surf.have.get(key);
-      if (cur && cur.ver === ver) continue;
-      const r = await fetch("/file/mesh/r_" + key + ".ply?v=" + ver);
-      if (!r.ok) continue;
-      const g = parsePly(await r.arrayBuffer());
-      if (surf.run !== s.run) { g.dispose(); break; }
-      g.computeVertexNormals();
-      if (cur) { gSurf.remove(cur.mesh); cur.mesh.geometry.dispose(); }
-      const mesh = new THREE.Mesh(g, surfMat); mesh.userData.shared = true;
-      gSurf.add(mesh); surf.have.set(key, { ver, mesh });
-      invalidate();
+  // 바뀐 구역을 4 개씩 동시에 받는다(원격 접속이면 왕복 지연이 쌓이므로)
+  const run = s.run; let k = 0;
+  const one = async () => {
+    while (k < todo.length && surf.run === run) {
+      const [x, y, z, ver] = todo[k++], key = x + "_" + y + "_" + z;
+      try {
+        const r = await fetch("/file/mesh/r_" + key + ".ply?v=" + ver);
+        if (!r.ok) continue;
+        const g = parsePly(await r.arrayBuffer());
+        if (surf.run !== run) { g.dispose(); return; }
+        g.computeVertexNormals();
+        const cur = surf.have.get(key);
+        if (cur && cur.ver >= ver) { g.dispose(); continue; }
+        if (cur) { gSurf.remove(cur.mesh); cur.mesh.geometry.dispose(); }
+        const mesh = new THREE.Mesh(g, surfMat); mesh.userData.shared = true;
+        gSurf.add(mesh); surf.have.set(key, { ver, mesh });
+        invalidate();
+      } catch (e) {}
     }
-  } catch (e) {}
+  };
+  await Promise.all([one(), one(), one(), one()]);
   surf.busy = false; pendingLoads--; loadDone();
 }
 function drawObjects() {  invalidate();

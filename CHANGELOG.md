@@ -17,6 +17,7 @@
 - PC 그래픽카드 실행(`--features directml`).
 - 속도 개선 기록 `docs/performance_log.md`, 평가 계획 `docs/evaluation_plan.md`.
 - 위치 추정 방법 문서 `docs/pose_and_map.md`, 동작 원리 문서 `docs/architecture.md`.
+- 쓴 데이터 목록과 받는 주소 `data/README.md`(영상은 올리지 않음).
 - 새 README 표지 `docs/cover-slam.gif`.
 - 뷰어: 물체 이름표만 따로 끄기, 방 이름표에 물체 수 표시.
 - 웹캠 녹화와 재생(`--rec`, `--cam <녹화 폴더>`).

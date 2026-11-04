@@ -37,7 +37,7 @@ USB 카메라를 손에 들고 방을 한 바퀴 훑으면, 라즈베리파이 5
 | `yolo26s-depth.onnx` | 깊이 추정 | [mobilint/YOLO26s-depth](https://huggingface.co/mobilint/YOLO26s-depth/resolve/main/yolo26s-depth.onnx) |
 | `superpoint.onnx` | 위치 추정용 특징점 | [EclipseAidge/SuperPoint](https://huggingface.co/EclipseAidge/SuperPoint/resolve/main/superpoint.onnx) |
 
-**2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 `freiburg1_desk`(책상, 23초) 또는 `freiburg3_long_office_household`(사무실, 87초)를 받아 `data/tum/`에 풉니다.
+**2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 `freiburg1_desk`(책상, 23초) 또는 `freiburg3_long_office_household`(사무실, 87초)를 받아 `data/tum/`에 풉니다. 쓴 데이터 전체 목록과 받는 주소는 [data/README.md](data/README.md)에 있습니다.
 
 **3. 빌드하고 실행**
 

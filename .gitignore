@@ -1,5 +1,7 @@
 models/
-data/
+# 데이터는 목록(data/README.md)만 올리고 영상·결과는 올리지 않음
+data/*
+!data/README.md
 *.pt
 *.onnx
 *.dxnn

@@ -11,6 +11,7 @@
   위치 추정: 같은 특징점의 3D 위치를 여러 장면에 걸쳐 평균 → 카메라 위치·방향
         ▼
   누적 지도: 깊이를 카메라 위치로 옮겨 3D 점·점유 지도에 더함(새 점만)
+            --surface 면 TSDF(2 cm 칸, 표면 근처 블록만)에 누적 평균 → Surface Nets 로 면(바뀐 64 cm 구역만)
   물체 트래커: 같은 자리·같은 이름이면 같은 물체로 합침, 안 보이면 "사라짐"
   병합 후처리(15 장마다): 따로 생긴 두 물체를 3D IoU·겹침 비율·이름 분포·색 분포로 판단해 합침
         ▼
@@ -32,6 +33,8 @@
 | `pipeline/` | 기억을 만드는 프로그램(Rust, memmap) |
 | `pipeline/src/vo.rs` | 위치 추정 |
 | `pipeline/src/maps.rs` | 누적 지도·물체 트래커 |
+| `pipeline/src/tsdf.rs` | 표면 지도(TSDF 융합·Surface Nets) |
+| `pipeline/src/dvo.rs` | 특징점 없는 RGB-D 직접 위치 추정 |
 | `pipeline/src/graph.rs` | 방 나누기·씬그래프 연결 |
 | `pipeline/src/seg.rs` | 모델 실행(ONNX·NPU) |
 | `viewer/sgview/` | 웹 뷰어(Rust 서버 + three.js) |

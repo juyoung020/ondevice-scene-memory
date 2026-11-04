@@ -15,6 +15,7 @@ mod out;
 mod rec;
 mod scale;
 mod seg;
+mod tsdf;
 mod vo;
 mod tum;
 
@@ -48,6 +49,9 @@ struct Args {
     npu_par: bool,
     scene_vox: f64,
     max_depth: f64,
+    scene_step: usize, // 3D 지도에 쓸 화소 간격
+    surface: bool,     // --surface: 점 대신 표면 지도(TSDF + Surface Nets)
+    tsdf_vox: f64,
 }
 
 fn args() -> Args {
@@ -76,6 +80,9 @@ fn args() -> Args {
         npu_par: v.iter().any(|x| x == "--npu-par"),
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
+        scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
+        surface: v.iter().any(|x| x == "--surface"),
+        tsdf_vox: get("--tsdf-vox").map_or(0.02, |s| s.parse().unwrap()),
     }
 }
 
@@ -243,6 +250,19 @@ fn depth_scale(zz: &[(f64, f64)]) -> Option<f64> {
     rs.sort_by(|x, y| x.partial_cmp(y).unwrap());
     Some(rs[rs.len() / 2].clamp(0.5, 2.0))
 }
+/// 바뀐 구역의 면 파일 쓰기(mesh/r_x_y_z.ply)
+fn write_surface(dir: &Path, ts: &mut tsdf::Tsdf) {
+    for (reg, verts, tris) in ts.take_dirty_meshes() {
+        out::ply_mesh(&dir.join(format!("mesh/r_{}_{}_{}.ply", reg.0, reg.1, reg.2)), &verts, &tris);
+    }
+}
+
+/// 뷰어용 표면 목록: 구역마다 [x, y, z, 판 번호](판이 바뀐 구역만 다시 받음)
+fn surface_json(ts: &tsdf::Tsdf, run: u64) -> serde_json::Value {
+    let regs: Vec<[i64; 4]> = ts.ver.iter().map(|(k, v)| [k.0 as i64, k.1 as i64, k.2 as i64, *v as i64]).collect();
+    json!({"run": run, "vox": ts.vox, "regions": regs})
+}
+
 fn make_seg(path: &str) -> Box<dyn seg::Segmenter + Send> {
     #[cfg(feature = "dxrt")]
     if path.ends_with(".dxnn") {
@@ -280,6 +300,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
+    let mut tsdf = a.surface.then(|| tsdf::Tsdf::new(a.tsdf_vox));
     let mut mem = Memory::new(0.012, 0.04);
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
@@ -294,6 +315,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 3D 지도 조각: 이번 실행 번호(뷰어가 새 실행이면 받은 조각을 비움), 조각 수, 보낸 점 수
     let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let _ = std::fs::remove_dir_all(a.out.join("scene"));
+    let _ = std::fs::remove_dir_all(a.out.join("mesh"));
+    std::fs::create_dir_all(a.out.join("mesh")).unwrap();
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
     let (mut n_chunk, mut n_scene) = (0usize, 0usize);
     let mut last_pose = [0.0; 3];
@@ -806,8 +829,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             grid.add((pwc[0], pwc[1]), &occ, &flo);
         }
         let mut sp = Vec::with_capacity(w * h / 4);
-        for v in (0..h).step_by(2) {
-            for u in (0..w).step_by(2) {
+        for v in (0..h).step_by(a.scene_step) {
+            for u in (0..w).step_by(a.scene_step) {
                 if let Some(pc) = back(u, v) {
                     if map_ok && pc[2] < a.max_depth && !depth_edge(&depth, w, h, u, v) {
                         let o = (v * w + u) * 3;
@@ -816,7 +839,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
         }
-        scene.add(nkf, &sp);
+        if let (Some(ts), true) = (tsdf.as_mut(), map_ok) {
+            ts.integrate(&depth, &rgb, w, h, seq.k, &r, &pwc, a.max_depth);
+        } else if !a.surface {
+            scene.add(nkf, &sp);
+        }
         let c3 = Instant::now();
 
         // 물체
@@ -909,6 +936,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     n_scene += pts.len();
                 }
                 scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
+                if let Some(ts) = tsdf.as_mut() {
+                    write_surface(&a.out, ts);
+                    scene_json["surface"] = surface_json(ts, run_id);
+                }
             }
             // 병합 후처리는 키프레임 15 장마다(물체 쌍을 매번 다 보지 않게, 중복이 자라기 전에 합침)
             let merge = nkf >= last_merge + 15;
@@ -943,6 +974,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         n_scene += pts.len();
     }
     scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
+    if let Some(ts) = tsdf.as_mut() {
+        write_surface(&a.out, ts);
+        scene_json["surface"] = surface_json(ts, run_id);
+    }
     let pts = scene.points();
     let t_end = traj.last().map_or(0.0, |x| x.0);
     for o in mem.objs.iter_mut().filter(|o| o.dirty) {

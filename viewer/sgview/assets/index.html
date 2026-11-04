@@ -77,6 +77,7 @@
     <label class="row"><input type="checkbox" id="j_stream" checked> Use the joint stream when it has an order</label>
     <label class="row"><input type="checkbox" id="c_follow"> Follow the robot (close-up)</label>
     <label class="row" title="viewer camera flies behind the handheld camera and looks where it looks"><input type="checkbox" id="c_chase"> Follow the handheld camera (behind)</label>
+    <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
     <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl" checked> Depth shading (EDL)</label>
     <div class="num">EDL strength <input type="number" id="n_edl" value="1" min="0" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_eetrace" checked> Gripper path</label>
@@ -135,11 +136,13 @@ camera.position.set(-9, -9, 9);
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 4);
 controls.update();
-scene.add(new THREE.AmbientLight(0xffffff, 1));
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const sun = new THREE.DirectionalLight(0xffffff, 0.45); sun.position.set(0.4, -0.6, 1); scene.add(sun);   // shades the surface map (Lambert); point/line materials are unlit
 
 const gMap = new THREE.Group(), gObjs = new THREE.Group(), gGraph = new THREE.Group(), gWalls = new THREE.Group(), gRobot = new THREE.Group();
 scene.add(gMap, gObjs, gGraph, gWalls, gRobot);
 const gScene = new THREE.Group(); scene.add(gScene);   // 3D map chunks: kept across object redraws, new chunks are appended
+const gSurf = new THREE.Group(); scene.add(gSurf);     // surface map regions (TSDF mesh): replaced only when a region's version changes
 
 // ---------------- EDL (eye-dome lighting) ----------------
 // Screen-space shading from the depth buffer (as in Potree / CloudCompare): each pixel is darkened by how much its
@@ -416,9 +419,35 @@ async function loadSceneChunks(sp) {
   sceneChunks.busy = false; pendingLoads--; loadDone();
 }
 
+// Surface map (TSDF + Surface Nets): regions [x, y, z, version]; only regions whose version changed are fetched again
+const surf = { run:null, have:new Map(), busy:false };
+const surfMat = new THREE.MeshLambertMaterial({ vertexColors:true, side:THREE.DoubleSide });
+async function loadSurface(s) {
+  if (surf.run !== s.run) { disposeGroup(gSurf); surf.have.clear(); surf.run = s.run; }
+  if (surf.busy) return;
+  surf.busy = true; pendingLoads++;
+  try {
+    for (const [x, y, z, ver] of s.regions) {
+      const key = x + "_" + y + "_" + z, cur = surf.have.get(key);
+      if (cur && cur.ver === ver) continue;
+      const r = await fetch("/file/mesh/r_" + key + ".ply?v=" + ver);
+      if (!r.ok) continue;
+      const g = parsePly(await r.arrayBuffer());
+      if (surf.run !== s.run) { g.dispose(); break; }
+      g.computeVertexNormals();
+      if (cur) { gSurf.remove(cur.mesh); cur.mesh.geometry.dispose(); }
+      const mesh = new THREE.Mesh(g, surfMat); mesh.userData.shared = true;
+      gSurf.add(mesh); surf.have.set(key, { ver, mesh });
+      invalidate();
+    }
+  } catch (e) {}
+  surf.busy = false; pendingLoads--; loadDone();
+}
 function drawObjects() {  invalidate();
   disposeGroup(gObjs);
   gObjs.visible = true;
+  if (view && view.scene_points && view.scene_points.surface) loadSurface(view.scene_points.surface);
+  gSurf.visible = opt("c_surf");
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor)
     const sp = view.scene_points, mat = () => pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") });
     if (sp.chunks != null) {   // chunked map: only chunks not yet fetched are downloaded and appended to gScene (not rebuilt here)
@@ -845,7 +874,7 @@ function applyView(v) {
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
   let sObj = ""; for (const o of view.objects) sObj += o.id + "|" + o.state + "|" + o.pos[0] + "," + o.pos[1] + "," + o.pos[2] + "|" + o.extent[0] + "," + o.extent[1] + "," + o.extent[2] + "|" + (o.points ? o.points.stamp : "") + "|" + (o.rgbd ? 1 : 0) + "|" + (o.room ?? "") + ";";
-  if (view.scene_points) sObj += "scene|" + (view.scene_points.chunks ?? view.scene_points.stamp) + "|" + view.scene_points.run;
+  if (view.scene_points) sObj += "scene|" + (view.scene_points.chunks ?? view.scene_points.stamp) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3]).reduce((a, b) => a + b, 0) : "");
   const sGraph = JSON.stringify(view.graph), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
   const objChanged = sObj !== prev.obj, graphChanged = objChanged || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
   if (objChanged) { fillSelect(); drawObjects(); }
@@ -1019,6 +1048,7 @@ function stepChase(dt) {
 }
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
 $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate;
+$("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
   if (!$("c_follow").checked || !robotGrp) return false;
   const tgt = new THREE.Vector3(robotGrp.position.x, robotGrp.position.y, 0.2);

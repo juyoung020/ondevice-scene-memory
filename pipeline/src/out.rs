@@ -53,6 +53,25 @@ pub fn ply(dst: &Path, pts: &[([f32; 3], [u8; 3])]) {
     write_atomic(dst, &b);
 }
 
+/// 면이 있는 PLY: 꼭짓점(float xyz + uchar rgb) + 삼각형(list uchar int)
+pub fn ply_mesh(dst: &Path, verts: &[([f32; 3], [u8; 3])], tris: &[[u32; 3]]) {
+    let mut b = Vec::with_capacity(verts.len() * 15 + tris.len() * 13 + 256);
+    write!(b, "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nelement face {}\nproperty list uchar int vertex_indices\nend_header\n", verts.len(), tris.len()).unwrap();
+    for (p, c) in verts {
+        for v in p {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(c);
+    }
+    for t in tris {
+        b.push(3);
+        for v in t {
+            b.extend_from_slice(&(*v as i32).to_le_bytes());
+        }
+    }
+    write_atomic(dst, &b);
+}
+
 pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
     let mut b = format!("P5\n{w} {h}\n255\n").into_bytes();
     b.extend_from_slice(px);

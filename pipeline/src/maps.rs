@@ -1,7 +1,7 @@
 //! 누적 지도들. 키프레임마다 새로 들어온 점만 해시 칸에 더하고(같은 키프레임은 칸당 한 번),
 //! 파일로 쓸 때는 칸을 한 번 훑기만 한다 — 지금까지 쌓인 점을 다시 정렬하지 않는다.
 use crate::geom::V3;
-use std::collections::{HashMap, HashSet};
+use crate::geom::{FastMap, FastSet};
 
 /// 칸 좌표 → 키(축마다 21 비트, ±1 백만 칸)
 #[inline]
@@ -31,15 +31,15 @@ struct SV {
 pub struct SceneMap {
     pub vox: f64,
     ratio: i64, // 지지 칸 = vox × ratio
-    cells: HashMap<u64, SV>,
-    support: HashMap<u64, (u32, u32)>, // 굵은 칸 → (본 키프레임 수, 마지막 키프레임)
+    cells: FastMap<u64, SV>,
+    support: FastMap<u64, (u32, u32)>, // 굵은 칸 → (본 키프레임 수, 마지막 키프레임)
     pub min_frames: u32,
-    sent: HashSet<u64>, // 이미 조각 파일로 내보낸 칸
+    sent: FastSet<u64>, // 이미 조각 파일로 내보낸 칸
 }
 
 impl SceneMap {
     pub fn new(vox: f64, sup: f64) -> SceneMap {
-        SceneMap { vox, ratio: (sup / vox).round() as i64, cells: HashMap::new(), support: HashMap::new(), min_frames: 2, sent: HashSet::new() }
+        SceneMap { vox, ratio: (sup / vox).round() as i64, cells: FastMap::default(), support: FastMap::default(), min_frames: 2, sent: FastSet::default() }
     }
     /// 한 키프레임의 점: (세계 점, 색, 카메라 거리)
     pub fn add(&mut self, kf: u32, pts: &[(V3, [u8; 3], f32)]) {
@@ -86,7 +86,7 @@ impl SceneMap {
 
 pub struct Grid {
     pub res: f64,
-    cells: HashMap<(i32, i32), (u32, u32)>, // (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수)
+    cells: FastMap<(i32, i32), (u32, u32)>, // (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수)
 }
 
 pub struct GridImg {
@@ -99,12 +99,12 @@ pub struct GridImg {
 
 impl Grid {
     pub fn new(res: f64) -> Grid {
-        Grid { res, cells: HashMap::new() }
+        Grid { res, cells: FastMap::default() }
     }
     pub fn add(&mut self, cam: (f64, f64), occ: &[(f64, f64)], floor: &[(f64, f64)]) {
         let c = |x: f64, y: f64| ((x / self.res).floor() as i32, (y / self.res).floor() as i32);
-        let o: HashSet<(i32, i32)> = occ.iter().map(|p| c(p.0, p.1)).collect();
-        let mut f: HashSet<(i32, i32)> = floor.iter().map(|p| c(p.0, p.1)).collect();
+        let o: FastSet<(i32, i32)> = occ.iter().map(|p| c(p.0, p.1)).collect();
+        let mut f: FastSet<(i32, i32)> = floor.iter().map(|p| c(p.0, p.1)).collect();
         let (cx, cy) = c(cam.0, cam.1);
         for &(x, y) in &o {
             let n = (x - cx).abs().max((y - cy).abs());
@@ -167,7 +167,7 @@ pub struct Crop {
 pub struct Obj {
     pub id: u32,
     pub name: String,
-    pub votes: HashMap<String, f32>,
+    pub votes: FastMap<String, f32>,
     pub score: f32,
     pub n_obs: u32,
     pub first_pos: V3,
@@ -176,8 +176,8 @@ pub struct Obj {
     pub last_seen: f64,
     pub miss: u32,
     pub state: &'static str,
-    pub cells: HashMap<u64, OV>,
-    pub support: HashMap<u64, u32>, // 굵은 칸 → 본 관측 수
+    pub cells: FastMap<u64, OV>,
+    pub support: FastMap<u64, u32>, // 굵은 칸 → 본 관측 수
     pub crop: Option<Crop>, // 가장 크게 본 장면
     pub crop_area: u32,
     pub crop_ver: u32, // 사진이 바뀔 때마다 +1(뷰어는 이게 바뀔 때만 다시 받음)
@@ -202,7 +202,7 @@ impl Memory {
     }
 
     /// 같은 이름(살아 있는) 물체 중 굵은 칸 겹침 25 % 이상이거나 중심이 크기에 맞춘 문턱 안이면 같은 물체
-    fn find(&self, name: &str, c: &V3, ext: &V3, keys: &HashSet<u64>) -> Option<usize> {
+    fn find(&self, name: &str, c: &V3, ext: &V3, keys: &FastSet<u64>) -> Option<usize> {
         let mut best = None;
         let mut bs = -1.0;
         for (i, o) in self.objs.iter().enumerate() {
@@ -242,13 +242,13 @@ impl Memory {
             }
         }
         let ext = [0, 1, 2].map(|k| (hi[k] - lo[k]).max(0.05));
-        let ckeys: HashSet<u64> = pts.iter().map(|(p, _)| key(p, self.sup)).collect();
+        let ckeys: FastSet<u64> = pts.iter().map(|(p, _)| key(p, self.sup)).collect();
         let i = match self.find(name, &c, &ext, &ckeys) {
             Some(i) => i,
             None => {
                 self.objs.push(Obj {
-                    id: self.next, name: name.into(), votes: HashMap::new(), score: 0.0, n_obs: 0, first_pos: c, pos: c,
-                    extent: ext, last_seen: stamp, miss: 0, state: "seen", cells: HashMap::new(), support: HashMap::new(),
+                    id: self.next, name: name.into(), votes: FastMap::default(), score: 0.0, n_obs: 0, first_pos: c, pos: c,
+                    extent: ext, last_seen: stamp, miss: 0, state: "seen", cells: FastMap::default(), support: FastMap::default(),
                     crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0, crop_saved: 0, cells_saved: 0,
                 });
                 self.next += 1;
@@ -425,7 +425,7 @@ impl Memory {
     }
 
     /// 보여야 할 자리(화면 안, 40 화소 이상, 깊이 일치)에서 그 자리에 아무것도 검출되지 않은 채 15 장 연속이면 사라짐
-    pub fn check_missing(&mut self, seen: &HashSet<u32>, k: [f64; 4], rwc: &crate::geom::M3, pwc: &V3, depth: &[f32], w: usize, h: usize) {
+    pub fn check_missing(&mut self, seen: &std::collections::HashSet<u32>, k: [f64; 4], rwc: &crate::geom::M3, pwc: &V3, depth: &[f32], w: usize, h: usize) {
         let miss_need = 15u32; // 보여야 할 자리에서 15 장 연속 안 보이면 사라짐(8 장은 검출이 잠깐 빠져도 사라짐이 됐음)
         // 이번 장면에 보인 물체 위치: 그 자리에서 다른 물체가 검출됐으면(중복이거나 이름이 바뀌어 검출됨, 예: 곰 인형 → 고양이) 놓친 걸로 세지 않음
         let seen_at: Vec<V3> = self.objs.iter().filter(|o| seen.contains(&o.id)).map(|o| o.pos).collect();

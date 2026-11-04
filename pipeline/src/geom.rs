@@ -131,3 +131,51 @@ pub fn interp_pose(ts: &[f64], ps: &[V3], qs: &[[f64; 4]], t: f64) -> (V3, M3) {
     let q = [0, 1, 2, 3].map(|k| q0[k] * (1.0 - a) + q1[k] * a);
     (p, quat_to_m(q))
 }
+
+/// 빠른 해시(정수 칸 열쇠용, rustc 의 Fx 방식): 기본 SipHash 는 칸 수십만 개를 장면마다 넣을 때 느리다
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+impl Fx {
+    #[inline]
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+impl std::hash::Hasher for Fx {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // 마지막에 비트를 고루 섞음(곱셈만으로는 높은 비트에만 다른 열쇠가 같은 통에 몰린다)
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.add(x as u64);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+    #[inline]
+    fn write_u32(&mut self, x: u32) {
+        self.add(x as u64);
+    }
+    #[inline]
+    fn write_i32(&mut self, x: i32) {
+        self.add(x as u32 as u64);
+    }
+    #[inline]
+    fn write_i64(&mut self, x: i64) {
+        self.add(x as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
+}
+pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<Fx>>;

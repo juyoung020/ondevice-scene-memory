@@ -48,11 +48,12 @@ fn samp(img: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f3
 /// 반환: (R, t, 쓰인 화소 수, 평균 밝기 오차, 깊이 배율 = 앞 깊이로 옮긴 거리 / 이번 깊이 중앙값)
 /// minlv: 가장 고운 단계 번호(딥러닝 깊이는 1: 640×480 단계는 깊이가 흐려 도움이 안 되고 시간만 40 % 더 듦)
 pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f64; 4], init: (M3, V3), minlv: usize) -> Option<(M3, V3, usize, f64, f64)> {
+
     let (w0, h0) = (prev.lv[0].0, prev.lv[0].1);
-    let (mut r, mut t) = init;
-    let mut last_n = 0;
-    let mut last_err = 1.0;
-    for l in (minlv..prev.lv.len()).rev() {
+    let nth = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+    let level = |l: usize, r_io: &mut M3, t_io: &mut V3, n_io: &mut usize, e_io: &mut f64| {
+        let (mut r, mut t) = (*r_io, *t_io);
+        let (mut last_n, mut last_err) = (*n_io, *e_io);
         let s = (1usize << l) as f64;
         let (fx, fy) = (k[0] / s, k[1] / s);
         let (cx, cy) = ((k[2] + 0.5) / s - 0.5, (k[3] + 0.5) / s - 0.5);
@@ -77,40 +78,71 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
             }
         }
         if pts.len() < 100 {
-            continue;
+            return;
         }
         let mut bias = 0f32; // 노출 변화(밝기 전체 차이)
         let iters = [6, 8, 10, 12][l.min(3)];
         for _ in 0..iters {
+            // 점마다 (H, g, 개수, Σw·r, Σw, Σ|r|) 를 쌓는다. 점이 많으면 코어마다 나눠 쌓고 더한다(보드 4 코어)
+            let acc = |chunk: &[(V3, f32)]| {
+                let mut hm = [[0.0f64; 6]; 6];
+                let mut g = [0.0f64; 6];
+                let (mut n, mut sr, mut sw, mut sabs) = (0usize, 0f64, 0f64, 0f64);
+                for (p0, v0) in chunk {
+                    let p1 = add(&mv(&r, p0), &t);
+                    if p1[2] < 0.03 {
+                        continue;
+                    }
+                    let (u, v) = (fx * p1[0] / p1[2] + cx, fy * p1[1] / p1[2] + cy);
+                    let Some((v1, gx, gy)) = samp(i1, w, h, u as f32, v as f32) else { continue };
+                    let res = (v1 - v0 - bias) as f64;
+                    let wgt = if res.abs() < 0.04 { 1.0 } else { 0.04 / res.abs() };
+                    let iz = 1.0 / p1[2];
+                    // 화면 기울기 × 투영 미분 → 점 위치에 대한 미분, 이동 = 그대로, 회전 = p1 × ju
+                    let ju = [gx as f64 * fx * iz, gy as f64 * fy * iz, -(gx as f64 * fx * p1[0] + gy as f64 * fy * p1[1]) * iz * iz];
+                    let jr = cross(&p1, &ju);
+                    let jac = [ju[0], ju[1], ju[2], jr[0], jr[1], jr[2]];
+                    for a in 0..6 {
+                        for b in a..6 {
+                            hm[a][b] += wgt * jac[a] * jac[b];
+                        }
+                        g[a] -= wgt * jac[a] * res;
+                    }
+                    n += 1;
+                    sr += wgt * res;
+                    sw += wgt;
+                    sabs += res.abs();
+                }
+                (hm, g, n, sr, sw, sabs)
+            };
+            let parts: Vec<_> = if pts.len() >= 4000 && nth > 1 {
+                std::thread::scope(|sc| {
+                    let hs: Vec<_> = pts.chunks(pts.len().div_ceil(nth)).map(|c| sc.spawn(move || acc(c))).collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            } else {
+                vec![acc(&pts)]
+            };
             let mut hm = [[0.0; 6]; 6];
             let mut g = [0.0; 6];
             let (mut n, mut sr, mut sw, mut sabs) = (0usize, 0f64, 0f64, 0f64);
-            for (p0, v0) in &pts {
-                let p1 = add(&mv(&r, p0), &t);
-                if p1[2] < 0.03 {
-                    continue;
-                }
-                let (u, v) = (fx * p1[0] / p1[2] + cx, fy * p1[1] / p1[2] + cy);
-                let Some((v1, gx, gy)) = samp(i1, w, h, u as f32, v as f32) else { continue };
-                let res = (v1 - v0 - bias) as f64;
-                let wgt = if res.abs() < 0.04 { 1.0 } else { 0.04 / res.abs() };
-                let iz = 1.0 / p1[2];
-                // 화면 기울기 × 투영 미분 → 점 위치에 대한 미분, 이동 = 그대로, 회전 = p1 × ju
-                let ju = [gx as f64 * fx * iz, gy as f64 * fy * iz, -(gx as f64 * fx * p1[0] + gy as f64 * fy * p1[1]) * iz * iz];
-                let jr = cross(&p1, &ju);
-                let jac = [ju[0], ju[1], ju[2], jr[0], jr[1], jr[2]];
+            for (h2, g2, n2, sr2, sw2, sa2) in parts {
                 for a in 0..6 {
-                    for b in 0..6 {
-                        hm[a][b] += wgt * jac[a] * jac[b];
+                    for b in a..6 {
+                        hm[a][b] += h2[a][b];
                     }
-                    g[a] -= wgt * jac[a] * res;
+                    g[a] += g2[a];
                 }
-                n += 1;
-                sr += wgt * res;
-                sw += wgt;
-                sabs += res.abs();
+                n += n2;
+                sr += sr2;
+                sw += sw2;
+                sabs += sa2;
             }
-            if n < 50 {
+            for a in 0..6 {
+                for b in 0..a {
+                    hm[a][b] = hm[b][a];
+                }
+            }            if n < 50 {
                 break;
             }
             bias += (sr / sw) as f32;
@@ -127,6 +159,12 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
                 break;
             }
         }
+        (*r_io, *t_io, *n_io, *e_io) = (r, t, last_n, last_err);
+    };
+    let (mut r, mut t) = init;
+    let (mut last_n, mut last_err) = (0usize, 1.0f64);
+    for l in (minlv..prev.lv.len()).rev() {
+        level(l, &mut r, &mut t, &mut last_n, &mut last_err);
     }
     if std::env::var_os("DVO_DEBUG").is_some() {
         eprintln!("dvo n {last_n} err {last_err:.3}");

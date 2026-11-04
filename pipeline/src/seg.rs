@@ -34,13 +34,14 @@ pub fn letterbox(rgb: &[u8], w: usize, h: usize, s: usize) -> Letterbox {
     let (nw, nh) = ((w as f32 * r).round() as usize, (h as f32 * r).round() as usize);
     let (px, py) = ((s - nw) / 2, (s - nh) / 2);
     let mut buf = vec![114u8; s * s * 3];
+    // 가로 원본 위치는 줄마다 같으니 한 번만 계산
+    let xs: Vec<usize> = (0..nw).map(|x| (((x as f32 + 0.5) / r) as usize).min(w - 1) * 3).collect();
     for y in 0..nh {
         let sy = (((y as f32 + 0.5) / r) as usize).min(h - 1);
-        for x in 0..nw {
-            let sx = (((x as f32 + 0.5) / r) as usize).min(w - 1);
-            let o = (sy * w + sx) * 3;
-            let d = ((py + y) * s + px + x) * 3;
-            buf[d..d + 3].copy_from_slice(&rgb[o..o + 3]);
+        let src = &rgb[sy * w * 3..(sy + 1) * w * 3];
+        let dst = &mut buf[((py + y) * s + px) * 3..((py + y) * s + px + nw) * 3];
+        for (d, &o) in dst.chunks_exact_mut(3).zip(&xs) {
+            d.copy_from_slice(&src[o..o + 3]);
         }
     }
     Letterbox { buf, r, px, py }
@@ -62,28 +63,44 @@ pub fn decode(det: &[f32], proto: &[f32], pc: usize, ph: usize, pw: usize, s: us
         let y2 = (((d[3] - py) / r).ceil() as i32).clamp(y1 + 1, h as i32);
         let coef = &d[6..6 + pc];
         let (bw, bh) = ((x2 - x1) as usize, (y2 - y1) as usize);
-        let mut mask = vec![false; bw * bh];
-        for yy in 0..bh {
-            let fy = (((y1 as usize + yy) as f32 + 0.5) * r + py) * scale - 0.5;
-            let y0 = (fy.floor() as i32).clamp(0, ph as i32 - 1) as usize;
-            let y1p = (y0 + 1).min(ph - 1);
-            let ay = (fy - y0 as f32).clamp(0.0, 1.0);
-            for xx in 0..bw {
-                let fx = (((x1 as usize + xx) as f32 + 0.5) * r + px) * scale - 0.5;
-                let x0 = (fx.floor() as i32).clamp(0, pw as i32 - 1) as usize;
-                let x1p = (x0 + 1).min(pw - 1);
-                let ax = (fx - x0 as f32).clamp(0.0, 1.0);
-                let mut v = 0.0;
-                for (k, c) in coef.iter().enumerate() {
-                    let b = k * ph * pw;
-                    let top = proto[b + y0 * pw + x0] * (1.0 - ax) + proto[b + y0 * pw + x1p] * ax;
-                    let bot = proto[b + y1p * pw + x0] * (1.0 - ax) + proto[b + y1p * pw + x1p] * ax;
-                    v += c * (top * (1.0 - ay) + bot * ay);
+        // 원형 격자 위치(행·열마다 한 번): (아래 칸, 위 칸, 가중)
+        let fy = |yy: usize| -> (usize, usize, f32) {
+            let f = (((y1 as usize + yy) as f32 + 0.5) * r + py) * scale - 0.5;
+            let y0 = (f.floor() as i32).clamp(0, ph as i32 - 1) as usize;
+            (y0, (y0 + 1).min(ph - 1), (f - y0 as f32).clamp(0.0, 1.0))
+        };
+        let fx = |xx: usize| -> (usize, usize, f32) {
+            let f = (((x1 as usize + xx) as f32 + 0.5) * r + px) * scale - 0.5;
+            let x0 = (f.floor() as i32).clamp(0, pw as i32 - 1) as usize;
+            (x0, (x0 + 1).min(pw - 1), (f - x0 as f32).clamp(0.0, 1.0))
+        };
+        let ys: Vec<_> = (0..bh).map(fy).collect();
+        let xs: Vec<_> = (0..bw).map(fx).collect();
+        // 계수·원형 내적은 선형이라 원형 격자(160²)에서 먼저 하고 화소마다 쌍선형으로 읽는다(화소마다 32 번 하던 것과 같은 값)
+        let (gy0, gy1) = (ys[0].0, ys[bh - 1].1);
+        let (gx0, gx1) = (xs[0].0, xs[bw - 1].1);
+        let gw = gx1 - gx0 + 1;
+        let mut g = vec![0f32; (gy1 - gy0 + 1) * gw];
+        for (k, c) in coef.iter().enumerate() {
+            let b = k * ph * pw;
+            for yy in gy0..=gy1 {
+                let src = &proto[b + yy * pw + gx0..b + yy * pw + gx1 + 1];
+                let dst = &mut g[(yy - gy0) * gw..(yy - gy0) * gw + gw];
+                for (o, s) in dst.iter_mut().zip(src) {
+                    *o += c * s;
                 }
-                mask[yy * bw + xx] = v > 0.0; // sigmoid(v) > 0.5
             }
         }
-        dets.push(Det { cls: d[5] as usize, score: d[4], box_: [x1, y1, x2, y2], mask });
+        let mut mask = vec![false; bw * bh];
+        for (yy, &(y0, y1p, ay)) in ys.iter().enumerate() {
+            let (r0, r1) = (&g[(y0 - gy0) * gw..(y0 - gy0) * gw + gw], &g[(y1p - gy0) * gw..(y1p - gy0) * gw + gw]);
+            for (xx, &(x0, x1p, ax)) in xs.iter().enumerate() {
+                let (a0, a1) = (x0 - gx0, x1p - gx0);
+                let top = r0[a0] * (1.0 - ax) + r0[a1] * ax;
+                let bot = r1[a0] * (1.0 - ax) + r1[a1] * ax;
+                mask[yy * bw + xx] = top * (1.0 - ay) + bot * ay > 0.0; // sigmoid(v) > 0.5
+            }
+        }        dets.push(Det { cls: d[5] as usize, score: d[4], box_: [x1, y1, x2, y2], mask });
     }
     dets
 }

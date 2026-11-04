@@ -3,7 +3,7 @@
 //! 거리가 0 을 지나는 곳에서 매끄러운 삼각형 면을 만든다. 칸은 표면 근처 블록(8×8×8)만 해시로 잡는다.
 //! 면 파일은 구역(블록 4×4×4)마다 따로 쓰고, 바뀐 구역만 다시 쓴다.
 use crate::geom::*;
-use std::collections::{HashMap, HashSet};
+use crate::geom::{FastMap, FastSet};
 
 const B: i32 = 8; // 블록 한 변의 칸 수
 const R: i32 = 4; // 구역 한 변의 블록 수
@@ -17,9 +17,9 @@ struct Block {
 pub struct Tsdf {
     pub vox: f64,
     trunc: f64,
-    blocks: HashMap<(i32, i32, i32), Block>,
-    dirty: HashSet<(i32, i32, i32)>, // 바뀐 구역
-    pub ver: HashMap<(i32, i32, i32), u32>, // 구역 → 판 번호(뷰어가 바뀐 것만 받음)
+    blocks: FastMap<(i32, i32, i32), Block>,
+    dirty: FastSet<(i32, i32, i32)>, // 바뀐 구역
+    pub ver: FastMap<(i32, i32, i32), u32>, // 구역 → 판 번호(뷰어가 바뀐 것만 받음)
 }
 
 #[inline]
@@ -29,7 +29,7 @@ fn div_floor(a: i32, b: i32) -> i32 {
 
 impl Tsdf {
     pub fn new(vox: f64) -> Tsdf {
-        Tsdf { vox, trunc: 3.0 * vox, blocks: HashMap::new(), dirty: HashSet::new(), ver: HashMap::new() }
+        Tsdf { vox, trunc: 3.0 * vox, blocks: FastMap::default(), dirty: FastSet::default(), ver: FastMap::default() }
     }
 
     /// 한 장면 더하기: depth(미터, w×h), rgb, 카메라→세계 (r, p), 보정값 k. step: 블록 잡을 때 화소 간격.
@@ -39,7 +39,7 @@ impl Tsdf {
         let vs = self.vox;
         let bs = vs * B as f64;
         // 1) 표면 근처 블록 잡기(화소 4 간격, 표면 앞뒤 trunc)
-        let mut touch: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut touch: FastSet<(i32, i32, i32)> = FastSet::default();
         for v in (0..h).step_by(4) {
             for u in (0..w).step_by(4) {
                 let z = depth[v * w + u] as f64;

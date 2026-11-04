@@ -17,6 +17,7 @@
 - PC 그래픽카드 실행(`--features directml`).
 - 속도 개선 기록 `docs/performance_log.md`, 평가 계획 `docs/evaluation_plan.md`.
 - 위치만 먼저 추적(`--fast-pose`): 모든 카메라 장면으로 위치를 갱신하고 깊이·분할은 모델 스레드가 쉬는 대로(깊이 5 장/초 조건 사무실 위치 오차 1.27 → 0.67 m), 깊이 전파로 깊이가 늦게 와도 기준이 오래되지 않음, 보드 흉내 `--depth-lag`.
+- 외부 SLAM 위치로 돌리기(`--gt`), 추정 경로 `poses_est.txt`, 정렬 후 위치 오차 도구 `ate`, 다른 카메라 RGB-D 를 TUM 형식으로 바꾸는 `rgbd2tum`.
 - 표면 지도 비교 도구 `surfcmp`(정확도·완전도), 평가 표 도구 `bench`(위치 오차·실패·속도·물체 수).
 - 방 이름: 방 안 물체 구성으로 종류를 정함(사무실·주방·거실·침실·식당·욕실, 단서 물체 가중 점수).
 - 위치 추정 방법 문서 `docs/pose_and_map.md`, 동작 원리 문서 `docs/architecture.md`.

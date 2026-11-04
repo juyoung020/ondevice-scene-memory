@@ -33,11 +33,13 @@ impl Tum {
         Tum { dir: PathBuf::new(), rgb: vec![], depth: vec![], ts: vec![], ps: vec![], qs: vec![], level: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], k }
     }
 
-    pub fn open(dir: &Path) -> Tum {
+    /// gt: 위치 파일(TUM 형식). 없으면 폴더의 groundtruth.txt(다른 SLAM 이 낸 위치를 넣을 때 씀)
+    pub fn open(dir: &Path, gt: Option<&Path>) -> Tum {
         let rgb = read_list(&dir.join("rgb.txt"));
         let depth = read_list(&dir.join("depth.txt"));
         let (mut ts, mut ps, mut qs) = (vec![], vec![], vec![]);
-        for l in std::fs::read_to_string(dir.join("groundtruth.txt")).expect("groundtruth.txt").lines() {
+        let gt_path = gt.map_or_else(|| dir.join("groundtruth.txt"), |p| p.to_path_buf());
+        for l in std::fs::read_to_string(&gt_path).expect("groundtruth.txt").lines() {
             if l.starts_with('#') {
                 continue;
             }

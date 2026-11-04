@@ -167,3 +167,15 @@ DEEPX 공식 모델 저장소([dx-modelzoo](https://github.com/DEEPX-AI/dx-model
 - [K1] Luxonis OAK-D Pro: https://docs.luxonis.com/hardware/products/OAK-D%20Pro
 - [P1] Raspberry Pi 5 USB 전원 백서: https://pip-assets.raspberrypi.com/categories/685-app-notes-guides-whitepapers/documents/RP-009856-WP-1-USB%20Power%20delivery%20on%20Raspberry%20Pi%205.pdf
 - DEEPX 분할 모델 mAP·연산량: dx_app 모델 카드 `src/cpp_example/instance_segmentation/*/README.md`, dx-modelzoo YAML
+
+## PC 첫 시험 (2026-11-05, D435i 실데이터)
+
+Digiteo seq2(RealSense D435i, 연구소 복도 58 m 한 바퀴, 1,658 장, 깊이 투사 켬)를 `rgbd2tum` 으로 640×480 으로 바꿔 RTAB-Map 0.24.2(Windows, 장면마다 노드)로 돌림. 정렬 후 위치 오차(`ate`, 정답 332 개):
+
+| 위치 | 위치 오차 | 최대 |
+|---|---|---|
+| **RTAB-Map** | **0.37 m** | 0.58 m |
+| 우리 DVO | 6.58 m | 12.4 m |
+
+RTAB-Map 처리 155 초(PC, 1,658 장). 그 위치 + D435 깊이 + YOLO-seg 로 memmap 표면 지도: 복도 한 바퀴가 이중벽 없이 닫힘, 바닥은 D435 깊이 잡음으로 군데군데 비어 보임. 컬러가 흑백인 데이터라 물체는 6 개.
+

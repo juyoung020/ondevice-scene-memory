@@ -9,6 +9,7 @@
 | TUM RGB-D fr1/desk | 위치 추정·지도 시험(책상, 23 초, 손에 든 Kinect) | 328 MB | https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_desk.tgz | `data/tum/rgbd_dataset_freiburg1_desk/` |
 | TUM RGB-D fr3/long_office_household | 위치 추정·지도·표지(사무실 22 m, 87 초) | 1.4 GB | https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_long_office_household.tgz | `data/tum/rgbd_dataset_freiburg3_long_office_household/` |
 | TUM-VI room1 (512, 16 bit) | 카메라+IMU 위치 추정 시험 | 1.6 GB | https://cvg.cit.tum.de/tumvi/exported/euroc/512_16/dataset-room1_512_16.tar | `data/tum/room1.tar` |
+| Digiteo seq2 (RealSense D435i, 연구소 복도 58 m 한 바퀴, 흑백 컬러, 정답 위치) | D435 깊이 + SLAM 시험 | 3.2 GB | https://doi.org/10.17632/tb9g7th9yz.2 | `data/d435/Digiteo_seq_2/` → `rgbd2tum` 으로 `data/d435/rgbd_dataset_freiburg3_digiteo2/` |
 | ADVIO 15 (아이폰 카메라+IMU, 사무실 52 초) | 0.2.0 의 VIO·ARKit 시험 | 77 MB | https://github.com/AaltoVision/ADVIO (advio-15.zip) | `data/advio/advio-15/` |
 
 받는 법(예: 책상):

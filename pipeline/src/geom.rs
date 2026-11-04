@@ -179,3 +179,22 @@ impl std::hash::Hasher for Fx {
 }
 pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<Fx>>;
+
+/// 회전 행렬 → 사원수 [x, y, z, w]
+pub fn quat_of(m: &M3) -> [f64; 4] {
+    let tr = m[0][0] + m[1][1] + m[2][2];
+    let (x, y, z, w) = if tr > 0.0 {
+        let s = (tr + 1.0).sqrt() * 2.0;
+        ((m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s, 0.25 * s)
+    } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
+        let s = (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt() * 2.0;
+        (0.25 * s, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s, (m[2][1] - m[1][2]) / s)
+    } else if m[1][1] > m[2][2] {
+        let s = (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt() * 2.0;
+        ((m[0][1] + m[1][0]) / s, 0.25 * s, (m[1][2] + m[2][1]) / s, (m[0][2] - m[2][0]) / s)
+    } else {
+        let s = (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt() * 2.0;
+        ((m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s, (m[1][0] - m[0][1]) / s)
+    };
+    [x, y, z, w]
+}

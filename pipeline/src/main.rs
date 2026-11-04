@@ -42,6 +42,7 @@ struct Args {
     dvo: bool, // --pose dvo: 특징점 없이 RGB-D 직접 방식
     cam: Option<String>,
     k: Option<[f64; 4]>,
+    gt: Option<String>, // --gt <파일>: TUM 영상의 위치를 이 파일(TUM 형식)로(예: RTAB-Map 이 낸 위치)
     sp: String,
     snaps: Vec<u32>,
     rec: Option<PathBuf>,
@@ -76,6 +77,7 @@ fn args() -> Args {
         vo: get("--pose").is_some_and(|p| p == "vo" || p == "dvo"),
         dvo: get("--pose").is_some_and(|p| p == "dvo"),
         cam: get("--cam"),
+        gt: get("--gt"),
         k: get("--k").map(|s| { let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect(); [v[0], v[1], v[2], v[3]] }),
         sp: get("--superpoint").unwrap_or(if cfg!(feature = "dxrt") { "superpoint_480x640.dxnn" } else { "models/superpoint.onnx" }.into()),
         snaps: get("--snaps").map_or(vec![], |s| s.split(',').filter_map(|x| x.parse().ok()).collect()),
@@ -305,7 +307,7 @@ struct Frame {
 
 fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter + Send> {
     // 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
-    let seq = if a.cam.is_some() { tum::Tum::empty(a.k.unwrap_or([477.0, 477.0, 320.0, 240.0])) } else { tum::Tum::open(&a.tum) };
+    let seq = if a.cam.is_some() { tum::Tum::empty(a.k.unwrap_or([477.0, 477.0, 320.0, 240.0])) } else { tum::Tum::open(&a.tum, a.gt.as_deref().map(Path::new)) };
     std::fs::create_dir_all(a.out.join("objects")).unwrap();
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
@@ -611,6 +613,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut vo_ms: Vec<(usize, usize)> = vec![];
     let mut vo_ok = false;
     let mut ate: Vec<(V3, V3)> = vec![];
+    let mut est_traj: Vec<(f64, V3, M3)> = vec![]; // 추정 위치(시각, 위치, 자세) → poses_est.txt(TUM 형식)
     let mut vo_fail = 0u32;
     let mut vo_reject = 0u32;
     let mut vo_nref = 0u32;
@@ -703,6 +706,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
                 vo_last_t = Some(t);
                 ate.push((p1, p_gt));
+                est_traj.push((t, p1, r1));
                 n_fast += 1;
                 if a.live > 0.0 {
                     let pw = [p1[0], p1[1], p1[2] - last_z0v];
@@ -865,8 +869,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             r = r2;
             p = p2;
             ate.push((p, p_gt));
+            est_traj.push((t, p, r));
             if rewind {
                 ate.pop();
+                est_traj.pop();
                 (vo_pose, vo_vel, vo_last_t, dvo_rel) = saved;
             }
         }        // 딥러닝 깊이 배율: 두 장면 삼각측량(포즈를 알 때)으로 실제 거리를 재서 맞춘다(scale.rs). 최근 5 개 중앙값으로 평활.
@@ -1216,6 +1222,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                      clock.load / n * 1e3, clock.seg / n * 1e3, clock.vo / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
                      n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);
         }
+    }
+    if !est_traj.is_empty() {
+        let mut s = String::from("# timestamp x y z qx qy qz qw (OpenCV 카메라 → 세계)\n");
+        for (t, p, r) in &est_traj {
+            let q = quat_of(r);
+            s += &format!("{t:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}\n", p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
+        }
+        let _ = std::fs::write(a.out.join("poses_est.txt"), s);
     }
     let seg = worker.join().expect("worker");
     let pts = scene.new_points();

@@ -424,15 +424,27 @@ impl Memory {
         keep
     }
 
-    /// 보여야 할 자리(화면 안, 깊이 일치)에서 연속 8 키프레임 안 보이면 사라짐
+    /// 보여야 할 자리(화면 안, 40 화소 이상, 깊이 일치)에서 그 자리에 아무것도 검출되지 않은 채 15 장 연속이면 사라짐
     pub fn check_missing(&mut self, seen: &HashSet<u32>, k: [f64; 4], rwc: &crate::geom::M3, pwc: &V3, depth: &[f32], w: usize, h: usize) {
+        let miss_need = 15u32; // 보여야 할 자리에서 15 장 연속 안 보이면 사라짐(8 장은 검출이 잠깐 빠져도 사라짐이 됐음)
+        // 이번 장면에 보인 물체 위치: 그 자리에서 다른 물체가 검출됐으면(중복이거나 이름이 바뀌어 검출됨, 예: 곰 인형 → 고양이) 놓친 걸로 세지 않음
+        let seen_at: Vec<V3> = self.objs.iter().filter(|o| seen.contains(&o.id)).map(|o| o.pos).collect();
         for o in self.objs.iter_mut() {
             if seen.contains(&o.id) || o.state == "gone" || o.n_obs < 5 {
+                continue;
+            }
+            let near = (0.5 * o.extent.iter().cloned().fold(0.0, f64::max)).max(0.3);
+            if seen_at.iter().any(|p| crate::geom::norm(&crate::geom::sub(p, &o.pos)) < near) {
                 continue;
             }
             let d = crate::geom::sub(&o.pos, pwc);
             let pc = [0, 1, 2].map(|j| rwc[0][j] * d[0] + rwc[1][j] * d[1] + rwc[2][j] * d[2]); // Rᵀ·d
             if pc[2] < 0.3 || pc[2] > 4.0 {
+                continue;
+            }
+            // 화면에서 40 화소보다 작게 보이면 검출이 원래 자주 빠지므로 세지 않음
+            let size_px = o.extent.iter().cloned().fold(0.0, f64::max) * k[0] / pc[2];
+            if size_px < 40.0 {
                 continue;
             }
             let u = k[0] * pc[0] / pc[2] + k[2];
@@ -443,9 +455,8 @@ impl Memory {
             let dz = depth[v as usize * w + u as usize] as f64;
             if dz <= 0.0 || (dz - pc[2]).abs() > 0.3 {
                 continue;
-            }
-            o.miss += 1;
-            if o.miss >= 8 {
+            }            o.miss += 1;
+            if o.miss >= miss_need {
                 o.state = "gone";
             }
         }

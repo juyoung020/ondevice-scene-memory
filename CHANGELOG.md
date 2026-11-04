@@ -17,6 +17,7 @@
 - PC 그래픽카드 실행(`--features directml`).
 - 속도 개선 기록 `docs/performance_log.md`, 평가 계획 `docs/evaluation_plan.md`.
 - 표면 지도 비교 도구 `surfcmp`(정확도·완전도).
+- 방 이름: 방 안 물체 구성으로 종류를 정함(사무실·주방·거실·침실·식당·욕실, 단서 물체 가중 점수).
 - 위치 추정 방법 문서 `docs/pose_and_map.md`, 동작 원리 문서 `docs/architecture.md`.
 - 쓴 데이터 목록과 받는 주소 `data/README.md`(영상은 올리지 않음).
 - 새 README 표지 `docs/cover-slam.gif`.
@@ -46,6 +47,8 @@
 - **호환 변경:** 파이썬 코드 전부(`tools/*.py`, `train/ObjectSAM` 의 파이썬). 실행은 `pipeline/` 으로.
 
 ### Fixed
+- 그대로 있는 물체를 '사라짐'으로 잘못 표시하던 문제(사무실 27 → 8 개).
+- 한 방이 여러 방으로 쪼개지던 문제(사무실 3 → 1 개).
 - 보드 화면 뷰어가 끊기고 멈추던 문제: EDL 을 기본으로 끔(보드 59 fps, 100 ms 넘는 멈춤 0).
 - 뷰어가 파일을 읽는 중일 때 윈도우에서 재생이 멈추던 문제.
 - 위치 추정이 한 번 실패하면 기준 장면을 새로 잡아 지도가 어긋나던 문제.

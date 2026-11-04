@@ -1,5 +1,6 @@
 //! 씬그래프 층: 방(점유 지도의 빈칸을 구역으로) + 엣지(contains 방→물체, on 위·아래, near 가까운 2 개).
-//! 방 나누기: 빈칸 거리변환(체임퍼 3-4) → 통로보다 넓은 곳(폭 ≥ min_width)을 씨앗 → 빈칸 안에서 씨앗을 동시에 키움(BFS).
+//! 방 나누기: 빈칸의 작은 구멍 메우기(닫힘) → 빈칸 거리변환(체임퍼 3-4) → 통로보다 넓은 곳(폭 ≥ min_width)을 씨앗 → 빈칸 안에서 씨앗을 동시에 키움(BFS)
+//! → 맞닿은 경계가 1.2 m 넘는 방끼리 합침(문은 그보다 좁다).
 use crate::maps::GridImg;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -11,7 +12,36 @@ pub struct Rooms {
 
 pub fn segment(g: &GridImg, res: f64, min_width: f64, min_area: f64) -> Rooms {
     let (w, h) = (g.w, g.h);
-    let free: Vec<bool> = g.px.iter().map(|&p| p == 254).collect();
+    // 빈칸 사이의 작은 미관측 구멍 메우기(닫힘: 빈칸을 r 칸 넓혔다가 다시 좁힘, 막힌 칸은 그대로): 손카메라는 바닥을 듬성듬성 봐서
+    // 빈칸이 얼룩덜룩하면 거리변환이 작아져 한 방이 여러 씨앗으로 갈라진다
+    let occ: Vec<bool> = g.px.iter().map(|&p| p == 0).collect();
+    let mut free: Vec<bool> = g.px.iter().map(|&p| p == 254).collect();
+    let r = 2i64;
+    let grow = |m: &[bool], want: bool| -> Vec<bool> {
+        let mut o = m.to_vec();
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let i = (y * w as i64 + x) as usize;
+                if m[i] == want {
+                    continue;
+                }
+                'n: for dy in -r..=r {
+                    for dx in -r..=r {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx >= 0 && ny >= 0 && nx < w as i64 && ny < h as i64 && m[(ny * w as i64 + nx) as usize] == want {
+                            o[i] = want;
+                            break 'n;
+                        }
+                    }
+                }
+            }
+        }
+        o
+    };
+    let closed = grow(&grow(&free, true), false);
+    for i in 0..w * h {
+        free[i] = (free[i] || closed[i]) && !occ[i];
+    }
     // 체임퍼 거리(칸 단위 ×3)
     let big = i32::MAX / 4;
     let mut d: Vec<i32> = free.iter().map(|&f| if f { big } else { 0 }).collect();
@@ -95,6 +125,46 @@ pub fn segment(g: &GridImg, res: f64, min_width: f64, min_area: f64) -> Rooms {
             }
         }
     }
+    // 맞닿은 경계가 문보다 넓으면(> 1.2 m) 같은 방: 가구가 빈칸을 좁혀 한 방이 여러 씨앗으로 갈라지는 것을 되붙인다
+    let mut contact: std::collections::HashMap<(i32, i32), usize> = std::collections::HashMap::new();
+    for y in 0..h {
+        for x in 0..w {
+            let a = lab[y * w + x];
+            if a < 0 {
+                continue;
+            }
+            for (nx, ny) in [(x + 1, y), (x, y + 1)] {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let b = lab[ny * w + nx];
+                if b >= 0 && b != a {
+                    *contact.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut parent: Vec<i32> = (0..n as i32).collect();
+    fn root(p: &mut [i32], mut i: i32) -> i32 {
+        while p[i as usize] != i {
+            p[i as usize] = p[p[i as usize] as usize];
+            i = p[i as usize];
+        }
+        i
+    }
+    for (&(a, b), &c) in &contact {
+        if c as f64 * res > 1.2 {
+            let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+            if ra != rb {
+                parent[ra.max(rb) as usize] = ra.min(rb);
+            }
+        }
+    }
+    for l in lab.iter_mut() {
+        if *l >= 0 {
+            *l = root(&mut parent, *l);
+        }
+    }
     // 작은 방 버리고 번호 다시 매김
     let mut area = vec![0usize; n];
     for &l in &lab {
@@ -120,8 +190,27 @@ pub fn segment(g: &GridImg, res: f64, min_width: f64, min_area: f64) -> Rooms {
 
 const PALETTE: [[u8; 3]; 7] = [[66, 133, 244], [52, 168, 83], [251, 188, 5], [234, 67, 53], [171, 71, 188], [0, 172, 193], [255, 112, 67]];
 
-/// objs: (id, pos, extent, gone). 반환: (rooms JSON, edges JSON)
-pub fn build(g: &GridImg, res: f64, objs: &[(u32, [f64; 3], [f64; 3], bool)], names: &dyn Fn(usize) -> (String, f32)) -> (Value, Value) {
+/// 방 종류: 방 안 물체 이름(COCO)으로 점수 — 종류마다 단서 물체와 가중. 가장 높은 종류가 2 점 넘으면 그 이름, 확신 = 그 점수 / 전체.
+pub fn room_type(names: &[&str]) -> (&'static str, f32) {
+    const KINDS: [(&str, &[(&str, f32)]); 6] = [
+        ("office", &[("tv", 1.0), ("laptop", 1.5), ("keyboard", 1.5), ("mouse", 1.5), ("book", 0.5), ("chair", 0.5), ("cell phone", 0.5)]),
+        ("kitchen", &[("refrigerator", 2.0), ("microwave", 2.0), ("oven", 2.0), ("sink", 1.5), ("toaster", 2.0), ("bowl", 0.5), ("cup", 0.3), ("bottle", 0.3), ("knife", 0.5), ("spoon", 0.5), ("fork", 0.5)]),
+        ("living room", &[("couch", 2.0), ("tv", 0.8), ("remote", 1.0), ("potted plant", 0.5), ("vase", 0.5)]),
+        ("bedroom", &[("bed", 3.0), ("teddy bear", 0.5), ("clock", 0.3)]),
+        ("dining room", &[("dining table", 1.5), ("chair", 0.5), ("wine glass", 1.0), ("cup", 0.3), ("bowl", 0.3)]),
+        ("bathroom", &[("toilet", 3.0), ("sink", 1.0), ("toothbrush", 2.0), ("hair drier", 2.0)]),
+    ];
+    let sc: Vec<f32> = KINDS.iter().map(|(_, cues)| names.iter().map(|n| cues.iter().find(|c| c.0 == *n).map_or(0.0, |c| c.1)).sum()).collect();
+    let tot: f32 = sc.iter().sum();
+    let (bi, &bs) = sc.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    if bs < 2.0 {
+        return ("room", 0.0);
+    }
+    (KINDS[bi].0, bs / tot.max(1e-6))
+}
+
+/// objs: (id, pos, extent, gone, 이름). 반환: (rooms JSON, edges JSON)
+pub fn build(g: &GridImg, res: f64, objs: &[(u32, [f64; 3], [f64; 3], bool, &str)]) -> (Value, Value) {
     let rooms = segment(g, res, 1.2, 3.0);
     let (w, h) = (g.w, g.h);
     let cell = |x: f64, y: f64| -> (i64, i64) { ((x / res).floor() as i64 - g.x0 as i64, h as i64 - 1 - ((y / res).floor() as i64 - g.y0 as i64)) };
@@ -191,7 +280,9 @@ pub fn build(g: &GridImg, res: f64, objs: &[(u32, [f64; 3], [f64; 3], bool)], na
             let s = sum[r];
             let cx = (g.x0 as f64 + s.0 / s.2 as f64 + 0.5) * res;
             let cy = (g.y0 as f64 + (h as f64 - 1.0 - s.1 / s.2 as f64) + 0.5) * res;
-            let (name, conf) = names(r);
+            let nm: Vec<&str> = live.iter().filter(|o| members[r].contains(&o.0)).map(|o| o.4).collect();
+            let (kind, conf) = room_type(&nm);
+            let name = if kind == "room" { format!("room {r}") } else { kind.to_string() };
             json!({"id": r, "name": name, "conf": conf, "centroid": [cx, cy], "area_m2": s.2 as f64 * res * res,
                    "color": PALETTE[r % PALETTE.len()], "objects": members[r]})
         })

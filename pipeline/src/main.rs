@@ -1063,8 +1063,8 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
     let (grid_j, rooms, edges) = match &gi {
         Some(g) => {
             out::pgm(&dir.join("map.pgm"), g.w, g.h, &g.px);
-            let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone")).collect();
-            let (rj, ej) = graph::build(g, grid.res, &ol, &|r| (format!("room {r}"), 0.0));
+            let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", o.name.as_str())).collect();
+            let (rj, ej) = graph::build(g, grid.res, &ol);
             (json!({"width": g.w, "height": g.h, "resolution": grid.res, "origin": [g.x0 as f64 * grid.res, g.y0 as f64 * grid.res]}), rj, ej)
         }
         None => (json!(null), json!([]), json!([])),

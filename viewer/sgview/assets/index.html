@@ -614,7 +614,11 @@ function drawGraph() {
 function drawRobot() {
   invalidate();
   if (!view || !view.pose) return;   // keep the robot where it was; never drop the model for a view without a pose
-  if (!robotGrp || (isHandheld() && view.cam)) buildRobot();   // handheld with a full pose: rebuilt so height and tilt follow the camera
+  if (isHandheld() && view.cam) {   // handheld: built once, then moved and tilted toward the newest pose at display rate (stepHandheld)
+    if (!robotGrp || !robotGrp.userData.hh) buildRobot();
+    setHandheldTarget(view.cam); applyHandheld(); return;
+  }
+  if (!robotGrp) buildRobot();
   const [x, y, yaw] = view.cam ? view.cam.pos : view.pose;
   robotGrp.position.set(x, y, 0); robotGrp.rotation.z = view.cam && isHandheld() ? 0 : yaw;
 }
@@ -923,7 +927,7 @@ async function pollPose() {
       }
     } catch (e) {}
   }
-  setTimeout(pollPose, 100);
+  setTimeout(pollPose, 50);   // 20 /s: --fast-pose writes a pose for every camera frame
 }
 
 
@@ -1201,7 +1205,36 @@ function buildHandheld() {
     floorMark.rotation.z = Math.atan2(f[1], f[0]);
   }
   g.add(cam, drop, floorMark);
+  g.userData.hh = { cam, drop, floorMark };
   return g;
+}
+// Handheld pose smoothing: pose.json gives a target 15–30 times a second; the shown pose approaches it (time constant 50 ms)
+// so the camera glides at 60 fps instead of jumping. Only transforms change — no geometry is rebuilt per pose.
+const hhTgt = { p: new THREE.Vector3(), q: new THREE.Quaternion(), yaw: 0, has: false };
+const hhCur = { p: new THREE.Vector3(), q: new THREE.Quaternion(), yaw: 0, init: false };
+function camQuat(R) {   // OpenCV camera -> world rotation as the phone's orientation (x forward, y left, z up)
+  const f = [R[0][2], R[1][2], R[2][2]], l = [-R[0][0], -R[1][0], -R[2][0]], u = [-R[0][1], -R[1][1], -R[2][1]];
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().set(f[0], l[0], u[0], 0, f[1], l[1], u[1], 0, f[2], l[2], u[2], 0, 0, 0, 0, 1));
+}
+function setHandheldTarget(vc) {
+  hhTgt.p.set(vc.pos[0], vc.pos[1], Math.max(vc.pos[2], 0.05)); hhTgt.q.copy(camQuat(vc.R)); hhTgt.yaw = Math.atan2(vc.R[1][2], vc.R[0][2]); hhTgt.has = true;
+  if (!hhCur.init) { hhCur.p.copy(hhTgt.p); hhCur.q.copy(hhTgt.q); hhCur.yaw = hhTgt.yaw; hhCur.init = true; }
+}
+function applyHandheld() {
+  const P = robotGrp && robotGrp.userData.hh; if (!P || !hhCur.init) return;
+  robotGrp.position.set(hhCur.p.x, hhCur.p.y, 0); robotGrp.rotation.z = 0;
+  P.cam.position.z = hhCur.p.z; P.cam.quaternion.copy(hhCur.q); P.floorMark.rotation.z = hhCur.yaw;
+  const a = P.drop.geometry.attributes.position; a.setXYZ(0, 0, 0, hhCur.p.z - 0.09); a.needsUpdate = true; P.drop.computeLineDistances();
+}
+function stepHandheld(dt) {
+  if (!hhTgt.has || !robotGrp || !robotGrp.userData.hh) return false;
+  const k = 1 - Math.exp(-dt / 0.05);
+  let d = hhTgt.yaw - hhCur.yaw; d = Math.atan2(Math.sin(d), Math.cos(d));
+  const moving = hhCur.p.distanceTo(hhTgt.p) + Math.abs(d) + (1 - Math.abs(hhCur.q.dot(hhTgt.q))) > 1e-4;
+  if (!moving) return false;
+  hhCur.p.lerp(hhTgt.p, k); hhCur.q.slerp(hhTgt.q, k); hhCur.yaw += d * k;
+  applyHandheld();
+  return true;
 }
 function buildRobot() {
   if (robotModel && robotModel.root.parent) robotModel.root.parent.remove(robotModel.root);   // keep the loaded model alive across rebuilds
@@ -1246,7 +1279,7 @@ async function startLive() {
     if (mapState) { mapState.tex.dispose(); mapState.mesh.geometry.dispose(); mapState.mesh.material.dispose(); gMap.remove(mapState.mesh); mapState = null; }
     dropAligned(); alignTheta = 0;
     trailN = 0; trailLast = null; if (trail) trail.geometry.setDrawRange(0, 0);
-    view = null; objs.clear(); selected = null; poseCur.init = false; poseTgt.has = false; robotGrp = null; liveGrid = null;
+    view = null; objs.clear(); selected = null; poseCur.init = false; poseTgt.has = false; hhCur.init = false; hhTgt.has = false; robotGrp = null; liveGrid = null;
     // Detach the LIMO + OMX URDF model before clearing: disposing gRobot with the model inside freed its meshes, and after a
     // stream reset (e.g. a looping replay) the robot came back as the box stand-in or not at all.
     if (robotModel && robotModel.root.parent) robotModel.root.parent.remove(robotModel.root);
@@ -1281,6 +1314,7 @@ $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar
   if (stepRobot(nowT)) needsRender = true;
   const dtc = Math.min(0.1, (nowT - lastCamT) / 1000);
   if (stepCamera(dtc)) needsRender = true;
+  if (stepHandheld(dtc)) needsRender = true;
   if (stepFollow(dtc)) needsRender = true;
   if (stepChase(dtc)) needsRender = true;
   if (updateEE()) needsRender = true;

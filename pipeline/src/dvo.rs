@@ -172,7 +172,13 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
     if last_n < 300 || last_err > 0.15 {
         return None;
     }
-    // 깊이 배율 이어 붙이기: 앞 깊이로 옮긴 점의 거리 / 이번 장면 깊이(같은 화소)
+    // 이번 장면 깊이가 없으면(위치만 추적하는 장면) 배율은 1
+    let sc = if cur_depth.is_empty() { 1.0 } else { depth_ratio(prev_depth, cur_depth, w0, h0, k, &r, &t) };
+    Some((r, t, last_n, last_err, sc))
+}
+
+/// 깊이 배율 이어 붙이기: 앞 장면 깊이를 (r, t) 로 이번 장면에 옮긴 거리 / 이번 장면 깊이(같은 화소)의 중앙값
+pub fn depth_ratio(prev_depth: &[f32], cur_depth: &[f32], w0: usize, h0: usize, k: [f64; 4], r: &M3, t: &V3) -> f64 {
     let (fx, fy, cx, cy) = (k[0], k[1], k[2], k[3]);
     let mut rs = vec![];
     for y in (8..h0 - 8).step_by(12) {
@@ -181,7 +187,7 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
             if !(0.2..6.0).contains(&z) {
                 continue;
             }
-            let p1 = add(&mv(&r, &[(x as f64 - cx) / fx * z, (y as f64 - cy) / fy * z, z]), &t);
+            let p1 = add(&mv(r, &[(x as f64 - cx) / fx * z, (y as f64 - cy) / fy * z, z]), t);
             if p1[2] < 0.2 {
                 continue;
             }
@@ -195,11 +201,10 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
             }
         }
     }
-    let sc = if rs.len() >= 30 {
+    if rs.len() >= 30 {
         rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         rs[rs.len() / 2].clamp(0.5, 2.0)
     } else {
         1.0
-    };
-    Some((r, t, last_n, last_err, sc))
+    }
 }

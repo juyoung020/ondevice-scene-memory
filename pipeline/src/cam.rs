@@ -38,8 +38,8 @@ impl Cam {
         Cam { latest, seen: 0, w: f.width as usize, h: f.height as usize }
     }
 
-    /// 새 프레임이 올 때까지 기다렸다 RGB8 로 해독
-    pub fn grab(&mut self) -> Vec<u8> {
+    /// 새 프레임이 올 때까지 기다렸다 RGB8 로 해독(받은 JPEG 도 같이: 녹화용)
+    pub fn grab(&mut self) -> (Vec<u8>, Vec<u8>) {
         loop {
             let (n, jpg) = {
                 let g = self.latest.lock().unwrap();
@@ -50,7 +50,7 @@ impl Cam {
                 if let Ok(img) = image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg) {
                     let img = img.into_rgb8();
                     if img.width() as usize == self.w && img.height() as usize == self.h {
-                        return img.into_raw();
+                        return (img.into_raw(), jpg);
                     }
                 }
             }

@@ -3,6 +3,7 @@
 //! 맞는 짝들의 재투영 오차를 가우스-뉴턴(후버 가중)으로 줄여 현재 카메라 포즈.
 use crate::geom::*;
 
+#[derive(Clone)]
 pub struct Feat {
     pub kp: Vec<(f32, f32)>, // 화소 (u, v)
     pub desc: Vec<f32>,      // kp 마다 256, L2 정규화

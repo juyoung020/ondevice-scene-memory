@@ -11,6 +11,7 @@ mod geom;
 mod graph;
 mod maps;
 mod out;
+mod rec;
 mod scale;
 mod seg;
 mod vo;
@@ -40,6 +41,11 @@ struct Args {
     k: Option<[f64; 4]>,
     sp: String,
     snaps: Vec<u32>,
+    rec: Option<PathBuf>,
+    seg_every: usize,
+    npu_par: bool,
+    scene_vox: f64,
+    max_depth: f64,
 }
 
 fn args() -> Args {
@@ -62,6 +68,11 @@ fn args() -> Args {
         k: get("--k").map(|s| { let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect(); [v[0], v[1], v[2], v[3]] }),
         sp: get("--superpoint").unwrap_or(if cfg!(feature = "dxrt") { "superpoint_480x640.dxnn" } else { "models/superpoint.onnx" }.into()),
         snaps: get("--snaps").map_or(vec![], |s| s.split(',').filter_map(|x| x.parse().ok()).collect()),
+        rec: get("--rec").map(PathBuf::from),
+        seg_every: get("--seg-every").map_or(1, |s| s.parse().unwrap()),
+        npu_par: v.iter().any(|x| x == "--npu-par"),
+        scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
+        max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
     }
 }
 
@@ -151,6 +162,75 @@ fn make_sp(path: &str) -> Box<dyn seg::FeatNet> {
     panic!("no backend for superpoint {path}")
 }
 
+/// 모델 셋 실행: 깊이·특징점·분할(do_seg 일 때). par 면 셋을 동시에(DX-M1 NPU 코어 3 개), 아니면 차례대로.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn run_models(dnet: &mut Option<Box<dyn seg::DepthNet>>, seg: &mut Box<dyn seg::Segmenter + Send>, spnet: &mut Option<Box<dyn seg::FeatNet>>,
+              rgb: &[u8], w: usize, h: usize, conf: f32, do_seg: bool, par: bool) -> (Option<Vec<f32>>, Option<Vec<seg::Det>>, Option<vo::Feat>) {
+    if par {
+        std::thread::scope(|sc| {
+            let hd = sc.spawn(|| dnet.as_mut().map(|n| n.run(rgb, w, h)));
+            let hf = sc.spawn(|| spnet.as_mut().map(|n| n.run(rgb, w, h)));
+            let dets = do_seg.then(|| seg.run(rgb, w, h, conf));
+            (hd.join().unwrap(), dets, hf.join().unwrap())
+        })
+    } else {
+        let pd = dnet.as_mut().map(|n| n.run(rgb, w, h));
+        let dets = do_seg.then(|| seg.run(rgb, w, h, conf));
+        (pd, dets, spnet.as_mut().map(|n| n.run(rgb, w, h)))
+    }
+}
+
+/// 한 장면의 '대략 수평'인 가장 큰 면(바닥·책상)을 RANSAC 으로 찾아 그 위쪽 법선을 세계 좌표로(IMU 없이 중력 방향 단서).
+/// 여러 장면의 법선을 모아 다수결로 수평을 정한다(gravity 합의).
+fn up_normal(depth: &[f32], w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V3> {
+    let [fx, fy, cx, cy] = k;
+    let mut pts: Vec<V3> = vec![];
+    for v in (0..h).step_by(8) {
+        for u in (0..w).step_by(8) {
+            let z = depth[v * w + u] as f64;
+            if z > 0.2 && z < 4.0 {
+                pts.push([(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]);
+            }
+        }
+    }
+    if pts.len() < 200 {
+        return None;
+    }
+    let up_c = [r[2][0], r[2][1], r[2][2]]; // 지금 가정한 세계 위(z)를 카메라 좌표로(Rᵀ·ẑ)
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let mut rnd = |m: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % m as u64) as usize
+    };
+    let (mut best_n, mut best_c) = ([0.0; 3], 0usize);
+    for _ in 0..300 {
+        let (a, b, c) = (pts[rnd(pts.len())], pts[rnd(pts.len())], pts[rnd(pts.len())]);
+        let mut n = cross(&sub(&b, &a), &sub(&c, &a));
+        let l = norm(&n);
+        if l < 1e-6 {
+            continue;
+        }
+        n = n.map(|x| x / l);
+        if dot(&n, &up_c) < 0.0 {
+            n = n.map(|x| -x);
+        }
+        if dot(&n, &up_c) < 50f64.to_radians().cos() {
+            continue; // 가정한 위에서 50° 넘게 기운 면(벽)은 제외
+        }
+        let d = dot(&n, &a);
+        let cnt = pts.iter().filter(|q| (dot(&n, q) - d).abs() < 0.02 + 0.01 * q[2]).count();
+        if cnt > best_c {
+            (best_n, best_c) = (n, cnt);
+        }
+    }
+    if best_c < pts.len() / 5 {
+        return None;
+    }
+    Some(mv(r, &best_n))
+}
+
 fn make_seg(path: &str) -> Box<dyn seg::Segmenter + Send> {
     #[cfg(feature = "dxrt")]
     if path.ends_with(".dxnn") {
@@ -174,7 +254,7 @@ struct Frame {
     w: usize,
     h: usize,
     depth: Vec<f32>,
-    dets: Vec<seg::Det>,
+    dets: Option<Vec<seg::Det>>, // 이번 장면에 분할을 안 돌렸으면 None(--seg-every)
     load: f64,
     seg: f64,
     scale: f64, // 딥러닝 깊이 / Kinect 중앙값(비교용, Kinect 깊이를 쓸 땐 NaN)
@@ -183,11 +263,11 @@ struct Frame {
 
 fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter + Send> {
     // 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
-    let seq = if a.cam.is_some() { tum::Tum::empty(a.k.unwrap_or([450.0, 450.0, 320.0, 240.0])) } else { tum::Tum::open(&a.tum) };
+    let seq = if a.cam.is_some() { tum::Tum::empty(a.k.unwrap_or([477.0, 477.0, 320.0, 240.0])) } else { tum::Tum::open(&a.tum) };
     std::fs::create_dir_all(a.out.join("objects")).unwrap();
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
-    let mut scene = SceneMap::new(0.01, 0.04);
+    let mut scene = SceneMap::new(a.scene_vox, 0.04);
     let mut mem = Memory::new(0.012, 0.04);
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
@@ -196,7 +276,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut clock = Clock::default();
     let mut nkf: u32 = 0;
     let mut cam_json = json!(null);
+    let mut last_view = Instant::now();
     let mut scene_json = json!(null);
+    // 3D 지도 조각: 이번 실행 번호(뷰어가 새 실행이면 받은 조각을 비움), 조각 수, 보낸 점 수
+    let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let _ = std::fs::remove_dir_all(a.out.join("scene"));
+    std::fs::create_dir_all(a.out.join("scene")).unwrap();
+    let (mut n_chunk, mut n_scene) = (0usize, 0usize);
     let mut last_pose = [0.0; 3];
     let t0 = Instant::now();
     // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
@@ -205,29 +291,74 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(1);
     let worker = {
         let seq = seq.clone();
-        let (every, conf, live, no_skip) = (a.every, a.conf, a.live, a.no_skip);
+        let (every, conf, live, no_skip, seg_every, npu_par) = (a.every, a.conf, a.live, a.no_skip, a.seg_every.max(1), a.npu_par);
         let mut dnet = make_depth(&a.depth);
         let mut spnet = a.vo.then(|| make_sp(&a.sp));
         let cam_path = a.cam.clone();
+        let rec_dir = a.rec.clone();
         std::thread::spawn(move || {
             let mut seg = seg;
-            #[cfg(feature = "cam")]
             if let Some(cp) = cam_path {
-                // 실시간 카메라: 깊이·분할·특징점 모두 NPU, 포즈는 vo 가 만든다(첫 장면: 수평으로 앞을 봄, 높이 1.3 m)
-                let mut cam = cam::Cam::open(&cp, 640, 480);
-                let (w, h) = (cam.w, cam.h);
+                // 카메라(장치) 또는 녹화 폴더: 깊이·분할·특징점 모두 모델, 위치는 vo 가 만든다(첫 장면: 수평으로 앞을 봄, 높이 1.3 m)
+                enum Src {
+                    #[cfg(feature = "cam")]
+                    Live(cam::Cam),
+                    Rec(rec::Player),
+                }
+                let mut src = match rec::Player::open(&cp) {
+                    Some(pl) => Src::Rec(pl),
+                    #[cfg(feature = "cam")]
+                    None => Src::Live(cam::Cam::open(&cp, 640, 480)),
+                    #[cfg(not(feature = "cam"))]
+                    None => panic!("--cam {cp}: 녹화 폴더(rgb.txt)가 아님 — 카메라 장치는 --features cam"),
+                };
+                let (w, h) = match &src {
+                    #[cfg(feature = "cam")]
+                    Src::Live(c) => (c.w, c.h),
+                    Src::Rec(pl) => (pl.w, pl.h),
+                };
+                #[cfg_attr(not(feature = "cam"), allow(unused_mut, unused_variables))]
+                let mut recorder = rec_dir.as_deref().map(rec::Recorder::new);
                 let r0 = [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]];
                 let p0 = [0.0, 0.0, 1.3];
                 let tc = Instant::now();
+                let mut t_first = None::<f64>;
+                let mut nf = 0usize;
                 loop {
                     let c0 = Instant::now();
-                    let rgb = cam.grab();
-                    let t = tc.elapsed().as_secs_f64();
+                    let (t, rgb) = match &mut src {
+                        #[cfg(feature = "cam")]
+                        Src::Live(c) => {
+                            let (rgb, jpg) = c.grab();
+                            let t = tc.elapsed().as_secs_f64();
+                            if let Some(r) = recorder.as_mut() {
+                                r.add(t, &jpg);
+                            }
+                            (t, rgb)
+                        }
+                        Src::Rec(pl) => {
+                            let Some((t, rgb)) = pl.next() else { break };
+                            // 재생 속도: --live 면 찍은 시각에 맞춤(밀리면 건너뜀), 아니면 최대 속도
+                            if live > 0.0 {
+                                let t0 = *t_first.get_or_insert(t);
+                                let ahead = (t - t0) / live - tc.elapsed().as_secs_f64();
+                                if !no_skip && ahead < -0.1 {
+                                    continue;
+                                }
+                                if ahead > 0.0 {
+                                    std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
+                                }
+                            }
+                            (t, rgb)
+                        }
+                    };
                     let c1 = Instant::now();
-                    // NPU 세 모델은 차례대로: 한 프로세스에서 동시에 던지면 DX-M1 DMA 쓰기 오류로 PCIe 링크가 내려갔다(2026-11-04)
-                    let depth = dnet.as_mut().expect("--cam needs --depth <.dxnn|.onnx>").run(&rgb, w, h);
-                    let dets = seg.run(&rgb, w, h, conf);
-                    let feat = spnet.as_mut().map(|n| n.run(&rgb, w, h));
+                    // 모델 셋은 차례대로: 한 프로세스에서 NPU 에 동시에 던지면 DX-M1 DMA 쓰기 오류로 PCIe 링크가 내려갔다(2026-11-04)
+                    // 물체 분할은 N 장마다(위치에는 깊이·특징점만 필요 → 위치를 더 자주 갱신)
+                    nf += 1;
+                    let do_seg = (nf - 1) % seg_every == 0;
+                    let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, do_seg, npu_par);
+                    let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
                     let c2 = Instant::now();
                     let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat };
                     if tx.send(f).is_err() {
@@ -235,10 +366,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     }
                 }
                 return seg;
-            }
-            #[cfg(not(feature = "cam"))]
-            assert!(cam_path.is_none(), "--cam needs --features cam");
-            for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
+            }            for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
                 if fi % every != 0 {
                     continue;
                 }
@@ -269,9 +397,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 assert_eq!((dw as usize, dh as usize), (w, h));
                 let c1 = Instant::now();
                 // 모델 셋은 차례대로(보드 NPU 는 동시에 던지면 불안정했다)
-                let pd = dnet.as_mut().map(|n| n.run(&rgb, w, h));
-                let dets = seg.run(&rgb, w, h, conf);
-                let feat = spnet.as_mut().map(|n| n.run(&rgb, w, h));
+                let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, true, npu_par);
                 // 딥러닝 깊이 / Kinect 중앙값(비교용)
                 let (depth, scale) = match pd {
                     Some(d) => {
@@ -303,8 +429,54 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         r: M3,
         p: V3,
     }
-    let mut vo_ref: Option<VoRef> = None;
-    let mut vo_pose: Option<(M3, V3)> = None;
+    /// 기준 장면 rf 와 이번 장면 f 를 맞춰 위치를 푼다: (위치, 짝, 거부됐나)
+    #[allow(clippy::too_many_arguments)]
+    fn vo_try(rf: &VoRef, f: &vo::Feat, depth: &[f32], w: usize, k: [f64; 4], pred: Option<(M3, V3)>, fallback: (M3, V3), dl: bool,
+              vo_pose: Option<(M3, V3)>, dt: f64) -> (Option<(M3, V3, usize)>, Vec<(usize, usize)>, bool) {
+        let [fx, fy, cx, cy] = k;
+        let ms = vo::match_mutual(&rf.f, f, 0.7);
+        let (mut world, mut cam, mut uv) = (vec![], vec![], vec![]);
+        for &(i, j) in &ms {
+            let Some((xw, _)) = rf.lm[i] else { continue };
+            let (u1, v1) = f.kp[j];
+            let z1 = depth[v1 as usize * w + u1 as usize] as f64;
+            cam.push((z1 > 0.2 && z1 < 6.0).then(|| [(u1 as f64 - cx) / fx * z1, (v1 as f64 - cy) / fy * z1, z1]));
+            world.push(xw);
+            uv.push((u1 as f64, v1 as f64));
+        }
+        // 딥러닝 깊이는 장면마다 배율이 흔들린다: 위치를 풀기 전에 예측 위치로 본 랜드마크 거리에 맞춰 이번 깊이 배율을 먼저 맞춘다
+        if let (true, Some((rp, pp))) = (dl, &pred) {
+            let mut rs: Vec<f64> = world
+                .iter()
+                .zip(&cam)
+                .filter_map(|(xw, c)| {
+                    let c = (*c)?;
+                    let d = sub(xw, pp);
+                    let zc = rp[0][2] * d[0] + rp[1][2] * d[1] + rp[2][2] * d[2];
+                    (zc > 0.2).then(|| zc / c[2])
+                })
+                .collect();
+            if rs.len() >= 20 {
+                rs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let s0 = rs[rs.len() / 2].clamp(0.5, 2.0);
+                for c in cam.iter_mut().flatten() {
+                    *c = c.map(|x| x * s0);
+                }
+            }
+        }
+        let mut est = vo::estimate(&world, &cam, &uv, k, pred.unwrap_or(fallback));
+        // 손으로 들고는 불가능한 움직임(2 m/s, 180°/s 초과)이면 틀린 추정
+        let mut rej = false;
+        if let (Some((r2, p2, _)), Some((r0, p0))) = (&est, &vo_pose) {
+            let d = dt.max(0.03);
+            if norm(&sub(p2, p0)) > 0.05 + 2.0 * d || rot_angle(r0, r2) > (10.0 + 180.0 * d).to_radians() {
+                est = None;
+                rej = true;
+            }
+        }
+        (est, ms, rej)
+    }
+    let mut vo_ref: Option<VoRef> = None;    let mut vo_pose: Option<(M3, V3)> = None;
     let mut vo_last_t: Option<f64> = None;
     let mut vo_vel: V3 = [0.0; 3]; // 등속 예측용 속도(m/s)
     let mut vo_ms: Vec<(usize, usize)> = vec![];
@@ -313,11 +485,15 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut vo_fail = 0u32;
     let mut vo_reject = 0u32;
     let mut vo_nref = 0u32;
+    let mut vo_last: Option<VoRef> = None; // 바로 앞 장면(기준과 안 맞을 때 대신)
+    let mut vo_fails_run = 0u32; // 연속 실패 수
+    // 수평 합의(웹캠·녹화): 처음 장면들의 수평면 법선(세계 좌표)을 모아 다수결로 '위'를 정하면 세계를 한 번 바로 세운다
+    let mut grav_obs: Vec<V3> = vec![];
+    let mut leveled = a.cam.is_none() || !a.vo;
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat }) = rx.recv() {
         let (p_gt, _r_gt) = (p, r);
         // 카메라만으로 포즈(--pose vo): 이전 키프레임과 SuperPoint 짝 → 이전 장면 깊이로 3D → 재투영 최소화. 첫 장면만 정답 포즈로 시작.
         if a.vo {
-            let [fx, fy, cx, cy] = seq.k;
             // 등속 예측: 직전 위치 + 속도 × 시간(IMU 없이 쓰는 움직임 사전 지식)
             let dt = vo_last_t.map(|t0| (t - t0).clamp(0.0, 1.0)).unwrap_or(0.0);
             let pred = vo_pose.map(|(r0, p0)| (r0, add(&p0, &vo_vel.map(|x| x * dt))));
@@ -325,48 +501,23 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             vo_ms.clear();
             vo_ok = false;
             if let (Some(f), Some(rf)) = (&feat, &vo_ref) {
-                vo_ms = vo::match_mutual(&rf.f, f, 0.7);
-                let (mut world, mut cam, mut uv) = (vec![], vec![], vec![]);
-                for &(i, j) in &vo_ms {
-                    let Some((xw, _)) = rf.lm[i] else { continue };
-                    let (u1, v1) = f.kp[j];
-                    let z1 = depth[v1 as usize * w + u1 as usize] as f64;
-                    cam.push((z1 > 0.2 && z1 < 6.0).then(|| [(u1 as f64 - cx) / fx * z1, (v1 as f64 - cy) / fy * z1, z1]));
-                    world.push(xw);
-                    uv.push((u1 as f64, v1 as f64));
-                }
-                // 딥러닝 깊이는 장면마다 배율이 흔들린다: 위치를 풀기 전에 예측 위치로 본 랜드마크 거리에 맞춰 이번 깊이 배율을 먼저 맞춘다
-                // (안 맞추면 3D-3D 초기값이 배율 차이 때문에 실패)
-                if let (true, Some((rp, pp))) = (a.depth != "kinect", &pred) {
-                    let mut rs: Vec<f64> = world
-                        .iter()
-                        .zip(&cam)
-                        .filter_map(|(xw, c)| {
-                            let c = (*c)?;
-                            let d = sub(xw, pp);
-                            let zc = rp[0][2] * d[0] + rp[1][2] * d[1] + rp[2][2] * d[2];
-                            (zc > 0.2).then(|| zc / c[2])
-                        })
-                        .collect();
-                    if rs.len() >= 20 {
-                        rs.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                        let s0 = rs[rs.len() / 2].clamp(0.5, 2.0);
-                        for c in cam.iter_mut().flatten() {
-                            *c = c.map(|x| x * s0);
+                let dl = a.depth != "kinect";
+                let (e, ms, rej) = vo_try(rf, f, &depth, w, seq.k, pred, (r, p), dl, vo_pose, dt);
+                vo_reject += rej as u32;
+                (est, vo_ms) = (e, ms);
+                // 기준과 안 맞으면 바로 앞 장면(움직임이 작아 짝이 많다)과 한 번 더, 맞으면 그 장면을 새 기준으로
+                if est.is_none() {
+                    if let Some(lf) = &vo_last {
+                        let (e, ms, rej) = vo_try(lf, f, &depth, w, seq.k, pred, (r, p), dl, vo_pose, dt);
+                        vo_reject += rej as u32;
+                        if e.is_some() {
+                            (est, vo_ms) = (e, ms);
+                            vo_ref = vo_last.take();
+                            vo_nref += 1;
                         }
                     }
                 }
-                est = vo::estimate(&world, &cam, &uv, seq.k, pred.unwrap_or((r, p)));
-                // 손으로 들고는 불가능한 움직임(2 m/s, 180°/s 초과)이면 틀린 추정 → 버리고 등속 예측을 쓴다
-                if let (Some((r2, p2, _)), Some((r0, p0))) = (&est, &vo_pose) {
-                    let d = dt.max(0.03);
-                    if norm(&sub(p2, p0)) > 0.05 + 2.0 * d || rot_angle(r0, r2) > (10.0 + 180.0 * d).to_radians() {
-                        est = None;
-                        vo_reject += 1;
-                    }
-                }
-            }
-            // 배율 이어 붙이기: 같은 랜드마크의 (평균 위치로 본 거리) / (이번 장면 예측 깊이) 중앙값으로 이번 장면 깊이를 맞춘다
+            }            // 배율 이어 붙이기: 같은 랜드마크의 (평균 위치로 본 거리) / (이번 장면 예측 깊이) 중앙값으로 이번 장면 깊이를 맞춘다
             if let (Some((r2, p2, _)), true, Some(f), Some(rf)) = (&est, a.depth != "kinect", &feat, &vo_ref) {
                 let mut rs = vec![];
                 for &(i, j) in &vo_ms {
@@ -391,7 +542,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             match (est, vo_pose) {
-                (Some((r2, p2, _)), prev) => {
+                (Some((mut r2, mut p2, _)), prev) => {
+                    // 거의 안 움직였으면(5 mm·0.3° 미만) 정지로 보고 위치를 그대로 둔다: 가만히 둔 카메라가 잡음으로 흘러가지 않게
+                    if let Some((r0, p0)) = prev {
+                        if norm(&sub(&p2, &p0)) < 0.005 && rot_angle(&r0, &r2) < 0.3f64.to_radians() {
+                            (r2, p2) = (r0, p0);
+                        }
+                    }
                     if let (Some((_, p0)), true) = (prev, dt > 0.0) {
                         // 속도는 부드럽게(반반 섞기), 2 m/s 로 자름
                         let v = sub(&p2, &p0).map(|x| x / dt);
@@ -404,6 +561,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 (None, None) => vo_pose = Some((r, p)),
                 (None, Some(_)) => {
                     vo_fail += 1;
+                    if std::env::var_os("VO_DEBUG").is_some() {
+                        eprintln!("vofail t {t:.2} feat {} ms {}", feat.as_ref().map_or(0, |f| f.kp.len()), vo_ms.len());
+                    }
                     vo_pose = pred;
                     vo_vel = vo_vel.map(|x| x * 0.5);
                 }
@@ -444,14 +604,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let mut keep = false;
                 let mut carry: Vec<(usize, V3, f64)> = vec![]; // 이번 장면 특징점 j 가 넘겨받을 검증된 랜드마크
                 if let (true, Some(rf)) = (vo_ok, vo_ref.as_mut()) {
-                    // 기준 장면 랜드마크를 이번 관측으로 평균: 이번 위치로 재투영해 4 화소·깊이 10 % 안에 들 때만
-                    let mut good = 0;
+                    // 추적: 기준 랜드마크가 이번 위치로 재투영해 4 화소 안에 드는 수(기준 유지 판단).
+                    // 평균: 그중 이번 깊이도 10 % 안에 맞는 것만 랜드마크 위치에 섞는다(딥러닝 깊이가 흔들려도 추적은 끊기지 않게).
+                    let mut track = 0;
                     for &(i, j) in &vo_ms {
                         let (u1, v1) = f.kp[j];
-                        let z1 = depth[v1 as usize * w + u1 as usize] as f64;
-                        if z1 < 0.2 || z1 > 6.0 || depth_edge(&depth, w, h, u1 as usize, v1 as usize) {
-                            continue;
-                        }
                         let Some((x0, n)) = rf.lm[i].as_mut() else { continue };
                         let d = sub(x0, &p);
                         let zc = r[0][2] * d[0] + r[1][2] * d[1] + r[2][2] * d[2];
@@ -460,7 +617,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         }
                         let uc = fx * (r[0][0] * d[0] + r[1][0] * d[1] + r[2][0] * d[2]) / zc + cx;
                         let vc = fy * (r[0][1] * d[0] + r[1][1] * d[1] + r[2][1] * d[2]) / zc + cy;
-                        if (uc - u1 as f64).hypot(vc - v1 as f64) > 4.0 || (zc - z1).abs() > 0.1 * zc {
+                        if (uc - u1 as f64).hypot(vc - v1 as f64) > 4.0 {
+                            continue;
+                        }
+                        track += 1;
+                        let z1 = depth[v1 as usize * w + u1 as usize] as f64;
+                        if z1 < 0.2 || z1 > 6.0 || (zc - z1).abs() > 0.1 * zc || depth_edge(&depth, w, h, u1 as usize, v1 as usize) {
+                            carry.push((j, *x0, *n));
                             continue;
                         }
                         let xw = add(&mv(&r, &[(u1 as f64 - cx) / fx * z1, (v1 as f64 - cy) / fy * z1, z1]), &p);
@@ -470,33 +633,84 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         }
                         *n = (*n + 1.0).min(20.0);
                         carry.push((j, *x0, *n));
-                        good += 1;
                     }
-                    // 기준 유지: 맞는 랜드마크가 충분하고 기준 장면에서 30 cm·20° 안
-                    keep = good >= 60 && norm(&sub(&p, &rf.p)) < 0.3 && rot_angle(&rf.r, &r) < 20f64.to_radians();
+                    // 기준 유지: 추적되는 랜드마크가 충분하고 기준 장면에서 30 cm·20° 안
+                    keep = track >= 80 && norm(&sub(&p, &rf.p)) < 0.3 && rot_angle(&rf.r, &r) < 20f64.to_radians();
                 }
-                if !keep {
-                    // 새 기준 장면: 이번 깊이로 랜드마크를 만들고, 앞 기준에서 검증된 것은 평균값을 넘겨받는다
-                    let mut lm: Vec<Option<(V3, f64)>> = f
-                        .kp
-                        .iter()
-                        .map(|&(u, v)| {
-                            let z = depth[v as usize * w + u as usize] as f64;
-                            (z > 0.2 && z < 6.0 && !depth_edge(&depth, w, h, u as usize, v as usize))
-                                .then(|| (add(&mv(&r, &[(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]), &p), 1.0))
-                        })
-                        .collect();
-                    for (j, x, n) in carry {
-                        lm[j] = Some((x, n));
+                // 실패하면 기준을 바로 버리지 않는다(흐린 한 장 때문에 예측 위치로 기준을 새로 잡으면 지도가 어긋남): 5 장 연속 실패면 그때 새로
+                if !vo_ok && vo_ref.is_some() {
+                    vo_fails_run += 1;
+                    if vo_fails_run < 5 {
+                        keep = true;
+                    } else {
+                        vo_fails_run = 0;
                     }
-                    vo_ref = Some(VoRef { f, lm, r, p });
+                } else {
+                    vo_fails_run = 0;
+                }
+                // 이번 장면 깊이로 만든 랜드마크(새 기준 또는 '바로 앞 장면' 후보)
+                let lm: Vec<Option<(V3, f64)>> = f
+                    .kp
+                    .iter()
+                    .map(|&(u, v)| {
+                        let z = depth[v as usize * w + u as usize] as f64;
+                        (z > 0.2 && z < 6.0 && !depth_edge(&depth, w, h, u as usize, v as usize))
+                            .then(|| (add(&mv(&r, &[(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]), &p), 1.0))
+                    })
+                    .collect();
+                if !keep {
+                    // 새 기준 장면: 앞 기준에서 검증된 랜드마크는 평균값을 넘겨받는다
+                    let mut lm2 = lm.clone();
+                    for (j, x, n) in carry {
+                        lm2[j] = Some((x, n));
+                    }
+                    vo_ref = Some(VoRef { f: f.clone(), lm: lm2, r, p });
                     vo_nref += 1;
+                }
+                vo_last = vo_ok.then(|| VoRef { f, lm, r, p });
+            }
+        }        // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
+        if !leveled && vo_ok {
+            if let Some(n) = up_normal(&depth, w, h, seq.k, &r) {
+                grav_obs.push(n);
+            }
+            if grav_obs.len() >= 15 {
+                let mean = |v: &[V3]| {
+                    let s = v.iter().fold([0.0; 3], |a, b| add(&a, b));
+                    let l = norm(&s).max(1e-9);
+                    s.map(|x| x / l)
+                };
+                let m0 = mean(&grav_obs);
+                let inl: Vec<V3> = grav_obs.iter().copied().filter(|n| dot(n, &m0) > 10f64.to_radians().cos()).collect();
+                if inl.len() * 10 >= grav_obs.len() * 6 {
+                    let up = mean(&inl);
+                    let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
+                    let rot_ref = |rf: &mut VoRef| {
+                        rf.r = mm(&fix, &rf.r);
+                        rf.p = mv(&fix, &rf.p);
+                        for l in rf.lm.iter_mut().flatten() {
+                            l.0 = mv(&fix, &l.0);
+                        }
+                    };
+                    if let Some(rf) = vo_ref.as_mut() {
+                        rot_ref(rf);
+                    }
+                    if let Some(rf) = vo_last.as_mut() {
+                        rot_ref(rf);
+                    }
+                    r = mm(&fix, &r);
+                    p = mv(&fix, &p);
+                    vo_pose = Some((r, p));
+                    vo_vel = mv(&fix, &vo_vel);
+                    leveled = true;
+                    eprintln!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
+                } else if grav_obs.len() > 60 {
+                    grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
                 }
             }
         }
         let c2 = Instant::now();
-        clock.load += load;
-        clock.seg += seg_s;
+        clock.load += load;        clock.seg += seg_s;
 
         // 바닥 높이: 화면 아래쪽 점이 카메라 아래로 얼마나 떨어졌나(95 %) → 카메라 높이, 짧게 평활
         let back = |u: usize, v: usize| -> Option<V3> {
@@ -524,7 +738,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             s.sort_by(|x, y| x.partial_cmp(y).unwrap());
             s[s.len() / 2]
         };
-        let z0v = *z0.get_or_insert(p[2] - h_now);
+        let z0v = if leveled { *z0.get_or_insert(p[2] - h_now) } else { p[2] - h_now };
         let pwc = [p[0], p[1], p[2] - z0v];
         let floor_z = pwc[2] - h_now;
         let to_w = |pc: &V3| add(&mv(&r, pc), &pwc);
@@ -544,12 +758,16 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
         }
-        grid.add((pwc[0], pwc[1]), &occ, &flo);
+        // 위치가 확인된 장면만 지도·물체에 넣는다(실패해 예측 위치뿐인 장면은 지도를 어긋나게 함)
+        let map_ok = (!a.vo || vo_ok) && leveled;
+        if map_ok {
+            grid.add((pwc[0], pwc[1]), &occ, &flo);
+        }
         let mut sp = Vec::with_capacity(w * h / 4);
         for v in (0..h).step_by(2) {
             for u in (0..w).step_by(2) {
                 if let Some(pc) = back(u, v) {
-                    if pc[2] < 4.0 && !depth_edge(&depth, w, h, u, v) {
+                    if map_ok && pc[2] < a.max_depth && !depth_edge(&depth, w, h, u, v) {
                         let o = (v * w + u) * 3;
                         sp.push((to_w(&pc), [rgb[o], rgb[o + 1], rgb[o + 2]], pc[2] as f32));
                     }
@@ -561,7 +779,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
 
         // 물체
         let mut seen = HashSet::new();
-        for d in &dets {
+        for d in dets.iter().flatten().filter(|_| map_ok) {
             let name = seg::COCO.get(d.cls).copied().unwrap_or("object");
             if name == "person" {
                 continue;
@@ -616,19 +834,35 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             let id = mem.update(name, d.score, &pts, med as f32, t, Some(crop));
             seen.insert(id);
         }
-        mem.check_missing(&seen, seq.k, &r, &pwc, &depth, w, h);
+        if dets.is_some() && map_ok {
+            mem.check_missing(&seen, seq.k, &r, &pwc, &depth, w, h);
+        }
         let c4 = Instant::now();
 
-        traj.push((t, [pwc[0], pwc[1], floor_z]));
+        // 지나온 길: 5 cm 이상 움직였을 때만 점 하나(가만히 있어도 장면마다 쌓이면 view.json 이 커져 원격 뷰어가 느려짐)
+        if traj.last().is_none_or(|(_, q)| (q[0] - pwc[0]).hypot(q[1] - pwc[1]) >= 0.05) {
+            traj.push((t, [pwc[0], pwc[1], floor_z]));
+        }
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
         cam_json = json!({"pos": pwc, "R": r});
         nkf += 1;
-        let write_now = a.live > 0.0 || nkf % 5 == 0 || nkf == 1 || a.snaps.contains(&nkf);
+        // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(뷰어가 0.1 초마다 받아 손카메라를 바로 움직임),
+        // 지도·물체·그래프(view.json)는 0.4 초마다
+        if a.live > 0.0 {
+            out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": !a.vo || vo_ok}).to_string().as_bytes());
+        }
+        let write_now = if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= 0.4 || nkf == 1 } else { nkf % 5 == 0 || nkf == 1 } || a.snaps.contains(&nkf);
         if write_now {
+            last_view = Instant::now();
             if nkf % a.scene_every == 1 || a.scene_every == 1 || a.snaps.contains(&nkf) || a.live == 0.0 && nkf % 50 == 0 {
-                let pts = scene.points();
-                out::ply(&a.out.join("scene_points.ply"), &pts);
-                scene_json = json!({"path": "scene_points.ply", "stamp": nkf, "voxel": scene.vox, "n": pts.len()});
+                // 새로 확정된 칸만 조각 파일로: 뷰어는 아직 안 받은 조각만 받는다(원격 접속에서 지도 전체를 매번 받지 않게)
+                let pts = scene.new_points();
+                if !pts.is_empty() {
+                    out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), &pts);
+                    n_chunk += 1;
+                    n_scene += pts.len();
+                }
+                scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
             }
             write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json);
         }
@@ -644,16 +878,21 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         clock.n += 1;
         if nkf % 25 == 0 {
             let n = clock.n as f64;
-            println!("kf {nkf} objects {} ({} gone) | ms/kf load {:.0} seg {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s",
+            println!("kf {nkf} objects {} ({} gone) | ms/kf load {:.0} seg {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | vo fail {vo_fail} reject {vo_reject} ref {vo_nref} pos ({:.2},{:.2},{:.2})",
                      mem.objs.len(), mem.objs.iter().filter(|o| o.state == "gone").count(),
                      clock.load / n * 1e3, clock.seg / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
-                     n / t0.elapsed().as_secs_f64());
+                     n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);
         }
     }
     let seg = worker.join().expect("worker");
+    let pts = scene.new_points();
+    if !pts.is_empty() {
+        out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), &pts);
+        n_chunk += 1;
+        n_scene += pts.len();
+    }
+    scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
     let pts = scene.points();
-    out::ply(&a.out.join("scene_points.ply"), &pts);
-    scene_json = json!({"path": "scene_points.ply", "stamp": nkf + 1, "voxel": scene.vox, "n": pts.len()});
     let t_end = traj.last().map_or(0.0, |x| x.0);
     write_view(&a.out, &grid, &mut mem, &traj, t_end, last_pose, &cam_json, &scene_json);
     let n = clock.n.max(1) as f64;
@@ -678,6 +917,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
         let base = format!("objects/O{}", o.id);
         if let Some(pts) = pts {
             out::ply(&dir.join(format!("{base}_points.ply")), &pts);
+            o.n_pts = pts.len();
             if let Some(c) = &o.crop {
                 out::png_rgb(&dir.join(format!("{base}_rgb.png")), c.w, c.h, &c.rgb);
                 out::png_gray(&dir.join(format!("{base}_mask.png")), c.w, c.h, &c.mask);
@@ -688,9 +928,9 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
         }
         let mut e = json!({"id": o.id, "name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
             "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": false,
-            "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox}});
+            "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox, "n": o.n_pts}});
         if o.crop.is_some() {
-            e["rgbd"] = json!({"rgb": format!("{base}_rgb.png"), "mask": format!("{base}_mask.png"), "depth": format!("{base}_depth.png")});
+            e["rgbd"] = json!({"rgb": format!("{base}_rgb.png"), "mask": format!("{base}_mask.png"), "depth": format!("{base}_depth.png"), "v": o.crop_ver});
         }
         objs.push(e);
     }

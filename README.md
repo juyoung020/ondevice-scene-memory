@@ -66,8 +66,11 @@ NPU="--seg $M/yolo26-s-seg_640x640.dxnn --depth $M/yolo26-depth-s_768x768.dxnn -
 
 # 시험 영상으로
 pipeline/target/release/memmap --tum data/tum/rgbd_dataset_freiburg1_desk --out data/memory/live --every 3 $NPU --live 1 --loop
-# 웹캠으로(실시간)
-pipeline/target/release/memmap --cam /dev/video0 --out data/memory/live $NPU --live 1
+# 웹캠으로(실시간, 모델 셋을 NPU 에서 동시에, 찍은 영상은 data/rec/cam1 에 남김)
+pipeline/target/release/memmap --cam /dev/video0 --out data/memory/live $NPU --live 1 --npu-par --seg-every 2 \
+    --scene-vox 0.02 --max-depth 3 --rec data/rec/cam1
+# 남긴 영상을 같은 조건으로 다시(PC·보드 모두)
+pipeline/target/release/memmap --cam data/rec/cam1 --out data/memory/replay $NPU --npu-par --seg-every 2
 
 # 뷰어: 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
 sgview data/memory/live --port 8091 --bind 0.0.0.0
@@ -80,7 +83,11 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 | 옵션 | 뜻 |
 |---|---|
-| `--tum <폴더>` / `--cam <장치>` | 입력: TUM 영상 폴더 또는 웹캠 |
+| `--tum <폴더>` / `--cam <장치 또는 녹화 폴더>` | 입력: TUM 영상, 웹캠, 또는 `--rec` 로 남긴 녹화 |
+| `--rec <폴더>` | 웹캠 영상을 그대로 남김(나중에 `--cam <폴더>` 로 다시) |
+| `--npu-par` | 모델 셋을 NPU 에서 동시에(보드에서 약 2 배 빠름) |
+| `--seg-every N` | 물체 분할은 N 장마다(위치 추정은 매 장) |
+| `--scene-vox` / `--max-depth` | 3D 지도 칸 크기(m, 기본 0.01) / 지도에 넣을 최대 거리(m, 기본 4) |
 | `--out <폴더>` | 기억을 저장할 폴더(뷰어가 이 폴더를 읽음) |
 | `--depth kinect \| <모델>` | 깊이: `kinect`면 TUM의 실측 깊이(비교 기준), 모델 파일이면 딥러닝 추정 |
 | `--pose vo` | 카메라 위치를 영상만으로 추정. 빼면 TUM의 정답 위치를 씀 |

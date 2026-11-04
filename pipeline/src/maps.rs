@@ -34,11 +34,12 @@ pub struct SceneMap {
     cells: HashMap<u64, SV>,
     support: HashMap<u64, (u32, u32)>, // 굵은 칸 → (본 키프레임 수, 마지막 키프레임)
     pub min_frames: u32,
+    sent: HashSet<u64>, // 이미 조각 파일로 내보낸 칸
 }
 
 impl SceneMap {
     pub fn new(vox: f64, sup: f64) -> SceneMap {
-        SceneMap { vox, ratio: (sup / vox).round() as i64, cells: HashMap::new(), support: HashMap::new(), min_frames: 2 }
+        SceneMap { vox, ratio: (sup / vox).round() as i64, cells: HashMap::new(), support: HashMap::new(), min_frames: 2, sent: HashSet::new() }
     }
     /// 한 키프레임의 점: (세계 점, 색, 카메라 거리)
     pub fn add(&mut self, kf: u32, pts: &[(V3, [u8; 3], f32)]) {
@@ -59,6 +60,17 @@ impl SceneMap {
                 s.1 = kf;
             }
         }
+    }
+    /// 지난번 이후 새로 확정된 칸만(조각 파일용): 뷰어가 지도 전체를 다시 받지 않게
+    pub fn new_points(&mut self) -> Vec<([f32; 3], [u8; 3])> {
+        let mut out = vec![];
+        for (k, v) in &self.cells {
+            if !self.sent.contains(k) && self.support.get(&coarse_of(*k, self.ratio)).map_or(0, |s| s.0) >= self.min_frames {
+                out.push(([v.sum[0] / v.n as f32, v.sum[1] / v.n as f32, v.sum[2] / v.n as f32], v.col));
+                self.sent.insert(*k);
+            }
+        }
+        out
     }
     /// 여러 키프레임에서 본 칸만: (점, 색)
     pub fn points(&self) -> Vec<([f32; 3], [u8; 3])> {
@@ -168,8 +180,10 @@ pub struct Obj {
     pub support: HashMap<u64, u32>, // 굵은 칸 → 본 관측 수
     pub crop: Option<Crop>, // 가장 크게 본 장면
     pub crop_area: u32,
+    pub crop_ver: u32, // 사진이 바뀔 때마다 +1(뷰어는 이게 바뀔 때만 다시 받음)
     pub dirty: bool,
     pub stamp: u32,
+    pub n_pts: usize, // 마지막으로 내보낸 점 수
 }
 
 pub struct Memory {
@@ -232,7 +246,7 @@ impl Memory {
                 self.objs.push(Obj {
                     id: self.next, name: name.into(), votes: HashMap::new(), score: 0.0, n_obs: 0, first_pos: c, pos: c,
                     extent: ext, last_seen: stamp, miss: 0, state: "seen", cells: HashMap::new(), support: HashMap::new(),
-                    crop: None, crop_area: 0, dirty: true, stamp: 0,
+                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0,
                 });
                 self.next += 1;
                 self.objs.len() - 1
@@ -269,6 +283,7 @@ impl Memory {
             if a > o.crop_area {
                 o.crop_area = a;
                 o.crop = Some(cr);
+                o.crop_ver += 1;
             }
         }
         o.id

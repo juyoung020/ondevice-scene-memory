@@ -101,4 +101,5 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 - **마우스:** 끌면 돌리기, 휠은 확대·축소, 오른쪽 끌기는 이동. 왼쪽 위 `Top view`(위에서 보기)·`Fit`(전체 맞추기).
 - **화면 구성:** 바닥의 흰색·검은색 칸이 점유 지도(갈 수 있는 곳·막힌 곳), 색 점이 3D 지도, 파란 원뿔이 지금 카메라입니다.
 - **물체 색:** 초록 = 지금 보임, 주황 = 옮겨짐, 회색 = 그 자리에서 사라짐.
-- **오른쪽 패널에서 켜고 끄기:** `3D map points`(지도), `Object name labels`(이름표), `Show graph layers`(위쪽 물체·방 층), `Objects as`(점 또는 표면).
+- **오른쪽 패널에서 켜고 끄기:** `3D map points`(지도), `Object name labels`(이름표), `Show graph layers`(위쪽 물체·방 층), `Objects as`(점 또는 표면), `Depth shading (EDL)`(입체 음영).
+- **시연할 때:** `Follow the handheld camera (behind)`를 켜면 시점이 손카메라 뒤에서 따라갑니다(마우스로 돌리면 꺼짐).

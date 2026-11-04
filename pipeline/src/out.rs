@@ -12,15 +12,18 @@ pub fn replace(tmp: &Path, dst: &Path) {
     std::fs::rename(tmp, dst).expect("replace");
 }
 
-/// 비동기 기록: 켜 두면 파일 쓰기를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜)
-static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(std::path::PathBuf, Vec<u8>)>> = std::sync::OnceLock::new();
+/// 기록할 내용: 바로 쓸 바이트, 또는 기록 스레드에서 만들 바이트(PNG 압축 등 무거운 것)
+type Job = Box<dyn FnOnce() -> Vec<u8> + Send>;
+
+/// 비동기 기록: 켜 두면 파일 쓰기(와 PNG 압축)를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜)
+static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(std::path::PathBuf, Job)>> = std::sync::OnceLock::new();
 
 pub fn start_writer() {
     WRITER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(std::path::PathBuf, Vec<u8>)>(256);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(std::path::PathBuf, Job)>(256);
         std::thread::spawn(move || {
-            for (p, b) in rx {
-                write_now(&p, &b);
+            for (p, job) in rx {
+                write_now(&p, &job());
             }
         });
         tx
@@ -28,9 +31,15 @@ pub fn start_writer() {
 }
 
 pub fn write_atomic(dst: &Path, bytes: &[u8]) {
+    let b = bytes.to_vec();
+    write_lazy(dst, Box::new(move || b));
+}
+
+/// 바이트를 기록 스레드에서 만들어 쓴다(기록 스레드가 없으면 바로)
+fn write_lazy(dst: &Path, job: Job) {
     match WRITER.get() {
-        Some(tx) => tx.send((dst.to_path_buf(), bytes.to_vec())).expect("writer"),
-        None => write_now(dst, bytes),
+        Some(tx) => tx.send((dst.to_path_buf(), job)).expect("writer"),
+        None => write_now(dst, &job()),
     }
 }
 
@@ -78,18 +87,28 @@ pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
     write_atomic(dst, &b);
 }
 
+// PNG 압축은 기록 스레드에서(물체 사진이 바뀔 때 본 스레드가 장당 수십 ms 멈추던 것)
 pub fn png_rgb(dst: &Path, w: u32, h: u32, rgb: &[u8]) {
-    let mut v = vec![];
-    image::RgbImage::from_raw(w, h, rgb.to_vec()).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-    write_atomic(dst, &v);
+    let px = rgb.to_vec();
+    write_lazy(dst, Box::new(move || {
+        let mut v = vec![];
+        image::RgbImage::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
+        v
+    }));
 }
 pub fn png_gray(dst: &Path, w: u32, h: u32, g: &[u8]) {
-    let mut v = vec![];
-    image::GrayImage::from_raw(w, h, g.to_vec()).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-    write_atomic(dst, &v);
+    let px = g.to_vec();
+    write_lazy(dst, Box::new(move || {
+        let mut v = vec![];
+        image::GrayImage::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
+        v
+    }));
 }
 pub fn png_u16(dst: &Path, w: u32, h: u32, d: &[u16]) {
-    let mut v = vec![];
-    image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(w, h, d.to_vec()).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-    write_atomic(dst, &v);
+    let px = d.to_vec();
+    write_lazy(dst, Box::new(move || {
+        let mut v = vec![];
+        image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
+        v
+    }));
 }

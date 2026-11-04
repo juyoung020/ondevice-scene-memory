@@ -703,6 +703,7 @@ dependencies = [
  "image",
  "ndarray",
  "ort",
+ "rayon",
  "serde",
  "serde_json",
  "v4l",

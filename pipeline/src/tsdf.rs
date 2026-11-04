@@ -109,17 +109,10 @@ impl Tsdf {
             }
             changed
         };
-        let nth = std::thread::available_parallelism().map_or(4, |x| x.get()).min(8);
-        let per = work.len().div_ceil(nth).max(1);
-        std::thread::scope(|sc| {
-            for part in work.chunks_mut(per) {
-                sc.spawn(|| {
-                    for (key, blk, ch) in part.iter_mut() {
-                        *ch = one(*key, blk);
-                    }
-                });
-            }
-        });
+        {
+            use rayon::prelude::*;
+            work.par_iter_mut().for_each(|(key, blk, ch)| *ch = one(*key, blk));
+        }
         for (key, blk, ch) in work {
             if ch {
                 self.dirty.insert((div_floor(key.0, R), div_floor(key.1, R), div_floor(key.2, R)));
@@ -132,13 +125,11 @@ impl Tsdf {
     pub fn take_dirty_meshes(&mut self) -> Vec<((i32, i32, i32), Vec<([f32; 3], [u8; 3])>, Vec<[u32; 3]>)> {
         let regions: Vec<(i32, i32, i32)> = self.dirty.drain().collect();
         // 구역끼리 독립: 코어마다 나눠 뽑는다(읽기만)
-        let nth = std::thread::available_parallelism().map_or(4, |x| x.get()).min(8);
-        let per = regions.len().div_ceil(nth).max(1);
         let this = &*self;
-        let mut out: Vec<_> = std::thread::scope(|sc| {
-            let hs: Vec<_> = regions.chunks(per).map(|part| sc.spawn(move || part.iter().map(|&reg| { let (v, t) = this.mesh_region(reg); (reg, v, t) }).collect::<Vec<_>>())).collect();
-            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
+        let mut out: Vec<_> = {
+            use rayon::prelude::*;
+            regions.par_iter().map(|&reg| { let (v, t) = this.mesh_region(reg); (reg, v, t) }).collect()
+        };
         for (reg, _, _) in &out {
             *self.ver.entry(*reg).or_insert(0) += 1;
         }

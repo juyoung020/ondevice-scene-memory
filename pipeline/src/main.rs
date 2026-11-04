@@ -589,6 +589,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut fast_hist: std::collections::VecDeque<(f64, M3, V3, bool)> = Default::default();
     let mut last_z0v = 0.0; // 마지막 깊이 장면의 바닥 기준 높이(위치만 추적한 장면의 pose.json 용)
     let mut n_fast = 0u32;
+    let mut t_fast = 0.0f64; // 위치만 추적한 장면에 쓴 시간(본 스레드)
     let mut dvo_rel: (M3, V3) = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]); // 직전 장면 사이 움직임
     // 직접 방식: 5 단계 피라미드(큰 움직임), 시작값 둘(움직임 없음 / 직전 움직임) 중 나은 쪽 → TUM 책상 Kinect 0.333 → 0.092 m, 실패 13 → 0
     let (dvo_dual, dvo_levels) = (true, 5usize);
@@ -650,6 +651,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             clock.vo += c_vo.elapsed().as_secs_f64();
+            t_fast += c_vo.elapsed().as_secs_f64();
             continue;
         }
         // 깊이가 늦게 도착한 장면: 위치는 이미 추적해 둔 것을 쓴다
@@ -983,18 +985,26 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         if map_ok {
             grid.add((pwc[0], pwc[1]), &occ, &flo);
         }
-        let mut sp = Vec::with_capacity(w * h / 4);
-        for v in (0..h).step_by(a.scene_step) {
-            for u in (0..w).step_by(a.scene_step) {
-                if let Some(pc) = back(u, v) {
-                    if map_ok && pc[2] < a.max_depth && !depth_edge(&depth, w, h, u, v) {
-                        let o = (v * w + u) * 3;
-                        sp.push((to_w(&pc), [rgb[o], rgb[o + 1], rgb[o + 2]], pc[2] as f32));
-                    }
-                }
-            }
-        }
-        if let (Some(ts), true) = (tsdf.as_mut(), map_ok) {
+        // 점 지도용 3D 점: 줄마다 나눠 상주 스레드 풀에서(표면 지도면 TSDF 가 깊이를 직접 쓰니 건너뜀)
+        let sp: Vec<(V3, [u8; 3], f32)> = if a.surface || !map_ok {
+            vec![]
+        } else {
+            use rayon::prelude::*;
+            let (step, maxd) = (a.scene_step, a.max_depth);
+            let rows: Vec<usize> = (0..h).step_by(step).collect();
+            rows.par_iter()
+                .flat_map_iter(|&v| {
+                    let (depth, rgb) = (&depth, &rgb);
+                    (0..w).step_by(step).filter_map(move |u| {
+                        let pc = back(u, v)?;
+                        (pc[2] < maxd && !depth_edge(depth, w, h, u, v)).then(|| {
+                            let o = (v * w + u) * 3;
+                            (to_w(&pc), [rgb[o], rgb[o + 1], rgb[o + 2]], pc[2] as f32)
+                        })
+                    })
+                })
+                .collect()
+        };        if let (Some(ts), true) = (tsdf.as_mut(), map_ok) {
             ts.integrate(&depth, &rgb, w, h, seq.k, &r, &pwc, a.max_depth);
         } else if !a.surface {
             scene.add(nkf, &sp);
@@ -1150,7 +1160,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     println!("{}", json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
         "scene_points": pts.len(), "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
-        "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "pose_only_frames": n_fast, "merged": mem.merged}));
+        "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "pose_only_frames": n_fast, "pose_only_ms": t_fast / (n_fast.max(1) as f64) * 1e3, "merged": mem.merged}));
     seg
 }
 

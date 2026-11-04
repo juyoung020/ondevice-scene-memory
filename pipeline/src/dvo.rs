@@ -6,6 +6,8 @@ use crate::geom::*;
 /// 흑백 피라미드: 단계마다 (가로, 세로, 밝기 0–1)
 pub struct Pyr {
     pub lv: Vec<(usize, usize, Vec<f32>)>,
+    /// 단계마다 밝기 기울기 영상(중앙 차분 /2): 표본 추출 때 쌍선형 3 번(밝기·가로·세로)으로 끝나게
+    pub gr: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
 pub fn pyramid(rgb: &[u8], w: usize, h: usize, n: usize) -> Pyr {
@@ -24,33 +26,48 @@ pub fn pyramid(rgb: &[u8], w: usize, h: usize, n: usize) -> Pyr {
         }
         lv.push((nw, nh, ng));
     }
-    Pyr { lv }
+    let gr = lv
+        .iter()
+        .map(|(w, h, g)| {
+            let (w, h) = (*w, *h);
+            let (mut gx, mut gy) = (vec![0f32; w * h], vec![0f32; w * h]);
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let i = y * w + x;
+                    gx[i] = 0.5 * (g[i + 1] - g[i - 1]);
+                    gy[i] = 0.5 * (g[i + w] - g[i - w]);
+                }
+            }
+            (gx, gy)
+        })
+        .collect();
+    Pyr { lv, gr }
 }
 
-/// 쌍선형 밝기와 기울기(중앙 차분)
+/// 쌍선형 밝기와 기울기(미리 만든 기울기 영상을 같은 가중으로: 밝기를 ±1 화소에서 다시 보간해 빼는 것과 같은 값)
 #[inline]
-fn samp(img: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f32)> {
+fn samp(img: &[f32], gx: &[f32], gy: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f32)> {
     if x < 1.0 || y < 1.0 || x >= (w - 2) as f32 || y >= (h - 2) as f32 {
         return None;
     }
-    let bl = |x: f32, y: f32| {
-        let (x0, y0) = (x as usize, y as usize);
-        let (ax, ay) = (x - x0 as f32, y - y0 as f32);
-        let i = y0 * w + x0;
-        let top = img[i] + (img[i + 1] - img[i]) * ax;
-        let bot = img[i + w] + (img[i + w + 1] - img[i + w]) * ax;
+    let (x0, y0) = (x as usize, y as usize);
+    let (ax, ay) = (x - x0 as f32, y - y0 as f32);
+    let i = y0 * w + x0;
+    let bl = |m: &[f32]| {
+        let top = m[i] + (m[i + 1] - m[i]) * ax;
+        let bot = m[i + w] + (m[i + w + 1] - m[i + w]) * ax;
         top + (bot - top) * ay
     };
-    Some((bl(x, y), 0.5 * (bl(x + 1.0, y) - bl(x - 1.0, y)), 0.5 * (bl(x, y + 1.0) - bl(x, y - 1.0))))
+    Some((bl(img), bl(gx), bl(gy)))
 }
-
 /// 앞 장면(밝기 피라미드·깊이) → 이번 장면 움직임. init: (R, t) 앞 카메라 좌표 → 이번 카메라 좌표의 첫 추정.
 /// 반환: (R, t, 쓰인 화소 수, 평균 밝기 오차, 깊이 배율 = 앞 깊이로 옮긴 거리 / 이번 깊이 중앙값)
 /// minlv: 가장 고운 단계 번호(딥러닝 깊이는 1: 640×480 단계는 깊이가 흐려 도움이 안 되고 시간만 40 % 더 듦)
 pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f64; 4], init: (M3, V3), minlv: usize) -> Option<(M3, V3, usize, f64, f64)> {
 
     let (w0, h0) = (prev.lv[0].0, prev.lv[0].1);
-    let nth = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+    // 점 합산은 상주 스레드 풀(rayon)로 나눔: 반복마다 스레드를 새로 띄우면(약 40 번/장) 그 비용이 이득을 먹었다(10 → 5.4 ms/장, PC)
+    let nth = rayon::current_num_threads().clamp(1, 8);
     let level = |l: usize, r_io: &mut M3, t_io: &mut V3, n_io: &mut usize, e_io: &mut f64| {
         let (mut r, mut t) = (*r_io, *t_io);
         let (mut last_n, mut last_err) = (*n_io, *e_io);
@@ -59,6 +76,7 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
         let (cx, cy) = ((k[2] + 0.5) / s - 0.5, (k[3] + 0.5) / s - 0.5);
         let (w, h, i0) = (prev.lv[l].0, prev.lv[l].1, &prev.lv[l].2);
         let i1 = &cur.lv[l].2;
+        let (g1x, g1y) = (&cur.gr[l].0, &cur.gr[l].1);
         // 앞 장면 점: 밝기 기울기가 있고 깊이가 있는 화소(맨 고운 단계는 2 화소 간격)
         let step = if l == 0 { 2 } else { 1 };
         let mut pts: Vec<(V3, f32)> = vec![];
@@ -94,7 +112,7 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
                         continue;
                     }
                     let (u, v) = (fx * p1[0] / p1[2] + cx, fy * p1[1] / p1[2] + cy);
-                    let Some((v1, gx, gy)) = samp(i1, w, h, u as f32, v as f32) else { continue };
+                    let Some((v1, gx, gy)) = samp(i1, g1x, g1y, w, h, u as f32, v as f32) else { continue };
                     let res = (v1 - v0 - bias) as f64;
                     let wgt = if res.abs() < 0.04 { 1.0 } else { 0.04 / res.abs() };
                     let iz = 1.0 / p1[2];
@@ -115,11 +133,9 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
                 }
                 (hm, g, n, sr, sw, sabs)
             };
-            let parts: Vec<_> = if pts.len() >= 4000 && nth > 1 {
-                std::thread::scope(|sc| {
-                    let hs: Vec<_> = pts.chunks(pts.len().div_ceil(nth)).map(|c| sc.spawn(move || acc(c))).collect();
-                    hs.into_iter().map(|h| h.join().unwrap()).collect()
-                })
+            let parts: Vec<_> = if pts.len() >= 2000 && nth > 1 {
+                use rayon::prelude::*;
+                pts.par_chunks(pts.len().div_ceil(nth)).map(acc).collect()
             } else {
                 vec![acc(&pts)]
             };

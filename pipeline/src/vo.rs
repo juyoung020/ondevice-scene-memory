@@ -87,11 +87,14 @@ pub fn match_mutual(a: &Feat, b: &Feat, min_sim: f32) -> Vec<(usize, usize)> {
     }
     let nth = std::thread::available_parallelism().map_or(4, |x| x.get()).min(8);
     let per = na.div_ceil(nth).max(1);
-    let parts: Vec<(Vec<(usize, f32)>, Vec<(usize, f32)>)> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..na)
+    let parts: Vec<(Vec<(usize, f32)>, Vec<(usize, f32)>)> = {
+        use rayon::prelude::*;
+        (0..na)
             .step_by(per)
+            .collect::<Vec<_>>()
+            .into_par_iter()
             .map(|s0| {
-                sc.spawn(move || {
+                {
                     let e0 = (s0 + per).min(na);
                     let mut ba = vec![(usize::MAX, -1.0f32); e0 - s0];
                     let mut bb = vec![(usize::MAX, -1.0f32); nb];
@@ -108,11 +111,10 @@ pub fn match_mutual(a: &Feat, b: &Feat, min_sim: f32) -> Vec<(usize, usize)> {
                         }
                     }
                     (ba, bb)
-                })
+                }
             })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+            .collect()
+    };
     let mut best_a = Vec::with_capacity(na);
     let mut best_b = vec![(usize::MAX, -1.0f32); nb];
     for (ba, bb) in parts {

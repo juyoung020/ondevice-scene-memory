@@ -395,16 +395,16 @@ impl Memory {
         if pts.is_empty() {
             return pts;
         }
+        // 중앙값·분위수는 정렬 대신 선택(같은 값, 큰 물체에서 수십 ms 걸리던 것)
+        let nth = |mut v: Vec<f32>, i: usize| *v.select_nth_unstable_by(i, |a, b| a.partial_cmp(b).unwrap()).1;
         let med = |k: usize| {
-            let mut v: Vec<f32> = pts.iter().map(|p| p.0[k]).collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[v.len() / 2]
+            let v: Vec<f32> = pts.iter().map(|p| p.0[k]).collect();
+            let i = v.len() / 2;
+            nth(v, i)
         };
         let m = [med(0), med(1), med(2)];
         let mut ds: Vec<f32> = pts.iter().map(|p| ((p.0[0] - m[0]).powi(2) + (p.0[1] - m[1]).powi(2) + (p.0[2] - m[2]).powi(2)).sqrt()).collect();
-        let mut sd = ds.clone();
-        sd.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let lim = 3.0 * sd[sd.len() / 2] + 0.05;
+        let lim = 3.0 * nth(ds.clone(), ds.len() / 2) + 0.05;
         let mut keep = vec![];
         for (p, d) in pts.into_iter().zip(ds.drain(..)) {
             if d <= lim {
@@ -412,9 +412,9 @@ impl Memory {
             }
         }
         let pct = |k: usize, q: f64| {
-            let mut v: Vec<f32> = keep.iter().map(|p| p.0[k]).collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[((v.len() - 1) as f64 * q) as usize] as f64
+            let v: Vec<f32> = keep.iter().map(|p| p.0[k]).collect();
+            let i = ((v.len() - 1) as f64 * q) as usize;
+            nth(v, i) as f64
         };
         if !keep.is_empty() {
             o.pos = [m[0] as f64, m[1] as f64, m[2] as f64];

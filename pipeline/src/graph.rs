@@ -14,31 +14,48 @@ pub fn segment(g: &GridImg, res: f64, min_width: f64, min_area: f64) -> Rooms {
     let (w, h) = (g.w, g.h);
     // 빈칸 사이의 작은 미관측 구멍 메우기(닫힘: 빈칸을 r 칸 넓혔다가 다시 좁힘, 막힌 칸은 그대로): 손카메라는 바닥을 듬성듬성 봐서
     // 빈칸이 얼룩덜룩하면 거리변환이 작아져 한 방이 여러 씨앗으로 갈라진다
-    let occ: Vec<bool> = g.px.iter().map(|&p| p == 0).collect();
-    let mut free: Vec<bool> = g.px.iter().map(|&p| p == 254).collect();
-    let r = 2i64;
-    let grow = |m: &[bool], want: bool| -> Vec<bool> {
-        let mut o = m.to_vec();
-        for y in 0..h as i64 {
-            for x in 0..w as i64 {
-                let i = (y * w as i64 + x) as usize;
-                if m[i] == want {
-                    continue;
-                }
-                'n: for dy in -r..=r {
-                    for dx in -r..=r {
-                        let (nx, ny) = (x + dx, y + dy);
-                        if nx >= 0 && ny >= 0 && nx < w as i64 && ny < h as i64 && m[(ny * w as i64 + nx) as usize] == want {
-                            o[i] = want;
-                            break 'n;
-                        }
+    let occ0: Vec<bool> = g.px.iter().map(|&p| p == 0).collect();
+    // 외톨이 막힘 칸(8 이웃에 막힌 칸이 1 개 이하)은 깊이 잡음으로 보고 빈칸으로: 딥러닝 깊이 지도는 빈 공간에 이런 점이 흩어져 방을 쪼갰다
+    let occ: Vec<bool> = (0..w * h)
+        .map(|i| {
+            if !occ0[i] {
+                return false;
+            }
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            let mut n = 0;
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if (dx, dy) != (0, 0) && nx >= 0 && ny >= 0 && nx < w as i64 && ny < h as i64 && occ0[(ny * w as i64 + nx) as usize] {
+                        n += 1;
                     }
+                }
+            }
+            n >= 2
+        })
+        .collect();
+    let mut free: Vec<bool> = (0..w * h).map(|i| g.px[i] == 254 || (occ0[i] && !occ[i])).collect();
+    // 넓히기/좁히기(정사각 2r+1 창): 가로로 한 번, 세로로 한 번(같은 결과, 칸마다 25 → 10 번 보기)
+    let r = 2usize;
+    let grow = |m: &[bool], want: bool| -> Vec<bool> {
+        let mut hz = m.to_vec();
+        for y in 0..h {
+            for x in 0..w {
+                if m[y * w + x] != want && (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| m[y * w + xx] == want) {
+                    hz[y * w + x] = want;
+                }
+            }
+        }
+        let mut o = hz.clone();
+        for y in 0..h {
+            for x in 0..w {
+                if hz[y * w + x] != want && (y.saturating_sub(r)..(y + r + 1).min(h)).any(|yy| hz[yy * w + x] == want) {
+                    o[y * w + x] = want;
                 }
             }
         }
         o
-    };
-    let closed = grow(&grow(&free, true), false);
+    };    let closed = grow(&grow(&free, true), false);
     for i in 0..w * h {
         free[i] = (free[i] || closed[i]) && !occ[i];
     }

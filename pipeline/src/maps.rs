@@ -202,7 +202,8 @@ impl Memory {
     }
 
     /// 같은 이름(살아 있는) 물체 중 굵은 칸 겹침 25 % 이상이거나 중심이 크기에 맞춘 문턱 안이면 같은 물체
-    fn find(&self, name: &str, c: &V3, ext: &V3, keys: &FastSet<u64>) -> Option<usize> {
+    /// cam: 관측한 카메라 위치(시선 방향 거리 오차를 따로 봄)
+    fn find(&self, name: &str, c: &V3, ext: &V3, keys: &FastSet<u64>, cam: Option<&V3>) -> Option<usize> {
         let mut best = None;
         let mut bs = -1.0;
         for (i, o) in self.objs.iter().enumerate() {
@@ -216,7 +217,17 @@ impl Memory {
             let ov = keys.iter().filter(|k| o.support.contains_key(k)).count() as f64 / keys.len().max(1) as f64;
             let e = [0, 1, 2].map(|k| o.extent[k].max(ext[k]));
             let gate = (0.6 * crate::geom::norm(&e)).max(0.5);
-            if ov >= 0.25 || d < gate {
+            // 딥러닝 깊이는 거리(시선 방향)가 주로 틀린다: 옆 방향은 같은 문턱, 시선 방향은 거리의 25 % 까지 더 허용
+            let along_ok = cam.is_some_and(|cp| {
+                let ray = crate::geom::sub(c, cp);
+                let rn = crate::geom::norm(&ray).max(1e-6);
+                let u = ray.map(|x| x / rn);
+                let diff = crate::geom::sub(&o.pos, c);
+                let along = crate::geom::dot(&diff, &u);
+                let lat = crate::geom::norm(&crate::geom::sub(&diff, &u.map(|x| x * along)));
+                lat < gate && along.abs() < gate.max(0.25 * rn)
+            });
+            if ov >= 0.25 || d < gate || along_ok {
                 let s = ov + (1.0 - d / 2.0) * 0.1;
                 if s > bs {
                     bs = s;
@@ -230,7 +241,7 @@ impl Memory {
     /// 한 관측(마스크 안 세계 점·색, 카메라 거리)을 기억에 더한다. 반환: 물체 번호
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, name: &str, score: f32, pts: &[(V3, [u8; 3])], dist: f32, stamp: f64,
-                  crop: Option<Crop>) -> u32 {
+                  crop: Option<Crop>, cam: Option<V3>) -> u32 {
         let n = pts.len() as f64;
         let mut c = [0.0; 3];
         let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
@@ -243,7 +254,7 @@ impl Memory {
         }
         let ext = [0, 1, 2].map(|k| (hi[k] - lo[k]).max(0.05));
         let ckeys: FastSet<u64> = pts.iter().map(|(p, _)| key(p, self.sup)).collect();
-        let i = match self.find(name, &c, &ext, &ckeys) {
+        let i = match self.find(name, &c, &ext, &ckeys, cam.as_ref()) {
             Some(i) => i,
             None => {
                 self.objs.push(Obj {
@@ -295,6 +306,13 @@ impl Memory {
     /// 병합 후처리(HOV-SG·ConceptGraphs 방식): 따로 생긴 두 물체가 같은 것이면 합친다.
     /// 기하: 굵은 칸(4 cm) 3D IoU, 작은 쪽 기준 겹침 비율. 의미: 이름 투표 분포 코사인. 생김새: 점 색 히스토그램 코사인.
     /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8). 반환: 합친 수
+    /// 잠깐 잡혔다 사라진 검출 지우기: 두 번 이하로 보였고 3 초 넘게 다시 안 보인 물체(한두 장면의 잘못된 검출이 화면을 어지럽힘)
+    pub fn prune(&mut self, now: f64) -> usize {
+        let n0 = self.objs.len();
+        self.objs.retain(|o| !(o.n_obs <= 2 && now - o.last_seen > 3.0));
+        n0 - self.objs.len()
+    }
+
     pub fn merge_pass(&mut self) -> usize {
         let hist = |o: &Obj| -> Vec<f32> {
             let mut h = vec![0f32; 64];

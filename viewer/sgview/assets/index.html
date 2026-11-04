@@ -396,13 +396,28 @@ async function ensurePoints(o) {
 }
 
 // 3D map chunks (scene/c<i>.ply): fetched once each, in order; a new run id clears them
-const sceneChunks = { run:null, geoms:[], next:0, busy:false };
+const sceneChunks = { run:null, geoms:[], next:0, busy:false, merged:0 };
+// every 32 chunks become one geometry (one draw call instead of 32): a live run writes a chunk per second, ~600 in 10 minutes
+function mergeSceneChunks() {
+  const K = 32, gs = sceneChunks.geoms;
+  if (gs.length - sceneChunks.merged < K) return;
+  const part = gs.slice(sceneChunks.merged, sceneChunks.merged + K);
+  let n = 0; for (const g of part) n += g.attributes.position.count;
+  const pos = new Float32Array(n * 3), col = new Uint8Array(n * 3); let o = 0;
+  for (const g of part) { pos.set(g.attributes.position.array, o * 3); col.set(g.attributes.color.array, o * 3); o += g.attributes.position.count; }
+  const m = new THREE.BufferGeometry();
+  m.setAttribute("position", new THREE.BufferAttribute(pos, 3)); m.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
+  for (const c of [...gScene.children]) if (part.includes(c.geometry)) gScene.remove(c);
+  for (const g of part) g.dispose();
+  gs.splice(sceneChunks.merged, K, m); sceneChunks.merged++;
+  addSceneChunk(m);
+}
 function sceneMat() { const sp = view.scene_points; return pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") }); }
 function addSceneChunk(g) { if (!opt("c_scene")) return; if (!gScene.userData.mat) gScene.userData.mat = sceneMat(); const p = new THREE.Points(g, gScene.userData.mat); p.userData.shared = true; gScene.add(p); }
 // display options changed: rebuild the chunk points with the new material (geometry is reused)
 function rebuildScene() { for (const c of [...gScene.children]) gScene.remove(c); if (gScene.userData.mat) gScene.userData.mat.dispose(); gScene.userData.mat = null; if (view && view.scene_points) for (const g of sceneChunks.geoms) addSceneChunk(g); invalidate(); }
 async function loadSceneChunks(sp) {
-  if (sceneChunks.run !== sp.run) { disposeGroup(gScene); for (const g of sceneChunks.geoms) g.dispose(); Object.assign(sceneChunks, { run:sp.run, geoms:[], next:0 }); }
+  if (sceneChunks.run !== sp.run) { disposeGroup(gScene); for (const g of sceneChunks.geoms) g.dispose(); Object.assign(sceneChunks, { run:sp.run, geoms:[], next:0, merged:0 }); }
   if (sceneChunks.busy || sceneChunks.next >= sp.chunks) return;
   sceneChunks.busy = true; pendingLoads++;
   const run = sp.run;
@@ -413,7 +428,7 @@ async function loadSceneChunks(sp) {
       const g = parsePly(await r.arrayBuffer());
       if (sceneChunks.run !== run) { g.dispose(); break; }
       sceneChunks.geoms.push(g); sceneChunks.next++;
-      addSceneChunk(g); invalidate();
+      addSceneChunk(g); mergeSceneChunks(); invalidate();
     }
   } catch (e) {}
   sceneChunks.busy = false; pendingLoads--; loadDone();
@@ -917,17 +932,19 @@ async function poll() {
 
 // fast camera pose (pose.json, a few hundred bytes, written every keyframe): the handheld camera moves without waiting for view.json
 let latestPose = null;
+let poseMissing = 0;   // no pose.json (not a live run): ask once a second instead of 20 times
 async function pollPose() {
   if (!document.hidden && view && !LIVE) {
     try {
       const r = await fetch("/file/pose.json?t=" + Date.now());
+      poseMissing = r.ok ? 0 : poseMissing + 1;
       if (r.ok) {
         const j = await r.json();
-        if (j.cam && (!latestPose || j.t !== latestPose.t)) { latestPose = j; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
+        if (j.cam && (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5)) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
       }
     } catch (e) {}
   }
-  setTimeout(pollPose, 50);   // 20 /s: --fast-pose writes a pose for every camera frame
+  setTimeout(pollPose, poseMissing > 3 ? 1000 : 50);   // 20 /s: --fast-pose writes a pose for every camera frame
 }
 
 
@@ -1205,13 +1222,14 @@ function buildHandheld() {
     floorMark.rotation.z = Math.atan2(f[1], f[0]);
   }
   g.add(cam, drop, floorMark);
-  g.userData.hh = { cam, drop, floorMark };
+  g.userData.hh = { cam, drop, floorMark, mats: [lens.material, faces.material, edges.material, drop.material, ring.material, dot.material, head.material], lost: null };
   return g;
 }
 // Handheld pose smoothing: pose.json gives a target 15–30 times a second; the shown pose approaches it (time constant 50 ms)
 // so the camera glides at 60 fps instead of jumping. Only transforms change — no geometry is rebuilt per pose.
 const hhTgt = { p: new THREE.Vector3(), q: new THREE.Quaternion(), yaw: 0, has: false };
 const hhCur = { p: new THREE.Vector3(), q: new THREE.Quaternion(), yaw: 0, init: false };
+let hhLost = false;
 function camQuat(R) {   // OpenCV camera -> world rotation as the phone's orientation (x forward, y left, z up)
   const f = [R[0][2], R[1][2], R[2][2]], l = [-R[0][0], -R[1][0], -R[2][0]], u = [-R[0][1], -R[1][1], -R[2][1]];
   return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().set(f[0], l[0], u[0], 0, f[1], l[1], u[1], 0, f[2], l[2], u[2], 0, 0, 0, 0, 1));
@@ -1222,6 +1240,7 @@ function setHandheldTarget(vc) {
 }
 function applyHandheld() {
   const P = robotGrp && robotGrp.userData.hh; if (!P || !hhCur.init) return;
+  if (P.lost !== hhLost) { P.lost = hhLost; for (const m of P.mats) m.color.setHex(hhLost ? 0xe5484d : 0x2f81f7); }   // red while tracking is lost (pose is only predicted)
   robotGrp.position.set(hhCur.p.x, hhCur.p.y, 0); robotGrp.rotation.z = 0;
   P.cam.position.z = hhCur.p.z; P.cam.quaternion.copy(hhCur.q); P.floorMark.rotation.z = hhCur.yaw;
   const a = P.drop.geometry.attributes.position; a.setXYZ(0, 0, 0, hhCur.p.z - 0.09); a.needsUpdate = true; P.drop.computeLineDistances();

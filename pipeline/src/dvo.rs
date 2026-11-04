@@ -10,7 +10,8 @@ pub struct Pyr {
     pub gr: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
-pub fn pyramid(rgb: &[u8], w: usize, h: usize, n: usize) -> Pyr {
+/// minlv: 기울기 영상은 이 단계부터만(더 고운 단계는 추적에 안 씀)
+pub fn pyramid(rgb: &[u8], w: usize, h: usize, n: usize, minlv: usize) -> Pyr {
     let g: Vec<f32> = rgb.chunks_exact(3).map(|c| (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) / 255.0).collect();
     let mut lv = vec![(w, h, g)];
     for _ in 1..n {
@@ -28,7 +29,11 @@ pub fn pyramid(rgb: &[u8], w: usize, h: usize, n: usize) -> Pyr {
     }
     let gr = lv
         .iter()
-        .map(|(w, h, g)| {
+        .enumerate()
+        .map(|(l, (w, h, g))| {
+            if l < minlv {
+                return (vec![], vec![]);
+            }
             let (w, h) = (*w, *h);
             let (mut gx, mut gy) = (vec![0f32; w * h], vec![0f32; w * h]);
             for y in 1..h - 1 {
@@ -68,6 +73,8 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
     let (w0, h0) = (prev.lv[0].0, prev.lv[0].1);
     // 점 합산은 상주 스레드 풀(rayon)로 나눔: 반복마다 스레드를 새로 띄우면(약 40 번/장) 그 비용이 이득을 먹었다(10 → 5.4 ms/장, PC)
     let nth = rayon::current_num_threads().clamp(1, 8);
+    // 수렴: 한 걸음이 0.1 mm·0.006° 미만이면 그 단계 끝(1e-10 은 거의 안 걸려 정해진 횟수를 다 돌았다, 1e-7 은 책상 정확도가 나빠짐)
+    let conv = 1e-8;
     let level = |l: usize, r_io: &mut M3, t_io: &mut V3, n_io: &mut usize, e_io: &mut f64| {
         let (mut r, mut t) = (*r_io, *t_io);
         let (mut last_n, mut last_err) = (*n_io, *e_io);
@@ -171,7 +178,7 @@ pub fn track(prev: &Pyr, prev_depth: &[f32], cur: &Pyr, cur_depth: &[f32], k: [f
             let dr = crate::vo::so3_exp([dx[3], dx[4], dx[5]]);
             r = mm(&dr, &r);
             t = add(&mv(&dr, &t), &[dx[0], dx[1], dx[2]]);
-            if dx.iter().map(|x| x * x).sum::<f64>() < 1e-10 {
+            if dx.iter().map(|x| x * x).sum::<f64>() < conv {
                 break;
             }
         }
@@ -223,4 +230,35 @@ pub fn depth_ratio(prev_depth: &[f32], cur_depth: &[f32], w0: usize, h0: usize, 
     } else {
         1.0
     }
+}
+
+/// 깊이 옮기기: 앞 장면 깊이를 (r, t)(앞 → 이번 카메라)로 이번 장면 화소에 찍는다(겹치면 가까운 것, 빈 곳은 0).
+/// 깊이 모델을 기다리는 동안 위치만 잡은 장면을 새 기준으로 쓰려고(깊이가 늦게 와도 기준이 오래되지 않게).
+pub fn warp_depth(src: &[f32], w: usize, h: usize, k: [f64; 4], r: &M3, t: &V3) -> Vec<f32> {
+    let (fx, fy, cx, cy) = (k[0], k[1], k[2], k[3]);
+    let mut dst = vec![f32::MAX; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let z = src[y * w + x] as f64;
+            if !(0.05..8.0).contains(&z) {
+                continue;
+            }
+            let p1 = add(&mv(r, &[(x as f64 - cx) / fx * z, (y as f64 - cy) / fy * z, z]), t);
+            if p1[2] < 0.05 {
+                continue;
+            }
+            let (u, v) = ((fx * p1[0] / p1[2] + cx).round(), (fy * p1[1] / p1[2] + cy).round());
+            if u < 0.0 || v < 0.0 || u >= w as f64 || v >= h as f64 {
+                continue;
+            }
+            let i = v as usize * w + u as usize;
+            dst[i] = dst[i].min(p1[2] as f32);
+        }
+    }
+    for d in dst.iter_mut() {
+        if *d == f32::MAX {
+            *d = 0.0;
+        }
+    }
+    dst
 }

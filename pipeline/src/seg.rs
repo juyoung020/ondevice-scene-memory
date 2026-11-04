@@ -150,25 +150,29 @@ impl Square {
             self.lut_ay = axis(h);
         }
         let mut buf = vec![0u8; s * s * 3];
-        for (d, &o) in buf.chunks_exact_mut(3).zip(&self.lut_in) {
-            let o = o as usize;
-            d.copy_from_slice(&rgb[o..o + 3]);
-        }
+        // 줄마다 상주 스레드 풀에서(보드 모델 스레드의 CPU 일)
+        use rayon::prelude::*;
+        buf.par_chunks_mut(s * 3).zip(self.lut_in.par_chunks(s)).for_each(|(row, lut)| {
+            for (d, &o) in row.chunks_exact_mut(3).zip(lut) {
+                let o = o as usize;
+                d.copy_from_slice(&rgb[o..o + 3]);
+            }
+        });
         buf
     }
     /// s² 결과 → w×h(쌍선형)
     pub fn back(&self, d: &[f32]) -> Vec<f32> {
         let (s, (w, h)) = (self.s, self.wh);
         let mut out = vec![0f32; w * h];
-        for (v, &(y0, y1, ay)) in self.lut_ay.iter().enumerate() {
+        use rayon::prelude::*;
+        out.par_chunks_mut(w).zip(self.lut_ay.par_iter()).for_each(|(row, &(y0, y1, ay))| {
             let (r0, r1) = (&d[y0 as usize * s..y0 as usize * s + s], &d[y1 as usize * s..y1 as usize * s + s]);
-            let row = &mut out[v * w..v * w + w];
             for (o, &(x0, x1, ax)) in row.iter_mut().zip(&self.lut_ax) {
                 let top = r0[x0 as usize] + (r0[x1 as usize] - r0[x0 as usize]) * ax;
                 let bot = r1[x0 as usize] + (r1[x1 as usize] - r1[x0 as usize]) * ax;
                 *o = top + (bot - top) * ay;
             }
-        }
+        });
         out
     }
 }

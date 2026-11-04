@@ -49,7 +49,8 @@ struct Args {
     npu_par: bool,
     sp_every: usize,
     fast_pose: bool,   // 모든 장면은 위치만 먼저 추적, 깊이·분할은 따로(카메라: 모델이 쉬는 대로 최신 장면에)
-    depth_every: usize, // --fast-pose 로 TUM 을 돌릴 때 깊이 장면 간격 // SuperPoint 는 N 장마다(사이 장면은 RGB-D 직접 방식으로 위치)
+    depth_every: usize, // --fast-pose 로 TUM 을 돌릴 때 깊이 장면 간격
+    depth_lag: usize,   // --fast-pose 로 TUM 을 돌릴 때 깊이 장면을 위치만 추적 장면 몇 장 뒤에 넣을지(보드의 모델 지연 흉내) // SuperPoint 는 N 장마다(사이 장면은 RGB-D 직접 방식으로 위치)
     scene_vox: f64,
     max_depth: f64,
     scene_step: usize, // 3D 지도에 쓸 화소 간격
@@ -84,6 +85,7 @@ fn args() -> Args {
         sp_every: get("--sp-every").map_or(1, |s| s.parse().unwrap()),
         fast_pose: v.iter().any(|x| x == "--fast-pose"),
         depth_every: get("--depth-every").map_or(3, |s| s.parse().unwrap()),
+        depth_lag: get("--depth-lag").map_or(0, |s| s.parse().unwrap()),
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
@@ -337,7 +339,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let worker = {
         let seq = seq.clone();
         let (every, conf, live, no_skip, seg_every, npu_par, sp_every) = (a.every, a.conf, a.live, a.no_skip, a.seg_every.max(1), a.npu_par, a.sp_every.max(1));
-        let (fast_pose, depth_every) = (a.fast_pose, a.depth_every.max(1));
+        let (fast_pose, depth_every, depth_lag) = (a.fast_pose, a.depth_every.max(1), a.depth_lag);
         let mut dnet = make_depth(&a.depth);
         // --fast-pose 는 위치를 모두 직접 방식으로 구하니 SuperPoint 는 돌리지 않는다(NPU 작업 하나 줄임)
         let mut spnet = (a.vo && !a.dvo && !a.fast_pose).then(|| make_sp(&a.sp));
@@ -374,7 +376,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // --fast-pose: 모델(깊이·분할)은 따로 스레드에서 쉬는 대로 가장 새 장면에 돌리고, 모든 장면은 먼저 위치 추적용으로 본 루프에 보낸다
                 // (모델을 기다리는 동안 들어온 카메라 장면도 위치에 쓴다 → 손카메라가 카메라 속도로 움직이고 큰 움직임에도 덜 놓친다)
                 let mut seg_slot = Some(seg);
-                let model = fast_pose.then(|| {
+                let rec_sim = matches!(src, Src::Rec(_)) && live == 0.0;
+                let mut nfp = 0usize;
+                // 녹화를 최대 속도로 돌릴 땐(rec_sim) 모델을 작업 스레드에서 차례대로(TUM 흉내와 같게: 깊이가 다음 장면보다 먼저 도착)
+                let model = (fast_pose && !rec_sim).then(|| {
                     let (jtx, jrx) = std::sync::mpsc::sync_channel::<(f64, Vec<u8>)>(0);
                     let tx2 = tx.clone();
                     let mut seg = seg_slot.take().unwrap();
@@ -434,6 +439,17 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         let _ = jtx.try_send((t, rgb));
                         continue;
                     }
+                    if fast_pose {
+                        // 녹화 최대 속도: 위치만 추적 장면을 먼저, depth_every 장마다 아래에서 모델까지
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true };
+                        if tx.send(f).is_err() {
+                            break;
+                        }
+                        nfp += 1;
+                        if (nfp - 1) % depth_every != 0 {
+                            continue;
+                        }
+                    }
                     // 모델 셋은 차례대로: 한 프로세스에서 NPU 에 동시에 던지면 DX-M1 DMA 쓰기 오류로 PCIe 링크가 내려갔다(2026-11-04)
                     // 물체 분할은 N 장마다(위치에는 깊이·특징점만 필요 → 위치를 더 자주 갱신)
                     nf += 1;
@@ -451,7 +467,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     return hd.join().unwrap();
                 }
                 return seg_slot.unwrap();
-            }            for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
+            }
+            let mut lagged: std::collections::VecDeque<(usize, Frame)> = Default::default();
+            let mut n_to = 0usize;
+            for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
                 if fi % every != 0 {
                     continue;
                 }
@@ -484,6 +503,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     if tx.send(f).is_err() {
                         break;
                     }
+                    // --depth-lag: 깊이 장면을 위치만 추적 장면 N 장 뒤에 내보냄(보드처럼 깊이가 늦게 도착)
+                    n_to += 1;
+                    while lagged.front().is_some_and(|(due, _)| *due <= n_to) {
+                        if tx.send(lagged.pop_front().unwrap().1).is_err() {
+                            break;
+                        }
+                    }
                     if fi / every % depth_every != 0 {
                         continue;
                     }
@@ -505,6 +531,15 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 };
                 let c2 = Instant::now();
                 let f = Frame { t, p, r, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false };
+                if fast_pose && depth_lag > 0 {
+                    lagged.push_back((n_to + depth_lag, f));
+                    continue;
+                }
+                if tx.send(f).is_err() {
+                    break;
+                }
+            }
+            for (_, f) in lagged {
                 if tx.send(f).is_err() {
                     break;
                 }
@@ -589,10 +624,16 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut fast_hist: std::collections::VecDeque<(f64, M3, V3, bool)> = Default::default();
     let mut last_z0v = 0.0; // 마지막 깊이 장면의 바닥 기준 높이(위치만 추적한 장면의 pose.json 용)
     let mut n_fast = 0u32;
+    // --fast-pose 기준 장면은 8 cm·5° 넘게 움직였을 때만 바꿈(깊이 전파도 같은 문턱): 보드 흉내 사무실 0.80 → 0.67 m, 책상 0.33 → 0.31 m,
+    // 12 cm·8° 는 빠른 움직임에서 실패가 생김(책상 0 → 10–28 회)
+    let (kf_t, kf_r) = (0.08f64, 5.0f64);
+    let mut dvo_ref_t = f64::MIN; // 기준 장면 시각
+    let prop = true; // 깊이 전파(위치만 잡은 장면을 옮긴 깊이와 함께 새 기준으로): 깊이가 2–3 장 늦게 올 때 책상 0.70 → 0.41 m, 실패 36 → 0
+    let mut fast_rel: (M3, V3) = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]); // 위치만 추적한 직전 두 장면 사이 움직임(앞 → 이번 카메라)
     let mut t_fast = 0.0f64; // 위치만 추적한 장면에 쓴 시간(본 스레드)
     let mut dvo_rel: (M3, V3) = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]); // 직전 장면 사이 움직임
-    // 직접 방식: 5 단계 피라미드(큰 움직임), 시작값 둘(움직임 없음 / 직전 움직임) 중 나은 쪽 → TUM 책상 Kinect 0.333 → 0.092 m, 실패 13 → 0
-    let (dvo_dual, dvo_levels) = (true, 5usize);
+    // 직접 방식: 6 단계 피라미드(20×15 까지, 큰 움직임), 시작값은 움직임 없음 → 안 되면 직전 움직임 → TUM 책상 Kinect 0.333 → 0.11 m, 실패 13 → 0
+    let (dvo_dual, dvo_levels) = (true, 6usize);
     let dvo_minlv = if a.depth == "kinect" { 0 } else { 1 }; // 딥러닝 깊이는 640×480 단계 생략(정확도 같고 40 % 빠름)
     let mut vo_dvo = 0u32; // 직접 방식으로 메운 장면 수
     let mut leveled = a.cam.is_none() || !a.vo;
@@ -604,7 +645,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         if track_only {
             if let (Some((rp, rd)), Some((rk, pk)), Some((r0, p0))) = (&dvo_prev, dvo_ref_pose, vo_pose) {
                 let dt = vo_last_t.map(|t0| (t - t0).clamp(0.0, 1.0)).unwrap_or(0.0);
-                let pyr = dvo::pyramid(&rgb, w, h, dvo_levels);
+                let pyr = dvo::pyramid(&rgb, w, h, dvo_levels, dvo_minlv);
                 let rel = |rc: &M3, pc: &V3| (mm(&tr(rc), &rk), mv(&tr(rc), &sub(&pk, pc)));
                 let to_pose = |b: &(M3, V3, usize, f64, f64)| {
                     let r1 = mm(&rk, &tr(&b.0));
@@ -614,13 +655,21 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 손으로 들고는 불가능한 움직임(2 m/s, 180°/s 초과)이면 버림
                 let dd = dt.max(0.03);
                 let sane = |q: &(M3, V3)| norm(&sub(&q.1, &p0)) <= 0.05 + 2.0 * dd && rot_angle(&r0, &q.0) <= (10.0 + 180.0 * dd).to_radians();
-                // 시작값: 직전 자세 그대로(등속 예측을 먼저 쓰면 한 번 틀린 뒤 계속 엇나갔다), 안 맞으면 등속 예측으로도
                 // 시작값: 기준 장면 그대로(움직임 없음)에서 먼저. 직전 자세에서 시작하면 사이 장면 하나가 틀릴 때 그 오차가 이어져 쌓였다.
                 // 실패하거나 불가능한 움직임이면 직전 자세에서 한 번 더(움직임이 커서 기준 그대로에서는 못 찾을 때)
                 let i3 = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]);
                 let b1 = dvo::track(rp, rd, &pyr, &[], seq.k, i3, dvo_minlv);
                 let b2 = if b1.as_ref().is_none_or(|b| !sane(&to_pose(b))) { dvo::track(rp, rd, &pyr, &[], seq.k, rel(&r0, &p0), dvo_minlv) } else { None };
-                let best = [b1, b2].into_iter().flatten().map(|b| (to_pose(&b), b.3)).filter(|(q, _)| sane(q)).min_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+                // 둘 다 안 되면 직전 움직임을 그대로 이어 간 자세(등속)에서: 장면 간격이 길어(녹화 0.1–0.2 초) 움직임이 클 때
+                let ok12 = [&b1, &b2].into_iter().flatten().any(|b| sane(&to_pose(b)));
+                let b3 = if ok12 {
+                    None
+                } else {
+                    let rp1 = mm(&r0, &tr(&fast_rel.0));
+                    let pp1 = sub(&p0, &mv(&rp1, &fast_rel.1));
+                    dvo::track(rp, rd, &pyr, &[], seq.k, rel(&rp1, &pp1), dvo_minlv)
+                };
+                let best = [b1, b2, b3].into_iter().flatten().map(|b| (to_pose(&b), b.3)).filter(|(q, _)| sane(q)).min_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
                 let ok = best.is_some();
                 match best {
                     Some(((r1, p1), _)) => {
@@ -629,6 +678,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             let s = 2.0 / norm(&v).max(2.0);
                             vo_vel = [0, 1, 2].map(|k| 0.5 * vo_vel[k] + 0.5 * v[k] * s);
                         }
+                        fast_rel = (mm(&tr(&r1), &r0), mv(&tr(&r1), &sub(&p0, &p1)));
                         vo_pose = Some((r1, p1));
                     }
                     None => {
@@ -638,6 +688,15 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     }
                 }
                 let (r1, p1) = vo_pose.unwrap();
+                // 깊이 전파: 기준에서 kf_t·kf_r 넘게 움직였으면 이 장면을 새 기준으로(기준 깊이를 이 장면으로 옮겨 붙임).
+                // 깊이 모델이 늦게 와도 기준이 오래되지 않아 큰 움직임을 덜 놓친다
+                if ok && prop && (norm(&sub(&p1, &pk)) > kf_t || rot_angle(&rk, &r1) > kf_r.to_radians()) {
+                    let (rr, tt) = (mm(&tr(&r1), &rk), mv(&tr(&r1), &sub(&pk, &p1)));
+                    let wd = dvo::warp_depth(rd, w, h, seq.k, &rr, &tt);
+                    dvo_prev = Some((pyr, wd));
+                    dvo_ref_pose = Some((r1, p1));
+                    dvo_ref_t = t;
+                }
                 fast_hist.push_back((t, r1, p1, ok));
                 if fast_hist.len() > 64 {
                     fast_hist.pop_front();
@@ -667,10 +726,26 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     *d *= sc;
                 }
             }
-            // 실패한 장면도 새 기준으로(예측 위치로라도 이어 가야 다음 장면이 다시 맞춰진다 — 앞 장면 방식과 같음)
-            dvo_prev = Some((dvo::pyramid(&rgb, w, h, dvo_levels), depth.clone()));
-            dvo_ref_pose = Some((r, p));
+            // 기준 바꾸기: 기준에서 충분히 움직였거나(kf_t m·kf_r °) 위치를 놓쳤으면 이 장면을 새 기준으로. 천천히 움직이면 같은 기준을 오래 써 오차가 덜 쌓인다
+            let moved = dvo_ref_pose.is_none_or(|(rk, pk)| norm(&sub(&p, &pk)) > kf_t || rot_angle(&rk, &r) > kf_r.to_radians());
+            if prop && hok && t <= dvo_ref_t {
+                // 기준이 이미 더 새 장면(깊이 전파): 이번 진짜 깊이를 그 기준으로 옮겨 기준 깊이를 바꿈
+                if let (Some((rp, _)), Some((rk, pk))) = (dvo_prev.take(), dvo_ref_pose) {
+                    let (rr, tt) = (mm(&tr(&rk), &r), mv(&tr(&rk), &sub(&p, &pk)));
+                    dvo_prev = Some((rp, dvo::warp_depth(&depth, w, h, seq.k, &rr, &tt)));
+                }
+            } else if !hok || moved || dvo_prev.is_none() {
+                dvo_ref_t = t;
+                dvo_prev = Some((dvo::pyramid(&rgb, w, h, dvo_levels, dvo_minlv), depth.clone()));
+                dvo_ref_pose = Some((r, p));
+            }
         } else if a.vo {
+            // --fast-pose 에서 위치 기록 없이 늦게 온 깊이 장면(시작 직후 등): 기준 장면 자세에서 이어 풀고, 최신 추적 상태(자세·속도·시각)는 되돌려 둔다
+            let rewind = a.fast_pose && vo_last_t.is_some_and(|lt| lt > t);
+            let saved = (vo_pose, vo_vel, vo_last_t, dvo_rel);
+            if rewind {
+                vo_pose = dvo_ref_pose.or(vo_pose);
+            }
             let prev_pose = vo_pose;
             // 등속 예측: 직전 위치 + 속도 × 시간(IMU 없이 쓰는 움직임 사전 지식)
             let dt = vo_last_t.map(|t0| (t - t0).clamp(0.0, 1.0)).unwrap_or(0.0);
@@ -697,7 +772,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             // RGB-D 직접 방식(DVO): --pose dvo 면 이것만, 아니면 특징점이 실패한 장면을 메운다(무늬 적은 장면·흐린 장면)
-            let pyr = dvo::pyramid(&rgb, w, h, dvo_levels);
+            let pyr = dvo::pyramid(&rgb, w, h, dvo_levels, dvo_minlv);
             let mut dvo_used = false;
             if est.is_none() {
                 if let (Some((pp, pd)), Some((r0, p0))) = (&dvo_prev, vo_pose) {
@@ -708,8 +783,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let i3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
                     let sane = |b: &(M3, V3, usize, f64, f64)| norm(&b.1) <= 0.05 + 2.0 * dd && rot_angle(&b.0, &i3) <= (10.0 + 180.0 * dd).to_radians();
                     let b1 = dvo::track(pp, pd, &pyr, &depth, seq.k, id3, dvo_minlv);
-                    // 밝기 오차가 크거나, 실패했거나, 불가능한 움직임으로 나왔으면 '직전 움직임'으로도 풀어 본다
-                    let b2 = if dvo_dual && b1.as_ref().is_none_or(|b| b.3 > 0.05 || !sane(b)) { dvo::track(pp, pd, &pyr, &depth, seq.k, dvo_rel, dvo_minlv) } else { None };
+                    // 실패했거나 불가능한 움직임으로 나왔을 때만 '직전 움직임'으로도 풀어 본다(밝기 오차로 둘을 견주면 사무실 15 장 간격 0.91 → 1.16 m 로 나빴다)
+                    let b2 = if dvo_dual && b1.as_ref().is_none_or(|b| !sane(b)) { dvo::track(pp, pd, &pyr, &depth, seq.k, dvo_rel, dvo_minlv) } else { None };
                     let any = b1.is_some() || b2.is_some();
                     let best = [b1, b2].into_iter().flatten().filter(|b| sane(b)).min_by(|x, y| x.3.partial_cmp(&y.3).unwrap());
                     if let Some((rr, tt, n, _, sc)) = best {
@@ -784,11 +859,16 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             }
             dvo_prev = Some((pyr, depth.clone()));
             dvo_ref_pose = vo_pose;
+            dvo_ref_t = t;
             vo_last_t = Some(t);
             let (r2, p2) = vo_pose.unwrap();
             r = r2;
             p = p2;
             ate.push((p, p_gt));
+            if rewind {
+                ate.pop();
+                (vo_pose, vo_vel, vo_last_t, dvo_rel) = saved;
+            }
         }        // 딥러닝 깊이 배율: 두 장면 삼각측량(포즈를 알 때)으로 실제 거리를 재서 맞춘다(scale.rs). 최근 5 개 중앙값으로 평활.
         let mut s_fix = 1.0;
         if a.depth != "kinect" && !a.vo {
@@ -1065,7 +1145,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             let crop = Crop { w: bw as u32, h: bh as u32, rgb: crgb, mask: m.iter().map(|&b| if b { 255 } else { 0 }).collect(), depth: cdep };
-            let id = mem.update(name, d.score, &pts, med as f32, t, Some(crop));
+            let id = mem.update(name, d.score, &pts, med as f32, t, Some(crop), (a.depth != "kinect").then_some(pwc));
             seen.insert(id);
         }
         if dets.is_some() && map_ok {
@@ -1082,12 +1162,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         nkf += 1;
         // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(뷰어가 0.1 초마다 받아 손카메라를 바로 움직임),
         // 지도·물체·그래프(view.json)는 0.4 초마다
-        if a.live > 0.0 {
+        // --fast-pose 는 위치만 추적한 장면이 이미 더 새 위치를 썼으니 늦게 온 깊이 장면은 쓰지 않음(손카메라가 뒤로 튀지 않게)
+        if a.live > 0.0 && !a.fast_pose {
             out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": !a.vo || vo_ok}).to_string().as_bytes());
         }
         let write_now = if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= 0.4 || nkf == 1 } else { nkf % 5 == 0 || nkf == 1 } || a.snaps.contains(&nkf);
         if !write_now && nkf >= last_merge + 15 {
             last_merge = nkf;
+            mem.prune(t);
             mem.merge_pass();
         }
         if write_now {
@@ -1168,6 +1250,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
 fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])], stamp: f64, pose: [f64; 3],
               cam: &serde_json::Value, scene: &serde_json::Value, merge: bool) {
     if merge {
+        mem.prune(stamp);
         mem.merge_pass();
     }
     let gi = grid.image();

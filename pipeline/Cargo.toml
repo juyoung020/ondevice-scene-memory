@@ -25,3 +25,7 @@ cam = ["dep:v4l"]
 name = "onnx_info"
 path = "src/bin/onnx_info.rs"
 required-features = ["onnx"]
+
+[profile.release]
+# 크레이트마다 한 덩어리로 최적화: 인라인이 코드 배치에 따라 달라지지 않게(PC 분할 단계가 빌드마다 1 ms 넘게 흔들렸다)
+codegen-units = 1

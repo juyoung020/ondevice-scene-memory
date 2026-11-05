@@ -2,6 +2,7 @@
 //!
 //!   memmap --tum data/tum/<seq> --out data/memory/<name> [--seg models/yolo26s-seg.onnx] [--every 5] [--conf 0.35]
 //!          [--live 1] [--no-skip] [--loop] [--scene-every 10] [--snaps 150,500]
+//!   rtab_bridge ... | memmap --stream - --out <dir> ...   (위치·컬러·깊이를 연결 프로그램 bridge/ 에서 받음, docs/bridge.md)
 //!
 //! 지도·트래커는 누적식(maps.rs): 키프레임마다 새 점만 해시 칸에 더하고, 기록은 칸을 한 번 훑기만 한다.
 //! 깊이는 1 단계로 TUM Kinect 실측을 쓴다(딥러닝 깊이는 다음 단계).
@@ -15,6 +16,7 @@ mod out;
 mod rec;
 mod scale;
 mod seg;
+mod stream;
 mod tsdf;
 mod vo;
 mod tum;
@@ -57,6 +59,8 @@ struct Args {
     scene_step: usize, // 3D 지도에 쓸 화소 간격
     surface: bool,     // --surface: 점 대신 표면 지도(TSDF + Surface Nets)
     tsdf_vox: f64,
+    stream: Option<String>, // --stream <파일|->: 연결 프로그램(bridge/)이 보내는 장면 스트림(위치·컬러·깊이)
+    no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
 }
 
 fn args() -> Args {
@@ -94,6 +98,8 @@ fn args() -> Args {
         surface: v.iter().any(|x| x == "--surface"),
         // 표면 칸 3 cm: 칸마다 측정이 더 모여 D435 깊이 잡음에도 면이 이어짐(2 cm 는 바닥·벽이 얼룩), 작은 물체(키보드·마우스)는 그대로
         tsdf_vox: get("--tsdf-vox").map_or(0.03, |s| s.parse().unwrap()),
+        stream: get("--stream"),
+        no_level: v.iter().any(|x| x == "--no-level"),
     }
 }
 
@@ -305,11 +311,20 @@ struct Frame {
     scale: f64, // 딥러닝 깊이 / Kinect 중앙값(비교용, Kinect 깊이를 쓸 땐 NaN)
     feat: Option<vo::Feat>,
     track_only: bool, // 깊이·분할 없이 위치만 추적하는 장면(--fast-pose)
+    lost: bool,       // 스트림 입력에서 위치를 놓친 장면(지도·물체에 넣지 않음)
 }
 
 fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter + Send> {
-    // 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
-    let seq = if a.cam.is_some() { tum::Tum::empty(a.k.unwrap_or([477.0, 477.0, 320.0, 240.0])) } else { tum::Tum::open(&a.tum, a.gt.as_deref().map(Path::new)) };
+    // 스트림 입력이면 첫 장면의 보정값, 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
+    let mut stream_rd = a.stream.as_deref().map(stream::StreamReader::open);
+    let stream_first = stream_rd.as_mut().map(|r| r.next().expect("--stream: 장면이 하나도 오지 않음"));
+    let seq = if let Some(f) = &stream_first {
+        tum::Tum::empty(f.k)
+    } else if a.cam.is_some() {
+        tum::Tum::empty(a.k.unwrap_or([477.0, 477.0, 320.0, 240.0]))
+    } else {
+        tum::Tum::open(&a.tum, a.gt.as_deref().map(Path::new))
+    };
     std::fs::create_dir_all(a.out.join("objects")).unwrap();
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
@@ -351,6 +366,38 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let rec_dir = a.rec.clone();
         std::thread::spawn(move || {
             let mut seg = seg;
+            if let (Some(mut rd), Some(first)) = (stream_rd, stream_first) {
+                // 장면 스트림(bridge/): 위치·깊이는 받은 그대로, 분할만 여기서. --every N 장마다, 위치를 놓친 장면은 모델 없이 표시만 넘김
+                let k0 = first.k;
+                let (mut next, mut n, mut read_s, mut n_corr) = (Some(first), 0usize, 0.0f64, 0u32);
+                while let Some(sf) = next.take() {
+                    // 지도 보정이 바뀐 장면(루프 클로저): 지난 장면 위치는 그대로 두고 이후 장면만 새 보정으로 들어온다
+                    n_corr += (sf.flags & stream::MAP_CORRECTED != 0) as u32;
+                    if n % every == 0 {
+                        if sf.k != k0 {
+                            eprintln!("스트림 장면 {}: 보정값이 바뀜 {:?} → {:?}(처음 값으로 계속)", sf.seq, k0, sf.k);
+                        }
+                        let c1 = Instant::now();
+                        let (w, h, lost) = (sf.w, sf.h, sf.lost());
+                        if sf.flags & stream::NEW_MAP != 0 {
+                            eprintln!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
+                        }
+                        let depth_m = sf.depth_m();
+                        let (pd, dets, feat) = if lost { (None, None, None) } else { run_models(&mut dnet, &mut seg, &mut spnet, &sf.rgb, w, h, conf, true, npu_par, true) };
+                        let depth = pd.unwrap_or(depth_m);
+                        let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: sf.rgb, w, h, depth, dets, load: read_s, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost };
+                        if tx.send(f).is_err() {
+                            break;
+                        }
+                    }
+                    n += 1;
+                    let c0 = Instant::now();
+                    next = rd.next();
+                    read_s = c0.elapsed().as_secs_f64();
+                }
+                eprintln!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번");
+                return seg;
+            }
             if let Some(cp) = cam_path {
                 // 카메라(장치) 또는 녹화 폴더: 깊이·분할·특징점 모두 모델, 위치는 vo 가 만든다(첫 장면: 수평으로 앞을 봄, 높이 1.3 m)
                 enum Src {
@@ -396,7 +443,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             nj += 1;
                             let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, (nj - 1) % seg_every == 0, npu_par, (nj - 1) % sp_every == 0);
                             let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
-                            let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: 0.0, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false };
+                            let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: 0.0, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false };
                             if tx2.send(f).is_err() {
                                 break;
                             }
@@ -436,7 +483,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let c1 = Instant::now();
                     if let Some((jtx, _)) = &model {
                         // 위치만 추적하는 장면으로 먼저 보내고(같은 장면의 깊이 결과보다 앞서 도착), 모델이 쉬고 있으면 이 장면을 맡긴다
-                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true };
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false };
                         if tx.send(f).is_err() {
                             break;
                         }
@@ -445,7 +492,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     }
                     if fast_pose {
                         // 녹화 최대 속도: 위치만 추적 장면을 먼저, depth_every 장마다 아래에서 모델까지
-                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true };
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false };
                         if tx.send(f).is_err() {
                             break;
                         }
@@ -461,7 +508,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let (pd, dets, feat) = run_models(&mut dnet, seg_slot.as_mut().unwrap(), &mut spnet, &rgb, w, h, conf, do_seg, npu_par, (nf - 1) % sp_every == 0);
                     let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
                     let c2 = Instant::now();
-                    let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat, track_only: false };
+                    let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false };
                     if tx.send(f).is_err() {
                         break;
                     }
@@ -503,7 +550,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let rgb = img.into_raw();
                 if fast_pose {
                     // 실시간과 같게: 모든 장면은 먼저 위치만 추적, 깊이·분할은 depth_every 장마다
-                    let f = Frame { t, p, r, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: 0.0, seg: 0.0, scale: f64::NAN, feat: None, track_only: true };
+                    let f = Frame { t, p, r, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: 0.0, seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false };
                     if tx.send(f).is_err() {
                         break;
                     }
@@ -534,7 +581,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     None => (kin, f64::NAN),
                 };
                 let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false };
+                let f = Frame { t, p, r, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false, lost: false };
                 if fast_pose && depth_lag > 0 {
                     lagged.push_back((n_to + depth_lag, f));
                     continue;
@@ -641,8 +688,23 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (dvo_dual, dvo_levels) = (true, 6usize);
     let dvo_minlv = if a.depth == "kinect" { 0 } else { 1 }; // 딥러닝 깊이는 640×480 단계 생략(정확도 같고 40 % 빠름)
     let mut vo_dvo = 0u32; // 직접 방식으로 메운 장면 수
-    let mut leveled = a.cam.is_none() || !a.vo;
-    while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only }) = rx.recv() {
+    // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
+    let mut leveled = if a.stream.is_some() { a.no_level } else { a.cam.is_none() || !a.vo };
+    let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
+    let (mut stream_lost, mut map_traj) = (0u32, Vec::<(f64, V3, M3)>::new()); // map_traj: 지도에 넣은 장면의 카메라 위치(메쉬 좌표) → poses_map.txt
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost }) = rx.recv() {
+        if lost {
+            stream_lost += 1;
+            if a.live > 0.0 {
+                // 뷰어: 마지막 위치 그대로, 놓침 표시(손카메라 빨간색)
+                out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false}).to_string().as_bytes());
+            }
+            continue;
+        }
+        if a.stream.is_some() {
+            r = mm(&stream_fix, &r);
+            p = mv(&stream_fix, &p);
+        }
         let c_vo = Instant::now();
         let (p_gt, _r_gt) = (p, r);
         // 위치만 추적하는 장면(--fast-pose): 깊이 모델을 기다리지 않고 마지막 깊이 장면(기준)에 맞춰 위치만 갱신 → 손카메라가 카메라 속도로 움직이고,
@@ -974,7 +1036,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 vo_last = vo_ok.then(|| VoRef { f, lm, r, p });
             }
         }        // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
-        if !leveled && vo_ok {
+        if !leveled && (vo_ok || a.stream.is_some()) {
             if let Some(n) = up_normal(&depth, w, h, seq.k, &r) {
                 grav_obs.push(n);
             }
@@ -1011,12 +1073,16 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         (hh.1, hh.2) = rot((hh.1, hh.2));
                     }
                     vo_vel = mv(&fix, &vo_vel);
+                    stream_fix = mm(&fix, &stream_fix);
                     leveled = true;
                     eprintln!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
                 } else if grav_obs.len() > 60 {
                     grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
                 }
             }
+        }
+        if a.stream.is_some() && leveled {
+            est_traj.push((t, p, r));
         }
         let c2 = Instant::now();
         clock.load += load;        clock.seg += seg_s;
@@ -1072,6 +1138,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let map_ok = (!a.vo || vo_ok) && leveled;
         if map_ok {
             grid.add((pwc[0], pwc[1]), &occ, &flo);
+            map_traj.push((t, pwc, r));
         }
         // 점 지도용 3D 점: 줄마다 나눠 상주 스레드 풀에서(표면 지도면 TSDF 가 깊이를 직접 쓰니 건너뜀)
         let sp: Vec<(V3, [u8; 3], f32)> = if a.surface || !map_ok {
@@ -1239,6 +1306,15 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         let _ = std::fs::write(a.out.join("poses_est.txt"), s);
     }
+    // 지도에 넣은 장면의 카메라 위치(메쉬·view.json 좌표, 바닥 높이 맞춘 뒤): 다른 실행과 표면을 맞대 볼 때(surfcmp --align)
+    if !map_traj.is_empty() {
+        let mut s = String::from("# timestamp x y z qx qy qz qw (OpenCV 카메라 → 지도, 메쉬 좌표)\n");
+        for (t, p, r) in &map_traj {
+            let q = quat_of(r);
+            s += &format!("{t:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}\n", p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
+        }
+        let _ = std::fs::write(a.out.join("poses_map.txt"), s);
+    }
     let seg = worker.join().expect("worker");
     let pts = scene.new_points();
     if !pts.is_empty() {
@@ -1262,9 +1338,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     for o in &mem.objs {
         *by.entry(o.name.as_str()).or_default() += 1;
     }
-    println!("{}", json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
+    let mut summary = json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
         "scene_points": pts.len(), "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
-        "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "pose_only_frames": n_fast, "pose_only_ms": t_fast / (n_fast.max(1) as f64) * 1e3, "merged": mem.merged}));
+        "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "pose_only_frames": n_fast, "pose_only_ms": t_fast / (n_fast.max(1) as f64) * 1e3, "merged": mem.merged});
+    if a.stream.is_some() {
+        summary["stream_lost"] = json!(stream_lost);
+    }
+    println!("{summary}");
     seg
 }
 

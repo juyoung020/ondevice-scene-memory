@@ -1,6 +1,10 @@
 //! 두 표면 지도(mesh/r_*.ply 폴더)의 거리: A 의 꼭짓점마다 B 의 가장 가까운 꼭짓점까지 거리.
-//!   surfcmp <A 기억 폴더> <B(기준) 기억 폴더>
+//!   surfcmp <A 기억 폴더> <B(기준) 기억 폴더> [--align]
 //! 출력: 평균·중앙값·90 %·5 cm 안 비율·10 cm 안 비율(10 cm 밖 꼭짓점은 '기준에 없는 면'으로 따로 셈).
+//! --align: 두 폴더의 poses_map.txt(지도에 넣은 카메라 위치)를 시각으로 짝지어 A 를 B 좌표로 옮긴 뒤 잼
+//!          (세계 좌표 잡는 법이 다른 실행끼리: 예 스트림 입력(바닥 합의) 대 오프라인 위치 파일(경로 평면)).
+#[path = "../horn.rs"]
+mod horn;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -24,7 +28,20 @@ fn load(dir: &Path) -> Vec<[f32; 3]> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (pa, pb) = (load(Path::new(&a[1])), load(Path::new(&a[2])));
+    let (mut pa, pb) = (load(Path::new(&a[1])), load(Path::new(&a[2])));
+    if a.iter().any(|x| x == "--align") {
+        let tr = |d: &str| horn::read_tum(&Path::new(d).join("poses_map.txt").to_string_lossy());
+        let (ea, eb) = (tr(&a[1]), tr(&a[2]));
+        let pairs: Vec<_> = horn::pair_by_time(&ea, &eb, 0.02).into_iter().map(|(i, j)| (ea[i].1, eb[j].1)).collect();
+        assert!(pairs.len() >= 3, "--align: 시각이 맞는 위치 짝이 3 개 미만");
+        let (r, ce, cg) = horn::horn(&pairs);
+        let rms = (pairs.iter().map(|(e, g)| { let d = horn::apply(&r, &ce, &cg, e); (0..3).map(|k| (d[k] - g[k]).powi(2)).sum::<f64>() }).sum::<f64>() / pairs.len() as f64).sqrt();
+        eprintln!("맞춤: 카메라 위치 짝 {} 개, 맞춘 뒤 위치 차이 RMSE {:.4} m", pairs.len(), rms);
+        for p in pa.iter_mut() {
+            let q = horn::apply(&r, &ce, &cg, &[p[0] as f64, p[1] as f64, p[2] as f64]);
+            *p = [q[0] as f32, q[1] as f32, q[2] as f32];
+        }
+    }
     let cell = 0.05f32;
     let key = |p: &[f32; 3]| ((p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32, (p[2] / cell).floor() as i32);
     let mut grid: HashMap<(i32, i32, i32), Vec<[f32; 3]>> = HashMap::new();

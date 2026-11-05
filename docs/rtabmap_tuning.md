@@ -5,6 +5,7 @@
 ## 측정 조건
 
 - PC: Ryzen 9 9950X, 프로세스를 논리 코어 하나에 묶고 우선순위 높음. RTAB-Map 0.24.2(Windows) `rtabmap-rgbd_dataset`, 모든 실행에 `Rtabmap/DetectionRate 1`(지도 갱신 1 초에 1 번).
+- 이 실행 파일의 기본 특징은 GFTT/BRIEF, 최적화기는 GTSAM 이다. Debian·Ubuntu 패키지로 빌드하면(보드) GFTT/ORB · g2o 가 되어 위치 오차가 달라진다: [board_bridge.md](board_bridge.md) "빌드마다 달라지는 RTAB-Map 기본값".
 - **위치 추적** = 출력 줄의 `odom=..ms`(장면마다), **지도 갱신** = `slam=..ms`(1 초에 1 번 도는 것만). 첫 장면은 뺌.
 - **위치 오차** = `ate`(Horn 정렬 후 RMSE). 두 가지:
   - 키프레임: 지도 노드(1 초에 1 개)의 최적화 위치. 복도는 정답과 짝이 15 개뿐이라 참고값.

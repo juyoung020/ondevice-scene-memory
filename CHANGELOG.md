@@ -9,6 +9,12 @@
 ### Added
 - 깊이→컬러 정렬 라이브러리 `bridge/align`(fast_align): librealsense `rs2::align` 과 화소 단위로 같은 결과를 줄 단위 여러 스레드로 냄(빠른 식·컬러 왜곡 적용 선택).
 - D455 도구 `d455_info`(보정값 JSON)·`d455_rec`(TUM 형식 녹화, rs2::align·fast_align 결과 함께)·`d455_align_check`(녹화로 정렬 비교)·`align_sdk_check`(카메라 없이 SDK 정렬과 비교)와 카메라 입력 문서 `docs/d455_input.md`.
+- 연결 프로그램 `bridge/`(C++): RealSense 카메라 또는 TUM 폴더 재생 → RTAB-Map 위치 → memmap 장면 스트림, 문서 `docs/bridge.md`.
+- memmap 장면 스트림 입력(`--stream`): 받은 위치·깊이로 지도·물체를 쌓고, 바닥 합의로 수평을 맞춤(`--no-level` 로 끔).
+- 모든 실행이 지도에 넣은 카메라 위치 `poses_map.txt` 를 남김.
+- `surfcmp --align`: 세계 좌표를 다르게 잡은 두 실행의 표면을 카메라 위치로 맞춰 비교.
+- `ate` 가 맞춘 뒤 카메라 자세 차이도 냄(카메라 축 약속 확인).
+- 보드(Debian 13 arm64)에 RTAB-Map·librealsense 소스 빌드 절차 `docs/board_bridge.md`.
 - RTAB-Map 보드용 설정 `docs/rtabmap_pi.ini`(위치 추적 PC 코어 하나 9.5 ms/장, 사무실 2.6 cm)과 조정 기록 `docs/rtabmap_tuning.md`.
 - Rust 파이프라인 `pipeline/`(memmap): 영상에서 3D 지도·물체 기억·씬그래프를 만든다.
 - 같은 코드가 PC(ONNX Runtime)와 보드(Pi5 + DX-M1 NPU)에서 돈다.

@@ -27,6 +27,7 @@
 - 기록은 바뀐 것만: 3D 지도는 새 칸만 조각 파일로, 물체 사진은 더 잘 보였을 때만, 물체 점 파일은 점이 5 % 넘게 늘었을 때만, 카메라 위치(pose.json)는 장면마다, 지도·물체 목록(view.json)은 0.4 초마다, 실시간 3D 지도 조각·표면은 1 초마다.
 - 병합 기준(HOV-SG·ConceptGraphs 방식): 4 cm 칸 IoU ≥ 0.5, 또는 작은 쪽 기준 겹침 ≥ 0.6 이면서 이름 투표 코사인 ≥ 0.5 이거나 색 히스토그램 코사인 ≥ 0.8.
 - 위치 추정과 지도 방법의 자세한 내용: [pose_and_map.md](pose_and_map.md).
+- RTAB-Map 위치를 장면마다 받는 연결 프로그램(`bridge/`, 깊이 카메라 → RTAB-Map → `memmap --stream`): [bridge.md](bridge.md), 보드 설치 [board_bridge.md](board_bridge.md).
 
 ## 폴더
 
@@ -39,6 +40,8 @@
 | `pipeline/src/dvo.rs` | 특징점 없는 RGB-D 직접 위치 추정 |
 | `pipeline/src/graph.rs` | 방 나누기·씬그래프 연결 |
 | `pipeline/src/seg.rs` | 모델 실행(ONNX·NPU) |
+| `pipeline/src/stream.rs` | 장면 스트림 입력(`--stream`, 연결 프로그램이 보냄) |
+| `bridge/` | 연결 프로그램 `rtab_bridge`(C++, RealSense·TUM → RTAB-Map → 장면 스트림) |
 | `viewer/sgview/` | 웹 뷰어(Rust 서버 + three.js) |
 | `train/ObjectSAM/` | 자체 분할 모델 학습기(C++/CUDA) |
 | `docs/` | 설계·측정 결과·평가 계획 |
@@ -49,4 +52,4 @@
 - 저장소 경로는 공백·한글 없이(`C:\ondevice`). DEEPX 도구가 이런 경로에서 깨진다.
 - 빌드 기능: PC `--features directml`(그래픽카드) 또는 기본(CPU), 보드 `--no-default-features --features dxrt,cam`.
 - 평가 표: `pipeline/target/release/bench [--quick]` — TUM 책상·사무실을 정해진 조건으로 돌려 위치 오차·실패·속도·물체 수를 한 표로(보드는 `--depth <.dxnn> --extra "--seg <.dxnn>"`). 표면 지도 비교: `surfcmp <A> <B>`.
-- 다른 카메라 RGB-D 를 TUM 형식으로: `rgbd2tum <원본> <출력(이름에 freiburg3)> fx fy cx cy <깊이 1 m 값>` — TUM fr3 보정값 640×480 으로 다시 그려 RTAB-Map `rtabmap-rgbd_dataset` 과 memmap 이 같이 읽음. 다른 SLAM 위치로 돌리기: `memmap --tum <폴더> --gt <위치 파일>`, 정렬 후 위치 오차: `ate <추정> <정답>`(memmap 은 `poses_est.txt` 를 남김).
+- 다른 카메라 RGB-D 를 TUM 형식으로: `rgbd2tum <원본> <출력(이름에 freiburg3)> fx fy cx cy <깊이 1 m 값>` — TUM fr3 보정값 640×480 으로 다시 그려 RTAB-Map `rtabmap-rgbd_dataset` 과 memmap 이 같이 읽음. 다른 SLAM 위치로 돌리기: `memmap --tum <폴더> --gt <위치 파일>`, 정렬 후 위치 오차: `ate <추정> <정답>`(memmap 은 `poses_est.txt`·`poses_map.txt` 를 남김), 세계 좌표가 다른 두 실행의 표면 비교: `surfcmp <A> <B> --align`.

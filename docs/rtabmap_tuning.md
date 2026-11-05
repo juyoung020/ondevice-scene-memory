@@ -123,7 +123,7 @@ A 대비 바꾼 것만 적음. F2M = `Odom/Strategy 0`(기본), F2F = `Odom/Stra
 ## 보드에서 확인할 것
 
 1. **배율 실측**: 같은 세 시퀀스를 Pi 에서 `taskset -c 1 rtabmap-rgbd_dataset --Rtabmap/DetectionRate 1 ...` 로 돌려 위 PC 숫자와 나눔(2–3 배 가정 확인).
-2. **카메라 경로 비용**: 이 측정의 `camera=` 는 PNG 읽기. 보드는 librealsense 프레임 수신 + 깊이를 컬러에 맞추는 정렬(CPU)이 따로 듦. 640×480@30 에서 정렬 시간과 USB3 연결 확인.
+2. **카메라 경로 비용**: 이 측정의 `camera=` 는 PNG 읽기. 보드는 librealsense 프레임 수신 + 깊이를 컬러에 맞추는 정렬(CPU)이 따로 듦(정렬 PC 0.6–0.9 ms, Pi 환산 약 2 ms: [`d455_input.md`](d455_input.md)). 640×480@30 에서 보드 정렬 시간(`bench_align`, `d455_align_check`)과 USB3 연결 확인.
 3. **동시 부하**: NPU YOLO 분할 + 표면 지도와 함께 돌릴 때 추적 코어가 빼앗기지 않는지(코어 고정), 열로 클럭이 내려가는지(`vcgencmd measure_clock arm`).
 4. **빠른 손 움직임**: fr1 책상 정도는 통과. 실제 D455 로 빠르게 돌릴 때 놓침과 `Odom/ResetCountdown 1` 재시작 뒤 지도 합침 확인.
 5. **D455 깊이 범위·잡음**(가장 가까운 거리 약 0.4 m): 무늬 적은 벽·먼 곳에서 특징 수(`quality=x/y` 의 y)가 100 아래로 자주 떨어지는지.

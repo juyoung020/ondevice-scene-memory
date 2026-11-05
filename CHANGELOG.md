@@ -8,6 +8,7 @@
 
 ### Added
 - 깊이→컬러 정렬 라이브러리 `bridge/align`(fast_align): librealsense `rs2::align` 과 화소 단위로 같은 결과를 줄 단위 여러 스레드로 냄(빠른 식·컬러 왜곡 적용 선택).
+- D455 도구 `d455_info`(보정값 JSON)·`d455_rec`(TUM 형식 녹화, rs2::align·fast_align 결과 함께)·`d455_align_check`(녹화로 정렬 비교)·`align_sdk_check`(카메라 없이 SDK 정렬과 비교)와 카메라 입력 문서 `docs/d455_input.md`.
 - RTAB-Map 보드용 설정 `docs/rtabmap_pi.ini`(위치 추적 PC 코어 하나 9.5 ms/장, 사무실 2.6 cm)과 조정 기록 `docs/rtabmap_tuning.md`.
 - Rust 파이프라인 `pipeline/`(memmap): 영상에서 3D 지도·물체 기억·씬그래프를 만든다.
 - 같은 코드가 PC(ONNX Runtime)와 보드(Pi5 + DX-M1 NPU)에서 돈다.

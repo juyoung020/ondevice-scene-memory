@@ -5,7 +5,7 @@
 
 ## 결론
 
-**깊이 카메라는 Intel RealSense D455 로 확정**(2026-11-05 확보). PC 시험은 같은 계열인 D435i 공개 데이터로 했다. 시작은 IMU 없이(D455 에는 IMU 가 있어 나중에 더할 수 있음). 위치는 RGB-D 만으로 추적하고, SLAM 은 RTAB-Map 의 `CameraRealSense2` 로 붙인다. Pi 5 에서는 librealsense 를 소스 빌드(RSUSB 백엔드, 커널 패치 없이)하고, 깊이-컬러 정렬은 SDK 가 CPU 에서 한다(보드에서 비용 확인 필요). 아래 카메라 비교는 조사 기록으로 둔다.
+**깊이 카메라는 Intel RealSense D455 로 확정**(2026-11-05 확보). PC 시험은 같은 계열인 D435i 공개 데이터로 했다. 시작은 IMU 없이(D455 에는 IMU 가 있어 나중에 더할 수 있음). 위치는 RGB-D 만으로 추적하고, SLAM 은 RTAB-Map 의 `CameraRealSense2` 로 붙인다. Pi 5 에서는 librealsense 를 소스 빌드(RSUSB 백엔드, 커널 패치 없이)하고, 깊이-컬러 정렬은 CPU 에서 SDK 의 NEON 경로 또는 같은 결과를 내는 `bridge/align` 의 fast_align 으로 한다(640×480 PC 0.6–0.9 ms, Pi 환산 약 2 ms, [`d455_input.md`](d455_input.md)). 아래 카메라 비교는 조사 기록으로 둔다.
 
 | 항목 | 추천 | 차선 |
 |---|---|---|

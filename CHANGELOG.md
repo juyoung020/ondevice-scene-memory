@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### Added
+- RTAB-Map 보드용 설정 `docs/rtabmap_pi.ini`(위치 추적 PC 코어 하나 9.5 ms/장, 사무실 2.6 cm)과 조정 기록 `docs/rtabmap_tuning.md`.
 - Rust 파이프라인 `pipeline/`(memmap): 영상에서 3D 지도·물체 기억·씬그래프를 만든다.
 - 같은 코드가 PC(ONNX Runtime)와 보드(Pi5 + DX-M1 NPU)에서 돈다.
 - 카메라만으로 위치 추정(`--pose vo`, IMU 없이).

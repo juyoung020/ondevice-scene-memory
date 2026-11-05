@@ -32,32 +32,41 @@ impl Tsdf {
         Tsdf { vox, trunc: 3.0 * vox, blocks: FastMap::default(), dirty: FastSet::default(), ver: FastMap::default() }
     }
 
-    /// 한 장면 더하기: depth(미터, w×h), rgb, 카메라→세계 (r, p), 보정값 k. step: 블록 잡을 때 화소 간격.
+    /// 한 장면 더하기: depth(미터, w×h), rgb, 카메라→세계 (r, p), 보정값 k.
     #[allow(clippy::too_many_arguments)]
     pub fn integrate(&mut self, depth: &[f32], rgb: &[u8], w: usize, h: usize, k: [f64; 4], r: &M3, p: &V3, max_depth: f64) {
+        use rayon::prelude::*;
         let [fx, fy, cx, cy] = k;
         let vs = self.vox;
         let bs = vs * B as f64;
-        // 1) 표면 근처 블록 잡기(화소 4 간격, 표면 앞뒤 trunc)
-        let mut touch: FastSet<(i32, i32, i32)> = FastSet::default();
+        let trunc = self.trunc;
+        // 1) 표면 근처 블록 잡기(화소 4 간격, 표면 앞뒤 trunc). 줄 안에서 바로 앞 화소와 같은 블록이면 건너뛰어
+        //    해시에는 화소당 약 0.4 번만 넣고, 블록은 좌표 순으로 정렬
+        let mut set: FastSet<(i32, i32, i32)> = FastSet::default();
         for v in (0..h).step_by(4) {
+            let mut last = [(i32::MIN, 0, 0); 3];
             for u in (0..w).step_by(4) {
                 let z = depth[v * w + u] as f64;
                 if !(0.2..max_depth).contains(&z) {
                     continue;
                 }
                 let ray = [(u as f64 - cx) / fx, (v as f64 - cy) / fy, 1.0];
-                for s in [-self.trunc, 0.0, self.trunc] {
+                for (j, s) in [-trunc, 0.0, trunc].into_iter().enumerate() {
                     let zz = z + s;
                     let x = add(&mv(r, &ray.map(|a| a * zz)), p);
-                    touch.insert(((x[0] / bs).floor() as i32, (x[1] / bs).floor() as i32, (x[2] / bs).floor() as i32));
+                    let key = ((x[0] / bs).floor() as i32, (x[1] / bs).floor() as i32, (x[2] / bs).floor() as i32);
+                    if key != last[j] {
+                        last[j] = key;
+                        set.insert(key);
+                    }
                 }
             }
         }
+        let mut touch: Vec<(i32, i32, i32)> = set.into_iter().collect();
+        touch.sort_unstable();
         // 2) 잡은 블록의 칸마다: 칸 중심을 이번 장면에 투영해 깊이와 비교. 블록끼리 독립이라 코어마다 나눠 돌린다.
         let rt = [0, 1, 2].map(|i| [0, 1, 2].map(|j| r[j][i]));
         let n = (B * B * B) as usize;
-        let trunc = self.trunc;
         let mut work: Vec<((i32, i32, i32), Block, bool)> = touch
             .into_iter()
             .map(|key| {
@@ -66,53 +75,57 @@ impl Tsdf {
             })
             .collect();
         let one = |key: (i32, i32, i32), blk: &mut Block| -> bool {
+            // 칸 중심의 카메라 좌표 Rᵀ·(x − p) 를 축마다 미리 곱해 둔다: 성분마다 (x 항 + y 항) + z 항 — 칸마다 행렬을 곱할 때와 같은 순서·같은 값
+            let axis = |a: usize, k0: i32| -> [[f64; 3]; B as usize] {
+                std::array::from_fn(|i| {
+                    let d = (k0 * B + i as i32) as f64 * vs + vs * 0.5 - p[a];
+                    [rt[0][a] * d, rt[1][a] * d, rt[2][a] * d]
+                })
+            };
+            let (ax, ay, az) = (axis(0, key.0), axis(1, key.1), axis(2, key.2));
             let mut changed = false;
-            for i in 0..n {
-                let (ix, iy, iz) = ((i as i32) % B, (i as i32 / B) % B, i as i32 / (B * B));
-                let xw = [
-                    (key.0 * B + ix) as f64 * vs + vs * 0.5,
-                    (key.1 * B + iy) as f64 * vs + vs * 0.5,
-                    (key.2 * B + iz) as f64 * vs + vs * 0.5,
-                ];
-                let pc = mv(&rt, &sub(&xw, p));
-                if pc[2] < 0.15 {
-                    continue;
-                }
-                let u = (fx * pc[0] / pc[2] + cx).round();
-                let v = (fy * pc[1] / pc[2] + cy).round();
-                if u < 0.0 || v < 0.0 || u >= w as f64 || v >= h as f64 {
-                    continue;
-                }
-                let (u, v) = (u as usize, v as usize);
-                let z = depth[v * w + u] as f64;
-                if !(0.2..max_depth).contains(&z) {
-                    continue;
-                }
-                let sdf = z - pc[2];
-                let tr = trunc;
-                if sdf < -tr {
-                    continue; // 표면 뒤 멀리: 모름
-                }
-                let t = (sdf / tr).min(1.0) as f32;
-                // 균일 가중: 1/거리² 가중은 먼 면을 덜 만들어 걸러낼 뿐, 정확도·완전도를 합친 F 는 오히려 낮았다(책상 0.40 → 0.30, surfcmp)
-                let wt = 1.0f32;
-                let w0 = blk.w[i];
-                blk.d[i] = (blk.d[i] * w0 + t * wt) / (w0 + wt);
-                if t.abs() < 1.0 {
-                    let o = (v * w + u) * 3;
-                    for q in 0..3 {
-                        blk.c[i][q] = (blk.c[i][q] * w0 + rgb[o + q] as f32 * wt) / (w0 + wt);
+            let mut i = 0usize;
+            for cz in &az {
+                for cy_ in &ay {
+                    for cx_ in &ax {
+                        let ii = i;
+                        i += 1;
+                        let pc = [cx_[0] + cy_[0] + cz[0], cx_[1] + cy_[1] + cz[1], cx_[2] + cy_[2] + cz[2]];
+                        if pc[2] < 0.15 {
+                            continue;
+                        }
+                        let u = (fx * pc[0] / pc[2] + cx).round();
+                        let v = (fy * pc[1] / pc[2] + cy).round();
+                        if u < 0.0 || v < 0.0 || u >= w as f64 || v >= h as f64 {
+                            continue;
+                        }
+                        let (u, v) = (u as usize, v as usize);
+                        let z = depth[v * w + u] as f64;
+                        if !(0.2..max_depth).contains(&z) {
+                            continue;
+                        }
+                        let sdf = z - pc[2];
+                        if sdf < -trunc {
+                            continue; // 표면 뒤 멀리: 모름
+                        }
+                        let t = (sdf / trunc).min(1.0) as f32;
+                        // 균일 가중: 1/거리² 가중은 먼 면을 덜 만들어 걸러낼 뿐, 정확도·완전도를 합친 F 는 오히려 낮았다(책상 0.40 → 0.30, surfcmp)
+                        let w0 = blk.w[ii];
+                        blk.d[ii] = (blk.d[ii] * w0 + t) / (w0 + 1.0);
+                        if t.abs() < 1.0 {
+                            let o = (v * w + u) * 3;
+                            for q in 0..3 {
+                                blk.c[ii][q] = (blk.c[ii][q] * w0 + rgb[o + q] as f32) / (w0 + 1.0);
+                            }
+                        }
+                        blk.w[ii] = (w0 + 1.0).min(64.0);
+                        changed = true;
                     }
                 }
-                blk.w[i] = (w0 + wt).min(64.0);
-                changed = true;
             }
             changed
         };
-        {
-            use rayon::prelude::*;
-            work.par_iter_mut().for_each(|(key, blk, ch)| *ch = one(*key, blk));
-        }
+        work.par_iter_mut().for_each(|(key, blk, ch)| *ch = one(*key, blk));
         for (key, blk, ch) in work {
             if ch {
                 self.dirty.insert((div_floor(key.0, R), div_floor(key.1, R), div_floor(key.2, R)));

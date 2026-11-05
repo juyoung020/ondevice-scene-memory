@@ -110,12 +110,13 @@ fn erode(m: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
             }
         }
     }
+    // 세로는 열마다 이어진 길이를 들고 줄 순서로 훑음(메모리를 차례로 읽게)
     let mut b = vec![false; w * h];
-    for x in 0..w {
-        let mut run = 0usize;
-        for y in 0..h {
-            run = if a[y * w + x] { run + 1 } else { 0 };
-            if run > 2 * r {
+    let mut run = vec![0usize; w];
+    for y in 0..h {
+        for x in 0..w {
+            run[x] = if a[y * w + x] { run[x] + 1 } else { 0 };
+            if run[x] > 2 * r {
                 b[(y - r) * w + x] = true;
             }
         }
@@ -265,7 +266,7 @@ fn depth_scale(zz: &[(f64, f64)]) -> Option<f64> {
 /// 바뀐 구역의 면 파일 쓰기(mesh/r_x_y_z.ply)
 fn write_surface(dir: &Path, ts: &mut tsdf::Tsdf) {
     for (reg, verts, tris) in ts.take_dirty_meshes() {
-        out::ply_mesh(&dir.join(format!("mesh/r_{}_{}_{}.ply", reg.0, reg.1, reg.2)), &verts, &tris);
+        out::ply_mesh(&dir.join(format!("mesh/r_{}_{}_{}.ply", reg.0, reg.1, reg.2)), verts, tris);
     }
 }
 
@@ -1108,26 +1109,29 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
             let (bw, bh) = (x2 - x1, y2 - y1);
             let m = erode(&d.mask, bw, bh, 3);
-            let mut pix: Vec<(usize, usize, f64)> = vec![];
+            // 마스크 안 깊이 있는 화소: 먼저 세어 간격을 정하고, 그 간격으로 최대 약 2,500 개만 모은다
+            let valid = |yy: usize, xx: usize| m[yy * bw + xx] && depth[(y1 + yy) * w + x1 + xx] as f64 > 0.2;
+            let cnt = (0..bh).map(|yy| (0..bw).filter(|&xx| valid(yy, xx)).count()).sum::<usize>();
+            if cnt < 80 {
+                continue;
+            }
+            let step = (cnt / 2500).max(1);
+            let mut pix: Vec<(usize, usize, f64)> = Vec::with_capacity(cnt / step + 1);
+            let mut k = 0usize;
             for yy in 0..bh {
                 for xx in 0..bw {
-                    if m[yy * bw + xx] {
-                        let (u, v) = (x1 + xx, y1 + yy);
-                        let z = depth[v * w + u] as f64;
-                        if z > 0.2 {
-                            pix.push((u, v, z));
+                    if valid(yy, xx) {
+                        if k % step == 0 {
+                            let (u, v) = (x1 + xx, y1 + yy);
+                            pix.push((u, v, depth[v * w + u] as f64));
                         }
+                        k += 1;
                     }
                 }
             }
-            if pix.len() < 80 {
-                continue;
-            }
-            let step = (pix.len() / 2500).max(1);
-            let pix: Vec<_> = pix.into_iter().step_by(step).collect();
             let mut zs: Vec<f64> = pix.iter().map(|q| q.2).collect();
-            zs.sort_by(|x, y| x.partial_cmp(y).unwrap());
-            let med = zs[zs.len() / 2];
+            let mid = zs.len() / 2;
+            let med = *zs.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
             if med > 5.0 {
                 continue;
             }
@@ -1142,17 +1146,20 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             if pts.len() < 50 || is_wall(&pts) {
                 continue;
             }
-            let mut crgb = Vec::with_capacity(bw * bh * 3);
-            let mut cdep = Vec::with_capacity(bw * bh);
-            for yy in 0..bh {
-                let o = ((y1 + yy) * w + x1) * 3;
-                crgb.extend_from_slice(&rgb[o..o + bw * 3]);
-                for xx in 0..bw {
-                    cdep.push((depth[(y1 + yy) * w + x1 + xx] * 1000.0).clamp(0.0, 65535.0) as u16);
+            // 사진은 그 물체의 지금 사진보다 클 때만 만든다(장면마다 모든 검출을 복사하지 않게)
+            let crop = || {
+                let mut crgb = Vec::with_capacity(bw * bh * 3);
+                let mut cdep = Vec::with_capacity(bw * bh);
+                for yy in 0..bh {
+                    let o = ((y1 + yy) * w + x1) * 3;
+                    crgb.extend_from_slice(&rgb[o..o + bw * 3]);
+                    for xx in 0..bw {
+                        cdep.push((depth[(y1 + yy) * w + x1 + xx] * 1000.0).clamp(0.0, 65535.0) as u16);
+                    }
                 }
-            }
-            let crop = Crop { w: bw as u32, h: bh as u32, rgb: crgb, mask: m.iter().map(|&b| if b { 255 } else { 0 }).collect(), depth: cdep };
-            let id = mem.update(name, d.score, &pts, med as f32, t, Some(crop), (a.depth != "kinect").then_some(pwc));
+                Crop { w: bw as u32, h: bh as u32, rgb: crgb, mask: m.iter().map(|&b| if b { 255 } else { 0 }).collect(), depth: cdep }
+            };
+            let id = mem.update(name, d.score, &pts, med as f32, t, (bw * bh) as u32, crop, (a.depth != "kinect").then_some(pwc));
             seen.insert(id);
         }
         if dets.is_some() && map_ok {
@@ -1188,9 +1195,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 새로 확정된 칸만 조각 파일로: 뷰어는 아직 안 받은 조각만 받는다(원격 접속에서 지도 전체를 매번 받지 않게)
                 let pts = scene.new_points();
                 if !pts.is_empty() {
-                    out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), &pts);
-                    n_chunk += 1;
                     n_scene += pts.len();
+                    out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), pts);
+                    n_chunk += 1;
                 }
                 scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
                 if let Some(ts) = tsdf.as_mut() {
@@ -1235,9 +1242,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let seg = worker.join().expect("worker");
     let pts = scene.new_points();
     if !pts.is_empty() {
-        out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), &pts);
-        n_chunk += 1;
         n_scene += pts.len();
+        out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), pts);
+        n_chunk += 1;
     }
     scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
     if let Some(ts) = tsdf.as_mut() {
@@ -1280,8 +1287,8 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
         let o = &mut mem.objs[i];
         let base = format!("objects/O{}", o.id);
         if let Some(pts) = pts {
-            out::ply(&dir.join(format!("{base}_points.ply")), &pts);
             o.n_pts = pts.len();
+            out::ply(&dir.join(format!("{base}_points.ply")), pts);
             o.cells_saved = o.cells.len();
             o.dirty = false;
             o.stamp += 1;
@@ -1318,7 +1325,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
     if !scene.is_null() {
         view["scene_points"] = scene.clone();
     }
-    out::write_atomic(&dir.join("view.json"), serde_json::to_string(&view).unwrap().as_bytes());
+    out::write_owned(&dir.join("view.json"), serde_json::to_vec(&view).unwrap());
 }
 
 /// 점 주변 5×5 깊이가 8 % 넘게 들쭉날쭉하면 경계

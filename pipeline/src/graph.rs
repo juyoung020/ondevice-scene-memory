@@ -35,27 +35,64 @@ pub fn segment(g: &GridImg, res: f64, min_width: f64, min_area: f64) -> Rooms {
         })
         .collect();
     let mut free: Vec<bool> = (0..w * h).map(|i| g.px[i] == 254 || (occ0[i] && !occ[i])).collect();
-    // 넓히기/좁히기(정사각 2r+1 창): 가로로 한 번, 세로로 한 번(같은 결과, 칸마다 25 → 10 번 보기)
-    let r = 2usize;
+    // 넓히기/좁히기(정사각 2r+1 창): 가로로 한 번, 세로로 한 번. 가장 가까운 want 칸까지의 거리를 앞뒤로 한 번씩 훑어 정한다
+    // (칸마다 창을 다시 보지 않게, 세로도 줄 순서로 훑음)
+    let r = 2isize;
     let grow = |m: &[bool], want: bool| -> Vec<bool> {
-        let mut hz = m.to_vec();
+        let far = -(r + 1) * 4; // 아직 want 를 못 봤음
+        // 가로: 창 안에 want 가 있으면 want, 없으면 원래 값(!want)
+        let mut hz = vec![!want; w * h];
         for y in 0..h {
+            let row = &m[y * w..(y + 1) * w];
+            let out = &mut hz[y * w..(y + 1) * w];
+            let mut last = far;
             for x in 0..w {
-                if m[y * w + x] != want && (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| m[y * w + xx] == want) {
-                    hz[y * w + x] = want;
+                if row[x] == want {
+                    last = x as isize;
+                }
+                if x as isize - last <= r {
+                    out[x] = want;
+                }
+            }
+            let mut next = w as isize - far;
+            for x in (0..w).rev() {
+                if row[x] == want {
+                    next = x as isize;
+                }
+                if next - x as isize <= r {
+                    out[x] = want;
                 }
             }
         }
-        let mut o = hz.clone();
+        // 세로: 열마다 마지막·다음 want 의 줄 번호를 들고 줄 순서로 훑음
+        let mut o = vec![!want; w * h];
+        let mut last = vec![far; w];
         for y in 0..h {
             for x in 0..w {
-                if hz[y * w + x] != want && (y.saturating_sub(r)..(y + r + 1).min(h)).any(|yy| hz[yy * w + x] == want) {
-                    o[y * w + x] = want;
+                let i = y * w + x;
+                if hz[i] == want {
+                    last[x] = y as isize;
+                }
+                if y as isize - last[x] <= r {
+                    o[i] = want;
+                }
+            }
+        }
+        let mut next = vec![h as isize - far; w];
+        for y in (0..h).rev() {
+            for x in 0..w {
+                let i = y * w + x;
+                if hz[i] == want {
+                    next[x] = y as isize;
+                }
+                if next[x] - y as isize <= r {
+                    o[i] = want;
                 }
             }
         }
         o
-    };    let closed = grow(&grow(&free, true), false);
+    };
+    let closed = grow(&grow(&free, true), false);
     for i in 0..w * h {
         free[i] = (free[i] || closed[i]) && !occ[i];
     }

@@ -238,10 +238,10 @@ impl Memory {
         best
     }
 
-    /// 한 관측(마스크 안 세계 점·색, 카메라 거리)을 기억에 더한다. 반환: 물체 번호
+    /// 한 관측(마스크 안 세계 점·색, 카메라 거리)을 기억에 더한다. 사진(crop)은 넓이(crop_area)가 지금 사진보다 클 때만 만든다. 반환: 물체 번호
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, name: &str, score: f32, pts: &[(V3, [u8; 3])], dist: f32, stamp: f64,
-                  crop: Option<Crop>, cam: Option<V3>) -> u32 {
+                  crop_area: u32, crop: impl FnOnce() -> Crop, cam: Option<V3>) -> u32 {
         let n = pts.len() as f64;
         let mut c = [0.0; 3];
         let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
@@ -292,13 +292,10 @@ impl Memory {
             o.pos = c;
             o.extent = ext;
         }
-        if let Some(cr) = crop {
-            let a = cr.w * cr.h;
-            if a > o.crop_area {
-                o.crop_area = a;
-                o.crop = Some(cr);
-                o.crop_ver += 1;
-            }
+        if crop_area > o.crop_area {
+            o.crop_area = crop_area;
+            o.crop = Some(crop());
+            o.crop_ver += 1;
         }
         o.id
     }

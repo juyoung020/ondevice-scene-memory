@@ -12,7 +12,7 @@ pub fn replace(tmp: &Path, dst: &Path) {
     std::fs::rename(tmp, dst).expect("replace");
 }
 
-/// 기록할 내용: 바로 쓸 바이트, 또는 기록 스레드에서 만들 바이트(PNG 압축 등 무거운 것)
+/// 기록할 내용: 바로 쓸 바이트, 또는 기록 스레드에서 만들 바이트(PLY 짜기·PNG 압축 등 무거운 것)
 type Job = Box<dyn FnOnce() -> Vec<u8> + Send>;
 
 /// 비동기 기록: 켜 두면 파일 쓰기(와 PNG 압축)를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜)
@@ -31,8 +31,12 @@ pub fn start_writer() {
 }
 
 pub fn write_atomic(dst: &Path, bytes: &[u8]) {
-    let b = bytes.to_vec();
-    write_lazy(dst, Box::new(move || b));
+    write_owned(dst, bytes.to_vec());
+}
+
+/// 이미 만든 바이트를 그대로 넘겨 쓴다(복사 없이)
+pub fn write_owned(dst: &Path, bytes: Vec<u8>) {
+    write_lazy(dst, Box::new(move || bytes));
 }
 
 /// 바이트를 기록 스레드에서 만들어 쓴다(기록 스레드가 없으면 바로)
@@ -50,7 +54,7 @@ fn write_now(dst: &Path, bytes: &[u8]) {
 }
 
 /// binary_little_endian PLY: float xyz + uchar rgb
-pub fn ply(dst: &Path, pts: &[([f32; 3], [u8; 3])]) {
+fn ply_bytes(pts: &[([f32; 3], [u8; 3])]) -> Vec<u8> {
     let mut b = Vec::with_capacity(pts.len() * 15 + 200);
     write!(b, "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n", pts.len()).unwrap();
     for (p, c) in pts {
@@ -59,11 +63,16 @@ pub fn ply(dst: &Path, pts: &[([f32; 3], [u8; 3])]) {
         }
         b.extend_from_slice(c);
     }
-    write_atomic(dst, &b);
+    b
+}
+
+/// 점 PLY: 바이트는 쓰는 쪽(실시간이면 기록 스레드)에서 짠다
+pub fn ply(dst: &Path, pts: Vec<([f32; 3], [u8; 3])>) {
+    write_lazy(dst, Box::new(move || ply_bytes(&pts)));
 }
 
 /// 면이 있는 PLY: 꼭짓점(float xyz + uchar rgb) + 삼각형(list uchar int)
-pub fn ply_mesh(dst: &Path, verts: &[([f32; 3], [u8; 3])], tris: &[[u32; 3]]) {
+fn ply_mesh_bytes(verts: &[([f32; 3], [u8; 3])], tris: &[[u32; 3]]) -> Vec<u8> {
     let mut b = Vec::with_capacity(verts.len() * 15 + tris.len() * 13 + 256);
     write!(b, "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nelement face {}\nproperty list uchar int vertex_indices\nend_header\n", verts.len(), tris.len()).unwrap();
     for (p, c) in verts {
@@ -78,13 +87,18 @@ pub fn ply_mesh(dst: &Path, verts: &[([f32; 3], [u8; 3])], tris: &[[u32; 3]]) {
             b.extend_from_slice(&(*v as i32).to_le_bytes());
         }
     }
-    write_atomic(dst, &b);
+    b
+}
+
+/// 면 PLY: 바이트는 쓰는 쪽(실시간이면 기록 스레드)에서 짠다
+pub fn ply_mesh(dst: &Path, verts: Vec<([f32; 3], [u8; 3])>, tris: Vec<[u32; 3]>) {
+    write_lazy(dst, Box::new(move || ply_mesh_bytes(&verts, &tris)));
 }
 
 pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
     let mut b = format!("P5\n{w} {h}\n255\n").into_bytes();
     b.extend_from_slice(px);
-    write_atomic(dst, &b);
+    write_owned(dst, b);
 }
 
 // PNG 압축은 기록 스레드에서(물체 사진이 바뀔 때 본 스레드가 장당 수십 ms 멈추던 것)

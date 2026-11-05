@@ -92,7 +92,8 @@ fn args() -> Args {
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
         surface: v.iter().any(|x| x == "--surface"),
-        tsdf_vox: get("--tsdf-vox").map_or(0.02, |s| s.parse().unwrap()),
+        // 표면 칸 3 cm: 칸마다 측정이 더 모여 D435 깊이 잡음에도 면이 이어짐(2 cm 는 바닥·벽이 얼룩), 작은 물체(키보드·마우스)는 그대로
+        tsdf_vox: get("--tsdf-vox").map_or(0.03, |s| s.parse().unwrap()),
     }
 }
 

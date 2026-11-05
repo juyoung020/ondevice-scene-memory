@@ -434,11 +434,46 @@ async function loadSceneChunks(sp) {
   sceneChunks.busy = false; pendingLoads--; loadDone();
 }
 
-// Surface map (TSDF + Surface Nets): regions [x, y, z, version]; only regions whose version changed are fetched again
-const surf = { run:null, have:new Map(), busy:false };
+// Surface map (TSDF + Surface Nets): regions [x, y, z, version]; only regions whose version changed are fetched again.
+// Regions are drawn in blocks of SB³ regions (3.84 m at 3 cm voxels): one mesh, one draw call per block. A changed region
+// rebuilds only its block; each block has its own bounding sphere, so blocks off screen are skipped.
+const SB = 4;
+const surf = { run:null, have:new Map(), blocks:new Map(), dirty:new Set(), timer:0, busy:false };
 const surfMat = new THREE.MeshLambertMaterial({ vertexColors:true, side:THREE.DoubleSide });
+function resetSurface() {
+  for (const b of surf.blocks.values()) if (b.mesh) { gSurf.remove(b.mesh); b.mesh.geometry.dispose(); }
+  surf.have.clear(); surf.blocks.clear(); surf.dirty.clear(); clearTimeout(surf.timer); surf.timer = 0;
+}
+function setRegion(key, x, y, z, ver, g) {   // keep the region's arrays (CPU only) and mark its block for rebuilding
+  const bk = Math.floor(x / SB) + "_" + Math.floor(y / SB) + "_" + Math.floor(z / SB);
+  surf.have.set(key, { ver, pos:g.attributes.position.array, col:g.attributes.color.array, nrm:g.attributes.normal.array, idx:g.index ? g.index.array : null });
+  let b = surf.blocks.get(bk); if (!b) { b = { keys:new Set(), mesh:null }; surf.blocks.set(bk, b); }
+  b.keys.add(key); surf.dirty.add(bk);
+  if (!surf.timer) surf.timer = setTimeout(flushSurface, 250);   // while loading, blocks are rebuilt at most 4 times a second
+}
+function flushSurface() {
+  clearTimeout(surf.timer); surf.timer = 0;
+  for (const bk of surf.dirty) {
+    const b = surf.blocks.get(bk), rs = [...b.keys].map(k => surf.have.get(k));
+    let nv = 0, ni = 0; for (const r of rs) { nv += r.pos.length / 3; ni += r.idx ? r.idx.length : 0; }
+    if (!ni) { if (b.mesh) { gSurf.remove(b.mesh); b.mesh.geometry.dispose(); b.mesh = null; } continue; }
+    const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), col = new Uint8Array(nv * 3), idx = nv < 65536 ? new Uint16Array(ni) : new Uint32Array(ni);
+    let v = 0, i = 0;
+    for (const r of rs) {
+      pos.set(r.pos, v * 3); nrm.set(r.nrm, v * 3); col.set(r.col, v * 3);
+      if (r.idx) { for (let j = 0; j < r.idx.length; j++) idx[i + j] = r.idx[j] + v; i += r.idx.length; }
+      v += r.pos.length / 3;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3, true)); g.setIndex(new THREE.BufferAttribute(idx, 1));
+    g.computeBoundingSphere();
+    if (b.mesh) { b.mesh.geometry.dispose(); b.mesh.geometry = g; } else { b.mesh = new THREE.Mesh(g, surfMat); gSurf.add(b.mesh); }
+  }
+  surf.dirty.clear(); invalidate();
+}
 async function loadSurface(s) {
-  if (surf.run !== s.run) { disposeGroup(gSurf); surf.have.clear(); surf.run = s.run; }
+  if (surf.run !== s.run) { resetSurface(); surf.run = s.run; }
   if (surf.busy) return;
   const todo = s.regions.filter(([x, y, z, ver]) => { const c = surf.have.get(x + "_" + y + "_" + z); return !c || c.ver !== ver; });
   if (!todo.length) return;
@@ -455,15 +490,13 @@ async function loadSurface(s) {
         if (surf.run !== run) { g.dispose(); return; }
         g.computeVertexNormals();
         const cur = surf.have.get(key);
-        if (cur && cur.ver >= ver) { g.dispose(); continue; }
-        if (cur) { gSurf.remove(cur.mesh); cur.mesh.geometry.dispose(); }
-        const mesh = new THREE.Mesh(g, surfMat); mesh.userData.shared = true;
-        gSurf.add(mesh); surf.have.set(key, { ver, mesh });
-        invalidate();
+        if (cur && cur.ver >= ver) continue;
+        setRegion(key, x, y, z, ver, g);
       } catch (e) {}
     }
   };
   await Promise.all([one(), one(), one(), one()]);
+  if (surf.run === run) flushSurface();
   surf.busy = false; pendingLoads--; loadDone();
 }
 function drawObjects() {  invalidate();

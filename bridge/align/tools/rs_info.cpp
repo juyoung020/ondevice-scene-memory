@@ -1,6 +1,6 @@
-// D455 정보를 JSON 으로: 장치·펌웨어·USB, 센서별 스트림 목록, IMU 유무, 깊이 단위, 고른 해상도의 깊이·컬러 내부 보정값과
+// RealSense(D435·D455) 정보를 JSON 으로: 장치·펌웨어·USB, 센서별 스트림 목록, IMU 유무, 깊이 단위, 고른 해상도의 깊이·컬러 내부 보정값과
 // 깊이→컬러 외부 변환(스트리밍 없이 프로파일에서 읽음).
-//   d455_info [--depth 640x480] [--color 640x480] [--fps 30] [> d455_info.json]
+//   rs_info [--depth 640x480] [--color 640x480] [--fps 30] [> rs_info.json]
 // 장치가 없으면 {"devices": [], "error": ...} 를 내고 끝 코드 2.
 #include <cstdio>
 #include <set>
@@ -32,9 +32,9 @@ int main(int argc, char** argv) {
         std::ostringstream js;
         js << "{\n  \"librealsense\": " << jstr(RS2_API_FULL_VERSION_STR) << ",\n";
         if (list.size() == 0) {
-            js << "  \"devices\": [],\n  \"error\": \"장치 없음: D455 를 USB3 포트에 꽂고 다시\"\n}\n";
+            js << "  \"devices\": [],\n  \"error\": \"장치 없음: RealSense 를 USB3 포트에 꽂고 다시\"\n}\n";
             std::fputs(js.str().c_str(), stdout);
-            std::fprintf(stderr, "d455_info: 장치 없음\n");
+            std::fprintf(stderr, "rs_info: 장치 없음\n");
             return 2;
         }
         js << "  \"devices\": [\n";

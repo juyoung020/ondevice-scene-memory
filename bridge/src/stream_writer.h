@@ -15,6 +15,13 @@ constexpr uint32_t kHeaderBytes = 176;
 constexpr uint32_t kLost = 1;         // 위치 놓침: 위치 칸은 의미 없음
 constexpr uint32_t kNewMap = 2;       // 이 장면에서 RTAB-Map 이 새 지도를 시작함
 constexpr uint32_t kMapCorrected = 4; // 이 장면에서 지도 보정(루프 클로저·최적화)이 바뀌어 위치가 뛸 수 있음
+constexpr uint32_t kGraphHeaderBytes = 16;  // 그래프 블록 MMG1 머리: 표시 4 + 머리 크기 4 + 노드 수 4 + 예약 4
+
+// 지도 노드 위치(OpenCV 카메라 → 세계, 장면 위치와 같은 좌표)
+struct GraphNode {
+    uint32_t id = 0;
+    double T[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+};
 
 struct OutFrame {
     uint32_t flags = 0;
@@ -26,7 +33,14 @@ struct OutFrame {
     float depth_per_m = 1000.f;
     cv::Mat bgr;    // CV_8UC3 BGR (쓸 때 RGB 로 바꿈)
     cv::Mat depth;  // CV_16UC1
+    uint32_t anchor = 0;  // 기준 지도 노드 id(0 = 없음): 장면 위치 = 노드 위치 × 상대 위치
+    // 비어 있지 않으면 장면이 아니라 그래프 블록(MMG1): 새로 생기거나 움직인 노드. 큐가 차도 버리지 않음
+    std::vector<GraphNode> graph;
+    bool is_graph() const { return !graph.empty(); }
 };
+
+// 그래프 블록(MMG1) 바이트: 머리 16 + 노드마다 id u32 + 예약 u32 + 3×4 f64
+std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes);
 
 // 머리 176 바이트를 버퍼에 채움(리틀 엔디언 기계 기준)
 void encode_header(const OutFrame& f, uint8_t* out);

@@ -1,6 +1,6 @@
-// 녹화 폴더(d455_rec)의 원래 깊이에 fast_align 을 다시 돌려 rs2::align 결과(depth_rs/)와 화소 차이·시간을 비교한다.
+// 녹화 폴더(rs_rec)의 원래 깊이에 fast_align 을 다시 돌려 rs2::align 결과(depth_rs/)와 화소 차이·시간을 비교한다.
 // 같은 원래 깊이로 rs2::align 도 카메라 없이(software_device) 다시 돌려 시간을 같은 조건에서 잰다.
-//   d455_align_check <녹화 폴더> [--core 29] [--threads 4] [--max N]
+//   rs_align_check <녹화 폴더> [--core 29] [--threads 4] [--max N]
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 int main(int argc, char** argv) {
     console_utf8();
     if (argc < 2) {
-        std::fprintf(stderr, "d455_align_check <녹화 폴더> [--core C] [--threads T] [--max N]\n");
+        std::fprintf(stderr, "rs_align_check <녹화 폴더> [--core C] [--threads T] [--max N]\n");
         return 1;
     }
     fs::path dir = argv[1];
@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
         auto raw = read_list((dir / "depth_raw.txt").string());
         auto rsl = read_list((dir / "depth_rs.txt").string());
         if (raw.size() != rsl.size()) throw std::runtime_error("depth_raw.txt 와 depth_rs.txt 장면 수가 다름");
-        std::printf("d455_align_check: %s, %zu 장, 깊이 %dx%d → 컬러 %dx%d, 컬러 왜곡 %s, 깊이 단위 %g m\n", dir.string().c_str(), raw.size(),
+        std::printf("rs_align_check: %s, %zu 장, 깊이 %dx%d → 컬러 %dx%d, 컬러 왜곡 %s, 깊이 단위 %g m\n", dir.string().c_str(), raw.size(),
                     di.width, di.height, ci.width, ci.height, rs2_distortion_to_string(ci.model), unit);
 
         pin_cores(core, 1);

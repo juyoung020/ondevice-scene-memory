@@ -7,8 +7,10 @@
 ## [Unreleased]
 
 ### Added
+- 루프 클로저 뒤 다시 쌓기(그래프 블록 MMG1, memmap 작업 스레드): 사무실 지도 위치 4.97 → 2.32 cm, 물체 52 → 48.
+- 보드 D435 실측(연결 프로그램 24.9 장/초, memmap NPU 10 키프레임/초)을 성능 기록에 더함.
 - 깊이→컬러 정렬 라이브러리 `bridge/align`(fast_align): librealsense `rs2::align` 과 화소 단위로 같은 결과를 줄 단위 여러 스레드로 냄(빠른 식·컬러 왜곡 적용 선택).
-- D455 도구 `d455_info`(보정값 JSON)·`d455_rec`(TUM 형식 녹화, rs2::align·fast_align 결과 함께)·`d455_align_check`(녹화로 정렬 비교)·`align_sdk_check`(카메라 없이 SDK 정렬과 비교)와 카메라 입력 문서 `docs/d455_input.md`.
+- RealSense 도구 `rs_info`(보정값 JSON)·`rs_rec`(TUM 형식 녹화, rs2::align·fast_align 결과 함께)·`rs_align_check`(녹화로 정렬 비교)·`align_sdk_check`(카메라 없이 SDK 정렬과 비교)와 카메라 입력 문서 `docs/realsense_input.md`.
 - 연결 프로그램 `bridge/`(C++): RealSense 카메라 또는 TUM 폴더 재생 → RTAB-Map 위치 → memmap 장면 스트림, 문서 `docs/bridge.md`.
 - memmap 장면 스트림 입력(`--stream`): 받은 위치·깊이로 지도·물체를 쌓고, 바닥 합의로 수평을 맞춤(`--no-level` 로 끔).
 - 모든 실행이 지도에 넣은 카메라 위치 `poses_map.txt` 를 남김.
@@ -43,6 +45,7 @@
 - 웹캠 지도를 바로 세우기: 여러 장면에서 찾은 수평면(바닥·책상) 방향의 합의로 위쪽을 정함(IMU 없이).
 
 ### Changed
+- 카메라를 RealSense D435 로 정리: 도구 이름 `rs_info`·`rs_rec`·`rs_align_check`, 카메라 문서 `docs/realsense_input.md` 에 보드에서 읽은 D435 보정값.
 - 표면 지도 융합이 빨라짐(결과 같음).
 - 물체 갱신·방 나누기·기록이 빨라짐(결과 같음).
 - 릴리스 빌드를 한 덩어리로 최적화(`codegen-units = 1`, 빌드마다 속도가 흔들리지 않게).

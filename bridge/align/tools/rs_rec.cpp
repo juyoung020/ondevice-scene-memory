@@ -1,5 +1,5 @@
-// D455 녹화: 컬러(RGB8)·원래 깊이(정렬 전)·rs2::align 결과·fast_align 결과를 TUM 형식 폴더로.
-//   d455_rec <출력 폴더> [초=10] [--emitter on|off] [--preset default|hand|high_accuracy|high_density|medium_density]
+// RealSense 녹화: 컬러(RGB8)·원래 깊이(정렬 전)·rs2::align 결과·fast_align 결과를 TUM 형식 폴더로.
+//   rs_rec <출력 폴더> [초=10] [--emitter on|off] [--preset default|hand|high_accuracy|high_density|medium_density]
 //            [--depth 640x480] [--color 640x480] [--fps 30] [--threads 1] [--skip 30]
 // 폴더:
 //   rgb/<시각>.png        컬러 RGB8                      rgb.txt
@@ -7,7 +7,7 @@
 //   depth_raw/<시각>.png  정렬 전 원래 깊이               depth_raw.txt
 //   depth_rs/<시각>.png   rs2::align 결과                depth_rs.txt
 //   calib.json(보정값·설정·rgbd2tum 명령), rec_stats.json(장면 수·시간)
-// 깊이 PNG 값은 카메라 깊이 단위 그대로(D455 기본 1 mm = 1000/m). memmap 은 rgbd2tum 으로 TUM fr3(5000/m)로 바꿔 읽는다.
+// 깊이 PNG 값은 카메라 깊이 단위 그대로(D400 기본 1 mm = 1000/m). memmap 은 rgbd2tum 으로 TUM fr3(5000/m)로 바꿔 읽는다.
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
     console_utf8();
     if (argc < 2) {
         std::fprintf(stderr,
-                     "d455_rec <출력 폴더> [초=10] [--emitter on|off] [--preset 이름] [--depth WxH] [--color WxH] [--fps N] [--threads N] [--skip N]\n");
+                     "rs_rec <출력 폴더> [초=10] [--emitter on|off] [--preset 이름] [--depth WxH] [--color WxH] [--fps N] [--threads N] [--skip N]\n");
         return 1;
     }
     fs::path out = argv[1];
@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
     try {
         rs2::context ctx;
         if (ctx.query_devices().size() == 0) {
-            std::fprintf(stderr, "d455_rec: 장치 없음(D455 를 USB3 포트에 꽂고 다시)\n");
+            std::fprintf(stderr, "rs_rec: 장치 없음(RealSense 를 USB3 포트에 꽂고 다시)\n");
             return 2;
         }
         for (const char* sub : {"rgb", "depth", "depth_raw", "depth_rs"}) fs::create_directories(out / sub);
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
         fast_align::DepthAligner ours(to_fa(di), to_fa(ci), to_fa(e), unit, fo);
         Writer writer(out, std::max(2u, std::thread::hardware_concurrency() / 4), 240);
 
-        std::printf("d455_rec: %s %s, 깊이 %dx%d · 컬러 %dx%d @%d, 레이저 %s, 프리셋 %s, 깊이 단위 %g m, %g 초 → %s\n",
+        std::printf("rs_rec: %s %s, 깊이 %dx%d · 컬러 %dx%d @%d, 레이저 %s, 프리셋 %s, 깊이 단위 %g m, %g 초 → %s\n",
                     dev.get_info(RS2_CAMERA_INFO_NAME), dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER), dw, dh, cw, ch, fps, emitter.c_str(),
                     preset.empty() ? "(그대로)" : preset.c_str(), unit, secs, out.string().c_str());
         std::ofstream frgb(out / "rgb.txt"), fdep(out / "depth.txt"), fraw(out / "depth_raw.txt"), frs(out / "depth_rs.txt"),

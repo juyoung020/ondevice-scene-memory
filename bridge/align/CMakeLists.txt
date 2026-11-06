@@ -1,4 +1,4 @@
-# 깊이 → 컬러 정렬 라이브러리(fast_align)와 시험·벤치, D455 도구.
+# 깊이 → 컬러 정렬 라이브러리(fast_align)와 시험·벤치, RealSense 도구.
 #   Windows:  cmake -S bridge/align -B bridge/align/build -G "Visual Studio 17 2022" -A x64 -DREALSENSE_ROOT=C:/librealsense2/v2.59.1
 #             cmake --build bridge/align/build --config Release
 #   Linux/Pi: cmake -S bridge/align -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build
@@ -14,7 +14,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(FA_NATIVE "이 기계에 맞춘 명령어(-march=native)" OFF)
-option(FA_TOOLS "D455 도구 빌드(librealsense 필요)" ON)
+option(FA_TOOLS "RealSense 도구 빌드(librealsense 필요)" ON)
 set(REALSENSE_ROOT "" CACHE PATH "librealsense SDK 폴더(include/, lib/, bin/)")
 
 if(MSVC)
@@ -53,7 +53,7 @@ target_compile_options(bench_align PRIVATE ${FA_REF_FLAGS})
 enable_testing()
 add_test(NAME test_align COMMAND test_align)
 
-# ---- D455 도구 ----
+# ---- RealSense 도구 ----
 if(FA_TOOLS)
   set(RS_FOUND OFF)
   if(REALSENSE_ROOT)
@@ -75,7 +75,7 @@ if(FA_TOOLS)
   if(RS_FOUND)
     add_library(lodepng STATIC third_party/lodepng/lodepng.cpp)
     target_include_directories(lodepng PUBLIC third_party/lodepng)
-    foreach(t d455_info d455_rec d455_align_check align_sdk_check)
+    foreach(t rs_info rs_rec rs_align_check align_sdk_check)
       add_executable(${t} tools/${t}.cpp)
       target_include_directories(${t} PRIVATE tools tests)
       target_link_libraries(${t} PRIVATE fast_align lodepng ${RS_TARGET})
@@ -83,13 +83,13 @@ if(FA_TOOLS)
     endforeach()
     if(WIN32 AND REALSENSE_ROOT)
       # 실행 파일 옆에 realsense2.dll
-      foreach(t d455_info d455_rec d455_align_check align_sdk_check)
+      foreach(t rs_info rs_rec rs_align_check align_sdk_check)
         add_custom_command(TARGET ${t} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                            ${REALSENSE_ROOT}/bin/realsense2.dll $<TARGET_FILE_DIR:${t}>)
       endforeach()
     endif()
-    message(STATUS "D455 도구: librealsense ${RS_TARGET}")
+    message(STATUS "RealSense 도구: librealsense ${RS_TARGET}")
   else()
-    message(STATUS "D455 도구: librealsense 없음 → 라이브러리·시험·벤치만")
+    message(STATUS "RealSense 도구: librealsense 없음 → 라이브러리·시험·벤치만")
   endif()
 endif()

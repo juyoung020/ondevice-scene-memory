@@ -1,4 +1,4 @@
-// RealSense 카메라(D455 등): 컬러 RGB8 + 깊이 Z16, 깊이를 컬러에 맞춤(depth_align). IMU 는 켜지 않는다.
+// RealSense 카메라(D435·D455 등): 컬러 RGB8 + 깊이 Z16, 깊이를 컬러에 맞춤(depth_align). IMU 는 켜지 않는다.
 #pragma once
 #include "depth_align.h"
 #include "frame_source.h"

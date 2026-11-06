@@ -1,4 +1,4 @@
-// D455 도구 공통: rs2 ↔ fast_align 변환, 보정값 JSON 쓰기·읽기, 16 비트/RGB PNG, 시간 재기,
+// RealSense 도구 공통: rs2 ↔ fast_align 변환, 보정값 JSON 쓰기·읽기, 16 비트/RGB PNG, 시간 재기,
 // 카메라 없이 rs2::align 을 돌리는 software_device 래퍼.
 #pragma once
 #include <librealsense2/hpp/rs_internal.hpp>

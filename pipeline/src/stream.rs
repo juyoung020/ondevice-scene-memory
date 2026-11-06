@@ -1,4 +1,5 @@
-//! 장면 스트림 입력(--stream): 연결 프로그램(bridge/, RTAB-Map)이 보내는 장면 = 머리 176 바이트 + RGB8 + 깊이 u16.
+//! 장면 스트림 입력(--stream): 연결 프로그램(bridge/, RTAB-Map)이 보내는 장면 = 머리 176 바이트 + RGB8 + 깊이 u16,
+//! 그 사이에 그래프 블록(MMG1: 새로 생기거나 움직인 지도 노드 위치)이 끼어 온다.
 //! 형식과 좌표 약속은 docs/bridge.md "스트림 형식".
 use crate::geom::*;
 use std::io::Read;
@@ -7,6 +8,12 @@ pub const HEADER: usize = 176;
 pub const LOST: u32 = 1;
 pub const NEW_MAP: u32 = 2;
 pub const MAP_CORRECTED: u32 = 4;
+/// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 예약 4), 노드마다 id u32 + 예약 u32 + 3×4 f64
+const GRAPH_HEADER: usize = 16;
+const GRAPH_NODE: usize = 8 + 96;
+
+/// 그래프 노드: (RTAB-Map 노드 id, 자세, 위치) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표
+pub type Node = (u32, M3, V3);
 
 pub struct StreamFrame {
     pub flags: u32,
@@ -23,6 +30,10 @@ pub struct StreamFrame {
     pub depth_per_m: f32,
     pub rgb: Vec<u8>,
     pub depth: Vec<u16>,
+    /// 기준 지도 노드 id(0 = 없음): 이 장면 위치 = 그 노드 위치 × 상대 위치(루프 클로저 뒤 다시 쌓기용)
+    pub anchor: u32,
+    /// 이 장면 앞에 온 그래프 블록의 노드
+    pub graph: Vec<Node>,
 }
 
 impl StreamFrame {
@@ -35,8 +46,13 @@ impl StreamFrame {
     }
 }
 
+fn pose_of(t3x4: &[f64]) -> (M3, V3) {
+    ([[t3x4[0], t3x4[1], t3x4[2]], [t3x4[4], t3x4[5], t3x4[6]], [t3x4[8], t3x4[9], t3x4[10]]], [t3x4[3], t3x4[7], t3x4[11]])
+}
+
 pub struct StreamReader {
     src: Box<dyn Read + Send>,
+    graph: Vec<Node>,
 }
 
 impl StreamReader {
@@ -47,23 +63,54 @@ impl StreamReader {
         } else {
             Box::new(std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(path).unwrap_or_else(|e| panic!("--stream {path}: {e}"))))
         };
-        StreamReader { src }
+        StreamReader { src, graph: vec![] }
     }
 
-    /// 다음 장면. 스트림이 끝나면(보내는 쪽이 닫음) None.
+    /// 스트림이 끝난 뒤 남은 그래프 노드(마지막 장면 뒤에 온 블록)
+    pub fn take_graph(&mut self) -> Vec<Node> {
+        std::mem::take(&mut self.graph)
+    }
+
+    /// 다음 장면(그 앞의 그래프 블록은 graph 에 담음). 스트림이 끝나면(보내는 쪽이 닫음) None.
     pub fn next(&mut self) -> Option<StreamFrame> {
-        let mut h = [0u8; HEADER];
-        if self.src.read_exact(&mut h).is_err() {
-            return None;
+        loop {
+            let mut m = [0u8; 4];
+            self.src.read_exact(&mut m).ok()?;
+            match &m {
+                b"MMF1" => return self.frame(),
+                b"MMG1" => self.graph_block()?,
+                _ => panic!("스트림 형식이 아님(머리 {m:?})"),
+            }
         }
-        assert_eq!(&h[0..4], b"MMF1", "스트림 형식이 아님(머리 MMF1 없음)");
+    }
+
+    fn graph_block(&mut self) -> Option<()> {
+        let mut h = [0u8; GRAPH_HEADER - 4];
+        self.src.read_exact(&mut h).ok()?;
+        let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+        assert_eq!(u32_at(0) as usize, GRAPH_HEADER, "모르는 그래프 블록 머리 크기");
+        let n = u32_at(4) as usize;
+        let mut b = vec![0u8; n * GRAPH_NODE];
+        self.src.read_exact(&mut b).ok()?;
+        for c in b.chunks_exact(GRAPH_NODE) {
+            let id = u32::from_le_bytes(c[0..4].try_into().unwrap());
+            let t: Vec<f64> = (0..12).map(|i| f64::from_le_bytes(c[8 + 8 * i..16 + 8 * i].try_into().unwrap())).collect();
+            let (r, p) = pose_of(&t);
+            self.graph.push((id, r, p));
+        }
+        Some(())
+    }
+
+    fn frame(&mut self) -> Option<StreamFrame> {
+        let mut h = [0u8; HEADER];
+        h[0..4].copy_from_slice(b"MMF1");
+        self.src.read_exact(&mut h[4..]).ok()?;
         let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         let f32_at = |o: usize| f32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         let f64_at = |o: usize| f64::from_le_bytes(h[o..o + 8].try_into().unwrap());
         assert_eq!(u32_at(4) as usize, HEADER, "모르는 머리 크기");
         let t3x4: Vec<f64> = (0..12).map(|i| f64_at(32 + 8 * i)).collect();
-        let r = [[t3x4[0], t3x4[1], t3x4[2]], [t3x4[4], t3x4[5], t3x4[6]], [t3x4[8], t3x4[9], t3x4[10]]];
-        let p = [t3x4[3], t3x4[7], t3x4[11]];
+        let (r, p) = pose_of(&t3x4);
         let (w, hh) = (u32_at(160) as usize, u32_at(164) as usize);
         let mut rgb = vec![0u8; w * hh * 3];
         let mut db = vec![0u8; w * hh * 2];
@@ -84,6 +131,8 @@ impl StreamReader {
             depth_per_m: f32_at(168),
             rgb,
             depth,
+            anchor: u32_at(172),
+            graph: std::mem::take(&mut self.graph),
         })
     }
 }

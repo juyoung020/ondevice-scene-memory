@@ -190,7 +190,7 @@ pub struct Obj {
 
 pub struct Memory {
     pub objs: Vec<Obj>,
-    next: u32,
+    pub next: u32, // 다음 물체 id(다시 쌓을 때 이어서 써 뷰어가 옛 물체 파일과 헷갈리지 않게)
     pub vox: f64,
     pub sup: f64,
     pub merged: u32, // 병합 후처리로 합친 수(누적)

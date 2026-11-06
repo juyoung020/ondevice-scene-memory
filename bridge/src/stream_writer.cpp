@@ -1,5 +1,6 @@
 #include "stream_writer.h"
 #include <opencv2/imgproc.hpp>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -32,7 +33,21 @@ void encode_header(const OutFrame& f, uint8_t* o) {
     put<uint32_t>(o, 160, (uint32_t)f.bgr.cols);
     put<uint32_t>(o, 164, (uint32_t)f.bgr.rows);
     put<float>(o, 168, f.depth_per_m);
-    // 172..176: 예약(0)
+    put<uint32_t>(o, 172, f.anchor);
+}
+
+std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes) {
+    std::vector<uint8_t> b(kGraphHeaderBytes + nodes.size() * (8 + 96), 0);
+    std::memcpy(b.data(), "MMG1", 4);
+    put<uint32_t>(b.data(), 4, kGraphHeaderBytes);
+    put<uint32_t>(b.data(), 8, (uint32_t)nodes.size());
+    size_t o = kGraphHeaderBytes;
+    for (const GraphNode& n : nodes) {
+        put<uint32_t>(b.data(), o, n.id);
+        for (int i = 0; i < 12; ++i) put<double>(b.data(), o + 8 + 8 * i, n.T[i]);
+        o += 8 + 96;
+    }
+    return b;
 }
 
 Writer::Writer(const std::string& path, int fd, size_t queue, bool block) : cap_(queue < 1 ? 1 : queue), block_(block) {
@@ -53,13 +68,18 @@ Writer::~Writer() { close(); }
 bool Writer::push(OutFrame&& f) {
     std::unique_lock<std::mutex> lk(m_);
     if (broken_) return false;
-    if (q_.size() >= cap_) {
+    // 그래프 블록은 큐 길이와 상관없이 넣는다(노드 위치를 잃으면 memmap 이 장면을 고칠 수 없음)
+    if (!f.is_graph() && q_.size() >= cap_) {
         if (block_) {
             cv_.wait(lk, [&] { return q_.size() < cap_ || broken_; });
             if (broken_) return false;
         } else {
-            q_.pop_front();
-            ++dropped_;
+            // 가장 오래된 장면을 버림(그래프 블록은 남김)
+            auto it = std::find_if(q_.begin(), q_.end(), [](const OutFrame& x) { return !x.is_graph(); });
+            if (it != q_.end()) {
+                q_.erase(it);
+                ++dropped_;
+            }
         }
     }
     q_.push_back(std::move(f));
@@ -105,6 +125,16 @@ void Writer::run() {
             f = std::move(q_.front());
             q_.pop_front();
             cv_.notify_all();
+        }
+        if (f.is_graph()) {
+            std::vector<uint8_t> b = encode_graph(f.graph);
+            if (!write_all(b.data(), b.size())) {
+                std::lock_guard<std::mutex> lk(m_);
+                broken_ = true;
+                cv_.notify_all();
+                return;
+            }
+            continue;
         }
         auto c0 = std::chrono::steady_clock::now();
         cv::cvtColor(f.bgr, rgb, cv::COLOR_BGR2RGB);

@@ -1,6 +1,6 @@
 # 보드에 연결 프로그램 올리기 (Pi 5 · Debian 13 trixie arm64)
 
-연결 프로그램(`bridge/`, [bridge.md](bridge.md))에 필요한 것: RTAB-Map 0.24.2 라이브러리, librealsense2(D455), OpenCV, CMake. memmap 은 지금처럼 `cargo build --release --no-default-features --features dxrt`.
+연결 프로그램(`bridge/`, [bridge.md](bridge.md))에 필요한 것: RTAB-Map 0.24.2 라이브러리, librealsense2(D435), OpenCV, CMake. memmap 은 지금처럼 `cargo build --release --no-default-features --features dxrt`.
 
 ## 패키지로 받을 수 있는 것 (2026-11-05 packages.debian.org 확인)
 
@@ -58,7 +58,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 - PC(WSL, 12 작업)에서 1 분 15 초, 컴파일 하나 최대 0.8 GB. 보드는 `-j 3`(8 GB 안).
 - 카메라 확인용 도구가 필요하면 `-DBUILD_TOOLS=ON`(`rs-enumerate-devices`).
-- D455 는 USB 3 포트(파란색)에. `rs-enumerate-devices` 의 `Usb Type Descriptor` 가 3.2 인지 확인.
+- D435 는 USB 3 포트(파란색)에. `rs-enumerate-devices` 의 `Usb Type Descriptor` 가 3.2 인지 확인.
 
 ### RTAB-Map 0.24.2 (화면 없이 라이브러리만)
 
@@ -85,5 +85,5 @@ ninja -C ~/build/bridge
 ## 보드에서 처음 할 확인
 
 1. `~/build/bridge/rtab_bridge --realsense --out /dev/null --max-frames 300 --stats /tmp/rs.csv` — 첫 줄의 카메라 이름·펌웨어·보정값, 끝의 `읽기`(카메라 대기 + 정렬)·`위치추적` ms.
-2. 위 보정값 줄의 `왜곡 모델`: D455 컬러는 왜곡 계수가 거의 0 이라 왜곡 없는 모델로 넘긴다.
+2. 위 보정값 줄의 `왜곡 모델`: D435 컬러는 왜곡 계수가 0 이라 왜곡 없는 모델로 넘긴다.
 3. 코어 묶기 예(코어 4 개): 연결 프로그램 `taskset -c 0,1`, memmap `taskset -c 2,3`. 숫자는 [bridge.md](bridge.md) "시간".

@@ -23,7 +23,7 @@ pub fn start_writer() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(std::path::PathBuf, Job)>(256);
         std::thread::spawn(move || {
             for (p, job) in rx {
-                write_now(&p, &job());
+                run_job(&p, job);
             }
         });
         tx
@@ -43,8 +43,15 @@ pub fn write_owned(dst: &Path, bytes: Vec<u8>) {
 fn write_lazy(dst: &Path, job: Job) {
     match WRITER.get() {
         Some(tx) => tx.send((dst.to_path_buf(), job)).expect("writer"),
-        None => write_now(dst, &job()),
+        None => run_job(dst, job),
     }
+}
+
+fn run_job(dst: &Path, job: Job) {
+    let c0 = std::time::Instant::now();
+    let b = job();
+    write_now(dst, &b);
+    stats::add(stats::kind(dst), b.len(), c0.elapsed().as_nanos() as u64);
 }
 
 fn write_now(dst: &Path, bytes: &[u8]) {
@@ -129,4 +136,51 @@ pub fn png_u16(dst: &Path, w: u32, h: u32, d: &[u16]) {
         image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
         v
     }));
+}
+
+/// 기록 통계(종류별 파일 수·바이트·짜기+쓰기 시간): 끝에 한 줄로 출력해 어느 파일이 디스크·기록 스레드를 먹는지 본다
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub const KINDS: [&str; 8] = ["view.json", "pose.json", "map.pgm", "mesh r_", "mesh t_", "obj ply", "obj png", "기타"];
+    static N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static B: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    pub fn kind(p: &std::path::Path) -> usize {
+        let s = p.to_string_lossy();
+        let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        if f == "view.json" { 0 } else if f == "pose.json" { 1 } else if f == "map.pgm" { 2 }
+        else if f.starts_with("r_") && s.contains("mesh") { 3 } else if f.starts_with("t_") && s.contains("mesh") { 4 }
+        else if s.contains("objects") && f.ends_with(".ply") { 5 } else if s.contains("objects") && f.ends_with(".png") { 6 } else { 7 }
+    }
+    pub fn add(k: usize, bytes: usize, ns: u64) {
+        N[k].fetch_add(1, Relaxed);
+        B[k].fetch_add(bytes as u64, Relaxed);
+        NS[k].fetch_add(ns, Relaxed);
+    }
+    pub fn report() -> String {
+        let mut s = String::from("기록:");
+        let (mut tb, mut tt) = (0u64, 0u64);
+        for k in 0..8 {
+            let (n, b, ns) = (N[k].load(Relaxed), B[k].load(Relaxed), NS[k].load(Relaxed));
+            if n > 0 {
+                s += &format!(" {} {}개 {:.1} MB {:.2} s |", KINDS[k], n, b as f64 / 1048576.0, ns as f64 * 1e-9);
+            }
+            tb += b;
+            tt += ns;
+        }
+        s + &format!(" 합 {:.1} MB {:.2} s", tb as f64 / 1048576.0, tt as f64 * 1e-9)
+    }
+}
+
+/// 지금 스레드를 뒤로(nice +10): 다시 쌓기·텍스처 같은 작업 스레드가 2 코어 보드에서 장면 처리 스레드와 코어를 다툴 때
+/// 장면 처리가 먼저 돌게 한다(작업 스레드는 남는 시간에 끝남). 리눅스만, 실패해도 그대로 진행.
+pub fn background_thread() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+            fn gettid() -> i32;
+        }
+        setpriority(0, gettid() as u32, 10); // PRIO_PROCESS + 스레드 id = 그 스레드만
+    }
 }

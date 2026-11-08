@@ -192,7 +192,9 @@ pub fn ort_env() -> &'static ort::environment::Environment {
 #[cfg(feature = "onnx")]
 fn session(path: &str) -> ort::session::Session {
     #[allow(unused_mut)]
-    let mut b = ort::session::Session::builder(ort_env()).unwrap().with_intra_threads(8).unwrap();
+    // 스레드는 쓸 수 있는 코어 수까지만(8 고정이면 taskset 2 코어에서 7 개가 서로 깨우며 문맥 전환 260 만 번·코어를 나눠 먹음)
+    let nth = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
+    let mut b = ort::session::Session::builder(ort_env()).unwrap().with_intra_threads(nth).unwrap();
     // directml 기능이면 그래픽카드로(안 되면 ORT 가 CPU 로 물러남). 입력 크기를 고정해 두면 DirectML 이 빠르다.
     #[cfg(feature = "directml")]
     let mut b = b.with_execution_providers([ort::ep::DirectML::default().build()]).unwrap().with_dimension_override("batch", 1).unwrap();

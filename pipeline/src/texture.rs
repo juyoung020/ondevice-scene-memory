@@ -810,7 +810,7 @@ impl Texturer {
             views: BTreeMap::new(), next_id: 1, bytes: 0, regs: BTreeMap::new(), cache: Mutex::new((HashMap::new(), VecDeque::new())),
             n_frames: 0, n_regions: 0, secs: 0.0, secs_max: 0.0, secs_frames: 0.0,
         };
-        let th = std::thread::Builder::new().name("texture".into()).spawn(move || w.run(crx, frx, otx)).unwrap();
+        let th = std::thread::Builder::new().name("texture".into()).spawn(move || { crate::out::background_thread(); w.run(crx, frx, otx) }).unwrap();
         Texturer { ctl, frames, out, th: Some(th), tex: HashMap::new() }
     }
     /// 장면 넘기기(작업 스레드가 밀려 있으면 버림)

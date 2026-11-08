@@ -411,24 +411,103 @@ fn content_type(p: &str) -> &'static str {
     }
 }
 
+/// What the current request on this connection asked for (one connection = one thread, so a thread-local is per request).
+#[derive(Default, Clone)]
+struct ReqCtx {
+    gzip: bool,                  // Accept-Encoding has gzip
+    keep: bool,                  // keep the connection open after the reply (HTTP/1.1 default)
+    if_none_match: Option<String>,
+}
+thread_local! { static REQ: std::cell::RefCell<ReqCtx> = std::cell::RefCell::new(ReqCtx::default()); }
+
+fn fnv(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &x in b {
+        h = (h ^ x as u64).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// gzip of text bodies, cached by content hash: view.json is sent to every client once per version and the page's
+/// scripts (three.min.js 603 KB → 150 KB) once per load, so each distinct body is compressed only once.
+fn gzip_cached(body: &[u8]) -> Arc<Vec<u8>> {
+    static CACHE: Mutex<Vec<(u64, usize, Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
+    let key = (fnv(body), body.len());
+    if let Some((_, _, z)) = CACHE.lock().unwrap().iter().find(|(h, n, _)| (*h, *n) == key) {
+        return z.clone();
+    }
+    let mut e = flate2::write::GzEncoder::new(Vec::with_capacity(body.len() / 4), flate2::Compression::new(6));
+    let _ = e.write_all(body);
+    let z = Arc::new(e.finish().unwrap_or_default());
+    let mut c = CACHE.lock().unwrap();
+    if c.len() >= 16 {
+        c.remove(0);
+    }
+    c.push((key.0, key.1, z.clone()));
+    z
+}
+
 fn respond(s: &mut TcpStream, code: u16, ctype: &str, extra: &str, body: &[u8]) {
     let reason = match code {
         200 => "OK",
         204 => "No Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         404 => "Not Found",
         _ => "Error",
     };
+    let ctx = REQ.with(|r| r.borrow().clone());
+    let texty = ctype.starts_with("application/json") || ctype.starts_with("text/") || ctype.starts_with("application/javascript");
+    let z = (code == 200 && ctx.gzip && texty && body.len() > 1024).then(|| gzip_cached(body));
+    let (body, enc): (&[u8], &str) = match &z {
+        Some(z) => (z, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"),
+        None => (body, ""),
+    };
+    // no-cache (not no-store): the browser may keep a copy but must revalidate; /file/ and the page answer 304 by ETag
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n{}\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: {}\r\n{}{}\r\n",
         code,
         reason,
         ctype,
         body.len(),
+        if ctx.keep { "keep-alive" } else { "close" },
+        enc,
         extra
     );
-    let _ = s.write_all(head.as_bytes());
-    let _ = s.write_all(body);
+    let mut out = Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body);
+    let _ = s.write_all(&out);
+}
+
+/// 200 with an ETag, or 304 when the browser already has this version
+fn respond_tagged(s: &mut TcpStream, ctype: &str, etag: &str, body: impl FnOnce() -> Option<std::borrow::Cow<'static, [u8]>>) {
+    let tag = format!("\"{}\"", etag);
+    if REQ.with(|r| r.borrow().if_none_match.as_deref() == Some(tag.as_str())) {
+        return respond(s, 304, ctype, &format!("ETag: {}\r\n", tag), b"");
+    }
+    match body() {
+        Some(b) => respond(s, 200, ctype, &format!("ETag: {}\r\n", tag), &b),
+        None => respond(s, 404, "text/plain", "", b"not found"),
+    }
+}
+
+/// Built-in page files: tag = content hash (computed once per asset)
+fn respond_static(s: &mut TcpStream, ctype: &str, body: &'static [u8]) {
+    static TAGS: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+    let id = body.as_ptr() as usize;
+    let tag = {
+        let mut t = TAGS.lock().unwrap();
+        match t.iter().find(|(p, _)| *p == id) {
+            Some((_, g)) => g.clone(),
+            None => {
+                let g = format!("s{:x}-{}", fnv(body), body.len());
+                t.push((id, g.clone()));
+                g
+            }
+        }
+    };
+    respond_tagged(s, ctype, &tag, || Some(std::borrow::Cow::Borrowed(body)))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -470,18 +549,49 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(p)
 }
 
-fn handle(mut s: TcpStream, st: Arc<State>) {
+/// One connection: HTTP/1.1 keep-alive, so the page's polls (view 4 /s, pose 20 /s) and the burst of mesh/object files at
+/// load reuse one socket and one thread instead of a TCP handshake + thread spawn per request. Idle connections close after 15 s.
+fn handle(s: TcpStream, st: Arc<State>) {
+    let mut s = s;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
     let mut rd = BufReader::new(s.try_clone().unwrap());
-    let mut line = String::new();
-    if rd.read_line(&mut line).is_err() {
-        return;
-    }
     loop {
-        let mut h = String::new();
-        if rd.read_line(&mut h).unwrap_or(0) <= 2 {
-            break;
+        let mut line = String::new();
+        if rd.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut ctx = ReqCtx { keep: line.trim_end().ends_with("HTTP/1.1"), ..Default::default() };
+        loop {
+            let mut h = String::new();
+            if rd.read_line(&mut h).unwrap_or(0) <= 2 {
+                break;
+            }
+            let Some((k, v)) = h.split_once(':') else { continue };
+            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+            match k.as_str() {
+                "accept-encoding" => ctx.gzip = v.split(',').any(|e| e.trim().split(';').next() == Some("gzip")),
+                "if-none-match" => ctx.if_none_match = Some(v.to_string()),
+                "connection" => {
+                    let v = v.to_ascii_lowercase();
+                    if v.contains("close") {
+                        ctx.keep = false;
+                    } else if v.contains("keep-alive") {
+                        ctx.keep = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        REQ.with(|r| *r.borrow_mut() = ctx);
+        handle_one(&mut s, &st, &line);
+        if !REQ.with(|r| r.borrow().keep) {
+            return;
         }
     }
+}
+
+fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
+    let mut s = s;
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
     if method != "GET" {
@@ -490,15 +600,15 @@ fn handle(mut s: TcpStream, st: Arc<State>) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let q = parse_query(query);
     match path {
-        "/" | "/index.html" => respond(&mut s, 200, "text/html; charset=utf-8", "", INDEX_HTML.as_bytes()),
-        "/three.min.js" => respond(&mut s, 200, "application/javascript", "", THREE_JS),
-        "/GLTFLoader.js" => respond(&mut s, 200, "application/javascript", "", GLTF_JS),
+        "/" | "/index.html" => respond_static(&mut s, "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
+        "/three.min.js" => respond_static(&mut s, "application/javascript", THREE_JS),
+        "/GLTFLoader.js" => respond_static(&mut s, "application/javascript", GLTF_JS),
         _ if path.starts_with("/robot/") => match ROBOT_FILES.iter().find(|(n, _)| *n == &path["/robot/".len()..]) {
             Some((n, b)) => respond(&mut s, 200, if n.ends_with(".json") { "application/json" } else { "model/gltf-binary" }, "", b),
             None if &path["/robot/".len()..] == "robot.json" => respond(&mut s, 200, "application/json", "", b"{}"),   // no model in this build: the page keeps its box stand-in
             None => respond(&mut s, 404, "text/plain", "", b"no such model file"),
         },
-        "/OrbitControls.js" => respond(&mut s, 200, "application/javascript", "", ORBIT_JS),
+        "/OrbitControls.js" => respond_static(&mut s, "application/javascript", ORBIT_JS),
         "/favicon.ico" => respond(&mut s, 204, "image/x-icon", "", b""),
         "/api/mode" => respond(&mut s, 200, "application/json", "", format!("{{\"live\":{}}}", st.live_mode).as_bytes()),
         "/api/robot" => {
@@ -509,8 +619,9 @@ fn handle(mut s: TcpStream, st: Arc<State>) {
             respond(&mut s, 200, "application/json", "", body.as_bytes())
         }
         "/stream" => {
-            let st2 = st.clone();
-            return serve_stream(s, st2);
+            REQ.with(|r| r.borrow_mut().keep = false); // the event stream owns this connection until the page goes away
+            let (st2, s2) = (st.clone(), match s.try_clone() { Ok(c) => c, Err(_) => return });
+            return serve_stream(s2, st2);
         }
         "/api/view" => {
             let vp = st.dir.join("view.json");
@@ -572,8 +683,9 @@ fn handle(mut s: TcpStream, st: Arc<State>) {
         },
         _ if path.starts_with("/file/") => {
             let rel = &path["/file/".len()..];
-            match safe_join(&st.dir, rel).and_then(|p| fs::read(p).ok()) {
-                Some(b) => respond(&mut s, 200, content_type(rel), "", &b),
+            // ETag = mtime + size: a page reload (or a second viewer) revalidates the meshes/objects it already has with 304
+            match safe_join(&st.dir, rel).and_then(|p| file_ver(&p).map(|v| (p, v))) {
+                Some((p, ver)) => respond_tagged(&mut s, content_type(rel), &ver, || fs::read(p).ok().map(std::borrow::Cow::Owned)),
                 None => respond(&mut s, 404, "text/plain", "", b"not found"),
             }
         }

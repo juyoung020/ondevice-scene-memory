@@ -12,6 +12,7 @@ struct Block {
     d: Vec<f32>,        // 잘린 거리(−1…1)
     w: Vec<f32>,        // 무게(관측 수, 상한 있음)
     c: Vec<[f32; 3]>,   // 색(가중 평균)
+    cw: Vec<f32>,       // 색 무게(가깝고 정면으로 본 장면일수록 큼)
 }
 
 pub struct Tsdf {
@@ -70,7 +71,7 @@ impl Tsdf {
         let mut work: Vec<((i32, i32, i32), Block, bool)> = touch
             .into_iter()
             .map(|key| {
-                let blk = self.blocks.remove(&key).unwrap_or_else(|| Block { d: vec![1.0; n], w: vec![0.0; n], c: vec![[0.0; 3]; n] });
+                let blk = self.blocks.remove(&key).unwrap_or_else(|| Block { d: vec![1.0; n], w: vec![0.0; n], c: vec![[0.0; 3]; n], cw: vec![0.0; n] });
                 (key, blk, false)
             })
             .collect();
@@ -109,16 +110,26 @@ impl Tsdf {
                             continue; // 표면 뒤 멀리: 모름
                         }
                         let t = (sdf / trunc).min(1.0) as f32;
-                        // 균일 가중: 1/거리² 가중은 먼 면을 덜 만들어 걸러낼 뿐, 정확도·완전도를 합친 F 는 오히려 낮았다(책상 0.40 → 0.30, surfcmp)
+                        // 형상 무게 = 비스듬함 코사인(이웃 깊이로 구한 면 법선 · 시선). 거리와는 무관하게 둔다 —
+                        // 1/거리² 를 곱하면 F 가 낮아짐(책상 0.40 → 0.30, surfcmp). 스치듯 본 먼 바닥(겹친 판·날개)은 무게가 작고, 약 80° 넘게 스치면 버림
+                        let cos = incidence(depth, w, h, u, v, fx, fy);
+                        if cos < GRAZE_MIN {
+                            continue;
+                        }
+                        let wt = cos as f32;
                         let w0 = blk.w[ii];
-                        blk.d[ii] = (blk.d[ii] * w0 + t) / (w0 + 1.0);
+                        blk.d[ii] = (blk.d[ii] * w0 + t * wt) / (w0 + wt);
                         if t.abs() < 1.0 {
+                            // 색 무게 = 코사인 × (1 m / 거리)²(형상 무게와 별개) — 가깝고 정면인 장면의 색이 앞섬
+                            let wc = (cos / (z * z).max(0.25)) as f32;
+                            let c0 = blk.cw[ii];
                             let o = (v * w + u) * 3;
                             for q in 0..3 {
-                                blk.c[ii][q] = (blk.c[ii][q] * w0 + rgb[o + q] as f32) / (w0 + 1.0);
+                                blk.c[ii][q] = (blk.c[ii][q] * c0 + rgb[o + q] as f32 * wc) / (c0 + wc);
                             }
+                            blk.cw[ii] = (c0 + wc).min(64.0);
                         }
-                        blk.w[ii] = (w0 + 1.0).min(64.0);
+                        blk.w[ii] = (w0 + wt).min(64.0);
                         changed = true;
                     }
                 }
@@ -275,4 +286,24 @@ impl Tsdf {
         }
         (verts, tris)
     }
+}
+
+/// 비스듬함 문턱(면 법선과 시선의 코사인): 이보다 작으면(약 80° 넘게 스침) 측정을 버림
+const GRAZE_MIN: f64 = 0.17;
+
+/// 화소 (u, v) 의 면 법선(옆·아래 화소 깊이 차이)과 시선 사이 코사인. 이웃 깊이가 없으면 1(모름 = 정면 취급)
+#[inline]
+fn incidence(depth: &[f32], w: usize, h: usize, u: usize, v: usize, fx: f64, fy: f64) -> f64 {
+    if u + 1 >= w || v + 1 >= h {
+        return 1.0;
+    }
+    let z = depth[v * w + u] as f64;
+    let (zr, zd) = (depth[v * w + u + 1] as f64, depth[(v + 1) * w + u] as f64);
+    if zr <= 0.0 || zd <= 0.0 || (zr - z).abs() > 0.1 * z || (zd - z).abs() > 0.1 * z {
+        return 1.0;
+    }
+    // 화면 기울기 → 카메라 좌표 법선: 깊이 변화 / 화소 크기(z/f)
+    let gx = (zr - z) * fx / z;
+    let gy = (zd - z) * fy / z;
+    1.0 / (1.0 + gx * gx + gy * gy).sqrt()
 }

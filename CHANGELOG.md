@@ -8,6 +8,7 @@
 
 ### Added
 - 루프 클로저 뒤 다시 쌓기(그래프 블록 MMG1, memmap 작업 스레드): 사무실 지도 위치 4.97 → 2.32 cm, 물체 52 → 48.
+- 다시 쌓기용 보관 장면을 손실 없이 압축(장당 1.54 → 0.85 MB).
 - 보드 D435 실측(연결 프로그램 24.9 장/초, memmap NPU 10 키프레임/초)을 성능 기록에 더함.
 - 깊이→컬러 정렬 라이브러리 `bridge/align`(fast_align): librealsense `rs2::align` 과 화소 단위로 같은 결과를 줄 단위 여러 스레드로 냄(빠른 식·컬러 왜곡 적용 선택).
 - RealSense 도구 `rs_info`(보정값 JSON)·`rs_rec`(TUM 형식 녹화, rs2::align·fast_align 결과 함께)·`rs_align_check`(녹화로 정렬 비교)·`align_sdk_check`(카메라 없이 SDK 정렬과 비교)와 카메라 입력 문서 `docs/realsense_input.md`.

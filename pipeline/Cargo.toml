@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 image = "0.25"
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 ndarray = { version = "0.17", optional = true }
 ort = { version = "2.0.0-rc.15", optional = true }
 rayon = "1"

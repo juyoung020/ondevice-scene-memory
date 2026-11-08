@@ -1337,7 +1337,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
     for (i, (kf, r, pwc)) in snap.iter().enumerate() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb, kf.w, kf.h, &kf.dets, i as u32, true, &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, i as u32, true, &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
         if (i + 1) % 15 == 0 {
             mem.prune(kf.t);
             mem.merge_pass();
@@ -1356,7 +1356,7 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
     mem.next = next;
     let newer: Snap = snapshot(kfs, fix, z0).into_iter().filter(|s| s.0.seq > rb.last_seq).collect();
     for (i, (kf, r, pwc)) in newer.iter().enumerate() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb, kf.w, kf.h, &kf.dets, (rb.n + i) as u32, true, grid, scene, tsdf, mem, traj, map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, (rb.n + i) as u32, true, grid, scene, tsdf, mem, traj, map_traj);
     }
     eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음, 물체 {} 개",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, newer.len(), mem.objs.len());

@@ -18,17 +18,20 @@ pub struct Kf {
     pub h_cam: f64, // 카메라 높이(바닥 위): 다시 쌓을 때 바닥 높이 = 카메라 z − h_cam
     pub w: usize,
     pub h: usize,
-    pub rgb: Vec<u8>,
-    depth_mm: Vec<u16>,
+    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4
+    depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4
     pub dets: Option<Vec<Det>>,
 }
 
 impl Kf {
     pub fn depth(&self) -> Vec<f32> {
-        self.depth_mm.iter().map(|&v| v as f32 * 1e-3).collect()
+        unpack_depth(&self.depth_z, self.w, self.h).iter().map(|&v| v as f32 * 1e-3).collect()
+    }
+    pub fn rgb(&self) -> Vec<u8> {
+        unpack_rgb(&self.rgb_z, self.w, self.h)
     }
     fn bytes(&self) -> usize {
-        self.rgb.len() + self.depth_mm.len() * 2 + self.dets.iter().flatten().map(|d| d.mask.len()).sum::<usize>()
+        self.rgb_z.len() + self.depth_z.len() + self.dets.iter().flatten().map(|d| d.mask.len()).sum::<usize>()
     }
 }
 
@@ -97,8 +100,8 @@ impl KfStore {
             None => (0, (r, p)),
         };
         let kf = Kf {
-            seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb: rgb.to_vec(),
-            depth_mm: depth.iter().map(|&d| (d * 1000.0).round().clamp(0.0, 65535.0) as u16).collect(),
+            seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z: pack_rgb(rgb, w, h),
+            depth_z: pack_depth(&depth.iter().map(|&d| (d * 1000.0).round().clamp(0.0, 65535.0) as u16).collect::<Vec<_>>(), w, h),
             dets: dets.as_ref().map(|v| v.iter().map(|d| Det { cls: d.cls, score: d.score, box_: d.box_, mask: d.mask.clone() }).collect()),
         };
         self.bytes += kf.bytes();
@@ -170,15 +173,102 @@ mod tests {
     }
 
     #[test]
+    fn pack_roundtrip_real() {
+        // TUM 책상 한 장(있으면): 손실 없이 되돌아오는지, 압축률·시간
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/tum/rgbd_dataset_freiburg1_desk");
+        let (Ok(rl), Ok(dl)) = (std::fs::read_to_string(dir.join("rgb.txt")), std::fs::read_to_string(dir.join("depth.txt"))) else { return };
+        let first = |s: &str| s.lines().find(|l| !l.starts_with('#')).unwrap().split_whitespace().nth(1).unwrap().to_string();
+        let im = image::open(dir.join(first(&rl))).unwrap().into_rgb8();
+        let (w, h) = (im.width() as usize, im.height() as usize);
+        let rgb = im.into_raw();
+        let d: Vec<u16> = image::open(dir.join(first(&dl))).unwrap().into_luma16().into_raw().iter().map(|v| v / 5).collect();
+        let t = std::time::Instant::now();
+        let (zr, zd) = (pack_rgb(&rgb, w, h), pack_depth(&d, w, h));
+        let tp = t.elapsed();
+        let t = std::time::Instant::now();
+        assert_eq!(unpack_rgb(&zr, w, h), rgb);
+        assert_eq!(unpack_depth(&zd, w, h), d);
+        eprintln!("컬러 {} → {} B, 깊이 {} → {} B, 묶기 {:?}, 풀기 {:?}", rgb.len(), zr.len(), d.len() * 2, zd.len(), tp, t.elapsed());
+    }
+
+    #[test]
     fn budget_thins() {
         let mut st = KfStore::new(1); // 1 MB
-        let rgb = vec![0u8; 300 * 1024];
-        let d = vec![1.0f32; 100 * 1024];
+        // 압축이 안 되는 값(의사 난수)
+        let mut s = 1u32;
+        let mut rnd = || { s = s.wrapping_mul(1664525).wrapping_add(1013904223); (s >> 24) as u8 };
+        let rgb: Vec<u8> = (0..320 * 300 * 3).map(|_| rnd()).collect();
+        let d: Vec<f32> = (0..320 * 300).map(|_| rnd() as f32 * 0.1).collect();
         for i in 0..10 {
-            st.push(i as f64, 0, rz(0.0), [0.0; 3], 1.0, 1, 1, &rgb, &d, &None);
+            st.push(i as f64, 0, rz(0.0), [0.0; 3], 1.0, 320, 300, &rgb, &d, &None);
         }
         assert!(st.bytes <= 1 << 20);
         assert!(st.stride > 1);
         assert!(st.kfs().windows(2).all(|w| w[0].t < w[1].t));
     }
+}
+
+/// 컬러 압축: 채널마다 면으로 모으고 줄 안에서 왼쪽 화소와의 차(u8 감싸기) → LZ4. 손실 없음.
+pub fn pack_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let n = w * h;
+    let mut b = vec![0u8; n * 3];
+    for c in 0..3 {
+        for y in 0..h {
+            let mut prev = 0u8;
+            for x in 0..w {
+                let v = rgb[(y * w + x) * 3 + c];
+                b[c * n + y * w + x] = v.wrapping_sub(prev);
+                prev = v;
+            }
+        }
+    }
+    lz4_flex::compress_prepend_size(&b)
+}
+
+pub fn unpack_rgb(z: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let b = lz4_flex::decompress_size_prepended(z).expect("보관 컬러 풀기");
+    let n = w * h;
+    let mut rgb = vec![0u8; n * 3];
+    for c in 0..3 {
+        for y in 0..h {
+            let mut prev = 0u8;
+            for x in 0..w {
+                prev = prev.wrapping_add(b[c * n + y * w + x]);
+                rgb[(y * w + x) * 3 + c] = prev;
+            }
+        }
+    }
+    rgb
+}
+
+/// 깊이 압축: 줄 안에서 왼쪽 화소와의 차(u16 감싸기)를 아래 바이트 면·위 바이트 면으로 → LZ4. 손실 없음.
+pub fn pack_depth(d: &[u16], w: usize, h: usize) -> Vec<u8> {
+    let n = w * h;
+    let mut b = vec![0u8; n * 2];
+    for y in 0..h {
+        let mut prev = 0u16;
+        for x in 0..w {
+            let i = y * w + x;
+            let v = d[i].wrapping_sub(prev);
+            prev = d[i];
+            b[i] = v as u8;
+            b[n + i] = (v >> 8) as u8;
+        }
+    }
+    lz4_flex::compress_prepend_size(&b)
+}
+
+pub fn unpack_depth(z: &[u8], w: usize, h: usize) -> Vec<u16> {
+    let b = lz4_flex::decompress_size_prepended(z).expect("보관 깊이 풀기");
+    let n = w * h;
+    let mut d = vec![0u16; n];
+    for y in 0..h {
+        let mut prev = 0u16;
+        for x in 0..w {
+            let i = y * w + x;
+            prev = prev.wrapping_add(b[i] as u16 | (b[n + i] as u16) << 8);
+            d[i] = prev;
+        }
+    }
+    d
 }

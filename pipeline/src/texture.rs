@@ -3,7 +3,8 @@
 //!   비슷한 자리(12 cm·12° 안)에 이미 있으면 10 % 넘게 선명할 때만 바꿔 넣는다. 위치는 장면 보관(`kfstore`)과 같이 기준 노드 × 상대 위치라 루프 클로저를 따른다.
 //! - 고르기: 삼각형마다 정면일수록·가까울수록·선명할수록 높은 점수, 보이는지는 보관한 깊이(4 화소 간격)와 맞대 본다(가려짐·깊이 경계 제외).
 //!   이웃 삼각형과 같은 장면을 쓰도록 몇 번 다듬고(ICM), 같은 장면 삼각형 덩어리(차트)마다 사진 조각을 잘라 구역 아틀라스 한 장에 모은다.
-//! - 장면마다 노출이 달라 생기는 이음매는 꼭짓점마다 표면 색(모든 장면 평균)에 맞춘 색 배율(꼭짓점 색)로 줄인다.
+//! - 장면마다 노출이 달라 생기는 이음매는 꼭짓점마다 표면 색(모든 장면 평균)에 맞춘 색 배율(꼭짓점 색)로 줄이고,
+//!   차트 경계에 닿은 삼각형은 이웃 사진과 섞어(꼭짓점 사진 무게를 보간) 경계 양쪽 색을 잇는다.
 //! - 작업 스레드 하나가 맡는다: 실시간 장면 처리는 사진을 넘기기만 하고, 2 초 넘게 안 바뀐 구역부터 하나씩(코어 하나의 절반만 씀) 붙인다.
 use crate::geom::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -295,6 +296,20 @@ fn bilinear(img: &[u8], w: usize, h: usize, u: f64, v: f64) -> [f32; 3] {
     o
 }
 
+/// 노출 맞춤 배율: 표면 색(모든 장면 평균) ÷ 사진 색(사진 좌표 u, v 둘레 5×5 흐린 값)
+fn raw_gain(im: &[u8], cam: &Cam, u: f64, v: f64, surf: &[u8; 3]) -> [f32; 3] {
+    let mut c = [0f32; 3];
+    for dy in -2..=2 {
+        for dx in -2..=2 {
+            let s = bilinear(im, cam.w, cam.h, u + 2.0 * dx as f64, v + 2.0 * dy as f64);
+            for q in 0..3 {
+                c[q] += s[q] / 25.0;
+            }
+        }
+    }
+    [0, 1, 2].map(|q| (surf[q] as f32 + 10.0) / (c[q] + 10.0))
+}
+
 /// 구역 면 하나에 텍스처: 사진을 붙일 삼각형이 하나도 없으면 None. img: 장면 id → 컬러(w×h×3)
 pub fn texture_region(verts: &Verts, tris: &Tris, cams: &[Cam], img: &dyn Fn(u32) -> Option<Arc<Vec<u8>>>) -> Option<TexMesh> {
     if tris.is_empty() || cams.is_empty() {
@@ -380,21 +395,7 @@ pub fn texture_region(verts: &Verts, tris: &Tris, cams: &[Cam], img: &dyn Fn(u32
             // 노출 맞춤(mvs-texturing 의 이음매 고르기를 줄인 것): 꼭짓점마다 표면 색(모든 장면 평균) ÷ 사진 색(5×5 흐린 값),
             // 차트 안 이웃끼리 세 번 평균해 꼭짓점 색(배율)으로 둔다 → 차트 경계 양쪽이 같은 표면 색에 맞아 이음매가 줄고, 안쪽 무늬는 사진 그대로
             let im = &imgs[l];
-            let mut gain: HashMap<u32, [f32; 3]> = uv
-                .iter()
-                .map(|(&vi, &(u, v))| {
-                    let mut c = [0f32; 3];
-                    for dy in -2..=2 {
-                        for dx in -2..=2 {
-                            let s = bilinear(im, cam.w, cam.h, u + 2.0 * dx as f64, v + 2.0 * dy as f64);
-                            for q in 0..3 {
-                                c[q] += s[q] / 25.0;
-                            }
-                        }
-                    }
-                    (vi, [0, 1, 2].map(|q| (verts[vi as usize].1[q] as f32 + 10.0) / (c[q] + 10.0)))
-                })
-                .collect();
+            let mut gain: HashMap<u32, [f32; 3]> = uv.iter().map(|(&vi, &(u, v))| (vi, raw_gain(im, cam, u, v, &verts[vi as usize].1))).collect();
             let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
             for &t in ts {
                 let tv = tris[t as usize];
@@ -462,10 +463,16 @@ pub fn texture_region(verts: &Verts, tris: &Tris, cams: &[Cam], img: &dyn Fn(u32
                 }
             }
         }
-        // 꼭짓점 사진 좌표 → 아틀라스 UV(텍스처 v 는 아래가 0)
+        // 꼭짓점 사진 좌표 → 아틀라스 화소 좌표(화소 i 의 가운데 = i + 0.5)
         for e in c.uv.values_mut() {
-            let (px, py) = (x0 as f64 + PAD as f64 + (e.0 - c.lo.0) * s + 0.5, y0 as f64 + PAD as f64 + (e.1 - c.lo.1) * s + 0.5);
-            *e = (px / aw as f64, 1.0 - py / ah as f64);
+            *e = (x0 as f64 + PAD as f64 + (e.0 - c.lo.0) * s + 0.5, y0 as f64 + PAD as f64 + (e.1 - c.lo.1) * s + 0.5);
+        }
+    }
+    blend_seams(verts, tris, &lab, &chart_of, &chs.iter().map(|c| (c.cam, &c.uv, &c.gain)).collect::<Vec<_>>(), cams, &cand, &imgs, (aw, ah, &mut atlas));
+    // 아틀라스 화소 좌표 → UV(텍스처 v 는 아래가 0)
+    for c in chs.iter_mut() {
+        for e in c.uv.values_mut() {
+            *e = (e.0 / aw as f64, 1.0 - e.1 / ah as f64);
         }
     }
     let white = untex.then(|| {
@@ -504,6 +511,126 @@ pub fn texture_region(verts: &Verts, tris: &Tris, cams: &[Cam], img: &dyn Fn(u32
         }));
     }
     Some(TexMesh { verts: out_v, tris: out_t, atlas: (aw, ah, atlas), used: used.iter().map(|&l| cams[cand[l as usize]].id).collect(), n_tex })
+}
+
+/// 이음매 섞기(경계 띠만 여러 장면 가중 평균): 꼭짓점마다 장면 무게 = 둘레 삼각형 중 그 장면 삼각형의 비율.
+/// 차트 경계 꼭짓점은 양쪽 차트에서 같은 무게라 경계 양쪽 색이 이어지고, 무게는 삼각형 안에서 보간돼 삼각형 한 개 폭 안에서 이웃 장면 사진으로 넘어간다.
+/// 이웃 장면 색은 (그 장면 노출 배율 ÷ 이 차트 배율)로 맞추고, 그 장면에서 가려진 점은 섞지 않는다. 경계에 닿은 삼각형만 칠한다
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn blend_seams(
+    verts: &Verts, tris: &Tris, lab: &[u16], chart_of: &[u32], chs: &[(usize, &HashMap<u32, (f64, f64)>, &HashMap<u32, [f32; 3]>)], cams: &[Cam], cand: &[usize],
+    imgs: &HashMap<u16, Arc<Vec<u8>>>, atlas: (usize, usize, &mut [u8]),
+) {
+    let (aw, ah, atlas) = atlas;
+    let mut vw: HashMap<u32, Vec<(u16, f32)>> = HashMap::new();
+    for (ti, t) in tris.iter().enumerate() {
+        if lab[ti] == u16::MAX {
+            continue;
+        }
+        for &vi in t {
+            let e = vw.entry(vi).or_default();
+            match e.iter_mut().find(|x| x.0 == lab[ti]) {
+                Some(x) => x.1 += 1.0,
+                None => e.push((lab[ti], 1.0)),
+            }
+        }
+    }
+    for e in vw.values_mut() {
+        let s: f32 = e.iter().map(|x| x.1).sum();
+        e.iter_mut().for_each(|x| x.1 /= s);
+    }
+    let inside = |cam: &Cam, u: f64, v: f64| u >= MARGIN && v >= MARGIN && u < cam.w as f64 - MARGIN && v < cam.h as f64 - MARGIN;
+    for (ti, t) in tris.iter().enumerate() {
+        let ch = chart_of[ti];
+        if ch == u32::MAX || t.iter().all(|vi| vw[vi].len() < 2) {
+            continue;
+        }
+        let own = lab[ti];
+        let (_, uv, gain) = chs[ch as usize];
+        // 이웃 장면: (장면, 꼭짓점별 무게, 노출 배율 비)
+        let mut others: Vec<(u16, [f32; 3], [f32; 3])> = vec![];
+        for (k, vi) in t.iter().enumerate() {
+            for &(l, w) in &vw[vi] {
+                if l == own {
+                    continue;
+                }
+                let i = others.iter().position(|o| o.0 == l).unwrap_or_else(|| {
+                    others.push((l, [0.0; 3], [0.0; 3]));
+                    others.len() - 1
+                });
+                others[i].1[k] = w;
+            }
+        }
+        others.retain_mut(|o| {
+            let (cam, im) = (&cams[cand[o.0 as usize]], &imgs[&o.0]);
+            let (mut r, mut n) = ([0f32; 3], 0f32);
+            for &vi in t {
+                let v = &verts[vi as usize];
+                if let Some((u, vv, _)) = cam.proj(&p64(&v.0)).filter(|&(u, vv, _)| inside(cam, u, vv)) {
+                    let (g, ga) = (raw_gain(im, cam, u, vv, &v.1), gain[&vi]);
+                    for q in 0..3 {
+                        r[q] += g[q].clamp(0.7, 1.4) / ga[q];
+                    }
+                    n += 1.0;
+                }
+            }
+            o.2 = r.map(|x| x / n.max(1.0));
+            n > 0.0
+        });
+        if others.is_empty() {
+            continue;
+        }
+        let p = t.map(|vi| uv[&vi]);
+        let x = t.map(|vi| p64(&verts[vi as usize].0));
+        let wa = t.map(|vi| vw[&vi].iter().find(|x| x.0 == own).map_or(0.0, |x| x.1));
+        let det = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[2].0 - p[0].0) * (p[1].1 - p[0].1);
+        if det.abs() < 1e-9 {
+            continue;
+        }
+        let lo = |a: f64, b: f64, c: f64| (a.min(b).min(c) - 0.5).floor().max(0.0) as usize;
+        let (x0, y0) = (lo(p[0].0, p[1].0, p[2].0), lo(p[0].1, p[1].1, p[2].1));
+        let (x1, y1) = ((p[0].0.max(p[1].0).max(p[2].0) as usize).min(aw - 1), (p[0].1.max(p[1].1).max(p[2].1) as usize).min(ah - 1));
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
+                let b1 = ((cx - p[0].0) * (p[2].1 - p[0].1) - (p[2].0 - p[0].0) * (cy - p[0].1)) / det;
+                let b2 = ((p[1].0 - p[0].0) * (cy - p[0].1) - (cx - p[0].0) * (p[1].1 - p[0].1)) / det;
+                let b = [1.0 - b1 - b2, b1, b2];
+                if b.iter().any(|&v| v < -0.1) {
+                    continue;
+                }
+                let b = b.map(|v| v.max(0.0));
+                let bs = b[0] + b[1] + b[2];
+                let b = b.map(|v| v / bs);
+                let o = (py * aw + px) * 3;
+                let w_own = (0..3).map(|k| b[k] as f32 * wa[k]).sum::<f32>();
+                let mut acc = [0, 1, 2].map(|q| atlas[o + q] as f32 * w_own);
+                let mut ws = w_own;
+                let xp = [0, 1, 2].map(|q| b[0] * x[0][q] + b[1] * x[1][q] + b[2] * x[2][q]);
+                for (l, w3, ratio) in &others {
+                    let w = (0..3).map(|k| b[k] as f32 * w3[k]).sum::<f32>();
+                    if w < 0.01 {
+                        continue;
+                    }
+                    let cam = &cams[cand[*l as usize]];
+                    let Some((u, v, z)) = cam.proj(&xp) else { continue };
+                    if !inside(cam, u, v) || !cam.visible(u, v, z) {
+                        continue;
+                    }
+                    let c = bilinear(&imgs[l], cam.w, cam.h, u, v);
+                    for q in 0..3 {
+                        acc[q] += w * c[q] * ratio[q];
+                    }
+                    ws += w;
+                }
+                if ws > w_own {
+                    for q in 0..3 {
+                        atlas[o + q] = (acc[q] / ws).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 텍스처 면 PLY: 위치·법선·UV(s, t)·색 + 삼각형

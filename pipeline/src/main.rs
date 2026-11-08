@@ -1540,16 +1540,19 @@ fn surface_outputs(dir: &Path, run_id: u64, vox: f64, s: &mut submap::Submaps, t
 const PTS_BUDGET: usize = 300_000;
 /// 점 작업 스레드에 밀린 장면이 이만큼이면 스트림 장면은 점 지도를 건너뜀(본 스레드는 기다리지 않음)
 const PTS_QUEUE: usize = 6;
-/// --surface --points: 점 지도에 넣는 장면 사이 최소 움직임(거리 m, 각도 °)
+/// --surface --points: 이만큼(거리 m, 각도 °) 안 움직인 장면은 점 격자 일부(1/PTS_SUB²)만 넣음
 const PTS_GAP_M: f64 = 0.04;
 const PTS_GAP_DEG: f64 = 4.0;
+/// 가까운 자리 장면은 점 격자 간격을 이만큼 곱해(점 1/PTS_SUB²) 어긋남을 돌려 가며 넣음
+const PTS_SUB: usize = 2;
 
 /// 노드 파일 바이트: (수준, 노드 키, 바이트)
 type PtsFiles = Vec<(u32, u64, Vec<u8>)>;
 
-/// 점 격자: 장면 화소 step 간격, 거른 뒤 남은 점의 깊이(m, 0 = 점 없음)·색
+/// 점 격자: 장면 화소 (off + step 간격), 거른 뒤 남은 점의 깊이(m, 0 = 점 없음)·색
 struct PtsGrid {
     step: usize,
+    off: [usize; 2],
     gw: usize,
     gh: usize,
     d: Vec<f32>,
@@ -1559,27 +1562,32 @@ struct PtsGrid {
 impl PtsGrid {
     fn from_z(z: &kfstore::PtsZ) -> PtsGrid {
         let (d, rgb) = z.unpack();
-        PtsGrid { step: z.step, gw: z.gw, gh: z.gh, d, rgb }
+        PtsGrid { step: z.step, off: z.off, gw: z.gw, gh: z.gh, d, rgb }
     }
     fn pack(&self) -> kfstore::PtsZ {
-        kfstore::PtsZ::pack(self.step, self.gw, self.gh, &self.d, &self.rgb)
+        kfstore::PtsZ::pack(self.step, self.off, self.gw, self.gh, &self.d, &self.rgb)
     }
 }
 
 /// 장면에서 점 지도에 넣을 점을 고른다(--scene-step 간격): 깊이 경계·비스듬히 본 면을 빼고 --pts-depth 안만.
 /// smooth(--surface --points): 깊이를 5×5 이웃 중 같은 면(Kinect 잡음 폭 안)의 평균으로 — 평면에서는 가운데 값과 같고
-/// 잡음은 이웃 수의 제곱근만큼 줄어 면이 얇아짐
-fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize) -> PtsGrid {
+/// 잡음은 이웃 수의 제곱근만큼 줄어 면이 얇아짐.
+/// part: Some(p) = 간격 PTS_SUB 배 격자의 p 번째 어긋남(점 1/PTS_SUB²) — 가까운 자리 장면이 돌아가며 모든 칸을 채움
+fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize, part: Option<usize>) -> PtsGrid {
     use rayon::prelude::*;
     let [fx, fy, cx, cy] = k;
-    let (step, maxd, smooth) = (a.scene_step, a.max_depth.min(a.pts_depth), a.surface);
-    let (gw, gh) = (w.div_ceil(step), h.div_ceil(step));
+    let (maxd, smooth) = (a.max_depth.min(a.pts_depth), a.surface);
+    let (step, off) = match part {
+        Some(p) => (a.scene_step * PTS_SUB, [(p % PTS_SUB) * a.scene_step, (p / PTS_SUB % PTS_SUB) * a.scene_step]),
+        None => (a.scene_step, [0, 0]),
+    };
+    let (gw, gh) = ((w - off[0]).div_ceil(step), (h - off[1]).div_ceil(step));
     let mut d = vec![0f32; gw * gh];
     let mut c = vec![0u8; gw * gh * 3];
     d.par_chunks_mut(gw).zip(c.par_chunks_mut(gw * 3)).enumerate().for_each(|(gy, (dr, cr))| {
-        let v = gy * step;
+        let v = off[1] + gy * step;
         for gx in 0..gw {
-            let u = gx * step;
+            let u = off[0] + gx * step;
             let z = depth[v * w + u] as f64;
             if !(z > 0.2 && z < 6.0) {
                 continue;
@@ -1592,7 +1600,7 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
             }
         }
     });
-    PtsGrid { step, gw, gh, d, rgb: c }
+    PtsGrid { step, off, gw, gh, d, rgb: c }
 }
 
 /// 5×5 이웃 중 가운데와 Kinect 잡음 폭(3 mm + 0.4 %·z²) 안인 깊이의 평균(가장자리 2 화소 안쪽만 불림: facing 이 보장)
@@ -1616,14 +1624,14 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3) -> Vec<(V3, [u8; 3], 
     let [fx, fy, cx, cy] = k;
     let mut out = Vec::with_capacity(g.d.len() / 2);
     for gy in 0..g.gh {
-        let v = (gy * g.step) as f64;
+        let v = (g.off[1] + gy * g.step) as f64;
         for gx in 0..g.gw {
             let i = gy * g.gw + gx;
             let z = g.d[i] as f64;
             if z <= 0.0 {
                 continue;
             }
-            let pc = [((gx * g.step) as f64 - cx) / fx * z, (v - cy) / fy * z, z];
+            let pc = [((g.off[0] + gx * g.step) as f64 - cx) / fx * z, (v - cy) / fy * z, z];
             out.push((add(&mv(r, &pc), pwc), [g.rgb[i * 3], g.rgb[i * 3 + 1], g.rgb[i * 3 + 2]], z as f32));
         }
     }
@@ -1632,7 +1640,7 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3) -> Vec<(V3, [u8; 3], 
 
 enum PtsMsg {
     /// 실시간 장면: 점을 고르고(보관 장면이면 점 격자를 압축해 붙임) 지도에 넣음
-    Frame { kf: u32, r: M3, pwc: V3, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>> },
+    Frame { kf: u32, r: M3, pwc: V3, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, part: Option<usize> },
     /// 보관 장면(다시 쌓은 뒤 이어 넣기): 붙여 둔 점 격자로
     Stored { kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf> },
     /// 노드 파일 쓰기(점 수 상한, 0 = 모두), 다 쓰면 알림(기다리는 모드)
@@ -1651,9 +1659,9 @@ struct PtsWorker {
     handle: Option<std::thread::JoinHandle<SceneMap>>,
     wait: bool, // 밀려도 기다림(TUM 입력: 결과가 늘 같게)
     out: PathBuf,
-    gap: Option<(f64, f64)>, // --surface --points: 이만큼(m, 라디안) 안 움직인 장면은 점 지도에 안 넣음
-    last: Option<(M3, V3)>, // 마지막으로 넣은 장면 위치
-    skipped: u32,
+    gap: Option<(f64, f64)>, // --surface --points: 이만큼(m, 라디안) 안 움직인 장면은 점 격자 일부만
+    last: Option<(M3, V3)>, // 마지막으로 다 넣은 장면 위치
+    skipped: u32, // 점 격자 일부만 넣은 가까운 자리 장면 수
     dropped: u32,
 }
 
@@ -1672,9 +1680,9 @@ impl PtsWorker {
             let (mut t_grid, mut t_add, mut t_write, mut nf) = (0f64, 0f64, 0f64, 0u32);
             for m in rx {
                 match m {
-                    PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep } => {
+                    PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep, part } => {
                         let c0 = Instant::now();
-                        let g = pts_grid(&a, k, &depth, &rgb, w, h);
+                        let g = pts_grid(&a, k, &depth, &rgb, w, h, part);
                         if let Some(s) = keep {
                             let _ = s.pts.set(Some(g.pack()));
                         }
@@ -1715,25 +1723,28 @@ impl PtsWorker {
     fn send(&self, m: PtsMsg) {
         self.tx.as_ref().unwrap().send(m).expect("점 작업 스레드");
     }
-    /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게
+    /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게.
+    /// 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면은 점 격자 일부만(어긋남을 돌려 가며) 넣음: 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
     #[allow(clippy::too_many_arguments)]
     fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: &[f32], rgb: &[u8], w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>) {
         use std::sync::atomic::Ordering::Relaxed;
-        // 직전에 넣은 장면과 거의 같은 자리에서 본 장면은 건너뜀(같은 시점의 잡음은 평균해도 덜 줄고 넣기·보관만 늚)
-        let near = self.gap.zip(self.last.as_ref()).is_some_and(|((dt, dr), (lr, lp))| norm(&sub(&pwc, lp)) < dt && rot_angle(&r, lr) < dr);
-        if near {
-            self.skipped += 1;
-        }
-        if near || (!self.wait && self.queued.load(Relaxed) >= PTS_QUEUE) {
-            self.dropped += !near as u32;
+        if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
+            self.dropped += 1;
             if let Some(s) = keep {
                 let _ = s.pts.set(None);
             }
             return;
         }
         self.queued.fetch_add(1, Relaxed);
-        self.last = Some((r, pwc));
-        self.send(PtsMsg::Frame { kf, r, pwc, depth: depth.to_vec(), rgb: rgb.to_vec(), w, h, keep });
+        let near = self.gap.zip(self.last.as_ref()).is_some_and(|((dt, dr), (lr, lp))| norm(&sub(&pwc, lp)) < dt && rot_angle(&r, lr) < dr);
+        let part = if near {
+            self.skipped += 1;
+            Some(self.skipped as usize % (PTS_SUB * PTS_SUB))
+        } else {
+            self.last = Some((r, pwc));
+            None
+        };
+        self.send(PtsMsg::Frame { kf, r, pwc, depth: depth.to_vec(), rgb: rgb.to_vec(), w, h, keep, part });
     }
     fn stored(&self, kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf>) {
         self.send(PtsMsg::Stored { kf, r, pwc, store });

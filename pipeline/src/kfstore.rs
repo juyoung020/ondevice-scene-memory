@@ -29,9 +29,10 @@ pub struct Kf {
     pub pts: std::sync::OnceLock<Option<PtsZ>>,
 }
 
-/// 점 격자 압축본: gw×gh(장면 화소 step 간격), 깊이 0 = 점 없음
+/// 점 격자 압축본: gw×gh(장면 화소 off + step 간격), 깊이 0 = 점 없음
 pub struct PtsZ {
     pub step: usize,
+    pub off: [usize; 2],
     pub gw: usize,
     pub gh: usize,
     depth_z: Vec<u8>,
@@ -39,9 +40,9 @@ pub struct PtsZ {
 }
 
 impl PtsZ {
-    pub fn pack(step: usize, gw: usize, gh: usize, depth: &[f32], rgb: &[u8]) -> PtsZ {
+    pub fn pack(step: usize, off: [usize; 2], gw: usize, gh: usize, depth: &[f32], rgb: &[u8]) -> PtsZ {
         let d: Vec<u16> = depth.iter().map(|&v| (v * 1000.0).round().clamp(0.0, 65535.0) as u16).collect();
-        PtsZ { step, gw, gh, depth_z: pack_depth(&d, gw, gh), rgb_z: pack_rgb(rgb, gw, gh) }
+        PtsZ { step, off, gw, gh, depth_z: pack_depth(&d, gw, gh), rgb_z: pack_rgb(rgb, gw, gh) }
     }
     /// (깊이 m, 색)
     pub fn unpack(&self) -> (Vec<f32>, Vec<u8>) {

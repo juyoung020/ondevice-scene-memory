@@ -716,6 +716,12 @@ struct Worker {
     secs: f64,
     secs_max: f64,
     secs_frames: f64,
+    n_reused: usize, // 면이 그대로라 텍스처를 다시 붙이지 않은 횟수
+}
+
+/// 두 면이 같은 모양인가: 삼각형이 같고 꼭짓점이 1 mm 안(색은 보지 않음 — 텍스처가 덮음)
+fn same_mesh(a: &(Verts, Tris), b: &(Verts, Tris)) -> bool {
+    a.1 == b.1 && a.0.len() == b.0.len() && a.0.iter().zip(&b.0).all(|(p, q)| (0..3).all(|i| (p.0[i] - q.0[i]).abs() < 1e-3))
 }
 
 impl Worker {
@@ -772,6 +778,7 @@ impl Worker {
             let v = self.views.remove(&victim).unwrap();
             self.bytes -= v.bytes();
         }
+        crate::out::slow(c0);
         self.secs_frames += c0.elapsed().as_secs_f64();
     }
 
@@ -822,6 +829,7 @@ impl Worker {
         let c0 = Instant::now();
         let st = &self.regs[&reg];
         let m = texture_region(&st.mesh.0, &st.mesh.1, cams, &|id| self.image(id));
+        crate::out::slow(c0);
         (m, c0.elapsed().as_secs_f64())
     }
 
@@ -869,8 +877,17 @@ impl Worker {
                 match c {
                     Ctl::Graph(g) => self.graph(g),
                     Ctl::Mesh(reg, ver, m) => {
+                        // 다시 뽑았어도 면이 그대로(꼭짓점 1 mm 안, 같은 삼각형)이고 붙일 때 쓴 사진도 움직이지 않았으면 붙인 텍스처를 그대로 씀
+                        let reuse = self.regs.get(&reg).is_some_and(|st| st.tv > 0 && !self.stale(st) && same_mesh(&st.mesh, &m));
                         let st = self.regs.entry(reg).or_insert(RegState { ver, mesh: m.clone(), t_mesh: Instant::now(), done: None, tv: 0 });
-                        (st.ver, st.mesh, st.t_mesh) = (ver, m, Instant::now());
+                        if reuse {
+                            let used = st.done.take().map(|d| d.1).unwrap_or_default();
+                            (st.ver, st.done) = (ver, Some((ver, used)));
+                            self.n_reused += 1;
+                            let _ = out.send(Out::Done(reg, ver, st.tv));
+                        } else {
+                            (st.ver, st.mesh, st.t_mesh) = (ver, m, Instant::now());
+                        }
                     }
                     Ctl::Finish => finish = true,
                 }
@@ -892,9 +909,9 @@ impl Worker {
                 }
                 let ntex = self.regs.values().filter(|s| s.tv > 0 && s.done.as_ref().is_some_and(|d| d.0 == s.ver)).count();
                 let msg = format!(
-                    "텍스처: 보관 사진 {} 장({:.0} MB, 받은 장면 {} 장, 고르기·JPEG {:.1} ms/장), 구역 {} 개 중 {} 개 붙임, 붙이기 {} 번 평균 {:.0} ms·최대 {:.0} ms, 끝 마무리 {} 구역 {:.2} 초",
+                    "텍스처: 보관 사진 {} 장({:.0} MB, 받은 장면 {} 장, 고르기·JPEG {:.1} ms/장), 구역 {} 개 중 {} 개 붙임, 붙이기 {} 번(면이 그대로라 다시 씀 {} 번) 평균 {:.0} ms·최대 {:.0} ms, 끝 마무리 {} 구역 {:.2} 초",
                     self.views.len(), self.bytes as f64 / 1048576.0, self.n_frames, self.secs_frames / self.n_frames.max(1) as f64 * 1e3,
-                    self.regs.len(), ntex, self.n_regions, self.secs / self.n_regions.max(1) as f64 * 1e3, self.secs_max * 1e3, n_final, wall
+                    self.regs.len(), ntex, self.n_regions, self.n_reused, self.secs / self.n_regions.max(1) as f64 * 1e3, self.secs_max * 1e3, n_final, wall
                 );
                 let _ = out.send(Out::Finished(msg));
                 return;
@@ -935,9 +952,9 @@ impl Texturer {
         let w = Worker {
             dir: dir.to_path_buf(), cap: cap_mb << 20, nodes: HashMap::new(), fix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], z0: 0.0,
             views: BTreeMap::new(), next_id: 1, bytes: 0, regs: BTreeMap::new(), cache: Mutex::new((HashMap::new(), VecDeque::new())),
-            n_frames: 0, n_regions: 0, secs: 0.0, secs_max: 0.0, secs_frames: 0.0,
+            n_frames: 0, n_regions: 0, secs: 0.0, secs_max: 0.0, secs_frames: 0.0, n_reused: 0,
         };
-        let th = std::thread::Builder::new().name("texture".into()).spawn(move || { crate::out::background_thread(); w.run(crx, frx, otx) }).unwrap();
+        let th = std::thread::Builder::new().name("texture".into()).spawn(move || { crate::out::thread_role(crate::out::Role::Texture); w.run(crx, frx, otx) }).unwrap();
         Texturer { ctl, frames, out, th: Some(th), tex: HashMap::new() }
     }
     /// 장면 넘기기(작업 스레드가 밀려 있으면 버림)

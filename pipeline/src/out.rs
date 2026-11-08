@@ -22,7 +22,12 @@ pub fn start_writer() {
     WRITER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(std::path::PathBuf, Job)>(256);
         std::thread::spawn(move || {
+            thread_role(Role::Writer);
             for (p, job) in rx {
+                if p.as_os_str().is_empty() {
+                    job(); // flush_writer 표시
+                    continue;
+                }
                 run_job(&p, job);
             }
         });
@@ -51,6 +56,7 @@ fn run_job(dst: &Path, job: Job) {
     let c0 = std::time::Instant::now();
     let b = job();
     write_now(dst, &b);
+    slow(c0);
     stats::add(stats::kind(dst), b.len(), c0.elapsed().as_nanos() as u64);
 }
 
@@ -172,15 +178,110 @@ pub mod stats {
     }
 }
 
-/// 지금 스레드를 뒤로(nice +10): 다시 쌓기·텍스처 같은 작업 스레드가 2 코어 보드에서 장면 처리 스레드와 코어를 다툴 때
-/// 장면 처리가 먼저 돌게 한다(작업 스레드는 남는 시간에 끝남). 리눅스만, 실패해도 그대로 진행.
-pub fn background_thread() {
+
+/// 기록 스레드에 밀린 파일을 모두 쓸 때까지 기다림(끝낼 때)
+pub fn flush_writer() {
+    if let Some(tx) = WRITER.get() {
+        let (dt, dr) = std::sync::mpsc::channel::<()>();
+        let _ = tx.send((std::path::PathBuf::new(), Box::new(move || { let _ = dt.send(()); vec![] })));
+        let _ = dr.recv();
+    }
+}
+
+/// 스레드 역할: 우선순위(nice)·코어 묶기를 역할마다 정한다(`--threads`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role { Main, Reader, Points, Texture, Rebuild, Writer }
+pub const ROLE_NAMES: [&str; 6] = ["main", "reader", "pts", "tex", "rebuild", "writer"];
+
+/// 역할별 (nice, 코어 묶음 비트). 묶음 0 = 프로세스가 받은 코어 전부
+static LAYOUT: std::sync::OnceLock<[(i32, u64); 6]> = std::sync::OnceLock::new();
+static FULL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// 프로세스가 쓸 수 있는 코어(taskset 으로 준 것)
+pub fn allowed_cpus() -> Vec<usize> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+        }
+        let mut m = [0u64; 16];
+        if sched_getaffinity(0, 128, m.as_mut_ptr()) == 0 {
+            return (0..1024).filter(|i| m[i / 64] >> (i % 64) & 1 == 1).collect();
+        }
+    }
+    (0..std::thread::available_parallelism().map_or(1, |n| n.get())).collect()
+}
+
+/// `--threads` 해석. 기본(auto): nice 는 본 스레드·읽기 0, 점 +5, 기록 +5, 텍스처·다시 쌓기 +10.
+/// 코어 4 개 이상이면 본 스레드·읽기(분할)를 앞 코어 둘에, 점·텍스처·다시 쌓기·기록을 나머지 코어에 묶는다.
+/// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔). 직접 주기: `main=0:0,pts=5:2-3,tex=10:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
+pub fn set_layout(spec: &str) {
+    let cpus = allowed_cpus();
+    let bits = |v: &[usize]| v.iter().fold(0u64, |m, &c| if c < 64 { m | 1 << c } else { m });
+    let mut l: [(i32, u64); 6] = [(0, 0), (0, 0), (5, 0), (10, 0), (10, 0), (5, 0)];
+    match spec {
+        "none" => l = [(0, 0); 6],
+        "auto" => {
+            if cpus.len() >= 4 {
+                let (fg, bg) = (bits(&cpus[..2]), bits(&cpus[2..]));
+                l = [(0, fg), (0, fg), (5, bg), (10, bg), (10, bg), (5, bg)];
+            }
+        }
+        s => {
+            for part in s.split(',') {
+                let (name, rest) = part.split_once('=').expect("--threads: 역할=nice[:코어]");
+                let i = ROLE_NAMES.iter().position(|n| *n == name).expect("--threads: 역할 이름(main reader pts tex rebuild writer)");
+                let (nice, cores) = rest.split_once(':').map_or((rest, None), |(a, b)| (a, Some(b)));
+                let mut cs = vec![];
+                for r in cores.unwrap_or("").split('+').filter(|x| !x.is_empty()) {
+                    let (a, b) = r.split_once('-').map_or((r, r), |x| x);
+                    cs.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap());
+                }
+                l[i] = (nice.parse().unwrap(), bits(&cs));
+            }
+        }
+    }
+    let _ = LAYOUT.set(l);
+    eprintln!("스레드 배치(코어 {:?}): {}", cpus, ROLE_NAMES.iter().zip(&l).map(|(n, (ni, m))| format!("{n} nice {ni}{}", if *m == 0 { String::new() } else { format!(" 코어 {m:#x}") })).collect::<Vec<_>>().join(", "));
+    // 묶지 않는 역할도 프로세스 코어 전부로 다시 묶음(앞서 다른 역할로 묶인 스레드가 역할을 바꿀 때)
+    let all = bits(&cpus);
+    let _ = FULL.set(all);
+}
+
+/// 지금 스레드를 역할에 맞게(우선순위·코어). 리눅스만, 실패해도 그대로 진행
+pub fn thread_role(r: Role) {
+    let (nice, mask) = LAYOUT.get().copied().unwrap_or([(0, 0), (0, 0), (5, 0), (10, 0), (10, 0), (5, 0)])[r as usize];
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
             fn setpriority(which: i32, who: u32, prio: i32) -> i32;
             fn gettid() -> i32;
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
         }
-        setpriority(0, gettid() as u32, 10); // PRIO_PROCESS + 스레드 id = 그 스레드만
+        let tid = gettid();
+        setpriority(0, tid as u32, nice); // PRIO_PROCESS + 스레드 id = 그 스레드만
+        let mask = if mask == 0 { FULL.get().copied().unwrap_or(0) } else { mask };
+        if mask != 0 {
+            let mut m = [0u64; 16];
+            m[0] = mask;
+            sched_setaffinity(tid, 128, m.as_ptr());
+        }
+    }
+    let _ = (nice, mask);
+}
+
+/// 보드 흉내(`--slow F`): 이 구간이 F 배 걸린 것처럼 코어를 붙잡고 기다림(잠들지 않아 코어 다툼도 그대로)
+static SLOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub fn set_slow(f: f32) {
+    SLOW.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+pub fn slow(c0: std::time::Instant) {
+    let f = f32::from_bits(SLOW.load(std::sync::atomic::Ordering::Relaxed));
+    if f > 1.0 {
+        let until = c0.elapsed().mul_f32(f - 1.0);
+        let c1 = std::time::Instant::now();
+        while c1.elapsed() < until {
+            std::hint::spin_loop();
+        }
     }
 }

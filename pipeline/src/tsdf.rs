@@ -146,8 +146,25 @@ impl Tsdf {
     }
     /// 바뀐 구역의 면(꼭짓점: 위치·색, 삼각형)을 뽑아 돌려준다(구역 → 면). 판 번호도 올린다.
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code)]
     pub fn take_dirty_meshes(&mut self) -> Vec<((i32, i32, i32), Vec<([f32; 3], [u8; 3])>, Vec<[u32; 3]>)> {
-        let regions: Vec<(i32, i32, i32)> = self.dirty.drain().collect();
+        self.take_dirty_meshes_max(usize::MAX)
+    }
+
+    /// 바뀐 구역 중 많아야 max 개만(구역 순서 앞쪽부터) 면을 뽑고 나머지는 바뀐 채로 둔다
+    #[allow(clippy::type_complexity)]
+    pub fn take_dirty_meshes_max(&mut self, max: usize) -> Vec<((i32, i32, i32), Vec<([f32; 3], [u8; 3])>, Vec<[u32; 3]>)> {
+        let regions: Vec<(i32, i32, i32)> = if self.dirty.len() <= max {
+            self.dirty.drain().collect()
+        } else {
+            let mut all: Vec<(i32, i32, i32)> = self.dirty.iter().copied().collect();
+            all.sort();
+            all.truncate(max);
+            for r in &all {
+                self.dirty.remove(r);
+            }
+            all
+        };
         // 구역끼리 독립: 코어마다 나눠 뽑는다(읽기만)
         let this = &*self;
         let mut out: Vec<_> = {

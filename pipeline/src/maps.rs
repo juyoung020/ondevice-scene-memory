@@ -457,7 +457,8 @@ impl Memory {
 
     /// 병합 후처리(HOV-SG·ConceptGraphs 방식): 따로 생긴 두 물체가 같은 것이면 합친다.
     /// 기하: 굵은 칸(4 cm) 3D IoU, 작은 쪽 기준 겹침 비율. 의미: 이름 투표 분포 코사인. 생김새: 점 색 히스토그램 코사인.
-    /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8). 반환: 합친 수
+    /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8), 또는 이름 ≥ 0.5 이고 작은 쪽 굳은 칸 70 % 가 큰 쪽 칸 안(겹침 ≥ 0.2).
+    /// 사라짐 표시된 물체도 후보(이름 ≥ 0.5 일 때만). 반환: 합친 수
     /// 잠깐 잡혔다 사라진 검출 지우기: 두 번 이하로 보였고 3 초 넘게 다시 안 보인 물체(한두 장면의 잘못된 검출이 화면을 어지럽힘)
     /// 다시 쌓은 물체에 옛 물체의 id 를 물려준다(같은 이름, 가장 가까운 것, 크기 절반 + 15 cm 안, 한 번씩만).
     /// 뷰어는 같은 물체를 계속 같은 것으로 보고(선택 유지), 사진이 그대로면 PNG 세 장을 다시 짜지·받지 않는다.
@@ -502,6 +503,7 @@ impl Memory {
     }
 
     pub fn merge_pass(&mut self) -> usize {
+        let (frag_in, frag_ovl) = (0.7f32, 0.2f32); // 조각: 굳은 칸 70 % 가 상대 칸 안, 전체 칸 겹침 20 % 이상
         let hist = |o: &Obj| -> Vec<f32> {
             let mut h = vec![0f32; 64];
             for v in o.cells.values() {
@@ -515,9 +517,16 @@ impl Memory {
             let nb = b.votes.values().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
             a.votes.iter().map(|(k, v)| v * b.votes.get(k).copied().unwrap_or(0.0)).sum::<f32>() / (na * nb)
         };
+        // 굳은 칸: 여러 관측이 지지한 굵은 칸(refresh 가 보여 주는 점과 같은 문턱). 가장자리 번짐·한두 장면 오검출 칸을 뺀 물체 몸통
+        let solid = |o: &Obj| -> Vec<u64> {
+            let thr = if o.n_obs < 3 { 1 } else { (0.15 * o.n_obs as f64).ceil().clamp(2.0, 10.0) as u32 };
+            o.support.iter().filter(|(_, n)| **n >= thr).map(|(k, _)| *k).collect()
+        };
         let mut merged = 0;
         loop {
-            let alive: Vec<usize> = (0..self.objs.len()).filter(|&i| self.objs[i].state != "gone").collect();
+            // 사라짐으로 표시된 물체도 후보: 정지 장면에서 잘못 사라짐 처리된 물체 자리에 같은 물체가 새로 생기면 둘로 남았다(중복 대부분이 이 경우).
+            // 사라진 물체가 낀 짝은 이름이 같아야(생김새만으로는 안 합침), 합친 물체는 더 최근에 본 쪽 상태를 따른다
+            let alive: Vec<usize> = (0..self.objs.len()).collect();
             let mut pair = None;
             'outer: for (ai, &i) in alive.iter().enumerate() {
                 for &j in &alive[ai + 1..] {
@@ -535,7 +544,15 @@ impl Memory {
                     let ovl = inter / sa.len().max(1) as f32;
                     let sem = votes_cos(a, b);
                     let app = if ovl >= 0.6 { hist(a).iter().zip(hist(b)).map(|(x, y)| x * y).sum::<f32>() } else { 0.0 };
-                    if iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) {
+                    let any_gone = a.state == "gone" || b.state == "gone";
+                    // 조각: 작은 쪽 굳은 칸의 대부분이 큰 쪽이 본 칸 안(같은 이름). 전체 칸 겹침은 번짐 칸이 분모를 키워 낮게 나온다
+                    let frag = || {
+                        let (s, l) = if a.support.len() <= b.support.len() { (a, b) } else { (b, a) };
+                        let sc = solid(s);
+                        sc.len() >= 3 && sc.iter().filter(|k| l.support.contains_key(k)).count() as f32 >= frag_in * sc.len() as f32
+                    };
+                    let geo = iou >= 0.5 || ovl >= 0.6 || (ovl >= frag_ovl && frag());
+                    if if any_gone { sem >= 0.5 && geo } else { iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) || (sem >= 0.5 && ovl >= frag_ovl && frag()) } {
                         pair = Some((i, j));
                         break 'outer;
                     }

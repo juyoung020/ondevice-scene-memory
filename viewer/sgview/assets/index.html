@@ -1477,10 +1477,9 @@ function applyView(v) {
   // Clicking an object still highlights its points.
   if (pointsAuto && view.scene_points && (view.scene_points.surface || view.scene_points.octree) && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
   // presentation defaults (once per page, a URL value such as ?c_scene=1 wins): the surface already shows the scene, so the point map
-  // only speckles it; a handheld camera marker is a debugging aid
+  // only speckles it
   if (!presetDone) { presetDone = true;
-    if (view.scene_points && view.scene_points.surface && !QS.has("c_scene") && $("c_scene").checked) { $("c_scene").checked = false; rebuildScene(); }
-    if (isHandheld() && !QS.has("c_robot") && $("c_robot").checked) { $("c_robot").checked = false; gRobot.visible = false; } }
+    if (view.scene_points && view.scene_points.surface && !QS.has("c_scene") && $("c_scene").checked) { $("c_scene").checked = false; rebuildScene(); } }
   objs.clear(); for (const o of view.objects) objs.set(o.id, o);
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything

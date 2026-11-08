@@ -5,40 +5,56 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sgview — scene graph</title>
 <style>
-  :root { --bg:#f4f4f6; --panel:#ffffff; --ink:#1d1d22; --mute:#6b6b76; --line:#dcdce2; --acc:#2a7de1; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#16161a; --panel:#202026; --ink:#ececf1; --mute:#9a9aa6; --line:#34343c; --acc:#5aa2ff; } }
-  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:13px/1.45 system-ui, sans-serif; overflow:hidden; }
-  #view { position:absolute; inset:0 340px 0 0; }
+  :root { --bg0:#0b0e14; --bg1:#1b2130; --panel:rgba(20,24,33,.78); --ink:#e8ebf2; --mute:#8d95a8; --line:rgba(255,255,255,.08); --acc:#6aa8ff; }
+  html, body { margin:0; height:100%; color:var(--ink); font:13px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif; overflow:hidden;
+    background:radial-gradient(ellipse 120% 90% at 50% 38%, var(--bg1) 0%, #121722 55%, var(--bg0) 100%); }
+  #view { position:absolute; inset:0; }
   canvas { display:block; }
-  #boot { position:absolute; left:0; top:0; right:340px; bottom:0; display:flex; align-items:center; justify-content:center; pointer-events:none; color:var(--mute); font-size:15px; letter-spacing:.04em; z-index:3; transition:opacity .25s; }
+  #boot { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; color:var(--mute); font-size:14px; letter-spacing:.08em; z-index:3; transition:opacity .4s; }
   #boot.gone { opacity:0; }
-  #labels { position:absolute; inset:0 340px 0 0; pointer-events:none; overflow:hidden; }
-  .lbl { position:absolute; transform:translate(-50%,-100%); background:rgba(255,255,255,.78); color:#111; padding:0 3px; border-radius:3px; font-size:11px; white-space:nowrap; }
-  .lbl.room { font-size:14px; font-weight:600; background:rgba(255,255,255,.9); }
-  #panel { position:absolute; top:0; right:0; bottom:0; width:340px; box-sizing:border-box; overflow-y:auto; background:var(--panel); border-left:1px solid var(--line); padding:10px 12px 24px; }
-  #status { font-weight:600; margin-bottom:6px; }
-  details { border-top:1px solid var(--line); padding:6px 0; }
-  summary { cursor:pointer; font-weight:600; }
-  label.row { display:flex; align-items:center; gap:6px; padding:1px 0; }
-  .num { display:flex; align-items:center; justify-content:space-between; gap:6px; padding:1px 0; }
-  input[type=number] { width:64px; }
-  select { max-width:190px; }
+  #labels { position:absolute; inset:0; pointer-events:none; overflow:hidden; }
+  .lbl { position:absolute; transform:translate(-50%,-100%); background:rgba(16,19,27,.72); color:#eef1f7; padding:2px 9px; border-radius:999px; font-size:11px; white-space:nowrap;
+    border:1px solid rgba(255,255,255,.10); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); box-shadow:0 2px 10px rgba(0,0,0,.35); }
+  .lbl.room { font-size:13px; font-weight:600; padding:3px 12px; }
+  .lbl.obj::before { content:""; display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--c, #2ea043); margin-right:6px; vertical-align:1px; }
+  .lbl.hot { font-size:12.5px; padding:4px 12px; background:rgba(16,19,27,.86); border-color:rgba(106,168,255,.55); z-index:2; }
+  .lbl.layer { background:none; border:0; box-shadow:none; color:var(--mute); font-size:11px; letter-spacing:.12em; font-weight:600; transform:translate(0,-100%); }
+  .lbl.traj { background:rgba(47,129,247,.85); }
+  #panel { position:absolute; top:64px; right:14px; bottom:14px; width:320px; box-sizing:border-box; overflow-y:auto; background:var(--panel); border:1px solid var(--line);
+    border-radius:14px; padding:10px 14px 18px; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); box-shadow:0 10px 40px rgba(0,0,0,.45);
+    transition:opacity .2s, transform .2s; z-index:6; scrollbar-width:thin; scrollbar-color:#3a4152 transparent; }
+  body:not(.panel-open) #panel { opacity:0; transform:translateX(16px); pointer-events:none; }
+  #status { font-weight:600; margin-bottom:6px; color:var(--mute); font-size:12px; }
+  details { border-top:1px solid var(--line); padding:7px 0; }
+  summary { cursor:pointer; font-weight:600; font-size:12px; letter-spacing:.04em; text-transform:uppercase; color:#c9cfdc; }
+  label.row { display:flex; align-items:center; gap:7px; padding:2px 0; }
+  .num { display:flex; align-items:center; justify-content:space-between; gap:6px; padding:2px 0; }
+  input[type=checkbox], input[type=range] { accent-color:var(--acc); }
+  input[type=number], select { width:64px; background:#11151e; color:var(--ink); border:1px solid #2c3242; border-radius:6px; padding:2px 4px; }
+  select { width:auto; max-width:190px; }
   table { border-collapse:collapse; width:100%; font-size:12px; }
   td { padding:1px 4px; vertical-align:top; border-bottom:1px solid var(--line); }
   td:first-child { color:var(--mute); white-space:nowrap; }
   .crop { margin-top:6px; } .crop img { max-width:100%; image-rendering:pixelated; border:1px solid var(--line); }
-  button { cursor:pointer; padding:3px 8px; }
-  .mono { font-family:ui-monospace, monospace; font-size:11px; word-break:break-all; color:var(--mute); }
+  button { cursor:pointer; padding:4px 10px; background:#1a1f2b; color:var(--ink); border:1px solid #2c3242; border-radius:8px; font:inherit; }
+  button:hover { border-color:var(--acc); }
+  .mono { font-family:ui-monospace, Consolas, monospace; font-size:11px; word-break:break-all; color:var(--mute); }
   .legend { color:var(--mute); font-size:12px; }
-  .lbl.obj { border-left:3px solid var(--c, #2ea043); }
-  .lbl.layer { background:none; color:var(--mute); font-size:11px; letter-spacing:.12em; font-weight:600; transform:translate(0,-100%); }
-  .lbl.traj { background:rgba(40,110,230,.9); color:#fff; }
-  #tip { position:absolute; pointer-events:none; background:rgba(20,20,26,.92); color:#fff; padding:3px 7px; border-radius:4px; font-size:12px; display:none; z-index:5; }
-  #tools { position:absolute; left:10px; top:10px; display:flex; gap:6px; z-index:4; }
-  #tools button { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:5px; }
+  #tip { position:absolute; pointer-events:none; background:rgba(16,19,27,.9); color:#fff; padding:4px 10px; border-radius:999px; font-size:12px; display:none; z-index:5; border:1px solid rgba(255,255,255,.12); }
+  #tools { position:absolute; right:14px; top:14px; display:flex; gap:4px; z-index:7; padding:4px; background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); box-shadow:0 6px 24px rgba(0,0,0,.35); }
+  #tools button { background:transparent; border:1px solid transparent; border-radius:8px; color:#cfd5e2; padding:5px 11px; }
+  #tools button:hover { background:rgba(255,255,255,.06); }
+  #tools button.on { background:rgba(106,168,255,.16); color:#fff; border-color:rgba(106,168,255,.4); }
+  #title { position:absolute; left:18px; top:16px; z-index:4; pointer-events:none; }
+  #title .t1 { font-size:17px; font-weight:650; letter-spacing:.01em; color:#f3f5fa; }
+  #title .t2 { font-size:12px; color:var(--mute); margin-top:2px; }
+  #keys { position:absolute; left:18px; bottom:14px; z-index:4; color:#6b7387; font-size:11px; pointer-events:none; letter-spacing:.02em; }
+  #keys b { color:#9aa3b5; font-weight:600; border:1px solid #333a4a; border-radius:4px; padding:0 4px; margin-right:3px; }
+  body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys { display:none; }
   canvas.crop { max-width:100%; image-rendering:pixelated; border:1px solid var(--line); display:block; }
   .stats { color:var(--mute); font-size:11px; }
-  @media (max-width:700px) { #view, #labels { right:0; } #panel { width:100%; top:55%; border-left:0; border-top:1px solid var(--line); } }
+  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } #keys { display:none; } }
 </style>
 </head>
 <body>
@@ -46,14 +62,21 @@
 <div id="boot">connecting …</div>
 <div id="labels"></div>
 <div id="tip"></div>
-<div id="tools"><button id="b_top">Top view</button><button id="b_fit">Fit</button></div>
+<div id="title"><div class="t1">Scene Memory</div><div class="t2" id="subtitle">3D map · on-device</div></div>
+<div id="keys"><b>drag</b>orbit · <b>F</b>fit · <b>T</b>top · <b>R</b>demo · <b>G</b>settings · <b>H</b>hide UI</div>
+<div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
 <div id="panel">
   <div id="status">waiting for view.json …</div>
   <div id="hud" class="mono"></div>
 
   <details open><summary>Display</summary>
+    <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
+    <label class="row" title="surface shading: soft light from above + sun on smooth normals (off = plain photo colours)"><input type="checkbox" id="c_shade" checked> Surface shading</label>
+    <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl"> Depth shading (EDL, quality high)</label>
+    <div class="num">EDL strength <input type="number" id="n_edl" value="1" min="0" max="5" step="0.1"></div>
+    <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog" checked> Depth fog</label>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
-    <label class="row"><input type="checkbox" id="c_olabels" checked> Object name labels</label>
+    <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
     <label class="row"><input type="checkbox" id="c_points" checked> Segment points</label>
     <label class="row">Point colour
       <select id="s_pcolor"><option>true colour</option><option>state colour</option></select></label>
@@ -66,31 +89,27 @@
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
     <label class="row"><input type="checkbox" id="c_gone" checked> Gone objects</label>
     <label class="row"><input type="checkbox" id="c_ceil"> Show ceiling</label>
-    <label class="row"><input type="checkbox" id="c_walls" checked> Walls as 2D lines</label>
-    <label class="row"><input type="checkbox" id="c_map" checked> Occupancy map</label>
+    <label class="row"><input type="checkbox" id="c_walls"> Walls as 2D lines</label>
+    <label class="row"><input type="checkbox" id="c_map"> Occupancy map</label>
     <label class="row"><input type="checkbox" id="c_robot" checked> Robot</label>
     <div class="num" title="1.0 = real size (the map is in metres)">Robot size × (1 = real) <input type="number" id="n_rscale" value="1" min="0.5" max="6" step="0.1"></div>
   </details>
 
-  <details id="jdetails" style="display:none" open><summary>Robot joints</summary>
+  <details id="jdetails" style="display:none"><summary>Robot joints</summary>
     <div id="jpanel"></div>
     <label class="row"><input type="checkbox" id="j_stream" checked> Use the joint stream when it has an order</label>
     <label class="row"><input type="checkbox" id="c_follow"> Follow the robot (close-up)</label>
     <label class="row" title="viewer camera flies behind the handheld camera and looks where it looks"><input type="checkbox" id="c_chase"> Follow the handheld camera (behind)</label>
-    <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
-    <label class="row" title="surface shading: soft light from above + sun on smooth normals (off = plain photo colours)"><input type="checkbox" id="c_shade" checked> Surface shading</label>
-    <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl"> Depth shading (EDL)</label>
-    <div class="num">EDL strength <input type="number" id="n_edl" value="1" min="0" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_eetrace" checked> Gripper path</label>
     <button id="j_home">Home pose</button> <button id="j_clear">Clear path</button>
     <div class="legend">Wheels roll with the base motion. Sliders pose the arm; a robot that publishes joints overrides them.</div>
   </details>
 
-  <details open><summary>Scene graph (objects · rooms)</summary>
-    <label class="row"><input type="checkbox" id="g_on" checked> Show graph layers</label>
+  <details><summary>Scene graph (objects · rooms)</summary>
+    <label class="row"><input type="checkbox" id="g_on"> Show graph layers</label>
     <label class="row"><input type="checkbox" id="g_objs" checked> Objects layer</label>
     <label class="row"><input type="checkbox" id="g_thumbs" checked> Object thumbnails</label>
-    <label class="row"><input type="checkbox" id="g_agents" checked> Agent trajectory</label>
+    <label class="row"><input type="checkbox" id="g_agents"> Agent trajectory</label>
     <label class="row"><input type="checkbox" id="g_rooms" checked> Rooms</label>
     <label class="row"><input type="checkbox" id="g_intra" checked> Intra-layer edges</label>
     <label class="row"><input type="checkbox" id="g_inter" checked> Inter-layer edges</label>
@@ -102,7 +121,7 @@
       Places (free-space skeleton) are computed in the backend for planning and are not shown.</div>
   </details>
 
-  <details open><summary>Wall state (2D walls → numbers)</summary>
+  <details><summary>Wall state (2D walls → numbers)</summary>
     <div id="wstate" class="legend">waiting for the map …</div>
     <button id="wsave">Save wall state (.json)</button>
   </details>
@@ -124,18 +143,31 @@ const EDGE_COL = { place:0x5a5a5a, door:0xe67814, agent:0x286ee6, inter:0x969696
 
 // ---------------- three.js ----------------
 const host = $("view");
-const renderer = new THREE.WebGLRenderer({ antialias:true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const QS = new URLSearchParams(location.search);
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });   // transparent clear: the page gradient is the background
+renderer.setClearColor(0x000000, 0);
 host.appendChild(renderer.domElement);
+// Quality: "high" = depth shading pass (EDL) + device pixel ratio up to 2; "low" = one plain pass at pixel ratio 1.
+// Weak GPUs (Raspberry Pi V3D, mobile, software rasterisers) start at low: a full-screen post pass froze the Pi 5 V3D.
+const GPU_NAME = (() => { try { const gl = renderer.getContext(), x = gl.getExtension("WEBGL_debug_renderer_info"); return String(gl.getParameter(x ? x.UNMASKED_RENDERER_WEBGL : gl.RENDERER)); } catch (e) { return ""; } })();
+const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShader|softpipe/i.test(GPU_NAME);
+let quality = QS.get("quality") || localStorage.getItem("sg_quality") || (WEAK_GPU ? "low" : "high");
+function applyQuality() {
+  renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
+  const e = $("c_edl"); if (e) e.checked = quality === "high";
+  const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
+  if (typeof resize === "function") { resize(); invalidate(); }
+}
+renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
 const scene = new THREE.Scene();
-const isDark = matchMedia("(prefers-color-scheme: dark)").matches;
-scene.background = new THREE.Color(isDark ? 0x16161a : 0xf4f4f6);
+const isDark = true;   // the viewer is dark-themed (gradient page background)
 THREE.Object3D.DefaultUp.set(0, 0, 1);
-const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 500);
+const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 500);
 camera.up.set(0, 0, 1);
 camera.position.set(-9, -9, 9);
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 4);
+controls.enableDamping = true; controls.dampingFactor = 0.09; controls.autoRotateSpeed = 0.6;
 controls.update();
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
 const sun = new THREE.DirectionalLight(0xffffff, 0.45); sun.position.set(0.4, -0.6, 1); scene.add(sun);   // lit materials (robot model); the surface map has its own shader (surfMaterial), point/line materials are unlit
@@ -449,8 +481,8 @@ const SB = 4;
 const surf = { run:null, have:new Map(), blocks:new Map(), dirty:new Set(), tex:new Map(), timer:0, busy:false };
 // Surface shading: hemisphere light (bright from above, darker from below) + one sun, from smooth vertex normals.
 // Textured: atlas × vertex colour × 2 (vertex colour = per-vertex exposure match). Cheap enough for the Pi 5 GPU (no extra passes).
-const surfUni = { sun:{ value:new THREE.Vector3(0.4, -0.6, 1).normalize() }, flatk:{ value:0 } };
-const SURF_VS = `varying vec3 vN; varying vec3 vC;
+const surfUni = { sun:{ value:new THREE.Vector3(0.45, -0.55, 0.9).normalize() }, flatk:{ value:0 }, fogC:{ value:new THREE.Color(0x161b26) }, fogR:{ value:new THREE.Vector2(8, 40) }, fogK:{ value:1 } };
+const SURF_VS = `varying vec3 vN; varying vec3 vC; varying float vD;
 #ifdef TEX
 varying vec2 vUv;
 #endif
@@ -459,28 +491,37 @@ void main() {
 #ifdef TEX
   vUv = uv;
 #endif
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  vec4 mv = modelViewMatrix * vec4(position, 1.0); vD = -mv.z;
+  gl_Position = projectionMatrix * mv;
 }`;
-const SURF_FS = `uniform vec3 sun; uniform float flatk; varying vec3 vN; varying vec3 vC;
+// Hemisphere (sky above, darker bounce below) + wrapped sun; back faces (seen through holes and ragged rims) are shaded dark so
+// they read as shadowed inside instead of bright patches; distance fog toward the page background gives depth.
+const SURF_FS = `uniform vec3 sun; uniform float flatk; uniform vec3 fogC; uniform vec2 fogR; uniform float fogK; varying vec3 vN; varying vec3 vC; varying float vD;
 #ifdef TEX
 uniform sampler2D map; varying vec2 vUv;
 #endif
 void main() {
-  vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
-  float l = mix(0.55, 0.85, 0.5 + 0.5 * n.z) + 0.25 * max(dot(n, sun), 0.0);
+  vec3 n = normalize(vN); float back = gl_FrontFacing ? 0.0 : 1.0; if (back > 0.5) n = -n;
+  float hemi = mix(0.62, 1.0, 0.5 + 0.5 * n.z);
+  float l = hemi * 0.74 + 0.30 * max((dot(n, sun) + 0.25) / 1.25, 0.0);
   l = mix(l, 1.0, flatk);
+  l *= mix(1.0, 0.38, back);
 #ifdef TEX
   vec3 c = texture2D(map, vUv).rgb * vC * 2.0;
 #else
   vec3 c = vC;
 #endif
-  gl_FragColor = vec4(min(c * l, 1.0), 1.0);
+  c = min(c * l, 1.0);
+  c = mix(c, c * c * (3.0 - 2.0 * c), 0.25);   // gentle S-curve: a little contrast for the photo atlases
+  float f = fogK * smoothstep(fogR.x, fogR.y, vD) * 0.75;
+  gl_FragColor = vec4(mix(c, fogC, f), 1.0);
 }`;
 function surfMaterial(tex) {
-  return new THREE.ShaderMaterial({ uniforms:{ sun:surfUni.sun, flatk:surfUni.flatk, map:{ value:tex || null } }, defines:tex ? { TEX:1 } : {},
+  return new THREE.ShaderMaterial({ uniforms:{ sun:surfUni.sun, flatk:surfUni.flatk, fogC:surfUni.fogC, fogR:surfUni.fogR, fogK:surfUni.fogK, map:{ value:tex || null } }, defines:tex ? { TEX:1 } : {},
     vertexShader:SURF_VS, fragmentShader:SURF_FS, vertexColors:true, side:THREE.DoubleSide });
 }
 const surfMat = surfMaterial(null);
+let surfFitted = false;   // first surface framing is instant, later growth flies
 function dropTexRegion(key) {
   const t = surf.tex.get(key); if (!t) return;
   gSurf.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.dispose(); t.tex.dispose(); surf.tex.delete(key);
@@ -576,9 +617,10 @@ async function loadSurface(s) {
     }
   };
   await Promise.all([one(), one(), one(), one()]);
-  if (surf.run === run) flushSurface();
+  if (surf.run === run) { flushSurface(); if (!userMoved && !QS.get("cam")) fitView(false, !surfFitted); else { const b = contentBox(); if (b) stageFor(b); } surfFitted = true; }
   surf.busy = false; pendingLoads--; loadDone();
 }
+const hasSurface = () => !!(view && view.scene_points && view.scene_points.surface);
 function drawObjects() {  invalidate();
   disposeGroup(gObjs);
   gObjs.visible = true;
@@ -604,14 +646,14 @@ function drawObjects() {  invalidate();
       const mesh = new THREE.Mesh(ent.geom, new THREE.MeshBasicMaterial({ vertexColors:opt("s_pcolor") === "true colour", color:opt("s_pcolor") === "true colour" ? 0xffffff : st, side:THREE.DoubleSide }));
       mesh.userData.shared = true; gObjs.add(mesh);
       if (sel) { const w = new THREE.Mesh(ent.geom, new THREE.MeshBasicMaterial({ color:0xffe14a, wireframe:true, transparent:true, opacity:0.35 })); w.userData.shared = true; gObjs.add(w); }
-    } else if (o.points && ent && ent.geom && (opt("c_points") || sel)) {   // points off: only the selected object, highlighted
+    } else if (o.points && ent && ent.geom && (opt("c_points") || (sel && !hasSurface()))) {   // points off: only the selected object, highlighted (with a surface map the outline box marks it)
       const true_ = opt("s_pcolor") === "true colour";
       if (opt("c_points")) {
         const m = pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * (sel ? 1.25 : 1), vertexColors:true_, color:st, square:false });
         const pts = new THREE.Points(ent.geom, m); pts.userData.shared = true;   // geometry belongs to plyCache
         gObjs.add(pts);
       }
-      if (sel) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
+      if (sel && !hasSurface()) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
     } else if (!o.points || !ent || !ent.geom) {
       // no points (yet): draw nothing at the object's place — the object is still its node in the graph layer.
       // A stand-in sphere here looked like a graph node that had dropped to the floor. Optional box only.
@@ -810,7 +852,12 @@ function updateLabels() {
       const e = ensureLabel(key, text, cls); want.add(key);
       e.style.left = ((_v.x + 1) / 2 * w) + "px"; e.style.top = ((1 - _v.y) / 2 * h) + "px";
     };
-    if (opt("c_olabels")) for (const o of view.objects) if (objVisible(o)) {
+    for (const id of new Set([selected, hoverId])) {   // hovered / selected object: one pill with the state dot
+      const o = id != null && objs.get(id); if (!o) continue;
+      put("h" + o.id, `${o.name} · ${o.state}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.08], "obj hot");
+      const e = labelEls.get("h" + o.id); if (e) e.style.setProperty("--c", "#" + new THREE.Color(STATE_COL[o.state] ?? 0xc83cc8).getHexString());
+    }
+    if (opt("c_olabels")) for (const o of view.objects) if (objVisible(o) && o.id !== selected && o.id !== hoverId) {
       put("o" + o.id, `${o.name}#${o.id}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.1], "obj");
       const e = labelEls.get("o" + o.id); if (e) e.style.setProperty("--c", "#" + new THREE.Color(STATE_COL[o.state] ?? 0xc83cc8).getHexString());
     }
@@ -825,7 +872,7 @@ function updateLabels() {
 // ---------------- selection / panel ----------------
 function select(id) {
   selected = id; $("s_obj").value = id == null ? "" : String(id);
-  drawObjects(); renderInfo();
+  drawObjects(); renderInfo(); drawHighlight();
 }
 let infoTimer = 0;
 function renderInfoSoon() { if (!infoTimer) infoTimer = setTimeout(() => { infoTimer = 0; renderInfo(); }, 250); }   // n_obs / last_seen tick: refresh the panel at 2 Hz, not per update
@@ -935,76 +982,129 @@ function fillSelect() {
 }
 $("s_obj").onchange = e => select(e.target.value === "" ? null : +e.target.value);
 
-// click picking: graph node within 12 px, else the nearest object box along the ray
-let down = null;
-renderer.domElement.addEventListener("pointerdown", e => { down = [e.clientX, e.clientY]; });
-renderer.domElement.addEventListener("pointerup", e => {
-  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4) { down = null; return; }
-  down = null;
+// picking: graph node within px pixels, else the nearest object box along the ray (structural objects such as walls only via nodes)
+function pickAt(mx, my, px) {
   const rc = renderer.domElement.getBoundingClientRect();
-  const mx = e.clientX - rc.left, my = e.clientY - rc.top;
-  let best = null, bd = 12;
-  for (const n of graphNodes) {
-    if (n.oid == null) continue;
-    _v.set(n.x, n.y, n.z).project(camera);
-    if (_v.z > 1) continue;
-    const d = Math.hypot((_v.x + 1) / 2 * rc.width - mx, (1 - _v.y) / 2 * rc.height - my);
-    if (d < bd) { bd = d; best = n.oid; }
-  }
-  if (best == null) {
-    const ray = new THREE.Raycaster(); ray.setFromCamera(new THREE.Vector2(mx / rc.width * 2 - 1, -(my / rc.height) * 2 + 1), camera);
-    let bt = Infinity;
-    for (const o of objs.values()) {
-      if (!objVisible(o)) continue;
-      const pad = 0.03, hb = o.extent.map(v => v / 2 + pad);
-      const box = new THREE.Box3(new THREE.Vector3(o.pos[0] - hb[0], o.pos[1] - hb[1], o.pos[2] - hb[2]), new THREE.Vector3(o.pos[0] + hb[0], o.pos[1] + hb[1], o.pos[2] + hb[2]));
-      const hit = ray.ray.intersectBox(box, new THREE.Vector3());
-      if (hit) { const t = hit.distanceTo(ray.ray.origin); if (t < bt) { bt = t; best = o.id; } }
-    }
-  }
-  if (best != null) select(best);
-});
-
-// hover: tooltip + pointer cursor over object nodes
-renderer.domElement.addEventListener("pointermove", e => {
-  if (e.buttons) { $("tip").style.display = "none"; return; }
-  const rc = renderer.domElement.getBoundingClientRect(), mx = e.clientX - rc.left, my = e.clientY - rc.top;
-  let best = null, bd = 10;
+  let best = null, bd = px;
   for (const n of graphNodes) {
     if (n.oid == null) continue;
     _v.set(n.x, n.y, n.z).project(camera); if (_v.z > 1) continue;
     const d = Math.hypot((_v.x + 1) / 2 * rc.width - mx, (1 - _v.y) / 2 * rc.height - my);
     if (d < bd) { bd = d; best = n.oid; }
   }
-  const tip = $("tip");
-  if (best == null) { tip.style.display = "none"; renderer.domElement.style.cursor = ""; return; }
-  const o = objs.get(best);
-  tip.textContent = `${o.name}#${o.id} · ${o.state} · ${o.n_obs} obs`;
-  tip.style.left = (mx + 14) + "px"; tip.style.top = (my + 10) + "px"; tip.style.display = "block"; renderer.domElement.style.cursor = "pointer";
+  if (best != null) return best;
+  const ray = new THREE.Raycaster(); ray.setFromCamera(new THREE.Vector2(mx / rc.width * 2 - 1, -(my / rc.height) * 2 + 1), camera);
+  let bt = Infinity;
+  for (const o of objs.values()) {
+    if (!objVisible(o) || o.structural) continue;
+    const pad = 0.03, hb = o.extent.map(v => v / 2 + pad);
+    const box = new THREE.Box3(new THREE.Vector3(o.pos[0] - hb[0], o.pos[1] - hb[1], o.pos[2] - hb[2]), new THREE.Vector3(o.pos[0] + hb[0], o.pos[1] + hb[1], o.pos[2] + hb[2]));
+    const hit = ray.ray.intersectBox(box, new THREE.Vector3());
+    if (hit) { const t = hit.distanceTo(ray.ray.origin) + Math.max(...o.extent) * 0.5; if (t < bt) { bt = t; best = o.id; } }   // smaller objects win when nested
+  }
+  return best;
+}
+// hover / selection highlight: soft rounded box outline in the accent colour (one line object, rebuilt only when the target changes)
+let hoverId = null;
+const gHi = new THREE.Group(); scene.add(gHi);
+let hiKey = "";
+function drawHighlight() {
+  const key = hoverId + "|" + selected; if (key === hiKey) return; hiKey = key;
+  disposeGroup(gHi);
+  for (const [id, col, op] of [[selected, 0xffd166, 0.95], [hoverId !== selected ? hoverId : null, 0x6aa8ff, 0.85]]) {
+    const o = id != null && objs.get(id); if (!o) continue;
+    const b = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(...o.extent.map(v => Math.max(v, 0.05) + 0.04))), new THREE.LineBasicMaterial({ color:col, transparent:true, opacity:op, depthTest:false, fog:false }));
+    b.position.set(...o.pos); b.renderOrder = 10; gHi.add(b);
+  }
+  invalidate();
+}
+let down = null;
+renderer.domElement.addEventListener("pointerdown", e => { down = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener("pointerup", e => {
+  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4) { down = null; return; }
+  down = null;
+  const rc = renderer.domElement.getBoundingClientRect();
+  const best = pickAt(e.clientX - rc.left, e.clientY - rc.top, 12);
+  select(best);   // empty space clears the selection
 });
-renderer.domElement.addEventListener("pointerleave", () => { $("tip").style.display = "none"; });
+// hover: pill label at the object + outline, pointer cursor
+let hoverT = 0;
+renderer.domElement.addEventListener("pointermove", e => {
+  if (e.buttons) { if (hoverId != null) { hoverId = null; drawHighlight(); } return; }
+  const now = performance.now(); if (now - hoverT < 40) return; hoverT = now;
+  const rc = renderer.domElement.getBoundingClientRect();
+  const best = pickAt(e.clientX - rc.left, e.clientY - rc.top, 10);
+  renderer.domElement.style.cursor = best == null ? "" : "pointer";
+  if (best !== hoverId) { hoverId = best; drawHighlight(); }
+});
+renderer.domElement.addEventListener("pointerleave", () => { if (hoverId != null) { hoverId = null; drawHighlight(); } });
 
 // toolbar: top view / fit
-function fitView(top) {
-  if (!view) return;
-  const g = view.grid, W = g.width * g.resolution, H = g.height * g.resolution;
-  const cx = g.origin[0] + W / 2, cy = g.origin[1] + H / 2, R = Math.max(W, H);
-  controls.target.set(cx, cy, top ? 0 : 3);
-  if (top) camera.position.set(cx, cy - 0.001, R * 1.15); else camera.position.set(cx - R * 0.55, cy - R * 0.55, R * 0.5 + 3);
-  controls.update();
-  if (!top) camFromQuery();
+// Content box: the surface map when there is one (that is what the demo shows), else the occupancy grid.
+function contentBox() {
+  const b = new THREE.Box3();
+  for (const m of gSurf.children) { if (!m.geometry.boundingBox) m.geometry.computeBoundingBox(); b.union(m.geometry.boundingBox); }
+  if (b.isEmpty() && view && view.grid) {
+    const g = view.grid; b.set(new THREE.Vector3(g.origin[0], g.origin[1], 0), new THREE.Vector3(g.origin[0] + g.width * g.resolution, g.origin[1] + g.height * g.resolution, 2));
+  }
+  return b.isEmpty() ? null : b;
 }
+// floor pad, fog and grid follow the content size
+function stageFor(b) {
+  const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3()), R = Math.max(s.x, s.y, 2);
+  floorPad.visible = true; floorPad.position.set(c.x, c.y, Math.min(b.min.z, 0) - 0.03); grid.position.z = Math.min(b.min.z, 0) - 0.05; floorPad.scale.set(s.x * 1.7 + 1, s.y * 1.7 + 1, 1);
+
+}
+// 3/4 view from above (azimuth from the -x/-y corner, ~38° down), distance chosen so the box fills the view
+function fitView(top, instant = true) {
+  const b = contentBox(); if (!b) return;
+  stageFor(b);
+  const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
+  const r = 0.5 * Math.hypot(s.x, s.y, s.z * 0.6), fov = camera.fov * Math.PI / 180, fit = r / Math.sin(Math.min(fov, fov * camera.aspect) / 2) * 0.66;
+  const tgt = new THREE.Vector3(c.x, c.y, top ? b.min.z : b.min.z + s.z * 0.3);
+  const az = -2.25, el = top ? 1.5697 : 0.66;
+  const pos = new THREE.Vector3(tgt.x + fit * Math.cos(el) * Math.cos(az), tgt.y + fit * Math.cos(el) * Math.sin(az), tgt.z + fit * Math.sin(el));
+  if (instant) { controls.target.copy(tgt); camera.position.copy(pos); controls.update(); camGoal = null; } else camGoal = { pos, target:tgt };
+  if (!top) camFromQuery();
+  invalidate();
+}
+let userMoved = false;
+function setDemo(on) { controls.autoRotate = on; $("b_demo").classList.toggle("on", on); invalidate(); }
+function togglePanel(on) { document.body.classList.toggle("panel-open", on); $("b_panel").classList.toggle("on", document.body.classList.contains("panel-open")); }
+$("b_demo").onclick = () => setDemo(!controls.autoRotate);
+$("b_panel").onclick = () => togglePanel();
+$("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; localStorage.setItem("sg_quality", quality); applyQuality(); };
+if (QS.get("ui") === "0") document.body.classList.add("ui-off");
+if (QS.get("panel") === "1") togglePanel(true);
+if (QS.get("demo") === "1") setTimeout(() => setDemo(true), 0);
 // ?cam=ex,ey,ez,tx,ty,tz: start camera (eye, target), for tests and demos
 function camFromQuery() {
   const q = new URLSearchParams(location.search).get("cam"); if (!q) return false;
   const v = q.split(",").map(Number); if (v.length !== 6 || v.some(isNaN)) return false;
   camera.position.set(v[0], v[1], v[2]); controls.target.set(v[3], v[4], v[5]); controls.update(); invalidate(); return true;
 }
-$("b_top").onclick = () => { autoFit = false; fitView(true); }; $("b_fit").onclick = () => { autoFit = true; if (LIVE && liveGrid) fitViewTo(liveGrid); else fitView(false); };
-addEventListener("keydown", e => { if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return; if (e.key === "t") fitView(true); if (e.key === "f") fitView(false); });
+$("b_top").onclick = () => { autoFit = false; fitView(true, false); }; $("b_fit").onclick = () => { autoFit = true; if (LIVE && liveGrid && !gSurf.children.length) fitViewTo(liveGrid); else fitView(false, false); };
+addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "t") fitView(true, false); if (k === "f") fitView(false, false);
+  if (k === "r") setDemo(!controls.autoRotate);
+  if (k === "g") togglePanel();
+  if (k === "h") document.body.classList.toggle("ui-off");
+  if (k === "escape") select(null);
+});
 
-// faint floor grid under the map
-const grid = new THREE.GridHelper(80, 80, isDark ? 0x3a3a46 : 0xcfcfd8, isDark ? 0x2a2a34 : 0xe2e2e8); grid.rotation.x = Math.PI / 2; grid.position.z = -0.02; scene.add(grid);
+// floor: fine grid that fades into the fog + a soft dark pad under the map (contact shadow), both well below the map's contrast
+const grid = new THREE.GridHelper(80, 160, 0x323b52, 0x232a3a); grid.rotation.x = Math.PI / 2; grid.position.z = -0.02;
+grid.material.transparent = true; grid.material.opacity = 0.45; grid.material.depthWrite = false; scene.add(grid);
+scene.fog = new THREE.Fog(0x141924, 10, 45);   // built-in materials (grid, lines, robot); the surface shader has its own fog
+const floorPad = (() => {
+  const c = document.createElement("canvas"); c.width = c.height = 256; const g = c.getContext("2d");
+  const r = g.createRadialGradient(128, 128, 10, 128, 128, 128); r.addColorStop(0, "rgba(0,0,0,0.55)"); r.addColorStop(0.55, "rgba(0,0,0,0.32)"); r.addColorStop(1, "rgba(0,0,0,0)");
+  g.fillStyle = r; g.fillRect(0, 0, 256, 256);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map:new THREE.CanvasTexture(c), transparent:true, depthWrite:false, fog:false }));
+  m.position.z = -0.015; m.visible = false; m.renderOrder = -1; scene.add(m); return m;
+})();
 // the map has no fixed size, so the grid follows the view (snapped to 1 m: lines do not swim) instead of sitting on a fixed square
 function snapGrid() { const x = Math.round(controls.target.x), y = Math.round(controls.target.y); if (x !== grid.position.x || y !== grid.position.y) { grid.position.x = x; grid.position.y = y; } }
 controls.addEventListener("change", snapGrid);
@@ -1013,9 +1113,12 @@ controls.addEventListener("change", snapGrid);
 function status() {
   if (!view || !view.graph) return;
   const c = k => (view.graph.nodes || []).filter(n => n.kind === k).length;
+  const rn = (view.rooms || []).map(r => r.name).filter(Boolean);
+  $("subtitle").textContent = `${rn.length ? rn.join(" · ") + " · " : ""}${view.objects.filter(o => !o.structural && o.state !== "gone").length} objects remembered`;
   $("status").textContent = `stamp ${view.stamp.toFixed(1)} s · objects ${view.objects.length} · rooms ${(view.rooms || []).length} · trajectory ${c("agent")} poses`;
 }
 // Redraw only the parts of a new summary (view.json content) that changed: string compare is far cheaper than rebuilding geometry.
+let presetDone = false, viewSeen = false;
 let pointsAuto = true;   // the user has not touched 'Segment points' yet
 function applyView(v) {
   const first = !view;
@@ -1023,6 +1126,11 @@ function applyView(v) {
   // with a surface map the objects are already in the mesh (shape and colour): their point clouds only speckle it, so start them off.
   // Clicking an object still highlights its points.
   if (pointsAuto && view.scene_points && view.scene_points.surface && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
+  // presentation defaults (once per page, a URL value such as ?c_scene=1 wins): the surface already shows the scene, so the point map
+  // only speckles it; a handheld camera marker is a debugging aid
+  if (!presetDone) { presetDone = true;
+    if (view.scene_points && view.scene_points.surface && !QS.has("c_scene") && $("c_scene").checked) { $("c_scene").checked = false; rebuildScene(); }
+    if (isHandheld() && !QS.has("c_robot") && $("c_robot").checked) { $("c_robot").checked = false; gRobot.visible = false; } }
   objs.clear(); for (const o of view.objects) objs.set(o.id, o);
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
@@ -1036,7 +1144,7 @@ function applyView(v) {
   if (!LIVE) { const sPose = JSON.stringify(view.pose); if (sPose !== prev.pose) drawRobot(); prev.pose = sPose; }
   status(); if (objChanged) renderInfo();
   Object.assign(prev, { obj:sObj, graph:sGraph, rooms:sRooms, grid:sGrid });
-  if (first) fitView(false);
+  if (!viewSeen) { viewSeen = true; fitView(false); const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
 }
 
 async function poll() {
@@ -1296,7 +1404,7 @@ function stepCamera(dt) {
   if (done) camGoal = null;
   return true;
 }
-controls.addEventListener("start", () => { autoFit = false; camGoal = null; if (opt("c_chase")) $("c_chase").checked = false; });   // the user moved the camera: stop following
+controls.addEventListener("start", () => { autoFit = false; camGoal = null; userMoved = true; if (controls.autoRotate) setDemo(false); if (opt("c_chase")) $("c_chase").checked = false; });   // the user moved the camera: stop following
 
 function onPoseEvent(d) {
   poseTgt.x = d.x; poseTgt.y = d.y; poseTgt.yaw = d.yaw; poseTgt.has = true;
@@ -1426,7 +1534,7 @@ async function startLive() {
     if (mapState) { mapState.tex.dispose(); mapState.mesh.geometry.dispose(); mapState.mesh.material.dispose(); gMap.remove(mapState.mesh); mapState = null; }
     dropAligned(); alignTheta = 0;
     trailN = 0; trailLast = null; if (trail) trail.geometry.setDrawRange(0, 0);
-    view = null; objs.clear(); selected = null; poseCur.init = false; poseTgt.has = false; hhCur.init = false; hhTgt.has = false; robotGrp = null; liveGrid = null;
+    view = null; objs.clear(); selected = null; hoverId = null; viewSeen = false; surfFitted = false; drawHighlight(); poseCur.init = false; poseTgt.has = false; hhCur.init = false; hhTgt.has = false; robotGrp = null; liveGrid = null;
     // Detach the LIMO + OMX URDF model before clearing: disposing gRobot with the model inside freed its meshes, and after a
     // stream reset (e.g. a looping replay) the robot came back as the box stand-in or not at all.
     if (robotModel && robotModel.root.parent) robotModel.root.parent.remove(robotModel.root);
@@ -1445,6 +1553,8 @@ async function startLive() {
 }
 
 // controls
+$("c_fog").onchange = () => { surfUni.fogK.value = opt("c_fog") ? 1 : 0; invalidate(); };
+applyQuality();
 $("c_points").addEventListener("change", () => { pointsAuto = false; });
 for (const id of ["c_points", "c_scene", "n_sop", "n_ssize", "s_odraw", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { rebuildScene(); drawObjects(); drawGraph(); };
 for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra", "g_inter", "n_objz", "n_h", "n_thumb"]) $(id).onchange = drawGraph;
@@ -1470,6 +1580,7 @@ $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar
   if (!needsRender) return;
   needsRender = false;
   const tr = performance.now();
+  { const d = camera.position.distanceTo(controls.target); surfUni.fogR.value.set(d * 1.15, d * 3.2); scene.fog.near = d * 0.6; scene.fog.far = opt("c_fog") ? d * 2.2 : 1e6; }   // fog follows the viewing distance: the focus stays clear at any zoom
   updatePointScale(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
 })();

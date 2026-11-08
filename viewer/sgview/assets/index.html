@@ -1923,8 +1923,9 @@ function queueUpload(bytes, fn) { upQ.push({ bytes, fn }); if (!upKick) upKick =
 // no animation frames (hidden tab, headless virtual-time screenshot): nothing to keep smooth, drain from a timer instead
 function kickUploads() { upKick = 0; const t = performance.now(); if (t - lastCamT > 90) { drainUploads(t); invalidate(); } if (upQ.length) upKick = setTimeout(kickUploads, 100); }
 function drainUploads(t0) {
-  let b = 0;
-  while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); }
+  let b = 0, n = 0;
+  while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); n++; }
+  if (n) invalidate();   // uploaded pieces must be drawn even when the camera is still
   if (!upQ.length && oct.want && oct.want.length) octPump();
 }
 // while moving (LOD frames) textured surface regions smaller than 2 px on screen are skipped; three.js frustum-culls the rest by bounding sphere

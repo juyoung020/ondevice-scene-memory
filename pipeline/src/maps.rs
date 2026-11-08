@@ -341,6 +341,7 @@ pub struct Obj {
     pub n_pts: usize, // 마지막으로 내보낸 점 수
     pub crop_saved: u32, // 파일로 쓴 사진의 crop_ver(같으면 다시 안 씀)
     pub cells_saved: usize, // 점 파일을 쓸 때의 칸 수(5 % 넘게 늘어야 다시 씀)
+    pub last_seg: u32, // 마지막으로 본 때의 Memory::n_seg
 }
 
 pub struct Memory {
@@ -349,11 +350,12 @@ pub struct Memory {
     pub vox: f64,
     pub sup: f64,
     pub merged: u32, // 병합 후처리로 합친 수(누적)
+    pub n_seg: u32, // 분할을 돌린 장면 수(분할을 건너뛴 장면은 세지 않음)
 }
 
 impl Memory {
     pub fn new(vox: f64, sup: f64) -> Memory {
-        Memory { objs: vec![], next: 0, vox, sup, merged: 0 }
+        Memory { objs: vec![], next: 0, vox, sup, merged: 0, n_seg: 0 }
     }
 
     /// 같은 이름(살아 있는) 물체 중 굵은 칸 겹침 25 % 이상이거나 중심이 크기에 맞춘 문턱 안이면 같은 물체
@@ -415,12 +417,13 @@ impl Memory {
                 self.objs.push(Obj {
                     id: self.next, name: name.into(), votes: FastMap::default(), score: 0.0, n_obs: 0, first_pos: c, pos: c,
                     extent: ext, last_seen: stamp, miss: 0, state: "seen", cells: FastMap::default(), support: FastMap::default(),
-                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0, crop_saved: 0, cells_saved: 0,
+                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0, crop_saved: 0, cells_saved: 0, last_seg: self.n_seg,
                 });
                 self.next += 1;
                 self.objs.len() - 1
             }
         };
+        let ns = self.n_seg;
         let o = &mut self.objs[i];
         for k in &ckeys {
             *o.support.entry(*k).or_insert(0) += 1;
@@ -440,6 +443,7 @@ impl Memory {
         o.n_obs += 1;
         o.score = o.score.max(score);
         o.last_seen = stamp;
+        o.last_seg = ns;
         o.miss = 0;
         o.state = "seen";
         o.dirty = true;
@@ -497,7 +501,9 @@ impl Memory {
 
     pub fn prune(&mut self, now: f64) -> usize {
         let n0 = self.objs.len();
-        self.objs.retain(|o| !(o.n_obs <= 2 && now - o.last_seen > 3.0));
+        // 두 번 이하로 본 물체는 3 초가 지나고 분할한 장면 8 장에서도 안 보였을 때 지움(분할을 건너뛴 장면은 못 본 것으로 세지 않음)
+        let ns = self.n_seg;
+        self.objs.retain(|o| !(o.n_obs <= 2 && now - o.last_seen > 3.0 && ns.saturating_sub(o.last_seg) >= 8));
         n0 - self.objs.len()
     }
 
@@ -568,6 +574,7 @@ impl Memory {
             a.score = a.score.max(b.score);
             if b.last_seen > a.last_seen {
                 a.last_seen = b.last_seen;
+                a.last_seg = a.last_seg.max(b.last_seg);
                 a.miss = b.miss;
                 a.state = b.state;
             }

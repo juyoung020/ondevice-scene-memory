@@ -25,6 +25,31 @@ pub struct Kf {
     crops: Vec<Crop>, // 줄인 보관: 검출 상자 안 컬러·깊이
     sparse: bool,
     pub dets: Option<Vec<Det>>,
+    /// 점 지도에 넣은 점(거른 뒤 --scene-step 간격 격자의 깊이 mm·색, LZ4): 점 작업 스레드가 채움 → 다시 쌓기는 온 장면 없이 이것만 읽는다
+    pub pts: std::sync::OnceLock<Option<PtsZ>>,
+}
+
+/// 점 격자 압축본: gw×gh(장면 화소 step 간격), 깊이 0 = 점 없음
+pub struct PtsZ {
+    pub step: usize,
+    pub gw: usize,
+    pub gh: usize,
+    depth_z: Vec<u8>,
+    rgb_z: Vec<u8>,
+}
+
+impl PtsZ {
+    pub fn pack(step: usize, gw: usize, gh: usize, depth: &[f32], rgb: &[u8]) -> PtsZ {
+        let d: Vec<u16> = depth.iter().map(|&v| (v * 1000.0).round().clamp(0.0, 65535.0) as u16).collect();
+        PtsZ { step, gw, gh, depth_z: pack_depth(&d, gw, gh), rgb_z: pack_rgb(rgb, gw, gh) }
+    }
+    /// (깊이 m, 색)
+    pub fn unpack(&self) -> (Vec<f32>, Vec<u8>) {
+        (unpack_depth(&self.depth_z, self.gw, self.gh).iter().map(|&v| v as f32 * 1e-3).collect(), unpack_rgb(&self.rgb_z, self.gw, self.gh))
+    }
+    fn bytes(&self) -> usize {
+        self.depth_z.len() + self.rgb_z.len()
+    }
 }
 
 /// 검출 상자 안 화소(줄인 보관)
@@ -89,6 +114,7 @@ impl Kf {
     fn bytes(&self) -> usize {
         self.rgb_z.len() + self.depth_z.len() + self.crops.iter().map(|c| c.rgb_z.len() + c.depth_z.len()).sum::<usize>()
             + self.dets.iter().flatten().map(|d| d.mask.len()).sum::<usize>()
+            + self.pts.get().and_then(|p| p.as_ref()).map_or(0, |p| p.bytes())
     }
 }
 
@@ -165,10 +191,10 @@ impl KfStore {
 
     /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음)
     #[allow(clippy::too_many_arguments)]
-    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &[f32], dets: &Option<Vec<Det>>, sparse: bool) {
+    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &[f32], dets: &Option<Vec<Det>>, sparse: bool) -> Option<Arc<Kf>> {
         self.count += 1;
         if (self.count - 1) % self.stride != 0 {
-            return;
+            return None;
         }
         let (anchor, rel) = match self.nodes.get(&anchor) {
             Some(n) => (anchor, inv_mul(n, &(r, p))),
@@ -199,9 +225,11 @@ impl KfStore {
         let kf = Kf {
             seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
             dets: dets.as_ref().map(|v| v.iter().map(|d| Det { cls: d.cls, score: d.score, box_: d.box_, mask: d.mask.clone() }).collect()),
+            pts: Default::default(),
         };
-        self.bytes += kf.bytes();
-        self.kfs.push(Arc::new(kf));
+        let kf = Arc::new(kf);
+        self.kfs.push(kf.clone());
+        self.bytes = self.kfs.iter().map(|k| k.bytes()).sum(); // 점 격자는 점 작업 스레드가 나중에 채우니 매번 다시 셈
         // 예산을 넘으면 하나 걸러 버리고 앞으로도 두 배 간격으로 보관
         while self.bytes > self.budget && self.kfs.len() > 2 {
             let old = std::mem::take(&mut self.kfs);
@@ -215,6 +243,7 @@ impl KfStore {
             self.stride *= 2;
             eprintln!("장면 보관: 예산 {} MB 넘음 → {} 장만 남기고 {} 장마다 보관", self.budget >> 20, self.kfs.len(), self.stride);
         }
+        self.kfs.last().filter(|k| Arc::ptr_eq(k, &kf)).cloned()
     }
 
     /// 보관한 장면의 지금 위치(수평 맞춤 전): 기준 노드 × 상대 위치

@@ -3,6 +3,25 @@
 use crate::geom::V3;
 use crate::geom::{FastMap, FastSet};
 
+/// x / n(정수 나눗셈, x ∈ [−255, 255], n ∈ 1..=16)을 표로: 칸마다 나눗셈 여섯 번이 넣기 시간의 큰 몫이었음
+const DIV: [[i16; 511]; 17] = {
+    let mut t = [[0i16; 511]; 17];
+    let mut n = 1;
+    while n < 17 {
+        let mut x = 0;
+        while x < 511 {
+            t[n][x] = ((x as i32 - 255) / n as i32) as i16;
+            x += 1;
+        }
+        n += 1;
+    }
+    t
+};
+#[inline]
+fn div(x: i32, n: i32) -> i32 {
+    DIV[n as usize][(x + 255) as usize] as i32
+}
+
 /// 칸 좌표 → 키(축마다 21 비트, ±1 백만 칸)
 #[inline]
 pub fn key(p: &V3, vox: f64) -> u64 {
@@ -36,6 +55,8 @@ struct SV {
 /// 가장 굵은 수준의 노드 하나에만 들어간다(겹침 없음) → 뷰어는 굵은 노드부터 받아 화면 크기 순으로 더 고운 노드를 더한다.
 pub const OCT_DEPTH: u32 = 5;
 pub const OCT_G: i64 = 32;
+/// 최근 칸 표(hot)에 남기는 키프레임 수
+const HOT_AGE: u32 = 24;
 
 pub struct Node {
     keys: Vec<u64>, // 고운 칸 키
@@ -45,7 +66,9 @@ pub struct Node {
 
 pub struct SceneMap {
     pub vox: f64,
-    cells: FastMap<u64, SV>,
+    cells: FastMap<u64, SV>, // 한동안 안 본 칸(큰 표: 칸마다 캐시·TLB 를 놓침)
+    hot: FastMap<u64, SV>,   // 최근 HOT_AGE 키프레임 안에 본 칸(작은 표: 장면마다 같은 칸을 거듭 보므로 넣기가 거의 여기서 끝남)
+    hot_kf: u32,             // 마지막으로 hot 을 비운 키프레임
     pub min_obs: u8, // 고운 칸을 본 키프레임 수 하한
     pending: Vec<u64>, // 막 확정된 칸(본 키프레임 수가 min_obs 에 닿은 칸): 다음 place 에서 옥트리로
     occ: Vec<FastSet<u64>>, // 수준별 차지한 칸
@@ -61,23 +84,28 @@ impl SceneMap {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let run = t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16;
         SceneMap {
-            vox, cells: FastMap::default(), min_obs: 2, pending: vec![],
+            vox, cells: FastMap::default(), hot: FastMap::default(), hot_kf: 0, min_obs: 2, pending: vec![],
             occ: (0..OCT_DEPTH).map(|_| FastSet::default()).collect(), nodes: FastMap::default(), run, n_placed: 0,
         }
     }
     /// 한 키프레임의 점: (세계 점, 색, 카메라 거리)
     pub fn add(&mut self, kf: u32, pts: &[(V3, [u8; 3], f32)]) {
         let vox = self.vox;
+        let (hot, cold) = (&mut self.hot, &mut self.cells);
         for (p, c, d) in pts {
-            let k = key(p, vox);
+            // 칸 좌표·칸 안 위치를 한 번에(key() 와 같은 식)
+            let f = [p[0] / vox, p[1] / vox, p[2] / vox];
+            let fl = f.map(|v| v.floor());
+            let g = |v: f64| ((v as i64 + (1 << 20)) as u64) & 0x1F_FFFF;
+            let k = (g(fl[0]) << 42) | (g(fl[1]) << 21) | g(fl[2]);
             let dmm = (d * 1000.0).clamp(0.0, 65535.0) as u16;
-            let q = |i: usize| (((p[i] / vox - (p[i] / vox).floor()) * 255.0).round() as i32).clamp(0, 255);
-            let e = self.cells.entry(k).or_insert(SV { off: [0; 3], col: *c, n: 0, nc: 0, nf: 0, last: u16::MAX, best: u16::MAX });
+            let q = |i: usize| (((f[i] - fl[i]) * 255.0).round() as i32).clamp(0, 255);
+            let e = hot.entry(k).or_insert_with(|| cold.remove(&k).unwrap_or(SV { off: [0; 3], col: *c, n: 0, nc: 0, nf: 0, last: u16::MAX, best: u16::MAX }));
             // 칸 안 평균: 이어 더하는 평균(16 번 넘으면 최근 쪽 무게를 둔 평균)
             let n = (e.n as i32 + 1).min(16);
             for i in 0..3 {
                 let m = e.off[i] as i32;
-                e.off[i] = (m + (q(i) - m) / n).clamp(0, 255) as u8;
+                e.off[i] = (m + div(q(i) - m, n)).clamp(0, 255) as u8;
             }
             e.n = n as u8;
             if e.last != kf as u16 {
@@ -97,11 +125,26 @@ impl SceneMap {
                 e.nc = e.nc.saturating_add(1).min(16);
                 for i in 0..3 {
                     let m = e.col[i] as i32;
-                    e.col[i] = (m + (c[i] as i32 - m) / e.nc as i32) as u8;
+                    e.col[i] = (m + div(c[i] as i32 - m, e.nc as i32)) as u8;
                 }
                 e.best = e.best.min(dmm);
             }
         }
+        // HOT_AGE 장 넘게 안 본 칸은 큰 표로(장면마다가 아니라 칸이 시야를 떠날 때 한 번만 큰 표를 건드림)
+        if kf.wrapping_sub(self.hot_kf) >= HOT_AGE / 2 || kf < self.hot_kf {
+            self.hot_kf = kf;
+            let now = kf as u16;
+            self.hot.retain(|k, v| {
+                let keep = now.wrapping_sub(v.last) < HOT_AGE as u16;
+                if !keep {
+                    cold.insert(*k, *v);
+                }
+                keep
+            });
+        }
+    }
+    fn cell(&self, k: &u64) -> &SV {
+        self.hot.get(k).unwrap_or_else(|| &self.cells[k])
     }
     fn pos(&self, k: u64, v: &SV) -> [f32; 3] {
         let f = |s: u32, i: usize| ((((k >> s) & 0x1F_FFFF) as i64 - (1 << 20)) as f64 + v.off[i] as f64 / 255.0) * self.vox;
@@ -138,7 +181,7 @@ impl SceneMap {
         let mut b = Vec::with_capacity(nd.keys.len() * 9);
         let mut cols = Vec::with_capacity(nd.keys.len() * 3);
         for k in &nd.keys {
-            let v = &self.cells[k];
+            let v = self.cell(k);
             let p = self.pos(*k, v);
             for i in 0..3 {
                 let q = ((p[i] as f64 - o[i]) / size * 65535.0).round().clamp(0.0, 65535.0) as u16;
@@ -184,7 +227,7 @@ impl SceneMap {
         self.n_placed
     }
     pub fn bytes(&self) -> usize {
-        self.cells.capacity() * 24 + self.occ.iter().map(|s| s.capacity() * 9).sum::<usize>()
+        (self.cells.capacity() + self.hot.capacity()) * 24 + self.occ.iter().map(|s| s.capacity() * 9).sum::<usize>()
             + self.nodes.values().map(|n| n.keys.capacity() * 8 + 48).sum::<usize>() + self.pending.capacity() * 8
     }
 }

@@ -204,18 +204,21 @@ const gSurf = new THREE.Group(); scene.add(gSurf);     // surface map regions (T
 // dark halo (Potree adds 100 per covered neighbour there).
 const edl = { rt:null, acc:null, w:0, h:0, scene:new THREE.Scene(), cam:new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1) };
 edl.mat = new THREE.ShaderMaterial({
-  uniforms:{ tColor:{ value:null }, tDepth:{ value:null }, tAcc:{ value:null }, uBlend:{ value:0 }, uPx:{ value:new THREE.Vector2() }, uNear:{ value:0.05 }, uFar:{ value:500 }, uStr:{ value:0.4 }, uRad:{ value:1.4 }, uTol:{ value:0.025 } },
+  uniforms:{ tColor:{ value:null }, tDepth:{ value:null }, tAcc:{ value:null }, uBlend:{ value:0 }, uPx:{ value:new THREE.Vector2() }, uNear:{ value:0.05 }, uFar:{ value:500 }, uStr:{ value:0.4 }, uRad:{ value:1.4 }, uTol:{ value:0.025 }, uN:{ value:8 } },
   vertexShader:`varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
-  fragmentShader:`uniform sampler2D tColor; uniform sampler2D tDepth; uniform sampler2D tAcc; uniform float uBlend; uniform vec2 uPx; uniform float uNear; uniform float uFar; uniform float uStr; uniform float uRad; uniform float uTol; varying vec2 vUv;
+  fragmentShader:`uniform sampler2D tColor; uniform sampler2D tDepth; uniform sampler2D tAcc; uniform float uBlend; uniform vec2 uPx; uniform float uNear; uniform float uFar; uniform float uStr; uniform float uRad; uniform float uTol; uniform int uN; varying vec2 vUv;
     float ld(float d){ if (d >= 1.0) return 0.0; float z = d * 2.0 - 1.0; return log2((2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear))); }
     void main(){
       vec4 c = texture2D(tColor, vUv); float l0 = ld(texture2D(tDepth, vUv).r), s = 0.0;
       if (uBlend > 0.5) { vec4 a = texture2D(tAcc, vUv); if (a.a > 0.001) c.rgb = a.rgb / a.a; }   // blended point splats (see octMaterial)
+      float st = 8.0 / float(uN);
       for (int i = 0; i < 8; i++) {
-        float a = float(i) * 0.7853982;
+        if (i >= uN) break;
+        float a = float(i) * 0.7853982 * st;
         float ln = ld(texture2D(tDepth, vUv + vec2(cos(a), sin(a)) * uPx * uRad).r);
         if (ln != 0.0) s += (l0 == 0.0) ? 100.0 : max(0.0, l0 - ln - uTol);
       }
+      s *= st;
       float shade = exp(-s / 8.0 * 300.0 * uStr);
       if (l0 == 0.0) { gl_FragColor = vec4(c.rgb * shade, max(c.a, (1.0 - shade) * 0.6)); return; }
       gl_FragColor = vec4(c.rgb * shade, c.a);
@@ -229,18 +232,36 @@ edl.scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), edl.mat));
 const canBlend = () => !!(renderer.capabilities.isWebGL2 ? renderer.extensions.get("EXT_color_buffer_float") : renderer.extensions.get("EXT_color_buffer_half_float"));
 const blendOn = () => quality === "high" && opt("c_blend") && gOct.visible && oct.drawn > 0 && canBlend();
 const _bm = { blending:THREE.CustomBlending, blendSrc:THREE.OneFactor, blendDst:THREE.OneFactor, blendEquation:THREE.AddEquation };
+// Interaction LOD (Low, or ?lod=1): while the camera moves the scene is drawn into a target at LOD_SCALE of the canvas size and the EDL
+// pass scales it up (4 neighbours). The point scale follows that target, so the octree also refines one level coarser (about a quarter of
+// the points). ~0.2 s after the camera stops one full-quality frame is drawn.
+const LOD_SCALE = +(QS.get("lodscale") || 0.5);
+const lodWanted = () => QS.has("lod") ? QS.get("lod") === "1" : quality === "low";
+let lodOn = false, lastMoveT = -1e9; const _lastCam = new THREE.Matrix4();
+const lo = { rt:null, w:0, h:0 };
+function rtSize() { const s = renderer.getDrawingBufferSize(new THREE.Vector2()); if (lodOn) s.set(Math.max(1, Math.round(s.x * LOD_SCALE)), Math.max(1, Math.round(s.y * LOD_SCALE))); return s; }
 function renderFrame() {
   octUni.near.value = camera.near; octUni.far.value = camera.far;
-  const blend = blendOn();
-  if (!opt("c_edl") && !blend) { renderer.render(scene, camera); return; }
-  const s = renderer.getDrawingBufferSize(new THREE.Vector2());
-  if (!edl.rt || edl.w !== s.x || edl.h !== s.y) {
-    if (edl.rt) { edl.rt.depthTexture.dispose(); edl.rt.dispose(); }
-    if (edl.acc) { edl.acc.dispose(); edl.acc = null; }
-    edl.rt = new THREE.WebGLRenderTarget(s.x, s.y); edl.rt.depthTexture = new THREE.DepthTexture(s.x, s.y);
-    edl.w = s.x; edl.h = s.y;
+  const blend = blendOn() && !lodOn;
+  if (!opt("c_edl") && !blend && !lodOn) { renderer.render(scene, camera); return; }
+  const s = rtSize();
+  let rt;
+  if (lodOn) {
+    if (!lo.rt || lo.w !== s.x || lo.h !== s.y) {
+      if (lo.rt) { lo.rt.depthTexture.dispose(); lo.rt.dispose(); }
+      lo.rt = new THREE.WebGLRenderTarget(s.x, s.y); lo.rt.depthTexture = new THREE.DepthTexture(s.x, s.y); lo.w = s.x; lo.h = s.y;
+    }
+    rt = lo.rt;
+  } else {
+    if (!edl.rt || edl.w !== s.x || edl.h !== s.y) {
+      if (edl.rt) { edl.rt.depthTexture.dispose(); edl.rt.dispose(); }
+      if (edl.acc) { edl.acc.dispose(); edl.acc = null; }
+      edl.rt = new THREE.WebGLRenderTarget(s.x, s.y); edl.rt.depthTexture = new THREE.DepthTexture(s.x, s.y);
+      edl.w = s.x; edl.h = s.y;
+    }
+    rt = edl.rt;
   }
-  renderer.setRenderTarget(edl.rt); renderer.render(scene, camera);
+  renderer.setRenderTarget(rt); renderer.render(scene, camera);
   if (blend) {
     if (!edl.acc) edl.acc = new THREE.WebGLRenderTarget(s.x, s.y, { type:THREE.HalfFloatType, depthBuffer:false, minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter });
     const ou = octUni; ou.depth.value = edl.rt.depthTexture; ou.res.value.set(s.x, s.y); ou.near.value = camera.near; ou.far.value = camera.far; ou.pass.value = 1;
@@ -253,12 +274,20 @@ function renderFrame() {
     m.blending = THREE.NormalBlending; m.depthTest = true; m.depthWrite = true; m.transparent = false;
     ou.pass.value = 0;
   }
-  renderer.setRenderTarget(null);
+  if (lodOn) {   // EDL at the reduced size too, then one bilinear blit to the canvas (premultiplied colour, transparent background kept)
+    if (!lo.out || lo.out.width !== s.x || lo.out.height !== s.y) { if (lo.out) lo.out.dispose(); lo.out = new THREE.WebGLRenderTarget(s.x, s.y, { depthBuffer:false }); }
+    renderer.setRenderTarget(lo.out); renderer.setClearColor(0x000000, 0); renderer.clear(true, false, false);
+  } else renderer.setRenderTarget(null);
   const u = edl.mat.uniforms;
-  u.tColor.value = edl.rt.texture; u.tDepth.value = edl.rt.depthTexture; u.tAcc.value = blend ? edl.acc.texture : null; u.uBlend.value = blend ? 1 : 0; u.uPx.value.set(1 / s.x, 1 / s.y);
+  u.tColor.value = rt.texture; u.tDepth.value = rt.depthTexture; u.uN.value = lodOn ? 4 : 8; u.tAcc.value = blend ? edl.acc.texture : null; u.uBlend.value = blend ? 1 : 0; u.uPx.value.set(1 / s.x, 1 / s.y);
   u.uNear.value = camera.near; u.uFar.value = camera.far; u.uStr.value = opt("c_edl") ? opt("n_edl") : 0; u.uTol.value = opt("n_edltol");
   renderer.render(edl.scene, edl.cam);
+  if (lodOn) { renderer.setRenderTarget(null); lo.blit.uniforms.t.value = lo.out.texture; renderer.render(lo.scene, edl.cam); }
 }
+lo.blit = new THREE.ShaderMaterial({ uniforms:{ t:{ value:null } }, vertexShader:`varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader:`uniform sampler2D t; varying vec2 vUv; void main(){ gl_FragColor = texture2D(t, vUv); }`, depthTest:false, depthWrite:false,
+  blending:THREE.CustomBlending, blendSrc:THREE.OneFactor, blendDst:THREE.OneMinusSrcAlphaFactor });
+lo.scene = new THREE.Scene(); lo.scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), lo.blit));
 let needsRender = true;
 function invalidate() { needsRender = true; }
 function resize() {
@@ -317,7 +346,7 @@ function pointMat({ size, color = 0xffffff, vertexColors = false, rim = 0, opaci
       }`,
     transparent:true, depthWrite:opacity >= 1 });
 }
-function updatePointScale() { pointUniforms.scale.value = renderer.domElement.height / (2 * Math.tan(camera.fov * Math.PI / 360)); }
+function updatePointScale() { pointUniforms.scale.value = (lodOn ? rtSize().y : renderer.domElement.height) / (2 * Math.tan(camera.fov * Math.PI / 360)); }
 
 function opt(id) { const e = $(id); return e.type === "checkbox" ? e.checked : (e.tagName === "SELECT" ? e.value : parseFloat(e.value)); }
 
@@ -695,6 +724,8 @@ async function octLoad(nds) {
     nds.forEach((nd, i) => {
       const buf = got[octFile(nd)], N = buf ? Math.floor(buf.byteLength / 9) : 0;
       if (oct.run !== run || N <= 0) return;
+      queueUpload(buf.byteLength, () => {
+      if (oct.run !== run || vers[i] !== nd.ver) return;
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.BufferAttribute(new Uint16Array(buf, 0, N * 3), 3, true));
       g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(buf, N * 6, N * 3), 3, true));
@@ -703,7 +734,8 @@ async function octLoad(nds) {
       const p = new THREE.Points(g, octMat); p.onBeforeRender = octNodeUniforms;
       p.position.set(nd.x * nd.size, nd.y * nd.size, nd.z * nd.size); p.scale.setScalar(nd.size); p.frustumCulled = false; p.visible = false;
       p.updateMatrix(); p.matrixAutoUpdate = false;
-      nd.obj = p; nd.loadedN = N; nd.loadedVer = vers[i]; oct.loadedPts += N; gOct.add(p);
+      nd.obj = p; nd.loadedN = N; nd.loadedVer = vers[i]; oct.loadedPts += N; gOct.add(p); invalidate();
+      });
     });
   } catch (e) {}
   for (const nd of nds) nd.loading = false;
@@ -711,7 +743,7 @@ async function octLoad(nds) {
   octPump();
 }
 function octPump() {
-  while (oct.loading < 2 && oct.want && oct.want.length && oct.run !== null) {
+  while (oct.loading < 2 && upQ.length < 24 && oct.want && oct.want.length && oct.run !== null) {
     const b = []; let pts = 0;
     while (oct.want.length && b.length < 12 && pts < 300000) { const nd = oct.want.shift(); if (!nd.loading && (!nd.obj || nd.loadedVer !== nd.ver)) { b.push(nd); pts += nd.n; } }
     if (!b.length) break;
@@ -894,7 +926,11 @@ async function loadSurface(s) {
         const cur = surf.have.get(key);
         if (tv) {   // textured: mesh + atlas
           if (cur && (cur.ver > ver || (cur.ver === ver && cur.tv >= tv))) { bm.close(); continue; }
-          setTexRegion(key, x, y, z, ver, tv, geomFrom(a), bitmapTexture(bm));
+          queueUpload(bm.width * bm.height * 4 + a.pos.byteLength * 3, () => {
+            const c2 = surf.have.get(key);
+            if (surf.run !== run || (c2 && (c2.ver > ver || (c2.ver === ver && c2.tv >= tv)))) { bm.close(); return; }
+            const tex = bitmapTexture(bm); setTexRegion(key, x, y, z, ver, tv, geomFrom(a), tex); renderer.initTexture(tex);
+          });
           continue;
         }
         if (cur && cur.ver >= ver && !cur.tv) continue;
@@ -1879,6 +1915,29 @@ $("c_robot").onchange = () => { gRobot.visible = $("c_robot").checked; robotEdge
 $("c_labels").onchange = invalidate; $("c_olabels").onchange = invalidate;
 $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar(opt("n_rscale")); invalidate(); };
 
+// GPU uploads (new point nodes, textured surface regions) are queued and spread over frames: at most UP_BYTES and UP_MS per frame, so a
+// burst of live map updates does not stall the orbit.
+const upQ = [], UP_BYTES = WEAK_GPU ? 1.5e6 : 16e6, UP_MS = WEAK_GPU ? 4 : 8;
+let upKick = 0;
+function queueUpload(bytes, fn) { upQ.push({ bytes, fn }); if (!upKick) upKick = setTimeout(kickUploads, 100); }
+// no animation frames (hidden tab, headless virtual-time screenshot): nothing to keep smooth, drain from a timer instead
+function kickUploads() { upKick = 0; const t = performance.now(); if (t - lastCamT > 90) { drainUploads(t); invalidate(); } if (upQ.length) upKick = setTimeout(kickUploads, 100); }
+function drainUploads(t0) {
+  let b = 0;
+  while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); }
+  if (!upQ.length && oct.want && oct.want.length) octPump();
+}
+// while moving (LOD frames) textured surface regions smaller than 2 px on screen are skipped; three.js frustum-culls the rest by bounding sphere
+const _sph = new THREE.Sphere();
+function surfCull() {
+  const k = pointUniforms.scale.value;
+  for (const t of surf.tex.values()) {
+    if (!lodOn) { t.mesh.visible = true; continue; }
+    const g = t.mesh.geometry; if (!g.boundingSphere) g.computeBoundingSphere();
+    const d = Math.max(1e-3, g.boundingSphere.center.distanceTo(camera.position) - g.boundingSphere.radius);
+    t.mesh.visible = g.boundingSphere.radius * k / d >= 2;
+  }
+}
 // render only when something changed (camera moved, data/options changed): an idle viewer costs nothing
 (function loop() {
   requestAnimationFrame(loop);
@@ -1892,11 +1951,17 @@ $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar
   if (stepChase(dtc)) needsRender = true;
   if (updateEE()) needsRender = true;
   lastCamT = nowT;
+  drainUploads(nowT);
+  camera.updateMatrixWorld();
+  { const a = _lastCam.elements, b = camera.matrixWorld.elements; for (let i = 0; i < 16; i++) if (Math.abs(a[i] - b[i]) > 1e-4) { lastMoveT = nowT; break; } }   // damping leaves sub-0.1 mm drift: not a move
+  const lw = lodWanted() && nowT - lastMoveT < 200;
+  if (lw !== lodOn) { lodOn = lw; needsRender = true; }
   if (!needsRender) return;
+  if (nowT === lastMoveT || !lodOn) _lastCam.copy(camera.matrixWorld);
   needsRender = false;
   const tr = performance.now();
   { const d = camera.position.distanceTo(controls.target); surfUni.fogR.value.set(d * 1.15, d * 3.2); scene.fog.near = d * 0.6; scene.fog.far = opt("c_fog") ? d * 2.2 : 1e6; }   // fog follows the viewing distance: the focus stays clear at any zoom
-  updatePointScale(); octUpdate(); renderFrame(); updateLabels();
+  updatePointScale(); octUpdate(); surfCull(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
 })();
 loadRobotModel();

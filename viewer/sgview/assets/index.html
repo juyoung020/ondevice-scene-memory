@@ -162,18 +162,20 @@ const EDGE_COL = { place:0x5a5a5a, door:0xe67814, agent:0x286ee6, inter:0x969696
 // ---------------- three.js ----------------
 const host = $("view");
 const QS = new URLSearchParams(location.search);
-const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });   // transparent clear: the page gradient is the background
-renderer.setClearColor(0x000000, 0);
-host.appendChild(renderer.domElement);
 // Quality: "high" = device pixel ratio up to 2 and a 3 M point budget for the octree point map; "low" = pixel ratio 1 and 0.8 M points.
 // Weak GPUs (Raspberry Pi V3D, mobile, software rasterisers) start at low. EDL depth shading stays on in both (one light full-screen pass).
-const GPU_NAME = (() => { try { const gl = renderer.getContext(), x = gl.getExtension("WEBGL_debug_renderer_info"); return String(gl.getParameter(x ? x.UNMASKED_RENDERER_WEBGL : gl.RENDERER)); } catch (e) { return ""; } })();
+// The GPU is read from a throwaway context first: weak GPUs get a canvas without multisampling (the scene is drawn into the EDL target,
+// which has none, so canvas MSAA only cost a resolve per frame there, and with EDL off it doubled the point fill cost).
+const GPU_NAME = (() => { try { const gl = document.createElement("canvas").getContext("webgl"), x = gl.getExtension("WEBGL_debug_renderer_info"), n = String(gl.getParameter(x ? x.UNMASKED_RENDERER_WEBGL : gl.RENDERER)); const l = gl.getExtension("WEBGL_lose_context"); if (l) l.loseContext(); return n; } catch (e) { return ""; } })();
 const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShader|softpipe/i.test(GPU_NAME);
+const renderer = new THREE.WebGLRenderer({ antialias:!WEAK_GPU, alpha:true });   // transparent clear: the page gradient is the background
+renderer.setClearColor(0x000000, 0);
+host.appendChild(renderer.domElement);
 let quality = QS.get("quality") || localStorage.getItem("sg_quality") || (WEAK_GPU ? "low" : "high");
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
-  try { for (const p of gOct.children) octQuality(p.material); } catch (e) {}   // point map not set up yet
+  try { octQuality(octMat); } catch (e) {}   // point map not set up yet
   if (typeof resize === "function") { resize(); invalidate(); }
 }
 renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
@@ -242,13 +244,13 @@ function renderFrame() {
   if (blend) {
     if (!edl.acc) edl.acc = new THREE.WebGLRenderTarget(s.x, s.y, { type:THREE.HalfFloatType, depthBuffer:false, minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter });
     const ou = octUni; ou.depth.value = edl.rt.depthTexture; ou.res.value.set(s.x, s.y); ou.near.value = camera.near; ou.far.value = camera.far; ou.pass.value = 1;
-    const ms = gOct.children.filter(p => p.visible).map(p => p.material);
-    for (const m of ms) { Object.assign(m, _bm); m.depthTest = false; m.depthWrite = false; m.transparent = true; }
+    const m = octMat;
+    Object.assign(m, _bm); m.depthTest = false; m.depthWrite = false; m.transparent = true;
     const cc = renderer.getClearColor(new THREE.Color()), ca = renderer.getClearAlpha();
     renderer.setRenderTarget(edl.acc); renderer.setClearColor(0x000000, 0); renderer.clear(true, false, false);
     const keep = scene.fog; scene.fog = null; renderer.render(gOct, camera); scene.fog = keep;
     renderer.setClearColor(cc, ca);
-    for (const m of ms) { m.blending = THREE.NormalBlending; m.depthTest = true; m.depthWrite = true; m.transparent = false; }
+    m.blending = THREE.NormalBlending; m.depthTest = true; m.depthWrite = true; m.transparent = false;
     ou.pass.value = 0;
   }
   renderer.setRenderTarget(null);
@@ -575,7 +577,7 @@ async function loadSceneChunks(sp) {
 // Every frame the visible nodes are chosen by screen size (largest first) until the point budget is reached; only those are fetched and
 // drawn. Node file: N × uint16 xyz (fraction of the node cube) then N × RGB, uploaded as normalised attributes without parsing.
 const gOct = new THREE.Group(); scene.add(gOct);
-const OCT_BUDGET = +(QS.get("budget") || 0);
+const OCT_BUDGET = +(QS.get("budget") || 0), OCT_REFINE = +(QS.get("refine") || 0);
 let octFitted = false;   // first octree framing done
 const oct = { run:null, ver:null, meta:null, nodes:new Map(), roots:[], busy:false, loading:0, loadedPts:0, drawn:0, nDrawn:0, box:null, tick:0 };
 function octBudget() { return OCT_BUDGET || (quality === "high" ? 3000000 : 800000); }
@@ -585,7 +587,7 @@ function octReset() {
 }
 function octUnload(n) {
   if (!n.obj) return;
-  gOct.remove(n.obj); n.obj.geometry.dispose(); n.obj.material.dispose(); oct.loadedPts -= n.loadedN; n.obj = null; n.loadedN = 0; n.loadedVer = -1;
+  gOct.remove(n.obj); n.obj.geometry.dispose(); oct.loadedPts -= n.loadedN; n.obj = null; n.loadedN = 0; n.loadedVer = -1;
 }
 async function loadOctree(o) {
   if (oct.run !== o.run) { octReset(); oct.run = o.run; }
@@ -677,6 +679,9 @@ function octMaterial() {
         if (vZ > front + max(uBand * vR, 0.006 * front)) discard;
         float w = 1.0 - r2; gl_FragColor = vec4(vC * w, w); }`, extensions:{ fragDepth:true } }));
 }
+// one material for every node (one program and state set; the two per-node uniforms are set just before each node is drawn)
+const octMat = octMaterial();
+function octNodeUniforms() { const u = octMat.uniforms; u.uIdx.value = this.userData.i; u.uSpacing.value = this.userData.sp; octMat.uniformsNeedUpdate = true; }
 // High: paraboloid splat depth (gl_FragDepth turns off early depth rejection, so Low keeps flat discs for the Pi 5 GPU)
 function octQuality(m) { const on = quality === "high"; if (!!m.defines.PARA !== on) { if (on) m.defines.PARA = 1; else delete m.defines.PARA; m.needsUpdate = true; } return m; }
 // nodes come in batches (one /api/files request for up to 12 nodes or 300 k points, two batches in flight), largest on screen first
@@ -695,7 +700,7 @@ async function octLoad(nds) {
       g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(buf, N * 6, N * 3), 3, true));
       g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0.5, 0.5, 0.5), 0.87);
       octUnload(nd);
-      const p = new THREE.Points(g, octMaterial());
+      const p = new THREE.Points(g, octMat); p.onBeforeRender = octNodeUniforms;
       p.position.set(nd.x * nd.size, nd.y * nd.size, nd.z * nd.size); p.scale.setScalar(nd.size); p.frustumCulled = false; p.visible = false;
       p.updateMatrix(); p.matrixAutoUpdate = false;
       nd.obj = p; nd.loadedN = N; nd.loadedVer = vers[i]; oct.loadedPts += N; gOct.add(p);
@@ -721,7 +726,7 @@ function octUpdate() {
   if (!oct.meta || !opt("c_scene")) { gOct.visible = false; oct.drawn = 0; return; }
   gOct.visible = true;
   camera.updateMatrixWorld(); _pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); _frus.setFromProjectionMatrix(_pm);
-  const proj = pointUniforms.scale.value, cam = camera.position, budget = octBudget(), minPx = oct.meta.g * (quality === "high" ? 1.0 : 1.6);   // refine while a node's point spacing on screen (2·radius / G) is above ~2 px (low: ~3 px)
+  const proj = pointUniforms.scale.value, cam = camera.position, budget = octBudget(), minPx = oct.meta.g * (OCT_REFINE || (quality === "high" ? 1.0 : 2.2));   // refine while a node's point spacing on screen (2·radius / G) is above ~2 px (low: ~4 px; the adaptive splat size closes the surface, 1.6 → 2.2 looked the same at 0.8× the points)
   const pr = nd => { const d = nd.center.distanceTo(cam); return d < nd.radius ? 1e9 : nd.radius * proj / d; };
   const heap = [];   // binary max-heap on priority
   const push = nd => { if (!_frus.intersectsBox(nd.box)) return; const e = [pr(nd), nd]; heap.push(e); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] >= e[0]) break; heap[i] = heap[p]; i = p; } heap[i] = e; };
@@ -743,21 +748,22 @@ function octUpdate() {
   const order = [], q = oct.roots.filter(isOn);
   for (let h = 0; h < q.length && q.length < VIS_W; h++) { const nd = q[h]; nd._i = h; order.push(nd); }
   // breadth-first: children of each node in octant order, appended after everything queued so far
+  let visChanged = false;
   for (let h = 0; h < order.length && order.length < VIS_W; h++) {
     const nd = order[h], kids = nd.kids.filter(isOn).sort((a, b) => oc(a) - oc(b));
     let mask = 0; const first = order.length;
     for (const k of kids) { if (order.length >= VIS_W) break; mask |= 1 << oc(k); k._i = order.length; order.push(k); }
-    const off = first - h, D = octVis.data;
-    D[4 * h] = mask; D[4 * h + 1] = (off >> 8) & 255; D[4 * h + 2] = off & 255; D[4 * h + 3] = 255;
+    const off = first - h, D = octVis.data, o = 4 * h, hi = (off >> 8) & 255, lo = off & 255;
+    if (D[o] !== mask || D[o + 1] !== hi || D[o + 2] !== lo) { D[o] = mask; D[o + 1] = hi; D[o + 2] = lo; D[o + 3] = 255; visChanged = true; }
   }
-  octVis.tex.needsUpdate = true;
+  if (visChanged) octVis.tex.needsUpdate = true;   // uploaded only when the drawn node set changed (an orbit over a loaded map uploads nothing)
   const drawSet = new Set(order);
   let drawn = 0, nDrawn = 0;
   for (const nd of oct.nodes.values()) {
     if (!nd.obj) continue;
     const on = drawSet.has(nd);
     nd.obj.visible = on;
-    if (on) { const u = nd.obj.material.uniforms; u.uIdx.value = nd._i; u.uSpacing.value = nd.spacing; drawn += nd.loadedN; nDrawn++; }
+    if (on) { nd.obj.userData.i = nd._i; nd.obj.userData.sp = nd.spacing; drawn += nd.loadedN; nDrawn++; }
   }
   oct.drawn = drawn; oct.nDrawn = nDrawn; oct.selPts = pts;
   if (oct.loadedPts > 2 * budget) {
@@ -1529,14 +1535,26 @@ async function loadRobotModel() {
   invalidate();
 }
 // The LIMO shell is white, like the map floor: tint it light blue-grey and draw dark edges so the silhouette reads on a white map.
+// The edges are found once the robot is shown, one mesh per idle slot (all at once they held the main thread ~0.5 s at start-up).
 function styleRobot(root) {
-  const edgeCache = new Map(), edgeMat = new THREE.LineBasicMaterial({ color:0x15171d });
-  root.traverse(o => {
-    if (!o.isMesh) return;
-    const c = o.material.color;
-    if (c.r > 0.9 && c.g > 0.9 && c.b > 0.9) c.set(0xc3c9d6);
-    if (!edgeCache.has(o.geometry)) edgeCache.set(o.geometry, new THREE.EdgesGeometry(o.geometry, 38));
-    o.add(new THREE.LineSegments(edgeCache.get(o.geometry), edgeMat));
+  root.traverse(o => { if (o.isMesh) { const c = o.material.color; if (c.r > 0.9 && c.g > 0.9 && c.b > 0.9) c.set(0xc3c9d6); } });
+  robotEdges();
+}
+const robotEdge = { todo:null, cache:new Map(), mat:new THREE.LineBasicMaterial({ color:0x15171d }), busy:false };
+function robotEdges() {
+  if (!robotModel || !gRobot.visible || robotEdge.busy) return;
+  if (!robotEdge.todo) { robotEdge.todo = []; robotModel.root.traverse(o => { if (o.isMesh) robotEdge.todo.push(o); }); }
+  if (!robotEdge.todo.length) return;
+  robotEdge.busy = true;
+  const idle = window.requestIdleCallback || (f => setTimeout(f, 16));
+  idle(function step() {
+    if (!gRobot.visible) { robotEdge.busy = false; return; }   // hidden again: continue when shown
+    const o = robotEdge.todo.shift();
+    if (o) {
+      if (!robotEdge.cache.has(o.geometry)) robotEdge.cache.set(o.geometry, new THREE.EdgesGeometry(o.geometry, 38));
+      o.add(new THREE.LineSegments(robotEdge.cache.get(o.geometry), robotEdge.mat)); invalidate();
+    }
+    if (robotEdge.todo.length) idle(step); else robotEdge.busy = false;
   });
 }
 const JOINT_SLIDERS = ["omx_joint1", "omx_joint2", "omx_joint3", "omx_joint4", "omx_joint5", "omx_gripper_joint_1", "omx_gripper_joint_2"];
@@ -1857,7 +1875,7 @@ for (const id of ["c_points", "c_scene", "n_sop", "n_ssize", "s_odraw", "s_pcolo
 for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra", "g_inter", "n_objz", "n_h", "n_thumb"]) $(id).onchange = drawGraph;
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };
 $("c_map").onchange = () => { gMap.visible = $("c_map").checked; invalidate(); };
-$("c_robot").onchange = () => { gRobot.visible = $("c_robot").checked; invalidate(); };
+$("c_robot").onchange = () => { gRobot.visible = $("c_robot").checked; robotEdges(); invalidate(); };
 $("c_labels").onchange = invalidate; $("c_olabels").onchange = invalidate;
 $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar(opt("n_rscale")); invalidate(); };
 

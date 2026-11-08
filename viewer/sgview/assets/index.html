@@ -18,7 +18,7 @@
   .lbl.room { font-size:13px; font-weight:600; padding:3px 12px; }
   .lbl.obj::before { content:""; display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--c, #2ea043); margin-right:6px; vertical-align:1px; }
   .lbl.hot { font-size:12.5px; padding:4px 12px; background:rgba(16,19,27,.86); border-color:rgba(106,168,255,.55); z-index:2; }
-  .lbl.layer { background:none; border:0; box-shadow:none; color:var(--mute); font-size:11px; letter-spacing:.12em; font-weight:600; transform:translate(0,-100%); }
+  .lbl.layer { background:rgba(16,19,27,.55); border:1px solid rgba(255,255,255,.18); color:#c9cfdc; font-size:12px; font-weight:600; letter-spacing:.06em; border-radius:6px; transform:translate(-100%,-50%); }
   .lbl.traj { background:rgba(47,129,247,.85); }
   #panel { position:absolute; top:64px; right:14px; bottom:14px; width:320px; box-sizing:border-box; overflow-y:auto; background:var(--panel); border:1px solid var(--line);
     border-radius:14px; padding:10px 14px 18px; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); box-shadow:0 10px 40px rgba(0,0,0,.45);
@@ -79,6 +79,8 @@
     <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog"> Depth fog</label>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
     <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
+    <div class="num" title="label only the N largest objects still in place, one per name (0 = every object with its id); labels that would overlap another are left out">Max object name labels <input type="number" id="n_olmax" value="0" min="0" max="200" step="1"></div>
+    <label class="row" title="short names beside each layer (3D map, objects, rooms)"><input type="checkbox" id="c_llabels"> Layer names</label>
     <label class="row"><input type="checkbox" id="c_points" checked> Segment points</label>
     <label class="row">Point colour
       <select id="s_pcolor"><option>true colour</option><option>state colour</option></select></label>
@@ -1170,25 +1172,48 @@ function updateLabels() {
   const want = new Set();
   if (view && opt("c_labels")) {
     const w = host.clientWidth, h = host.clientHeight;
-    const put = (key, text, pos, cls) => {
+    const boxes = [];   // screen rectangles of the labels placed so far (object name labels skip a spot already taken)
+    const put = (key, text, pos, cls, avoid) => {
       _v.set(...pos).project(camera);
       if (_v.z > 1 || Math.abs(_v.x) > 1.1 || Math.abs(_v.y) > 1.1) return;
-      const e = ensureLabel(key, text, cls); want.add(key);
-      e.style.left = ((_v.x + 1) / 2 * w) + "px"; e.style.top = ((1 - _v.y) / 2 * h) + "px";
+      const e = ensureLabel(key, text, cls);
+      const x = (_v.x + 1) / 2 * w, y = (1 - _v.y) / 2 * h; e.style.left = x + "px";
+      const hit = r => boxes.some(b => r.left < b.right + 2 && r.right > b.left - 2 && r.top < b.bottom + 1 && r.bottom > b.top - 1);
+      let r;
+      for (const dy of avoid ? [0, -1, 1] : [0]) {   // spot taken: try one label height above, then below
+        e.style.top = y + dy * e.offsetHeight + "px"; r = e.getBoundingClientRect();
+        if (!avoid || !hit(r)) break; r = null;
+      }
+      if (!r) return;
+      boxes.push(r); want.add(key);
+    };
+    const putLayer = (key, text, pts) => {   // left of the layer's leftmost point on screen
+      let best = null;
+      for (const p of pts) { _v.set(...p).project(camera); if (_v.z > 1) continue; if (!best || _v.x < best[0]) best = [_v.x, _v.y]; }
+      if (!best || Math.abs(best[1]) > 1) return;
+      const e = ensureLabel(key, text, "layer"); want.add(key);
+      e.style.left = Math.max((best[0] + 1) / 2 * w - 14, e.offsetWidth + 8) + "px"; e.style.top = ((1 - best[1]) / 2 * h) + "px";
+      boxes.push(e.getBoundingClientRect());
     };
     for (const id of new Set([selected, hoverId])) {   // hovered / selected object: one pill with the state dot
       const o = id != null && objs.get(id); if (!o) continue;
       put("h" + o.id, `${o.name} · ${o.state}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.08], "obj hot");
       const e = labelEls.get("h" + o.id); if (e) e.style.setProperty("--c", "#" + new THREE.Color(STATE_COL[o.state] ?? 0xc83cc8).getHexString());
     }
-    if (opt("c_olabels")) for (const o of view.objects) if (objVisible(o) && o.id !== selected && o.id !== hoverId) {
-      put("o" + o.id, `${o.name}#${o.id}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.1], "obj");
+    if (opt("g_on") && opt("g_rooms")) for (const r of view.rooms || []) put("r" + r.id, (r.name || ("room " + r.id)) + (r.objects ? ` · ${r.objects.length} objects` : ""), [r.centroid[0], r.centroid[1], zOf("room") + 0.6], "room");
+    if (opt("g_on") && trajInfo && opt("g_agents")) put("traj", `${robotLabel()} ${trajInfo.len.toFixed(1)} m`, trajInfo.last, "traj");
+    if (opt("c_llabels")) {
+      const b = contentBox();
+      if (b) putLayer("L0", "3D 지도", [[b.min.x, b.min.y, 0], [b.min.x, b.max.y, 0], [b.max.x, b.min.y, 0], [b.max.x, b.max.y, 0]]);
+      if (opt("g_on")) for (const [kind, text] of [["object", "물체"], ["room", "방"]]) putLayer("L" + kind, text, graphNodes.filter(n => n.kind === kind).map(n => [n.x, n.y, n.z]));
+    }
+    const nMax = opt("n_olmax");
+    let olist = view.objects.filter(o => objVisible(o) && o.id !== selected && o.id !== hoverId && (nMax <= 0 || o.state !== "gone"));
+    if (nMax > 0) olist = olist.sort((a, b) => b.extent[0] * b.extent[1] * b.extent[2] - a.extent[0] * a.extent[1] * a.extent[2]).filter((o, i, l) => l.findIndex(q => q.name === o.name) === i).slice(0, nMax);   // one label per name, the largest
+    if (opt("c_olabels")) for (const o of olist) {
+      put("o" + o.id, nMax > 0 ? o.name : `${o.name}#${o.id}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.1], "obj", true);
       const e = labelEls.get("o" + o.id); if (e) e.style.setProperty("--c", "#" + new THREE.Color(STATE_COL[o.state] ?? 0xc83cc8).getHexString());
     }
-    if (opt("g_on")) {
-      if (trajInfo && opt("g_agents")) put("traj", `${robotLabel()} ${trajInfo.len.toFixed(1)} m`, trajInfo.last, "traj");
-    }
-    if (opt("g_on") && opt("g_rooms")) for (const r of view.rooms || []) put("r" + r.id, (r.name || ("room " + r.id)) + (r.objects ? ` · ${r.objects.length} objects` : ""), [r.centroid[0], r.centroid[1], zOf("room") + 0.6], "room");
   }
   for (const [k, e] of labelEls) if (!want.has(k)) { e.remove(); labelEls.delete(k); }
 }
@@ -1912,7 +1937,7 @@ for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra"
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };
 $("c_map").onchange = () => { gMap.visible = $("c_map").checked; invalidate(); };
 $("c_robot").onchange = () => { gRobot.visible = $("c_robot").checked; robotEdges(); invalidate(); };
-$("c_labels").onchange = invalidate; $("c_olabels").onchange = invalidate;
+$("c_labels").onchange = invalidate; $("c_olabels").onchange = invalidate; $("c_llabels").onchange = invalidate; $("n_olmax").onchange = invalidate;
 $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar(opt("n_rscale")); invalidate(); };
 
 // GPU uploads (new point nodes, textured surface regions) are queued and spread over frames: at most UP_BYTES and UP_MS per frame, so a

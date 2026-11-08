@@ -18,6 +18,7 @@ mod rec;
 mod scale;
 mod seg;
 mod stream;
+mod submap;
 mod tsdf;
 mod vo;
 mod tum;
@@ -65,6 +66,7 @@ struct Args {
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
+    submap: submap::Policy, // --submap-secs S --submap-m M --submap-deg D: 스트림 표면 지도에서 새 서브맵을 여는 조건
 }
 
 fn args() -> Args {
@@ -106,6 +108,12 @@ fn args() -> Args {
         no_level: v.iter().any(|x| x == "--no-level"),
         rebuild_every: if v.iter().any(|x| x == "--no-rebuild") { -1.0 } else { get("--rebuild-every").map_or(5.0, |s| s.parse().unwrap()) },
         kf_store_mb: get("--kf-store-mb").map_or(3000, |s| s.parse().unwrap()),
+        // 20 초·2 m·60°: 사무실 표면이 전체 다시 쌓기와 5 cm 안 95.8 %(10 초 91.0 %, 40 초 94.6 %·중앙 오차 1.2 cm), 서브맵 16 개 80 MB
+        submap: submap::Policy {
+            secs: get("--submap-secs").map_or(20.0, |s| s.parse().unwrap()),
+            dist: get("--submap-m").map_or(2.0, |s| s.parse().unwrap()),
+            deg: get("--submap-deg").map_or(60.0, |s| s.parse().unwrap()),
+        },
     }
 }
 
@@ -337,7 +345,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
-    let mut tsdf = a.surface.then(|| tsdf::Tsdf::new(a.tsdf_vox));
+    // 스트림 표면 지도(루프 클로저 반영)는 서브맵이 표면을 맡는다: 장면은 서브맵에 쌓고, 전체 표면은 서브맵을 합친 것
+    let sub_mode = a.stream.is_some() && a.surface && a.rebuild_every >= 0.0;
+    let mut tsdf = (a.surface && !sub_mode).then(|| tsdf::Tsdf::new(a.tsdf_vox));
+    let mut subs = sub_mode.then(|| submap::Submaps::new(a.tsdf_vox, a.submap));
     let mut mem = Memory::new(0.012, 0.04);
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
@@ -721,18 +732,28 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, anchor, graph }) = rx.recv() {
         if !graph.is_empty() {
             kfs.apply_graph(&graph);
+            if let Some(s) = subs.as_mut() {
+                s.check(&|id| node_map(&kfs, &stream_fix, z0.unwrap_or(0.0), id));
+            }
         }
         if let Some(job) = rb_job.take_if(|j| j.is_finished()) {
-            install(a, seq.k, job.join().expect("다시 쌓기 스레드"), &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+            let mut rb = job.join().expect("다시 쌓기 스레드");
+            install_surface(&mut subs, rb.surf.take());
+            install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
             (n_rebuild, last_merge) = (n_rebuild + 1, nkf);
-            scene_json = fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf);
+            scene_json = match subs.as_mut() {
+                Some(s) => surface_outputs(&a.out, run_id, scene.vox, s),
+                None => fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf),
+            };
             write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, true);
         }
-        if rb_job.is_none() && kfs.dirty && a.rebuild_every > 0.0 && last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every {
+        let surf_dirty = subs.as_ref().is_some_and(|s| s.dirty);
+        if rb_job.is_none() && (kfs.dirty || surf_dirty) && a.rebuild_every > 0.0 && last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every {
             let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
+            let sj = subs.as_mut().map(|s| s.plan(&|id| node_map(&kfs, &stream_fix, z0.unwrap_or(0.0), id)));
             kfs.clear_dirty();
-            rb_job = Some(std::thread::spawn(move || rebuild_maps(&ar, k, &snap, next, moved)));
+            rb_job = Some(std::thread::spawn(move || rebuild_maps(&ar, k, &snap, next, moved, sj)));
             last_rebuild = Instant::now();
         }
         let raw = (r, p); // 받은 위치(수평 맞춤 전): 다시 쌓기용 보관
@@ -1166,8 +1187,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         // 위치가 확인된 장면만 지도·물체에 넣는다(실패해 예측 위치뿐인 장면은 지도를 어긋나게 함)
         let map_ok = (!a.vo || vo_ok) && leveled;
         let (c3, c4) = map_frame(a, seq.k, t, &r, &pwc, floor_z, &depth, &rgb, w, h, &dets, nkf, map_ok, &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+        let c_sub = Instant::now();
+        if let (Some(s), true) = (subs.as_mut(), map_ok) {
+            s.integrate(t, anchor, &|id| node_map(&kfs, &stream_fix, z0v, id), &(r, pwc), &depth, &rgb, w, h, seq.k, a.max_depth);
+        }
+        let t_sub = c_sub.elapsed().as_secs_f64();
         if map_ok && a.stream.is_some() && a.rebuild_every >= 0.0 {
-            kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets);
+            kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, sub_mode);
         }
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
         cam_json = json!({"pos": pwc, "R": r});
@@ -1198,7 +1224,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     n_chunk += 1;
                 }
                 scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
-                if let Some(ts) = tsdf.as_mut() {
+                if let Some(ts) = surf(&mut tsdf, &mut subs) {
                     write_surface(&a.out, ts);
                     scene_json["surface"] = surface_json(ts, run_id);
                 }
@@ -1217,9 +1243,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         let c5 = Instant::now();
         clock.vo += (c2 - c_vo).as_secs_f64();
-        clock.map += (c3 - c2).as_secs_f64();
+        clock.map += (c3 - c2).as_secs_f64() + t_sub;
         clock.obj += (c4 - c3).as_secs_f64();
-        clock.write += (c5 - c4).as_secs_f64();
+        clock.write += (c5 - c4).as_secs_f64() - t_sub;
         clock.n += 1;
         if nkf % 25 == 0 {
             let n = clock.n as f64;
@@ -1232,21 +1258,31 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 끝: 마지막 다시 쌓기 뒤에 노드가 또 움직였으면 끝난 그래프로 한 번 더(결과 지도·물체·poses_map.txt 가 최종 위치를 따름)
     let mut installed = false;
     if let Some(job) = rb_job.take() {
-        install(a, seq.k, job.join().expect("다시 쌓기 스레드"), &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+        let mut rb = job.join().expect("다시 쌓기 스레드");
+        install_surface(&mut subs, rb.surf.take());
+        install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
         (n_rebuild, installed) = (n_rebuild + 1, true);
     }
-    if kfs.dirty && a.rebuild_every >= 0.0 {
+    if let Some(s) = subs.as_mut() {
+        s.check(&|id| node_map(&kfs, &stream_fix, z0.unwrap_or(0.0), id));
+    }
+    if (kfs.dirty || subs.as_ref().is_some_and(|s| s.dirty)) && a.rebuild_every >= 0.0 {
         let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
-        let rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved);
+        let sj = subs.as_mut().map(|s| s.plan(&|id| node_map(&kfs, &stream_fix, z0.unwrap_or(0.0), id)));
+        let mut rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved, sj);
         kfs.clear_dirty();
-        install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+        install_surface(&mut subs, rb.surf.take());
+        install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
         (n_rebuild, installed) = (n_rebuild + 1, true);
     }
-    if installed {
+    if installed && subs.is_none() {
         fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf); // scene_json 은 아래 마지막 기록에서 다시 만듦
     }
     if a.stream.is_some() {
-        eprintln!("다시 쌓기 {n_rebuild} 번, 보관 장면 {} 개", kfs.len());
+        eprintln!("다시 쌓기 {n_rebuild} 번, 보관 장면 {} 개({:.0} MB)", kfs.len(), kfs.bytes() as f64 / 1048576.0);
+    }
+    if let Some(s) = subs.as_ref() {
+        eprintln!("서브맵 {} 개({:.0} MB), 전체 표면 {:.0} MB", s.len(), s.bytes() as f64 / 1048576.0, s.global.bytes() as f64 / 1048576.0);
     }
     if !est_traj.is_empty() {
         let mut s = String::from("# timestamp x y z qx qy qz qw (OpenCV 카메라 → 세계)\n");
@@ -1273,7 +1309,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         n_chunk += 1;
     }
     scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
-    if let Some(ts) = tsdf.as_mut() {
+    if let Some(ts) = surf(&mut tsdf, &mut subs) {
         write_surface(&a.out, ts);
         scene_json["surface"] = surface_json(ts, run_id);
     }
@@ -1303,7 +1339,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
 struct Rebuilt {
     grid: Grid,
     scene: SceneMap,
-    tsdf: Option<tsdf::Tsdf>,
+    surf: Option<submap::Done>, // 서브맵을 다시 합친 전체 표면(표면 지도)
     mem: Memory,
     traj: Vec<(f64, [f64; 3])>,
     map_traj: Vec<(f64, V3, M3)>,
@@ -1328,11 +1364,11 @@ fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
 }
 
 /// 보관한 장면을 주어진 위치로 빈 지도·물체·지나온 길에 처음부터 쌓는다. 물체 id 는 next_id 부터.
-fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f64)) -> Rebuilt {
+fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f64), surf: Option<submap::Job>) -> Rebuilt {
     let c0 = Instant::now();
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
-    let mut tsdf = a.surface.then(|| tsdf::Tsdf::new(a.tsdf_vox));
+    let mut tsdf = None; // 표면은 서브맵이 맡음
     let mut mem = Memory::new(0.012, 0.04);
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
@@ -1344,22 +1380,60 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
         }
     }
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
-    Rebuilt { grid, scene, tsdf, mem, traj, map_traj, last_seq, n: snap.len(), secs: c0.elapsed().as_secs_f64(), moved }
+    let secs = c0.elapsed().as_secs_f64();
+    Rebuilt { grid, scene, surf: surf.map(|j| j.run()), mem, traj, map_traj, last_seq, n: snap.len(), secs, moved }
 }
 
 /// 다시 쌓은 지도로 갈아 끼우고, 쌓는 동안 새로 보관한 장면을 지금 위치로 이어서 넣는다
 #[allow(clippy::too_many_arguments)]
-fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3, z0: f64, grid: &mut Grid, scene: &mut SceneMap, tsdf: &mut Option<tsdf::Tsdf>,
+fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3, z0: f64, grid: &mut Grid, scene: &mut SceneMap,
            mem: &mut Memory, traj: &mut Vec<(f64, [f64; 3])>, map_traj: &mut Vec<(f64, V3, M3)>) {
     let next = mem.next.max(rb.mem.next);
-    (*grid, *scene, *tsdf, *mem, *traj, *map_traj) = (rb.grid, rb.scene, rb.tsdf, rb.mem, rb.traj, rb.map_traj);
+    (*grid, *scene, *mem, *traj, *map_traj) = (rb.grid, rb.scene, rb.mem, rb.traj, rb.map_traj);
     mem.next = next;
     let newer: Snap = snapshot(kfs, fix, z0).into_iter().filter(|s| s.0.seq > rb.last_seq).collect();
     for (i, (kf, r, pwc)) in newer.iter().enumerate() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, (rb.n + i) as u32, true, grid, scene, tsdf, mem, traj, map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, (rb.n + i) as u32, true, grid, scene, &mut None, mem, traj, map_traj);
     }
     eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음, 물체 {} 개",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, newer.len(), mem.objs.len());
+}
+
+/// RTAB-Map 노드의 지금 위치를 지도 좌표로(수평 맞춤·바닥 높이 원점 적용)
+fn node_map(kfs: &kfstore::KfStore, fix: &M3, z0: f64, id: u32) -> Option<tsdf::Pose> {
+    kfs.node(id).map(|(r, p)| {
+        let q = mv(fix, &p);
+        (mm(fix, &r), [q[0], q[1], q[2] - z0])
+    })
+}
+
+/// 면을 뽑을 표면: 서브맵이면 활성 서브맵을 옮긴 전체 표면
+fn surf<'a>(tsdf: &'a mut Option<tsdf::Tsdf>, subs: &'a mut Option<submap::Submaps>) -> Option<&'a mut tsdf::Tsdf> {
+    match subs {
+        Some(s) => {
+            s.flush();
+            Some(&mut s.global)
+        }
+        None => tsdf.as_mut(),
+    }
+}
+
+/// 다시 합친 전체 표면으로 갈아 끼우기
+fn install_surface(subs: &mut Option<submap::Submaps>, done: Option<submap::Done>) {
+    if let (Some(s), Some(d)) = (subs.as_mut(), done) {
+        let c0 = Instant::now();
+        let (n, nm, secs) = (d.n, d.n_moved, d.secs);
+        s.install(d);
+        eprintln!("서브맵 다시 합치기: 서브맵 {n} 개 중 {nm} 개 움직임 → {secs:.2} 초(작업 스레드) + 갈아 끼우기 {:.3} 초, 다시 뽑을 구역 {} 개",
+                  c0.elapsed().as_secs_f64(), s.global.n_dirty());
+    }
+}
+
+/// 서브맵 표면을 다시 합친 뒤 출력: 실행 번호는 그대로, 바뀐 구역의 면 파일만 다시 씀(뷰어는 판 번호가 바뀐 구역만 받음)
+fn surface_outputs(dir: &Path, run_id: u64, vox: f64, s: &mut submap::Submaps) -> serde_json::Value {
+    s.flush();
+    write_surface(dir, &mut s.global);
+    json!({"run": run_id, "chunks": 0, "prefix": "scene/c", "voxel": vox, "n": 0, "surface": surface_json(&s.global, run_id)})
 }
 
 /// 다시 쌓은 뒤 출력 새로: 실행 번호를 바꿔 뷰어가 받은 조각·표면을 비우게 하고, 옛 조각·면 파일을 지우고 지금 지도를 처음부터 씀

@@ -1,5 +1,7 @@
 //! 지도에 넣은 장면 보관 + RTAB-Map 노드 위치: 루프 클로저로 노드가 움직이면 보관한 장면을 고친 위치로 다시 쌓는다.
 //! 장면 위치 = 기준 노드의 지금 위치 × (받을 때 기준 노드에서 본 상대 위치). 노드 위치는 스트림 그래프 블록(MMG1)으로 온다.
+//! 줄인 보관(표면 지도: 표면은 서브맵이 맡음): 점유 격자·물체에 쓰는 것만 — 깊이는 4 화소 간격, 검출 상자 안은 컬러·깊이 그대로.
+//! 점유 격자는 16 화소 간격(8 + 16k)만 읽어 4 화소 간격 깊이와 같은 값이고, 물체 점·사진은 상자 안만 읽는다.
 use crate::geom::*;
 use crate::seg::Det;
 use std::collections::HashMap;
@@ -18,20 +20,60 @@ pub struct Kf {
     pub h_cam: f64, // 카메라 높이(바닥 위): 다시 쌓을 때 바닥 높이 = 카메라 z − h_cam
     pub w: usize,
     pub h: usize,
-    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4
-    depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4
+    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 비어 있음)
+    depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4(줄인 보관이면 4 화소 간격)
+    crops: Vec<Crop>, // 줄인 보관: 검출 상자 안 컬러·깊이
+    sparse: bool,
     pub dets: Option<Vec<Det>>,
 }
 
+/// 검출 상자 안 화소(줄인 보관)
+struct Crop {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    rgb_z: Vec<u8>,
+    depth_z: Vec<u8>,
+}
+
+const Q: usize = 4; // 줄인 보관의 깊이 화소 간격
+
 impl Kf {
     pub fn depth(&self) -> Vec<f32> {
-        unpack_depth(&self.depth_z, self.w, self.h).iter().map(|&v| v as f32 * 1e-3).collect()
+        if !self.sparse {
+            return unpack_depth(&self.depth_z, self.w, self.h).iter().map(|&v| v as f32 * 1e-3).collect();
+        }
+        let (qw, qh) = (self.w.div_ceil(Q), self.h.div_ceil(Q));
+        let q = unpack_depth(&self.depth_z, qw, qh);
+        let mut d: Vec<f32> = (0..self.w * self.h).map(|i| q[(i / self.w / Q) * qw + (i % self.w) / Q] as f32 * 1e-3).collect();
+        for c in &self.crops {
+            let z = unpack_depth(&c.depth_z, c.w, c.h);
+            for y in 0..c.h {
+                for x in 0..c.w {
+                    d[(c.y + y) * self.w + c.x + x] = z[y * c.w + x] as f32 * 1e-3;
+                }
+            }
+        }
+        d
     }
     pub fn rgb(&self) -> Vec<u8> {
-        unpack_rgb(&self.rgb_z, self.w, self.h)
+        if !self.sparse {
+            return unpack_rgb(&self.rgb_z, self.w, self.h);
+        }
+        let mut rgb = vec![0u8; self.w * self.h * 3];
+        for c in &self.crops {
+            let z = unpack_rgb(&c.rgb_z, c.w, c.h);
+            for y in 0..c.h {
+                let o = ((c.y + y) * self.w + c.x) * 3;
+                rgb[o..o + c.w * 3].copy_from_slice(&z[y * c.w * 3..(y + 1) * c.w * 3]);
+            }
+        }
+        rgb
     }
     fn bytes(&self) -> usize {
-        self.rgb_z.len() + self.depth_z.len() + self.dets.iter().flatten().map(|d| d.mask.len()).sum::<usize>()
+        self.rgb_z.len() + self.depth_z.len() + self.crops.iter().map(|c| c.rgb_z.len() + c.depth_z.len()).sum::<usize>()
+            + self.dets.iter().flatten().map(|d| d.mask.len()).sum::<usize>()
     }
 }
 
@@ -75,6 +117,11 @@ impl KfStore {
         self.kfs.len()
     }
 
+    /// 보관한 장면 바이트(압축 뒤)
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// 그래프 블록: 새 노드는 더하고, 있던 노드가 문턱 넘게 움직였으면 다시 쌓기 표시
     pub fn apply_graph(&mut self, upd: &[(u32, M3, V3)]) {
         for (id, r, p) in upd {
@@ -88,9 +135,14 @@ impl KfStore {
         }
     }
 
-    /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표)
+    /// 노드의 지금 위치(수평 맞춤 전, RTAB-Map 지도 좌표)
+    pub fn node(&self, id: u32) -> Option<(M3, V3)> {
+        self.nodes.get(&id).copied()
+    }
+
+    /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음)
     #[allow(clippy::too_many_arguments)]
-    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &[f32], dets: &Option<Vec<Det>>) {
+    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &[f32], dets: &Option<Vec<Det>>, sparse: bool) {
         self.count += 1;
         if (self.count - 1) % self.stride != 0 {
             return;
@@ -99,9 +151,30 @@ impl KfStore {
             Some(n) => (anchor, inv_mul(n, &(r, p))),
             None => (0, (r, p)),
         };
+        let mm16 = |d: f32| (d * 1000.0).round().clamp(0.0, 65535.0) as u16;
+        let (rgb_z, depth_z, crops) = if sparse {
+            let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
+            let q: Vec<u16> = (0..qw * qh).map(|i| mm16(depth[(i / qw) * Q * w + (i % qw) * Q])).collect();
+            let crops = dets.iter().flatten().filter_map(|d| {
+                let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
+                let (x2, y2) = (x2.min(w), y2.min(h));
+                (x2 > x1 && y2 > y1).then(|| {
+                    let (cw, ch) = (x2 - x1, y2 - y1);
+                    let mut cr = Vec::with_capacity(cw * ch * 3);
+                    let mut cd = Vec::with_capacity(cw * ch);
+                    for y in y1..y2 {
+                        cr.extend_from_slice(&rgb[(y * w + x1) * 3..(y * w + x2) * 3]);
+                        cd.extend(depth[y * w + x1..y * w + x2].iter().map(|&v| mm16(v)));
+                    }
+                    Crop { x: x1, y: y1, w: cw, h: ch, rgb_z: pack_rgb(&cr, cw, ch), depth_z: pack_depth(&cd, cw, ch) }
+                })
+            }).collect();
+            (vec![], pack_depth(&q, qw, qh), crops)
+        } else {
+            (pack_rgb(rgb, w, h), pack_depth(&depth.iter().map(|&d| mm16(d)).collect::<Vec<_>>(), w, h), vec![])
+        };
         let kf = Kf {
-            seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z: pack_rgb(rgb, w, h),
-            depth_z: pack_depth(&depth.iter().map(|&d| (d * 1000.0).round().clamp(0.0, 65535.0) as u16).collect::<Vec<_>>(), w, h),
+            seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
             dets: dets.as_ref().map(|v| v.iter().map(|d| Det { cls: d.cls, score: d.score, box_: d.box_, mask: d.mask.clone() }).collect()),
         };
         self.bytes += kf.bytes();
@@ -153,7 +226,7 @@ mod tests {
         let mut st = KfStore::new(100);
         st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0])]);
         // 노드 1 에서 x 로 1 m 앞의 장면
-        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None);
+        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None, false);
         assert!(!st.dirty);
         // 노드가 원점에서 90° 돌고 (0, 2, 0) 으로 옮겨짐 → 장면은 (0, 3, 0), 90°
         st.apply_graph(&[(1, rz(std::f64::consts::FRAC_PI_2), [0.0, 2.0, 0.0])]);
@@ -167,7 +240,7 @@ mod tests {
     fn small_move_not_dirty() {
         let mut st = KfStore::new(100);
         st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0])]);
-        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None);
+        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None, false);
         st.apply_graph(&[(1, rz(0.001), [0.005, 0.0, 0.0])]);
         assert!(!st.dirty);
     }
@@ -192,6 +265,32 @@ mod tests {
     }
 
     #[test]
+    fn sparse_keeps_grid_and_boxes() {
+        // 줄인 보관: 점유 격자 화소(8 + 16k)와 검출 상자 안은 받은 값 그대로, 나머지 깊이는 4 화소 간격 값
+        let (w, h) = (64, 48);
+        let d: Vec<f32> = (0..w * h).map(|i| 0.5 + (i % 97) as f32 * 0.01).collect();
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let det = Det { cls: 1, score: 0.9, box_: [10, 5, 30, 21], mask: vec![true; 20 * 16] };
+        let mut st = KfStore::new(100);
+        st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &rgb, &d, &Some(vec![det]), true);
+        let kf = &st.kfs()[0];
+        let (d2, c2) = (kf.depth(), kf.rgb());
+        let mm = |v: f32| (v * 1000.0).round() * 1e-3;
+        for v in (8..h).step_by(16) {
+            for u in (8..w).step_by(16) {
+                assert!((d2[v * w + u] - mm(d[v * w + u])).abs() < 1e-6);
+            }
+        }
+        for v in 5..21 {
+            for u in 10..30 {
+                assert!((d2[v * w + u] - mm(d[v * w + u])).abs() < 1e-6);
+                assert_eq!(c2[(v * w + u) * 3..(v * w + u) * 3 + 3], rgb[(v * w + u) * 3..(v * w + u) * 3 + 3]);
+            }
+        }
+        assert!((d2[3 * w + 2] - mm(d[0])).abs() < 1e-6);
+    }
+
+    #[test]
     fn budget_thins() {
         let mut st = KfStore::new(1); // 1 MB
         // 압축이 안 되는 값(의사 난수)
@@ -200,7 +299,7 @@ mod tests {
         let rgb: Vec<u8> = (0..320 * 300 * 3).map(|_| rnd()).collect();
         let d: Vec<f32> = (0..320 * 300).map(|_| rnd() as f32 * 0.1).collect();
         for i in 0..10 {
-            st.push(i as f64, 0, rz(0.0), [0.0; 3], 1.0, 320, 300, &rgb, &d, &None);
+            st.push(i as f64, 0, rz(0.0), [0.0; 3], 1.0, 320, 300, &rgb, &d, &None, false);
         }
         assert!(st.bytes <= 1 << 20);
         assert!(st.stride > 1);

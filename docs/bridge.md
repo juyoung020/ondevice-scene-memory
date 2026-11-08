@@ -144,7 +144,7 @@ memmap 출력은 TUM 입력과 같고, 스트림이면 `poses_est.txt`(받아 �
 
 ## 검증 (WSL Ubuntu 24.04, TUM 재생, 2026-11-05)
 
-`bridge/tools/check_tum.sh` 로 시퀀스마다 세 번 돌려 견줌. RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드해 기본 특징이 GFTT/ORB, 최적화기가 g2o 다(보드와 같은 조합, [board_bridge.md](board_bridge.md)). memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --surface --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
+`bridge/tools/check_tum.sh` 로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --surface --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
 
 - **기준**: 같은 설정 + 모든 장면을 지도 노드로 끝까지 돌려 최적화한 위치 → `memmap --tum --gt`(오프라인 경로).
 - **같은 위치 오프라인**: 스트림 실행이 보낸 위치 파일 그대로 → `memmap --tum --gt`. 스트림과 위치가 같고 입력 경로만 다르다.
@@ -170,6 +170,22 @@ memmap 출력은 TUM 입력과 같고, 스트림이면 `poses_est.txt`(받아 �
 - 같은 설정도 실행마다 흔들린다(RTAB-Map 안 병렬 처리): 사무실 보낸 위치 4.0 · 4.9 · 6.4 cm, 책상 지도 노드 4.4–10.4 cm.
 - 자세 차이(정답에 맞춘 뒤 중앙): 사무실 2.3°, 책상 4.4°. 복도는 정답 자세의 축 약속이 달라(Digiteo 정답) 자세 비교에서 뺐다.
 - 세 시퀀스는 놓침 0. 놓침 경로는 fr1 책상에서 장면 150–249 를 빼 큰 틈을 만든 재생으로 확인: 틈 다음 장면(150)이 놓침 + 새 지도(상태 1 + 2)로 오고 memmap 은 그 한 장만 빼고(`stream_lost` 1) 계속 쌓았다. 61 장 뒤(211) 루프 클로저로 두 지도가 합쳐지며 상태 4 가 왔다.
+
+### 특징·최적화기 비교 (WSL, 2026-11-08)
+
+`rtab_bridge --tum <시퀀스> --config <ini> --out /dev/null` 을 조합마다 세 번, 다섯 조합을 서로 다른 코어에서 동시에 돌림. 오차는 정답 기준 `ate`, "끝 그래프" = `--final-poses`(최적화된 지도 노드), "보낸 위치" = `--poses`(장면이 들어온 순간). 세 시퀀스 모두 놓침 0(정확도 우선 + ORB 책상 한 번만 놓침 1).
+
+| 빌드 · 설정 | 사무실 끝 그래프 | 책상 끝 그래프 | 보낸 위치 사무실 / 책상 | 위치 추적 ms/장 |
+|---|---|---|---|---|
+| ORB + g2o(배포판 OpenCV), `rtabmap_pi.ini` 의 특징·최적화기 줄 없음 | 2.2 / 2.8 / 3.3 cm | 4.3 / 4.3 / 4.4 cm | 4.4–5.6 / 6.0–6.1 cm | 10.0–12.0 |
+| BRIEF + GTSAM(OpenCV contrib + GTSAM 빌드), 빌드 기본값 | 2.8 / 7.1 / 3.3 | 3.4 / 3.6 / 3.6 | 3.9–10.5 / 5.7–5.8 | 10.0–12.1 |
+| **BRIEF + GTSAM, `rtabmap_pi.ini`(세 줄 적음)** | **2.4 / 2.6 / 2.7** | **3.6 / 3.6 / 3.7** | 3.7–4.0 / 5.7–5.8 | 10.0–11.9 |
+| 정확도 우선(C-BA3) + BRIEF + GTSAM | 1.9 / 1.9 / 2.0 | 3.4 / 4.5 / 3.6 | 3.9–4.5 / 3.8–5.5 | 12.9–15.7 |
+| 정확도 우선 + ORB + g2o | 2.2 / 2.3 / 2.5 | 3.6 / 6.8 / 4.2 | 3.4–4.0 / 5.5–11.2 | 12.9–15.9 |
+
+- BRIEF + GTSAM 은 책상에서 약 0.8 cm 낫고 위치 추적 시간은 같다. 사무실 7.1 cm 는 세 번 중 한 번(실행마다 흔들림)이고, 같은 설정을 ini 에 적은 세 번은 2.4–2.7 cm.
+- 지도(사무실 녹화 스트림 → memmap `--depth kinect --surface --seg yolo26s-seg.onnx --every 2 --max-depth 3.5`, `data/memory/q_bg`): 지도 위치(`poses_map.txt`) 오차 7.50 → **2.81 cm**, 물체 49 → 48, 루프 클로저 12, 걸린 시간 1:45, 최대 메모리 1.52 GB. 그림(뷰어 같은 시점, 이전 = ORB + g2o): `docs/results/briefgtsam_v_before_desk.png` → `briefgtsam_v_after_desk.png`, 가까이 `briefgtsam_v_before_close.png` → `briefgtsam_v_after_close.png`. 테이프 받침(빨강)이 두 겹 조각에서 한 덩어리로, 잡지 글자가 조금 더 또렷해진다. 칸막이 둘레 깊이 경계의 잘게 쪼개진 조각, 비닐봉지·접시의 번짐, 반사 얼룩은 둘 다 남는다(위치보다 텍스처 고르기 쪽 원인).
+- 정확도 우선은 사무실 1.9–2.0 cm 로 가장 정확하지만 장면당 약 3 ms 더 들어 보드(장당 27–30 ms)에서 30 장/초를 넘는다. 15 장/초 입력이나 정확도가 먼저인 녹화 재생에 쓴다.
 
 ### 루프 클로저 뒤 다시 쌓기 검증 (WSL, 2026-11-08)
 

@@ -1,6 +1,6 @@
 # 보드에 연결 프로그램 올리기 (Pi 5 · Debian 13 trixie arm64)
 
-연결 프로그램(`bridge/`, [bridge.md](bridge.md))에 필요한 것: RTAB-Map 0.24.2 라이브러리, librealsense2(D435), OpenCV, CMake. memmap 은 지금처럼 `cargo build --release --no-default-features --features dxrt`.
+연결 프로그램(`bridge/`, [bridge.md](bridge.md))에 필요한 것: RTAB-Map 0.24.2 라이브러리(GTSAM 4.2, OpenCV 4.10.0 + contrib), librealsense2(D435), CMake. memmap 은 지금처럼 `cargo build --release --no-default-features --features dxrt`.
 
 ## 패키지로 받을 수 있는 것 (2026-11-05 packages.debian.org 확인)
 
@@ -8,37 +8,32 @@
 |---|---|---|
 | RTAB-Map | 없음(모든 판 검색 결과 없음) → 소스 빌드 | — |
 | librealsense2 | 없음(Debian 검색 결과 없음). RealSense 공식 apt 저장소는 `librealsense.intel.com/Debian/apt-repo` 가 403 → 소스 빌드 | — |
-| OpenCV | `libopencv-dev` | 4.10.0 |
+| OpenCV | `libopencv-dev` 4.10.0(contrib 없음) → contrib 와 함께 소스 빌드 | — |
 | PCL(RTAB-Map 필수) | `libpcl-dev` | 1.15.0 |
 | g2o(그래프 최적화) | `libg2o-dev` | 0~20230806 |
-| GTSAM | `libgtsam-dev` | 4.2.0, CMake 설정이 패키지에 없는 `libCppUnitLite.a` 를 가리켜 RTAB-Map 설정 단계가 멈춤(같은 패키지인 Ubuntu 24.04 에서 재현) → `-DWITH_GTSAM=OFF` |
-| OpenCV xfeatures2d(BRIEF 기술자) | 없음(`xfeatures2d.hpp` 를 담은 패키지 없음) | — |
+| GTSAM | `libgtsam-dev` 4.2.0 은 CMake 설정이 패키지에 없는 `libCppUnitLite.a` 를 가리켜 RTAB-Map 설정 단계가 멈춤(같은 패키지인 Ubuntu 24.04 에서 재현) → 4.2 소스 빌드 | — |
+| OpenCV xfeatures2d(BRIEF 기술자) | 없음(`xfeatures2d.hpp` 를 담은 패키지 없음) → OpenCV 4.10.0 + contrib 소스 빌드 | — |
 
-### 빌드마다 달라지는 RTAB-Map 기본값
+### 특징·최적화기는 ini 에 적음
 
-RTAB-Map 은 빌드에 들어간 라이브러리에 따라 기본값을 고른다. `docs/rtabmap_pi.ini` 는 이 둘을 적지 않아 기본값을 따른다.
+RTAB-Map 은 빌드에 들어간 라이브러리에 따라 기본값을 고른다(xfeatures2d 가 있으면 GFTT/BRIEF, 없으면 GFTT/ORB; GTSAM 이 있으면 GTSAM, 없으면 g2o). `docs/rtabmap_pi.ini` 는 `Vis/FeatureType=6`, `Kp/DetectorStrategy=6`(GFTT/BRIEF), `Optimizer/Strategy=2`(GTSAM) 을 적어 어느 빌드든 같은 조합을 쓰고, 보드는 아래 순서로 OpenCV contrib 와 GTSAM 을 넣어 빌드한다. 없는 조합을 고르면 RTAB-Map 이 경고를 내고 다른 것으로 바꾸니 실행 로그를 본다.
 
-| 파라미터 | Windows 0.24.2 실행 파일(조정 기록을 잰 것) | Debian·Ubuntu 패키지로 빌드 |
-|---|---|---|
-| `Vis/FeatureType`, `Kp/DetectorStrategy` | 6 = GFTT/BRIEF (xfeatures2d 있음) | 8 = GFTT/ORB |
-| `Optimizer/Strategy` | 2 = GTSAM | 1 = g2o |
-
-같은 PC·같은 설정(`rtabmap_pi.ini`)에서 이 둘만 바꿔 Windows 도구로 잰 키프레임 위치 오차(한 번씩):
+같은 PC·같은 설정에서 이 둘만 바꿔 Windows 도구로 잰 키프레임 위치 오차(한 번씩):
 
 | 조합 | 사무실 | fr1 책상 |
 |---|---|---|
-| BRIEF + GTSAM (Windows 기본) | 2.1 cm | 2.8 cm |
+| BRIEF + GTSAM (ini) | 2.1 cm | 2.8 cm |
 | BRIEF + g2o | — | 4.7 cm |
 | ORB + GTSAM | 3.6 cm | 4.1 cm |
-| ORB + g2o (Debian 빌드 기본) | 3.7 cm | 10.0 cm |
+| ORB + g2o (배포판 패키지만으로 빌드한 기본값) | 3.7 cm | 10.0 cm |
 
-사무실은 특징 종류(BRIEF → ORB)가 차이를 만들고 최적화기는 거의 같다. fr1 책상은 같은 조합도 실행마다 4–10 cm 로 흔들린다(연결 프로그램으로 두 번: 4.6 · 10.4 cm). 보드는 WSL 빌드와 같은 ORB + g2o 가 되고, 연결 프로그램의 측정값은 [bridge.md](bridge.md) "검증". BRIEF 를 쓰려면 OpenCV 를 contrib(xfeatures2d) 와 함께 소스 빌드해 RTAB-Map 을 그 OpenCV 로 다시 빌드한다.
+연결 프로그램(WSL, 세 번씩, 끝 그래프의 지도 노드 오차)은 [bridge.md](bridge.md) "특징·최적화기 비교".
 
 ## 설치 순서
 
 ```bash
 sudo apt install -y build-essential cmake ninja-build git pkg-config \
-  libopencv-dev libpcl-dev libg2o-dev libsqlite3-dev libeigen3-dev libsuitesparse-dev \
+  libpcl-dev libg2o-dev libsqlite3-dev libeigen3-dev libsuitesparse-dev \
   libusb-1.0-0-dev libudev-dev libssl-dev
 ```
 
@@ -60,25 +55,48 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 - 카메라 확인용 도구가 필요하면 `-DBUILD_TOOLS=ON`(`rs-enumerate-devices`).
 - D435 는 USB 3 포트(파란색)에. `rs-enumerate-devices` 의 `Usb Type Descriptor` 가 3.2 인지 확인.
 
+### OpenCV 4.10.0 + contrib (xfeatures2d)
+
+```bash
+git clone --depth 1 --branch 4.10.0 https://github.com/opencv/opencv.git ~/src/opencv
+git clone --depth 1 --branch 4.10.0 https://github.com/opencv/opencv_contrib.git ~/src/opencv_contrib
+cmake -S ~/src/opencv -B ~/build/opencv -G Ninja -DCMAKE_BUILD_TYPE=Release   -DCMAKE_INSTALL_PREFIX=$HOME/opt/opencv -DOPENCV_EXTRA_MODULES_PATH=$HOME/src/opencv_contrib/modules   -DBUILD_LIST=core,imgproc,imgcodecs,features2d,flann,calib3d,xfeatures2d,video,videoio,highgui,photo,stitching   -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOCS=OFF -DBUILD_opencv_apps=OFF   -DBUILD_opencv_python3=OFF -DBUILD_JAVA=OFF -DWITH_QT=OFF -DWITH_GTK=OFF -DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF   -DWITH_OPENCL=OFF -DWITH_IPP=OFF -DWITH_ADE=OFF -DOPENCV_ENABLE_NONFREE=OFF
+ninja -C ~/build/opencv -j 3 install
+```
+
+- 모듈 목록에 `stitching` 이 있어야 RTAB-Map 설정 단계가 OpenCV 를 받아들인다(RTAB-Map 이 찾는 구성 요소).
+- PC(WSL, 24 작업)에서 1 분 26 초. BRIEF 는 nonfree 가 아니라 `OPENCV_ENABLE_NONFREE=OFF` 그대로.
+
+### GTSAM 4.2
+
+```bash
+git clone --depth 1 --branch 4.2 https://github.com/borglab/gtsam.git ~/src/gtsam
+cmake -S ~/src/gtsam -B ~/build/gtsam -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/opt/gtsam   -DCMAKE_INSTALL_RPATH=$HOME/opt/gtsam/lib   -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF -DGTSAM_BUILD_TIMING_ALWAYS=OFF -DGTSAM_BUILD_PYTHON=OFF   -DGTSAM_INSTALL_MATLAB_TOOLBOX=OFF -DGTSAM_BUILD_DOCS=OFF -DGTSAM_USE_SYSTEM_EIGEN=ON -DGTSAM_WITH_TBB=OFF   -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF -DGTSAM_BUILD_UNSTABLE=ON
+ninja -C ~/build/gtsam -j 3 install
+```
+
+- `CMAKE_INSTALL_RPATH`: `libgtsam.so` 가 같이 설치되는 `libmetis-gtsam.so` 를 찾게 함(없으면 실행 때 "libmetis-gtsam.so: cannot open").
+- PC 에서 약 1 분.
+
 ### RTAB-Map 0.24.2 (화면 없이 라이브러리만)
 
 ```bash
 git clone --depth 1 --branch 0.24.2 https://github.com/introlab/rtabmap.git ~/src/rtabmap
-cmake -S ~/src/rtabmap -B ~/build/rtabmap -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX=$HOME/opt/rtabmap -DWITH_QT=OFF -DBUILD_APP=OFF -DBUILD_TOOLS=OFF \
-  -DBUILD_EXAMPLES=OFF -DWITH_PYTHON=OFF -DWITH_GTSAM=OFF
+PATH=/usr/bin:/bin cmake -S ~/src/rtabmap -B ~/build/rtabmap -G Ninja -DCMAKE_BUILD_TYPE=Release   -DCMAKE_INSTALL_PREFIX=$HOME/opt/rtabmap   -DOpenCV_DIR=$HOME/opt/opencv/lib/cmake/opencv4 -DGTSAM_DIR=$HOME/opt/gtsam/lib/cmake/GTSAM -DWITH_GTSAM=ON   -DCMAKE_INSTALL_RPATH="$HOME/opt/rtabmap/lib;$HOME/opt/gtsam/lib;$HOME/opt/opencv/lib"   -DWITH_QT=OFF -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_PYTHON=OFF -DBUILD_TESTING=OFF
 ninja -C ~/build/rtabmap -j 3 && ninja -C ~/build/rtabmap install
 ```
 
+- `CMAKE_INSTALL_RPATH`: 설치한 `librtabmap_core.so` 가 소스 빌드 GTSAM·OpenCV 를 잡게 함. 배포판 `libgtsam` 이 깔려 있으면 그쪽(TBB 할당자 빌드)을 잡아 연결 프로그램 링크가 `gtsam::NonlinearFactor::rekey` 정의 없음으로 멈춘다.
 - `BUILD_TOOLS=OFF`: 도구 중 `rtabmap-euroc_dataset` 이 배포판 yaml-cpp 와 링크 오류. 연결 프로그램은 핵심 라이브러리만 쓴다.
-- 설정 단계는 PATH 를 훑으니 길면 `PATH=/usr/bin:/bin` 으로 줄여 돌린다.
+- 설정 단계는 PATH 를 훑으니 `PATH=/usr/bin:/bin` 으로 줄여 돌린다.
 
 ### 연결 프로그램
 
 ```bash
 cd ~/om   # 저장소
-cmake -S bridge -B ~/build/bridge -G Ninja -DCMAKE_PREFIX_PATH="$HOME/opt/rtabmap;$HOME/opt/librealsense"
+cmake -S bridge -B ~/build/bridge -G Ninja   -DCMAKE_PREFIX_PATH="$HOME/opt/rtabmap;$HOME/opt/librealsense;$HOME/opt/gtsam;$HOME/opt/opencv"   -DOpenCV_DIR=$HOME/opt/opencv/lib/cmake/opencv4   -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$HOME/opt/gtsam/lib -Wl,-rpath,$HOME/opt/gtsam/lib"
 ninja -C ~/build/bridge
+# ldd ~/build/bridge/rtab_bridge 에서 libgtsam·libopencv_core 가 ~/opt 쪽인지 확인
 # 설정 출력에 "RealSense 입력 켬 (librealsense2 2.59.1)" 이 보여야 카메라 입력이 들어감
 ```
 

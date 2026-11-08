@@ -5,7 +5,7 @@
 ## 측정 조건
 
 - PC: Ryzen 9 9950X, 프로세스를 논리 코어 하나에 묶고 우선순위 높음. RTAB-Map 0.24.2(Windows) `rtabmap-rgbd_dataset`, 모든 실행에 `Rtabmap/DetectionRate 1`(지도 갱신 1 초에 1 번).
-- 이 실행 파일의 기본 특징은 GFTT/BRIEF, 최적화기는 GTSAM 이다. Debian·Ubuntu 패키지로 빌드하면(보드) GFTT/ORB · g2o 가 되어 위치 오차가 달라진다: [board_bridge.md](board_bridge.md) "빌드마다 달라지는 RTAB-Map 기본값".
+- 이 실행 파일의 기본 특징은 GFTT/BRIEF, 최적화기는 GTSAM 이고, `rtabmap_pi.ini` 가 이 둘을 적어 보드 빌드도 같은 조합을 쓴다: [board_bridge.md](board_bridge.md) "특징·최적화기는 ini 에 적음".
 - **위치 추적** = 출력 줄의 `odom=..ms`(장면마다), **지도 갱신** = `slam=..ms`(1 초에 1 번 도는 것만). 첫 장면은 뺌.
 - **위치 오차** = `ate`(Horn 정렬 후 RMSE). 두 가지:
   - 키프레임: 지도 노드(1 초에 1 개)의 최적화 위치. 복도는 정답과 짝이 15 개뿐이라 참고값.
@@ -107,7 +107,7 @@ A 대비 바꾼 것만 적음. F2M = `Odom/Strategy 0`(기본), F2F = `Odom/Stra
 | `Reg/Force3DoF` | false | 손카메라(6 자유도) |
 | `Odom/ResetCountdown` | 1 | 놓치면 바로 새 지도로 이어감(측정 도구와 같은 동작), 루프 클로저로 다시 합침 |
 
-**정확도 우선: C-BA3** — F2M + `Vis/MaxFeatures 400`, `Kp/MaxFeatures 300`, `OdomF2M/MaxSize 1000`, `OdomF2M/BundleAdjustmentMaxFrames 3`. 사무실 2.1–2.3 cm, 책상 2.7–3.1 cm 로 추천보다 조금 정확하고 장면당 2.5 ms 더 듦. ini 안에 주석으로 넣어 둠.
+**정확도 우선: C-BA3** (30 장/초 시연에는 쓰지 않음: 보드 위치 추적이 장당 27–30 ms 라 +3 ms(보드 약 +9 ms)면 30 장/초 예산을 넘음) — F2M + `Vis/MaxFeatures 400`, `Kp/MaxFeatures 300`, `OdomF2M/MaxSize 1000`, `OdomF2M/BundleAdjustmentMaxFrames 3`. 사무실 2.1–2.3 cm, 책상 2.7–3.1 cm 로 추천보다 조금 정확하고 장면당 2.5 ms 더 듦. ini 안에 주석으로 넣어 둠. WSL 연결 프로그램(BRIEF + GTSAM, 세 번)으로는 추천 2.4–2.7 cm·책상 3.6–3.7 cm, 정확도 우선 1.9–2.0 cm·책상 3.4–4.5 cm, 위치 추적 10.0–11.9 → 12.9–15.7 ms/장([bridge.md](bridge.md) "특징·최적화기 비교").
 
 ## Pi 5 환산 (A76 코어 = 이 PC 코어의 2–3 배 시간으로 가정)
 

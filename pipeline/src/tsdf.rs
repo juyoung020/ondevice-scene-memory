@@ -307,3 +307,278 @@ fn incidence(depth: &[f32], w: usize, h: usize, u: usize, v: usize, fx: f64, fy:
     let gy = (zd - z) * fy / z;
     1.0 / (1.0 + gx * gx + gy * gy).sqrt()
 }
+
+// ------------------------------------------------------------------ 서브맵 합치기(cblox getProjectedMap 방식)
+// 서브맵 = 기준 노드에 붙은 자기 좌표의 TSDF. 전체 표면 = 서브맵마다 지금 자세로 옮겨(삼선형 보간) 무게 평균한 것.
+// 칸 값은 (거리, 무게, 색) 평균이고, 더하기·빼기는 무게 합 산술이라 같은 자세로 더한 것을 그대로 뺄 수 있다.
+
+/// 블록 키(블록 단위 정수 좌표)
+pub type BKey = (i32, i32, i32);
+/// 자세: 회전·이동(원본 좌표 → 이 지도 좌표)
+pub type Pose = (M3, V3);
+
+impl Clone for Block {
+    fn clone(&self) -> Block {
+        Block { d: self.d.clone(), w: self.w.clone(), c: self.c.clone(), cw: self.cw.clone() }
+    }
+}
+
+/// 칸 하나에 (거리 d, 무게 w, 색 c) 를 부호 s(+1 더하기, −1 빼기)로 섞는다
+#[inline]
+fn mix(blk: &mut Block, i: usize, d: f32, w: f32, c: [f32; 3], s: f32) {
+    let w0 = blk.w[i];
+    let w1 = w0 + s * w;
+    if w1 < 1e-3 {
+        (blk.d[i], blk.w[i], blk.c[i]) = (1.0, 0.0, [0.0; 3]);
+        return;
+    }
+    blk.d[i] = ((blk.d[i] * w0 + s * d * w) / w1).clamp(-1.0, 1.0);
+    for q in 0..3 {
+        blk.c[i][q] = ((blk.c[i][q] * w0 + s * c[q] * w) / w1).clamp(0.0, 255.0);
+    }
+    blk.w[i] = w1;
+}
+
+fn empty_block() -> Block {
+    let n = (B * B * B) as usize;
+    Block { d: vec![1.0; n], w: vec![0.0; n], c: vec![[0.0; 3]; n], cw: vec![0.0; n] }
+}
+
+impl Tsdf {
+    /// 블록 한 변(m)
+    pub fn block_size(&self) -> f64 {
+        self.vox * B as f64
+    }
+
+    /// 칸 배열이 차지하는 바이트(대략)
+    pub fn bytes(&self) -> usize {
+        self.blocks.len() * (B * B * B) as usize * 20
+    }
+
+    /// 면을 다시 뽑을 구역 수
+    pub fn n_dirty(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// 바뀐 구역을 꺼낸다(면은 뽑지 않음): 서브맵에서 전체 표면으로 옮길 곳
+    pub fn drain_dirty_regions(&mut self) -> Vec<BKey> {
+        self.dirty.drain().collect()
+    }
+
+    /// 구역들 안에 있는 블록 키
+    pub fn blocks_in_regions(&self, regs: &[BKey]) -> Vec<BKey> {
+        let mut out = vec![];
+        for r in regs {
+            for z in 0..R {
+                for y in 0..R {
+                    for x in 0..R {
+                        let k = (r.0 * R + x, r.1 * R + y, r.2 * R + z);
+                        if self.blocks.contains_key(&k) {
+                            out.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 다른 지도의 블록을 그대로 복사(같은 키)
+    pub fn copy_blocks_from(&mut self, src: &Tsdf, keys: &[BKey]) {
+        for k in keys {
+            if let Some(b) = src.blocks.get(k) {
+                self.blocks.insert(*k, b.clone());
+            }
+        }
+    }
+
+    /// 판 번호를 넘겨받고 다시 쓸 구역을 정한다(전체 표면을 새로 합친 뒤 바뀐 곳만 뷰어가 받게)
+    pub fn adopt_versions(&mut self, old: &mut Tsdf, dirty: impl IntoIterator<Item = BKey>) {
+        self.ver = std::mem::take(&mut old.ver);
+        self.dirty.clear();
+        self.dirty.extend(dirty);
+        self.dirty.extend(old.dirty.drain());
+    }
+
+    /// 원본 지도의 블록들이 자세 pose 에서 덮는 구역
+    pub fn footprint(src: &Tsdf, pose: &Pose) -> FastSet<BKey> {
+        let bs = src.block_size();
+        let rs = bs * R as f64;
+        let mut out = FastSet::default();
+        for k in src.blocks.keys() {
+            for c in 0..8 {
+                let q = [(k.0 + (c & 1)) as f64 * bs, (k.1 + ((c >> 1) & 1)) as f64 * bs, (k.2 + (c >> 2)) as f64 * bs];
+                let x = add(&mv(&pose.0, &q), &pose.1);
+                out.insert(((x[0] / rs).floor() as i32, (x[1] / rs).floor() as i32, (x[2] / rs).floor() as i32));
+            }
+        }
+        out
+    }
+
+    /// 자세가 회전 없이 블록 단위로만 옮기면 그 블록 수(칸을 보간 없이 그대로 옮길 수 있음)
+    pub fn aligned(&self, pose: &Pose) -> Option<BKey> {
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        if (0..3).any(|i| (0..3).any(|j| (pose.0[i][j] - id[i][j]).abs() > 1e-9)) {
+            return None;
+        }
+        let bs = self.block_size();
+        let o = pose.1.map(|v| v / bs);
+        if o.iter().any(|v| (v - v.round()).abs() > 1e-6) {
+            return None;
+        }
+        Some((o[0].round() as i32, o[1].round() as i32, o[2].round() as i32))
+    }
+
+    /// 원본 지도 src 를 자세 pose(src → 이 지도)로 옮겨 더하거나(s = 1) 빼기(s = −1). 바뀐 구역은 면을 다시 뽑게 표시.
+    /// 블록 단위 이동이면 칸을 그대로, 아니면 이 지도 칸 중심을 원본 좌표로 되돌려 이웃 8 칸을 삼선형 보간(무게를 곱해 섞으니 빈 칸은 무게 0).
+    /// keys: 블록 단위 이동일 때 이 원본 블록만(None = 전부). 칸 크기는 같아야 한다.
+    pub fn merge(&mut self, src: &Tsdf, pose: &Pose, s: f32, keys: Option<&[BKey]>) {
+        use rayon::prelude::*;
+        let n = (B * B * B) as usize;
+        if let Some(o) = self.aligned(pose) {
+            let all: Vec<BKey>;
+            let ks = match keys {
+                Some(k) => k,
+                None => {
+                    all = src.blocks.keys().copied().collect();
+                    &all
+                }
+            };
+            for k in ks {
+                let Some(sb) = src.blocks.get(k) else { continue };
+                let tk = (k.0 + o.0, k.1 + o.1, k.2 + o.2);
+                let tb = self.blocks.entry(tk).or_insert_with(empty_block);
+                let mut ch = false;
+                for i in 0..n {
+                    if sb.w[i] > 0.0 {
+                        mix(tb, i, sb.d[i], sb.w[i], sb.c[i], s);
+                        ch = true;
+                    }
+                }
+                if ch {
+                    self.dirty.insert((div_floor(tk.0, R), div_floor(tk.1, R), div_floor(tk.2, R)));
+                }
+            }
+            return;
+        }
+        assert!(keys.is_none(), "블록 단위 이동이 아닐 때는 지도 전체만 옮김");
+        let vs = self.vox;
+        let bs = self.block_size();
+        // 대상 블록: 원본 블록 상자(칸 하나 넓혀)의 꼭짓점 8 개를 옮긴 범위
+        let mut tset: FastSet<BKey> = FastSet::default();
+        for k in src.blocks.keys() {
+            let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+            for c in 0..8 {
+                let e = [c & 1, (c >> 1) & 1, c >> 2];
+                let q = [
+                    (k.0 + e[0]) as f64 * bs + if e[0] == 0 { -vs } else { vs },
+                    (k.1 + e[1]) as f64 * bs + if e[1] == 0 { -vs } else { vs },
+                    (k.2 + e[2]) as f64 * bs + if e[2] == 0 { -vs } else { vs },
+                ];
+                let x = add(&mv(&pose.0, &q), &pose.1);
+                for a in 0..3 {
+                    lo[a] = lo[a].min(x[a]);
+                    hi[a] = hi[a].max(x[a]);
+                }
+            }
+            let (a0, a1) = (lo.map(|v| (v / bs).floor() as i32), hi.map(|v| (v / bs).floor() as i32));
+            for z in a0[2]..=a1[2] {
+                for y in a0[1]..=a1[1] {
+                    for x in a0[0]..=a1[0] {
+                        tset.insert((x, y, z));
+                    }
+                }
+            }
+        }
+        let mut tv: Vec<BKey> = tset.into_iter().collect();
+        tv.sort_unstable();
+        let r = &pose.0;
+        let rt = [0, 1, 2].map(|i| [0, 1, 2].map(|j| r[j][i]));
+        let p = pose.1;
+        // 대상 블록끼리 독립(원본은 읽기만): 코어마다 나눠 보간
+        type Samp = Vec<(u16, f32, f32, [f32; 3])>;
+        let res: Vec<(BKey, Samp)> = tv
+            .par_iter()
+            .filter_map(|&tk| {
+                let mut out: Samp = vec![];
+                let mut cache: (BKey, Option<&Block>) = ((i32::MIN, 0, 0), None);
+                for i in 0..n {
+                    let (ix, iy, iz) = ((i as i32) % B, (i as i32 / B) % B, i as i32 / (B * B));
+                    let xg = [((tk.0 * B + ix) as f64 + 0.5) * vs, ((tk.1 * B + iy) as f64 + 0.5) * vs, ((tk.2 * B + iz) as f64 + 0.5) * vs];
+                    let xs = mv(&rt, &sub(&xg, &p));
+                    let q = xs.map(|v| v / vs - 0.5);
+                    let fl = q.map(|v| v.floor());
+                    let f = [q[0] - fl[0], q[1] - fl[1], q[2] - fl[2]];
+                    let i0 = fl.map(|v| v as i32);
+                    let (mut sw, mut sd, mut sc) = (0f64, 0f64, [0f64; 3]);
+                    for c in 0..8 {
+                        let e = [c & 1, (c >> 1) & 1, c >> 2];
+                        let tw = (0..3).map(|a| if e[a] == 1 { f[a] } else { 1.0 - f[a] }).product::<f64>();
+                        if tw <= 0.0 {
+                            continue;
+                        }
+                        let v = [i0[0] + e[0], i0[1] + e[1], i0[2] + e[2]];
+                        let bk = (div_floor(v[0], B), div_floor(v[1], B), div_floor(v[2], B));
+                        if cache.0 != bk {
+                            cache = (bk, src.blocks.get(&bk));
+                        }
+                        let Some(b) = cache.1 else { continue };
+                        let li = ((v[2].rem_euclid(B) * B + v[1].rem_euclid(B)) * B + v[0].rem_euclid(B)) as usize;
+                        let ww = tw * b.w[li] as f64;
+                        if ww <= 0.0 {
+                            continue;
+                        }
+                        sw += ww;
+                        sd += ww * b.d[li] as f64;
+                        for q in 0..3 {
+                            sc[q] += ww * b.c[li][q] as f64;
+                        }
+                    }
+                    if sw > 1e-6 {
+                        out.push((i as u16, (sd / sw) as f32, sw as f32, sc.map(|v| (v / sw) as f32)));
+                    }
+                }
+                (!out.is_empty()).then_some((tk, out))
+            })
+            .collect();
+        for (tk, out) in res {
+            let tb = self.blocks.entry(tk).or_insert_with(empty_block);
+            for (i, d, w, c) in out {
+                mix(tb, i as usize, d, w, c, s);
+            }
+            self.dirty.insert((div_floor(tk.0, R), div_floor(tk.1, R), div_floor(tk.2, R)));
+        }
+    }
+
+    /// 칸 하나 값(시험용): (거리, 무게)
+    #[cfg(test)]
+    pub fn at(&self, x: &V3) -> Option<(f32, f32)> {
+        let v = x.map(|a| (a / self.vox).floor() as i32);
+        let b = self.blocks.get(&(div_floor(v[0], B), div_floor(v[1], B), div_floor(v[2], B)))?;
+        let li = ((v[2].rem_euclid(B) * B + v[1].rem_euclid(B)) * B + v[0].rem_euclid(B)) as usize;
+        Some((b.d[li], b.w[li]))
+    }
+
+    /// 무게 있는 칸 전부(시험용): (칸 중심, 거리, 무게)
+    #[cfg(test)]
+    pub fn voxels(&self) -> Vec<(V3, f32, f32)> {
+        let mut out = vec![];
+        for (k, b) in &self.blocks {
+            for i in 0..(B * B * B) as usize {
+                if b.w[i] <= 0.0 {
+                    continue;
+                }
+                let (ix, iy, iz) = ((i as i32) % B, (i as i32 / B) % B, i as i32 / (B * B));
+                let c = [((k.0 * B + ix) as f64 + 0.5) * self.vox, ((k.1 * B + iy) as f64 + 0.5) * self.vox, ((k.2 * B + iz) as f64 + 0.5) * self.vox];
+                out.push((c, b.d[i], b.w[i]));
+            }
+        }
+        out
+    }
+
+    /// 표면 근처 거리 값 위치 오차 확인용 잘림 거리
+    #[cfg(test)]
+    pub fn trunc(&self) -> f64 {
+        self.trunc
+    }
+}

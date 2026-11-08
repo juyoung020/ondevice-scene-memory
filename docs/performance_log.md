@@ -423,6 +423,7 @@ headless Edge, SwiftShader + CPU 4 배 느리게, 1280×800, 시점 `cam=2.3,-2.
 - 움직이는 동안(Low 기본, `?lod=`): 캔버스 절반 해상도(`?lodscale=`)에 그리고 EDL 이웃 4 개, 점 크기·노드 세밀함이 그 해상도를 따라 점 약 1/4, 화면 2 화소 아래 텍스처 구역은 건너뜀. 멈추고 0.2 s 뒤 원래 화질 한 장.
 - 올리기 줄: 새 점 노드·텍스처 구역은 프레임마다 약한 GPU 1.5 MB·4 ms(그 밖 16 MB·8 ms)까지만 GPU 에 올림. 갱신 중에도 긴 작업 60 ms 이하.
 - 멈춘 화면은 이전과 같음(화소 차 평균 1–2/255, 32 넘는 화소 0). 그림: `docs/results/view4_still_low_pts.png`(멈춤) · `view4_moving_low_pts.png`(도는 중) · `view4_still_high_pts.png`(High).
+- 모드별 확인(표면·점 지도 × High·Low × 멈춤·돌린 뒤 3 초): `docs/results/view5_{surf,pts}_{low,high}_{still,after}.png`. High 점 섞기는 섞기 패스의 깊이 텍스처를 풀어 두어 본 패스가 제 깊이를 읽는 되먹임(GL 이 그리기를 버림)이 없다.
 ## 보드 실시간: 밀린 장면 버리기·본 스레드 멈춤 나누기 (2026-11-08)
 
 사무실 녹화 스트림(`--stream office_bg.mmf --depth kinect --surface --points --seg yolo26s-seg.onnx --max-depth 3.5 --scene-vox 0.006`), WSL. 보드 흉내 = `taskset -c 0,1,2,3` + `--slow 3`(본·점·텍스처·다시 쌓기·기록 스레드 일을 3 배로, 코어를 붙잡고 기다림) + `--seg-min-ms 97`(NPU 분할 시간) + `--stream-rate 1`(찍은 시각대로 내보냄). 밀림 = 장면을 끝낸 시각 − 찍은 시각.

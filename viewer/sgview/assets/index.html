@@ -76,7 +76,7 @@
     <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl" checked> Depth shading (EDL)</label>
     <div class="num">EDL strength <input type="number" id="n_edl" value="0.4" min="0" max="3" step="0.05"></div>
     <div class="num" title="depth steps smaller than this (log2 view depth, 0.025 ≈ 1.7 %: Kinect depth noise between neighbouring splats) are not shaded: the small depth jitter between overlapping splats of one surface stays unshaded, real edges and creases still darken">EDL tolerance <input type="number" id="n_edltol" value="0.025" min="0" max="0.1" step="0.002"></div>
-    <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog" checked> Depth fog</label>
+    <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog"> Depth fog</label>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
     <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
     <label class="row"><input type="checkbox" id="c_points" checked> Segment points</label>
@@ -272,7 +272,7 @@ function renderFrame() {
     const keep = scene.fog; scene.fog = null; renderer.render(gOct, camera); scene.fog = keep;
     renderer.setClearColor(cc, ca);
     m.blending = THREE.NormalBlending; m.depthTest = true; m.depthWrite = true; m.transparent = false;
-    ou.pass.value = 0;
+    ou.pass.value = 0; ou.depth.value = null;   // unbind: pass 0 renders into edl.rt, sampling its depth there is a feedback loop (GL drops the draw)
   }
   if (lodOn) {   // EDL at the reduced size too, then one bilinear blit to the canvas (premultiplied colour, transparent background kept)
     if (!lo.out || lo.out.width !== s.x || lo.out.height !== s.y) { if (lo.out) lo.out.dispose(); lo.out = new THREE.WebGLRenderTarget(s.x, s.y, { depthBuffer:false }); }
@@ -814,7 +814,7 @@ const SB = 4;
 const surf = { run:null, have:new Map(), blocks:new Map(), dirty:new Set(), tex:new Map(), timer:0, busy:false };
 // Surface shading: hemisphere light (bright from above, darker from below) + one sun, from smooth vertex normals.
 // Textured: atlas × vertex colour × 2 (vertex colour = per-vertex exposure match). Cheap enough for the Pi 5 GPU (no extra passes).
-const surfUni = { sun:{ value:new THREE.Vector3(0.45, -0.55, 0.9).normalize() }, flatk:{ value:0 }, fogC:{ value:new THREE.Color(0x161b26) }, fogR:{ value:new THREE.Vector2(8, 40) }, fogK:{ value:1 } };
+const surfUni = { sun:{ value:new THREE.Vector3(0.45, -0.55, 0.9).normalize() }, flatk:{ value:0 }, fogC:{ value:new THREE.Color(0x161b26) }, fogR:{ value:new THREE.Vector2(8, 40) }, fogK:{ value:0 } };
 const SURF_VS = `varying vec3 vN; varying vec3 vC; varying float vD;
 #ifdef TEX
 varying vec2 vUv;
@@ -1921,7 +1921,7 @@ const upQ = [], UP_BYTES = WEAK_GPU ? 1.5e6 : 16e6, UP_MS = WEAK_GPU ? 4 : 8;
 let upKick = 0;
 function queueUpload(bytes, fn) { upQ.push({ bytes, fn }); if (!upKick) upKick = setTimeout(kickUploads, 100); }
 // no animation frames (hidden tab, headless virtual-time screenshot): nothing to keep smooth, drain from a timer instead
-function kickUploads() { upKick = 0; const t = performance.now(); if (t - lastCamT > 90) { drainUploads(t); invalidate(); } if (upQ.length) upKick = setTimeout(kickUploads, 100); }
+function kickUploads() { upKick = 0; if (performance.now() - lastCamT > 90) { while (upQ.length) upQ.shift().fn(); invalidate(); frame(); } if (upQ.length || oct.loading) upKick = setTimeout(kickUploads, 100); }
 function drainUploads(t0) {
   let b = 0, n = 0;
   while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); n++; }
@@ -1940,8 +1940,7 @@ function surfCull() {
   }
 }
 // render only when something changed (camera moved, data/options changed): an idle viewer costs nothing
-(function loop() {
-  requestAnimationFrame(loop);
+function frame() {
   controls.update();
   const nowT = performance.now();
   if (stepRobot(nowT)) needsRender = true;
@@ -1954,17 +1953,17 @@ function surfCull() {
   lastCamT = nowT;
   drainUploads(nowT);
   camera.updateMatrixWorld();
-  { const a = _lastCam.elements, b = camera.matrixWorld.elements; for (let i = 0; i < 16; i++) if (Math.abs(a[i] - b[i]) > 1e-4) { lastMoveT = nowT; break; } }   // damping leaves sub-0.1 mm drift: not a move
+  { const a = _lastCam.elements, b = camera.matrixWorld.elements; for (let i = 0; i < 16; i++) if (Math.abs(a[i] - b[i]) > 1e-4) { lastMoveT = nowT; _lastCam.copy(camera.matrixWorld); needsRender = true; break; } }   // damping leaves sub-0.1 mm drift: not a move
   const lw = lodWanted() && nowT - lastMoveT < 200;
   if (lw !== lodOn) { lodOn = lw; needsRender = true; }
   if (!needsRender) return;
-  if (nowT === lastMoveT || !lodOn) _lastCam.copy(camera.matrixWorld);
   needsRender = false;
   const tr = performance.now();
-  { const d = camera.position.distanceTo(controls.target); surfUni.fogR.value.set(d * 1.15, d * 3.2); scene.fog.near = d * 0.6; scene.fog.far = opt("c_fog") ? d * 2.2 : 1e6; }   // fog follows the viewing distance: the focus stays clear at any zoom
+  { const d = camera.position.distanceTo(controls.target); surfUni.fogR.value.set(d * 1.15, d * 3.2); scene.fog.near = d * 0.6; scene.fog.far = d * 2.2; }   // fog follows the viewing distance: the focus stays clear at any zoom
   updatePointScale(); octUpdate(); surfCull(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
-})();
+}
+(function loop() { requestAnimationFrame(loop); frame(); })();
 loadRobotModel();
 loadRobotKind().then(invalidate);
 // 주소 뒤 ?c_surf=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)

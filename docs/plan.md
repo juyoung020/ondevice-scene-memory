@@ -2,22 +2,22 @@
 
 ## 목표
 
-손으로 움직이는 RGB 카메라 하나로, 보드 안에서 끝까지(카메라 → NPU 추론 → 3D 매핑 → 씬그래프 → 검색) 물체 공간 기억을 만든다.
+손으로 움직이는 RealSense D435 깊이 카메라 하나로, 보드 안에서 끝까지(카메라 → RTAB-Map 위치 → NPU 분할 → 3D 매핑 → 씬그래프 → 검색) 물체 공간 기억을 만든다.
 
 ## 위치와 3D 지도
 
-[pose_and_map.md](pose_and_map.md) 에 방법·결과.
+[bridge.md](bridge.md) 에 방법·결과(RTAB-Map 위치·루프 클로저, TSDF 서브맵 표면).
 
 ## 부품
 
 | 단계 | 방법 | 돌리는 곳 |
 |---|---|---|
-| 카메라 위치 | SuperPoint 특징점(NPU) + 랜드마크 평균 위치 추정(CPU) — pose_and_map.md | CPU + NPU |
-| 깊이 | **YOLO26-depth** (DEEPX 모델 동물원에 n/s/m/l/x, 768×768, NYU 실내, max 10 m) | NPU |
+| 카메라 위치 | RTAB-Map(BRIEF 특징 + GTSAM 최적화, 루프 클로저) — bridge.md | CPU |
+| 깊이 | D435 실측 깊이(컬러에 맞춤) | 카메라 |
 | 물체 분할 | **ObjectSAM 을 YOLO26-seg 로 다시 학습** (클래스 없이 물체만, 벽·천장·바닥 제외) + 우리 데이터로 미세조정 | NPU |
 | 물체 벡터 | CLIP 계열 영상 인코더, 물체 부분만 잘라 벡터 1개 (DEEPX 튜토리얼 T22 CLIP) | NPU |
 | 글 검색 벡터 | 같은 CLIP 의 글 인코더 | CPU 또는 NPU |
-| 3D 매핑 | 마스크 픽셀 × 깊이 → 3D 점, 3D 겹침 + 벡터 코사인으로 같은 물체 합치기 | CPU |
+| 3D 매핑 | TSDF 서브맵 표면 + 사진 텍스처, Potree 점 지도, 마스크 픽셀 × 깊이 → 3D 점, 3D 겹침 + 벡터 코사인으로 같은 물체 합치기 | CPU |
 | 저장 | 기억 폴더(view.json · 점 파일 · 물체 사진) | CPU |
 | 보기 | 웹 뷰어 | CPU |
 

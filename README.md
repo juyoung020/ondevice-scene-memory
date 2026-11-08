@@ -34,8 +34,6 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 - 방 나누기와 방 종류(물체 구성으로: 사무실·주방·거실 …), 방↔물체·물체↔물체 연결
 - 보드 실시간, PC·폰·보드 화면 브라우저 뷰어(High/Low 화질)
 
-카메라 하나(RGB)만 있을 때는 깊이도 NPU 모델로 추정하는 방식(`--depth <모델> --pose vo`)도 그대로 쓸 수 있습니다.
-
 ## 성능 (PC에서 보드를 흉내 낸 측정, 사무실 영상)
 
 | 항목 | 값 |
@@ -56,8 +54,6 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 | 파일 | 하는 일 | 받는 곳 |
 |---|---|---|
 | `yolo26s-seg.onnx` | 물체 찾기(분할) | Hugging Face `prithivMLmods/YOLO26-ONNX` |
-| `yolo26s-depth.onnx` | 깊이 추정(RGB만 쓸 때) | [mobilint/YOLO26s-depth](https://huggingface.co/mobilint/YOLO26s-depth/resolve/main/yolo26s-depth.onnx) |
-| `superpoint.onnx` | 위치 추정용 특징점(RGB만 쓸 때) | [EclipseAidge/SuperPoint](https://huggingface.co/EclipseAidge/SuperPoint/resolve/main/superpoint.onnx) |
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).
 
@@ -99,7 +95,6 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | 옵션 | 뜻 |
 |---|---|
 | `--stream -\|<파일>` | `rtab_bridge` 장면 스트림 입력(표준입력 또는 남겨 둔 파일) |
-| `--tum <폴더>` / `--cam <장치 또는 녹화 폴더>` | RGB만 쓰는 입력: TUM 영상, 웹캠, 녹화 |
 | `--surface` / `--points` | 텍스처 표면 지도 / 3D 점 지도(둘 다 켤 수 있음) |
 | `--submap-secs S` | 표면 서브맵 길이(초, 기본 20) |
 | `--rebuild-every S` / `--no-rebuild` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5) / 끄기 |

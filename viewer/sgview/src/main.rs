@@ -402,6 +402,7 @@ fn walls_json(st: &State, q: &HashMap<String, String>) -> Option<String> {
 fn content_type(p: &str) -> &'static str {
     match p.rsplit('.').next().unwrap_or("") {
         "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
         "json" => "application/json",
         "html" => "text/html; charset=utf-8",
         "js" => "application/javascript",

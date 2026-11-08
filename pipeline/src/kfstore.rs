@@ -140,6 +140,14 @@ impl KfStore {
         self.nodes.get(&id).copied()
     }
 
+    /// 장면 위치를 기준 노드에서 본 상대 위치로(노드를 모르면 기준 0 + 받은 위치 그대로)
+    pub fn rel_of(&self, anchor: u32, r: M3, p: V3) -> (u32, (M3, V3)) {
+        match self.nodes.get(&anchor) {
+            Some(n) => (anchor, inv_mul(n, &(r, p))),
+            None => (0, (r, p)),
+        }
+    }
+
     /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음)
     #[allow(clippy::too_many_arguments)]
     pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &[f32], dets: &Option<Vec<Det>>, sparse: bool) {

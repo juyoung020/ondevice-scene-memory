@@ -78,6 +78,7 @@
     <label class="row"><input type="checkbox" id="c_follow"> Follow the robot (close-up)</label>
     <label class="row" title="viewer camera flies behind the handheld camera and looks where it looks"><input type="checkbox" id="c_chase"> Follow the handheld camera (behind)</label>
     <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
+    <label class="row" title="surface shading: soft light from above + sun on smooth normals (off = plain photo colours)"><input type="checkbox" id="c_shade" checked> Surface shading</label>
     <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl"> Depth shading (EDL)</label>
     <div class="num">EDL strength <input type="number" id="n_edl" value="1" min="0" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_eetrace" checked> Gripper path</label>
@@ -137,7 +138,7 @@ const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 4);
 controls.update();
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-const sun = new THREE.DirectionalLight(0xffffff, 0.45); sun.position.set(0.4, -0.6, 1); scene.add(sun);   // shades the surface map (Lambert); point/line materials are unlit
+const sun = new THREE.DirectionalLight(0xffffff, 0.45); sun.position.set(0.4, -0.6, 1); scene.add(sun);   // lit materials (robot model); the surface map has its own shader (surfMaterial), point/line materials are unlit
 
 const gMap = new THREE.Group(), gObjs = new THREE.Group(), gGraph = new THREE.Group(), gWalls = new THREE.Group(), gRobot = new THREE.Group();
 scene.add(gMap, gObjs, gGraph, gWalls, gRobot);
@@ -357,15 +358,20 @@ function parsePly(buf) {
   for (const p of props) { off[p.name] = { o:stride, t:p.type }; stride += size[p.type] || 4; }
   const dv = new DataView(buf, end);
   const pos = new Float32Array(n * 3), col = new Uint8Array(n * 3).fill(200);
+  const nrm = off.nx ? new Float32Array(n * 3) : null, uv = off.s ? new Float32Array(n * 2) : null;
   const rd = (b, p) => { const t = p.t; return t === "float" || t === "float32" ? dv.getFloat32(b + p.o, true) : t === "double" ? dv.getFloat64(b + p.o, true) : dv.getUint8(b + p.o); };
   for (let i = 0; i < n; i++) {
     const b = i * stride;
     pos[3*i] = rd(b, off.x); pos[3*i+1] = rd(b, off.y); pos[3*i+2] = rd(b, off.z);
     if (off.red) { col[3*i] = rd(b, off.red); col[3*i+1] = rd(b, off.green); col[3*i+2] = rd(b, off.blue); }
+    if (nrm) { nrm[3*i] = rd(b, off.nx); nrm[3*i+1] = rd(b, off.ny); nrm[3*i+2] = rd(b, off.nz); }
+    if (uv) { uv[2*i] = rd(b, off.s); uv[2*i+1] = rd(b, off.t); }
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
   g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
+  if (nrm) g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));   // textured surface regions carry smooth normals and atlas UVs
+  if (uv) g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
   if (nf) {   // triangle faces (list uchar int): object surface mesh
     const idx = new Uint32Array(nf * 3); let b = n * stride;
     for (let i = 0; i < nf; i++) { const k = dv.getUint8(b); b += 1; for (let j = 0; j < 3 && j < k; j++) idx[3*i+j] = dv.getInt32(b + 4*j, true); b += 4 * k; }
@@ -434,22 +440,84 @@ async function loadSceneChunks(sp) {
   sceneChunks.busy = false; pendingLoads--; loadDone();
 }
 
-// Surface map (TSDF + Surface Nets): regions [x, y, z, version]; only regions whose version changed are fetched again.
-// Regions are drawn in blocks of SB³ regions (3.84 m at 3 cm voxels): one mesh, one draw call per block. A changed region
-// rebuilds only its block; each block has its own bounding sphere, so blocks off screen are skipped.
+// Surface map (TSDF + Surface Nets): regions [x, y, z, version] or [x, y, z, version, texture]; only regions whose version
+// (or texture number) changed are fetched again.
+// Vertex-colour regions are drawn in blocks of SB³ regions (3.84 m at 3 cm voxels): one mesh, one draw call per block. A changed
+// region rebuilds only its block; each block has its own bounding sphere, so blocks off screen are skipped.
+// Textured regions (photo atlas mesh/t_x_y_z_n.jpg + mesh/t_x_y_z_n.ply with UVs and smooth normals) are one mesh each.
 const SB = 4;
-const surf = { run:null, have:new Map(), blocks:new Map(), dirty:new Set(), timer:0, busy:false };
-const surfMat = new THREE.MeshLambertMaterial({ vertexColors:true, side:THREE.DoubleSide });
+const surf = { run:null, have:new Map(), blocks:new Map(), dirty:new Set(), tex:new Map(), timer:0, busy:false };
+// Surface shading: hemisphere light (bright from above, darker from below) + one sun, from smooth vertex normals.
+// Textured: atlas × vertex colour × 2 (vertex colour = per-vertex exposure match). Cheap enough for the Pi 5 GPU (no extra passes).
+const surfUni = { sun:{ value:new THREE.Vector3(0.4, -0.6, 1).normalize() }, flatk:{ value:0 } };
+const SURF_VS = `varying vec3 vN; varying vec3 vC;
+#ifdef TEX
+varying vec2 vUv;
+#endif
+void main() {
+  vN = normal; vC = color;
+#ifdef TEX
+  vUv = uv;
+#endif
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+const SURF_FS = `uniform vec3 sun; uniform float flatk; varying vec3 vN; varying vec3 vC;
+#ifdef TEX
+uniform sampler2D map; varying vec2 vUv;
+#endif
+void main() {
+  vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
+  float l = mix(0.55, 0.85, 0.5 + 0.5 * n.z) + 0.25 * max(dot(n, sun), 0.0);
+  l = mix(l, 1.0, flatk);
+#ifdef TEX
+  vec3 c = texture2D(map, vUv).rgb * vC * 2.0;
+#else
+  vec3 c = vC;
+#endif
+  gl_FragColor = vec4(min(c * l, 1.0), 1.0);
+}`;
+function surfMaterial(tex) {
+  return new THREE.ShaderMaterial({ uniforms:{ sun:surfUni.sun, flatk:surfUni.flatk, map:{ value:tex || null } }, defines:tex ? { TEX:1 } : {},
+    vertexShader:SURF_VS, fragmentShader:SURF_FS, vertexColors:true, side:THREE.DoubleSide });
+}
+const surfMat = surfMaterial(null);
+function dropTexRegion(key) {
+  const t = surf.tex.get(key); if (!t) return;
+  gSurf.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.dispose(); t.tex.dispose(); surf.tex.delete(key);
+}
 function resetSurface() {
   for (const b of surf.blocks.values()) if (b.mesh) { gSurf.remove(b.mesh); b.mesh.geometry.dispose(); }
+  for (const k of [...surf.tex.keys()]) dropTexRegion(k);
   surf.have.clear(); surf.blocks.clear(); surf.dirty.clear(); clearTimeout(surf.timer); surf.timer = 0;
 }
+function blockKey(x, y, z) { return Math.floor(x / SB) + "_" + Math.floor(y / SB) + "_" + Math.floor(z / SB); }
 function setRegion(key, x, y, z, ver, g) {   // keep the region's arrays (CPU only) and mark its block for rebuilding
-  const bk = Math.floor(x / SB) + "_" + Math.floor(y / SB) + "_" + Math.floor(z / SB);
-  surf.have.set(key, { ver, pos:g.attributes.position.array, col:g.attributes.color.array, nrm:g.attributes.normal.array, idx:g.index ? g.index.array : null });
+  const bk = blockKey(x, y, z);
+  dropTexRegion(key);
+  surf.have.set(key, { ver, tv:0, pos:g.attributes.position.array, col:g.attributes.color.array, nrm:g.attributes.normal.array, idx:g.index ? g.index.array : null });
   let b = surf.blocks.get(bk); if (!b) { b = { keys:new Set(), mesh:null }; surf.blocks.set(bk, b); }
   b.keys.add(key); surf.dirty.add(bk);
   if (!surf.timer) surf.timer = setTimeout(flushSurface, 250);   // while loading, blocks are rebuilt at most 4 times a second
+}
+function setTexRegion(key, x, y, z, ver, tv, g, tex) {   // textured region: its own mesh, taken out of its vertex-colour block
+  const b = surf.blocks.get(blockKey(x, y, z));
+  if (b && b.keys.delete(key)) { surf.dirty.add(blockKey(x, y, z)); if (!surf.timer) surf.timer = setTimeout(flushSurface, 250); }
+  dropTexRegion(key);
+  const mesh = new THREE.Mesh(g, surfMaterial(tex));
+  gSurf.add(mesh); surf.tex.set(key, { mesh, tex });
+  surf.have.set(key, { ver, tv });
+  invalidate();
+}
+function loadTexture(url) {
+  return new Promise((ok, fail) => {
+    const img = new Image();
+    img.onload = () => {
+      const t = new THREE.Texture(img);
+      t.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+      t.needsUpdate = true; ok(t);
+    };
+    img.onerror = fail; img.src = url;
+  });
 }
 function flushSurface() {
   clearTimeout(surf.timer); surf.timer = 0;
@@ -474,23 +542,35 @@ function flushSurface() {
 }
 async function loadSurface(s) {
   if (surf.run !== s.run) { resetSurface(); surf.run = s.run; }
+  surfUni.flatk.value = opt("c_shade") ? 0 : 1;
   if (surf.busy) return;
-  const todo = s.regions.filter(([x, y, z, ver]) => { const c = surf.have.get(x + "_" + y + "_" + z); return !c || c.ver !== ver; });
+  const todo = s.regions.filter(([x, y, z, ver, tv]) => { const c = surf.have.get(x + "_" + y + "_" + z); return !c || c.ver !== ver || c.tv !== (tv || 0); });
   if (!todo.length) return;
   surf.busy = true; pendingLoads++;
   // 바뀐 구역을 4 개씩 동시에 받는다(원격 접속이면 왕복 지연이 쌓이므로)
   const run = s.run; let k = 0;
   const one = async () => {
     while (k < todo.length && surf.run === run) {
-      const [x, y, z, ver] = todo[k++], key = x + "_" + y + "_" + z;
+      const [x, y, z, ver, tv] = todo[k++], key = x + "_" + y + "_" + z;
       try {
+        if (tv) {   // textured: mesh + atlas
+          const base = "/file/mesh/t_" + key + "_" + tv;
+          const [r, tex] = await Promise.all([fetch(base + ".ply"), loadTexture(base + ".jpg")]);
+          if (!r.ok) { tex.dispose(); continue; }
+          const g = parsePly(await r.arrayBuffer());
+          if (surf.run !== run) { g.dispose(); tex.dispose(); return; }
+          const cur = surf.have.get(key);
+          if (cur && (cur.ver > ver || (cur.ver === ver && cur.tv >= tv))) { g.dispose(); tex.dispose(); continue; }
+          setTexRegion(key, x, y, z, ver, tv, g, tex);
+          continue;
+        }
         const r = await fetch("/file/mesh/r_" + key + ".ply?v=" + ver);
         if (!r.ok) continue;
         const g = parsePly(await r.arrayBuffer());
         if (surf.run !== run) { g.dispose(); return; }
         g.computeVertexNormals();
         const cur = surf.have.get(key);
-        if (cur && cur.ver >= ver) continue;
+        if (cur && cur.ver >= ver && !cur.tv) continue;
         setRegion(key, x, y, z, ver, g);
       } catch (e) {}
     }
@@ -912,6 +992,13 @@ function fitView(top) {
   controls.target.set(cx, cy, top ? 0 : 3);
   if (top) camera.position.set(cx, cy - 0.001, R * 1.15); else camera.position.set(cx - R * 0.55, cy - R * 0.55, R * 0.5 + 3);
   controls.update();
+  if (!top) camFromQuery();
+}
+// ?cam=ex,ey,ez,tx,ty,tz: start camera (eye, target), for tests and demos
+function camFromQuery() {
+  const q = new URLSearchParams(location.search).get("cam"); if (!q) return false;
+  const v = q.split(",").map(Number); if (v.length !== 6 || v.some(isNaN)) return false;
+  camera.position.set(v[0], v[1], v[2]); controls.target.set(v[3], v[4], v[5]); controls.update(); invalidate(); return true;
 }
 $("b_top").onclick = () => { autoFit = false; fitView(true); }; $("b_fit").onclick = () => { autoFit = true; if (LIVE && liveGrid) fitViewTo(liveGrid); else fitView(false); };
 addEventListener("keydown", e => { if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return; if (e.key === "t") fitView(true); if (e.key === "f") fitView(false); });
@@ -940,7 +1027,7 @@ function applyView(v) {
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
   let sObj = ""; for (const o of view.objects) sObj += o.id + "|" + o.state + "|" + o.pos[0] + "," + o.pos[1] + "," + o.pos[2] + "|" + o.extent[0] + "," + o.extent[1] + "," + o.extent[2] + "|" + (o.points ? o.points.stamp : "") + "|" + (o.rgbd ? 1 : 0) + "|" + (o.room ?? "") + ";";
-  if (view.scene_points) sObj += "scene|" + (view.scene_points.chunks ?? view.scene_points.stamp) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3]).reduce((a, b) => a + b, 0) : "");
+  if (view.scene_points) sObj += "scene|" + (view.scene_points.chunks ?? view.scene_points.stamp) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3] * 1000 + (r[4] || 0)).reduce((a, b) => a + b, 0) : "");
   const sGraph = JSON.stringify(view.graph), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
   const objChanged = sObj !== prev.obj, graphChanged = objChanged || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
   if (objChanged) { fillSelect(); drawObjects(); }
@@ -1117,6 +1204,7 @@ function stepChase(dt) {
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
 $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate;
 $("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); invalidate(); };
+$("c_shade").onchange = () => { surfUni.flatk.value = opt("c_shade") ? 0 : 1; invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
   if (!$("c_follow").checked || !robotGrp) return false;
   const tgt = new THREE.Vector3(robotGrp.position.x, robotGrp.position.y, 0.2);
@@ -1197,6 +1285,7 @@ function fitViewTo(g, instant) {
   const goal = { pos:new THREE.Vector3(cx - R * 0.55, cy - R * 0.55, R * 0.5 + 3), target:new THREE.Vector3(cx, cy, 3) };
   if (instant) { controls.target.copy(goal.target); camera.position.copy(goal.pos); controls.update(); camGoal = null; }
   else camGoal = goal;
+  if (camFromQuery()) camGoal = null;
   invalidate();
 }
 function stepCamera(dt) {
@@ -1388,6 +1477,7 @@ loadRobotModel();
 loadRobotKind().then(invalidate);
 // 주소 뒤 ?c_surf=0&c_edl=1 처럼 체크 상자 초기값을 정할 수 있음(시험·시연용)
 for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); }
+camFromQuery();
 startLive().then(live => { if (!live) { $("boot").classList.add("gone"); poll(); pollPose(); } });
 </script>
 </body>

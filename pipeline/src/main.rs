@@ -19,6 +19,7 @@ mod scale;
 mod seg;
 mod stream;
 mod submap;
+mod texture;
 mod tsdf;
 mod vo;
 mod tum;
@@ -67,6 +68,7 @@ struct Args {
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
     submap: submap::Policy, // --submap-secs S --submap-m M --submap-deg D: 스트림 표면 지도에서 새 서브맵을 여는 조건
+    tex_mb: usize,          // --tex-mb M: 표면 텍스처용 장면 사진 보관 예산(스트림 표면 지도, --no-texture = 0 = 텍스처 없음)
 }
 
 fn args() -> Args {
@@ -114,6 +116,7 @@ fn args() -> Args {
             dist: get("--submap-m").map_or(2.0, |s| s.parse().unwrap()),
             deg: get("--submap-deg").map_or(60.0, |s| s.parse().unwrap()),
         },
+        tex_mb: if v.iter().any(|x| x == "--no-texture") { 0 } else { get("--tex-mb").map_or(400, |s| s.parse().unwrap()) },
     }
 }
 
@@ -284,15 +287,32 @@ fn depth_scale(zz: &[(f64, f64)]) -> Option<f64> {
     Some(rs[rs.len() / 2].clamp(0.5, 2.0))
 }
 /// 바뀐 구역의 면 파일 쓰기(mesh/r_x_y_z.ply)
-fn write_surface(dir: &Path, ts: &mut tsdf::Tsdf) {
+/// 텍스처를 붙이면 바뀐 구역 면을 작업 스레드에도 넘김
+fn write_surface(dir: &Path, ts: &mut tsdf::Tsdf, tex: Option<&texture::Texturer>) {
     for (reg, verts, tris) in ts.take_dirty_meshes() {
+        if let Some(tx) = tex {
+            tx.mesh(reg, ts.ver[&reg], verts.clone(), tris.clone());
+        }
         out::ply_mesh(&dir.join(format!("mesh/r_{}_{}_{}.ply", reg.0, reg.1, reg.2)), verts, tris);
     }
 }
 
-/// 뷰어용 표면 목록: 구역마다 [x, y, z, 판 번호](판이 바뀐 구역만 다시 받음)
-fn surface_json(ts: &tsdf::Tsdf, run: u64) -> serde_json::Value {
-    let regs: Vec<[i64; 4]> = ts.ver.iter().map(|(k, v)| [k.0 as i64, k.1 as i64, k.2 as i64, *v as i64]).collect();
+/// 뷰어용 표면 목록: 구역마다 [x, y, z, 판 번호](판이 바뀐 구역만 다시 받음).
+/// 지금 면에 텍스처를 붙였으면 [x, y, z, 판 번호, 텍스처 번호](mesh/t_x_y_z_번호.ply + .jpg)
+fn surface_json(ts: &tsdf::Tsdf, run: u64, tex: Option<&texture::Texturer>) -> serde_json::Value {
+    let regs: Vec<Vec<i64>> = ts
+        .ver
+        .iter()
+        .map(|(k, v)| {
+            let mut r = vec![k.0 as i64, k.1 as i64, k.2 as i64, *v as i64];
+            if let Some(&(tv_ver, tv)) = tex.and_then(|t| t.tex.get(k)) {
+                if tv_ver == *v {
+                    r.push(tv as i64);
+                }
+            }
+            r
+        })
+        .collect();
     json!({"run": run, "vox": ts.vox, "regions": regs})
 }
 
@@ -349,6 +369,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let sub_mode = a.stream.is_some() && a.surface && a.rebuild_every >= 0.0;
     let mut tsdf = (a.surface && !sub_mode).then(|| tsdf::Tsdf::new(a.tsdf_vox));
     let mut subs = sub_mode.then(|| submap::Submaps::new(a.tsdf_vox, a.submap));
+    // 표면 텍스처(작업 스레드): 서브맵 표면 구역에 장면 사진을 붙임
+    let mut tex = (sub_mode && a.tex_mb > 0).then(|| texture::Texturer::start(&a.out, a.tex_mb));
     let mut mem = Memory::new(0.012, 0.04);
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
@@ -732,6 +754,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, anchor, graph }) = rx.recv() {
         if !graph.is_empty() {
             kfs.apply_graph(&graph);
+            if let Some(tx) = tex.as_ref() {
+                tx.graph(&graph);
+            }
             if let Some(s) = subs.as_mut() {
                 s.check(&|id| node_map(&kfs, &stream_fix, z0.unwrap_or(0.0), id));
             }
@@ -742,7 +767,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
             (n_rebuild, last_merge) = (n_rebuild + 1, nkf);
             scene_json = match subs.as_mut() {
-                Some(s) => surface_outputs(&a.out, run_id, scene.vox, s),
+                Some(s) => surface_outputs(&a.out, run_id, scene.vox, s, tex.as_ref()),
                 None => fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf),
             };
             write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, true);
@@ -1194,6 +1219,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let t_sub = c_sub.elapsed().as_secs_f64();
         if map_ok && a.stream.is_some() && a.rebuild_every >= 0.0 {
             kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, sub_mode);
+            if let Some(tx) = tex.as_mut() {
+                tx.poll();
+                let (anc, rel) = kfs.rel_of(anchor, raw.0, raw.1);
+                tx.frame(texture::FrameIn { anchor: anc, rel, w, h, k: seq.k, rgb: rgb.clone(), dq: texture::depth_grid(&depth, w, h), fix: stream_fix, z0: z0v });
+            }
         }
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
         cam_json = json!({"pos": pwc, "R": r});
@@ -1225,8 +1255,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
                 scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
                 if let Some(ts) = surf(&mut tsdf, &mut subs) {
-                    write_surface(&a.out, ts);
-                    scene_json["surface"] = surface_json(ts, run_id);
+                    write_surface(&a.out, ts, tex.as_ref());
+                    scene_json["surface"] = surface_json(ts, run_id, tex.as_ref());
                 }
             }
             // 병합 후처리는 키프레임 15 장마다(물체 쌍을 매번 다 보지 않게, 중복이 자라기 전에 합침)
@@ -1310,8 +1340,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
     if let Some(ts) = surf(&mut tsdf, &mut subs) {
-        write_surface(&a.out, ts);
-        scene_json["surface"] = surface_json(ts, run_id);
+        write_surface(&a.out, ts, tex.as_ref());
+        // 텍스처: 남은 구역을 모두 붙인 뒤 목록을 만든다
+        if let Some(tx) = tex.as_mut() {
+            let c0 = Instant::now();
+            tx.finish();
+            eprintln!("텍스처 마무리 기다림 {:.2} 초", c0.elapsed().as_secs_f64());
+        }
+        scene_json["surface"] = surface_json(ts, run_id, tex.as_ref());
     }
     let pts = scene.points();
     let t_end = traj.last().map_or(0.0, |x| x.0);
@@ -1430,10 +1466,10 @@ fn install_surface(subs: &mut Option<submap::Submaps>, done: Option<submap::Done
 }
 
 /// 서브맵 표면을 다시 합친 뒤 출력: 실행 번호는 그대로, 바뀐 구역의 면 파일만 다시 씀(뷰어는 판 번호가 바뀐 구역만 받음)
-fn surface_outputs(dir: &Path, run_id: u64, vox: f64, s: &mut submap::Submaps) -> serde_json::Value {
+fn surface_outputs(dir: &Path, run_id: u64, vox: f64, s: &mut submap::Submaps, tex: Option<&texture::Texturer>) -> serde_json::Value {
     s.flush();
-    write_surface(dir, &mut s.global);
-    json!({"run": run_id, "chunks": 0, "prefix": "scene/c", "voxel": vox, "n": 0, "surface": surface_json(&s.global, run_id)})
+    write_surface(dir, &mut s.global, tex);
+    json!({"run": run_id, "chunks": 0, "prefix": "scene/c", "voxel": vox, "n": 0, "surface": surface_json(&s.global, run_id, tex)})
 }
 
 /// 다시 쌓은 뒤 출력 새로: 실행 번호를 바꿔 뷰어가 받은 조각·표면을 비우게 하고, 옛 조각·면 파일을 지우고 지금 지도를 처음부터 씀
@@ -1452,8 +1488,8 @@ fn fresh_outputs(dir: &Path, run_id: &mut u64, n_chunk: &mut usize, n_scene: &mu
     }
     let mut sj = json!({"run": *run_id, "chunks": *n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": *n_scene});
     if let Some(ts) = tsdf.as_mut() {
-        write_surface(dir, ts);
-        sj["surface"] = surface_json(ts, *run_id);
+        write_surface(dir, ts, None);
+        sj["surface"] = surface_json(ts, *run_id, None);
     }
     sj
 }

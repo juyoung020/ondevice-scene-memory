@@ -12,6 +12,8 @@
 //! GET /api/walls?x=&y=&yaw=  {"segments": [[ax,ay,bx,by]..], "state": [56 floats], "pose": [x,y,yaw]}
 //! GET /api/depth?path=<rel>  16-bit grey PNG → u16 little-endian pixels (X-W / X-H)
 //! GET /file/<relative path>  any file below the memory dir (PNG crops, PLY points)
+//! GET /api/files?p=a,b,..   many files below the memory dir in one reply (see pack_files)
+//! GET /stream               SSE: live stream (--ingest), else folder events vv (view.json version) / fpose (pose.json)
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -510,6 +512,23 @@ fn respond_static(s: &mut TcpStream, ctype: &str, body: &'static [u8]) {
     respond_tagged(s, ctype, &tag, || Some(std::borrow::Cow::Borrowed(body)))
 }
 
+/// `/api/files` body: per file `u32 name length, name, u32 data length (u32::MAX = missing), data` (little-endian), in request order.
+fn pack_files(root: &Path, rels: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in rels {
+        out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        out.extend_from_slice(r.as_bytes());
+        match safe_join(root, r).and_then(|p| fs::read(p).ok()) {
+            Some(b) => {
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
+        }
+    }
+    out
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -549,7 +568,7 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(p)
 }
 
-/// One connection: HTTP/1.1 keep-alive, so the page's polls (view 4 /s, pose 20 /s) and the burst of mesh/object files at
+/// One connection: HTTP/1.1 keep-alive, so the page's requests (view on change, batched mesh/point files, object files) at
 /// load reuse one socket and one thread instead of a TCP handshake + thread spawn per request. Idle connections close after 15 s.
 fn handle(s: TcpStream, st: Arc<State>) {
     let mut s = s;
@@ -676,6 +695,14 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 }
                 _ => respond(&mut s, 404, "text/plain", "", b"not a grey png"),
             }
+        }
+        // many files in one reply (first load: dozens of surface regions / point nodes): see pack_files
+        "/api/files" => {
+            let rels: Vec<&str> = q.get("p").map(|s| s.split(',').filter(|r| !r.is_empty()).take(256).collect()).unwrap_or_default();
+            let vers: Vec<String> = rels.iter().map(|r| safe_join(&st.dir, r).and_then(|p| file_ver(&p)).unwrap_or_default()).collect();
+            let tag = format!("b{:x}", fnv(format!("{:?}{:?}", rels, vers).as_bytes()));
+            let dir = st.dir.clone();
+            respond_tagged(&mut s, "application/octet-stream", &tag, || Some(std::borrow::Cow::Owned(pack_files(&dir, &rels))))
         }
         "/api/walls" => match walls_json(&st, &q) {
             Some(j) => respond(&mut s, 200, "application/json", "", j.as_bytes()),
@@ -899,6 +926,9 @@ fn serve_stream(mut s: TcpStream, st: Arc<State>) {
     if s.write_all(head.as_bytes()).is_err() {
         return;
     }
+    if !st.live_mode {
+        return serve_file_events(s, st);
+    }
     let (tx, rx) = sync_channel::<Arc<String>>(1024);
     {
         // build the snapshot and register under the live lock so no update is missed or duplicated
@@ -982,5 +1012,73 @@ fn main() {
         let _ = c.set_nodelay(true);
         let st = st.clone();
         std::thread::spawn(move || handle(c, st));
+    }
+}
+
+/// GET /stream without --ingest (a memory folder written by memmap/scenemap): the server watches the folder for the page instead
+/// of the page polling. `vv` = view.json version (the page then fetches /api/view once), `fpose` = pose.json text (fast camera
+/// pose). Checks are two file stats every 50 ms on the server; an idle viewer gets only a keepalive comment every 10 s.
+fn serve_file_events(mut s: TcpStream, st: Arc<State>) {
+    let _ = s.set_nodelay(true);
+    let (vp, pp) = (st.dir.join("view.json"), st.dir.join("pose.json"));
+    let (mut vv, mut pv) = (String::new(), String::new());
+    let mut quiet = Instant::now();
+    loop {
+        let mut out = String::new();
+        if let Some(v) = file_ver(&vp) {
+            if v != vv {
+                out.push_str(&sse("vv", &serde_json::Value::String(v.clone()).to_string()));
+                vv = v;
+            }
+        }
+        if let Some(v) = file_ver(&pp) {
+            if v != pv {
+                if let Ok(t) = fs::read_to_string(&pp) {
+                    let t = t.trim();
+                    if t.starts_with('{') && t.ends_with('}') {   // a half-written file is skipped; the next stat sees it again
+                        out.push_str(&sse("fpose", &t.replace('\n', " ")));
+                        pv = v;
+                    }
+                }
+            }
+        }
+        if out.is_empty() && quiet.elapsed() > Duration::from_secs(10) {
+            out.push_str(": keepalive\n\n");
+        }
+        if !out.is_empty() {
+            if s.write_all(out.as_bytes()).is_err() {
+                return;
+            }
+            quiet = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_files_layout() {
+        let d = std::env::temp_dir().join(format!("sgview_pack_{}", std::process::id()));
+        fs::create_dir_all(d.join("mesh")).unwrap();
+        fs::write(d.join("mesh/a.ply"), b"abc").unwrap();
+        let b = pack_files(&d, &["mesh/a.ply", "mesh/none.ply", "../x"]);
+        let mut i = 0;
+        let mut rd = |n: usize| { let s = &b[i..i + n]; i += n; s.to_vec() };
+        let u = |v: Vec<u8>| u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+        assert_eq!(u(rd(4)), 10);
+        assert_eq!(rd(10), b"mesh/a.ply");
+        assert_eq!(u(rd(4)), 3);
+        assert_eq!(rd(3), b"abc");
+        assert_eq!(u(rd(4)), 13);
+        rd(13);
+        assert_eq!(u(rd(4)), u32::MAX);
+        assert_eq!(u(rd(4)), 4);
+        rd(4);
+        assert_eq!(u(rd(4)), u32::MAX);   // outside the folder: refused like a missing file
+        assert_eq!(i, b.len());
+        let _ = fs::remove_dir_all(&d);
     }
 }

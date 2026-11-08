@@ -72,9 +72,10 @@
   <details open><summary>Display</summary>
     <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
     <label class="row" title="surface shading: soft light from above + sun on smooth normals (off = plain photo colours)"><input type="checkbox" id="c_shade" checked> Surface shading</label>
+    <label class="row" title="High quality: overlapping point splats are blended into one smooth surface instead of the nearest disc winning (one extra pass of the point map)"><input type="checkbox" id="c_blend" checked> Blend point splats (High)</label>
     <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl" checked> Depth shading (EDL)</label>
     <div class="num">EDL strength <input type="number" id="n_edl" value="0.4" min="0" max="3" step="0.05"></div>
-    <div class="num" title="depth steps smaller than this (log2 view depth, 0.01 ≈ 0.7 %) are not shaded: the small depth jitter between overlapping splats of one surface stays unshaded, real edges and creases still darken">EDL tolerance <input type="number" id="n_edltol" value="0.01" min="0" max="0.1" step="0.002"></div>
+    <div class="num" title="depth steps smaller than this (log2 view depth, 0.025 ≈ 1.7 %: Kinect depth noise between neighbouring splats) are not shaded: the small depth jitter between overlapping splats of one surface stays unshaded, real edges and creases still darken">EDL tolerance <input type="number" id="n_edltol" value="0.025" min="0" max="0.1" step="0.002"></div>
     <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog" checked> Depth fog</label>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
     <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
@@ -135,6 +136,20 @@
   </details>
 </div>
 
+<script>
+// ?perf=<ms>: load measurement for tests (requests, bytes, main-thread long tasks, when the last map data arrived), shown as the page title
+(() => { const ms = +new URLSearchParams(location.search).get("perf"); if (!ms) return;
+  performance.setResourceTimingBufferSize(20000); const lt = []; try { new PerformanceObserver(l => lt.push(...l.getEntries())).observe({ type:"longtask", buffered:true }); } catch (e) {}
+  setTimeout(async () => {
+    // [start, end, bytes] of every request: the page's and the loader worker's (which fetches the map files)
+    const page = performance.getEntriesByType("resource").filter(r => !/\/stream$/.test(r.name)).map(r => [r.startTime, r.responseEnd, r.transferSize || 0, /\/file\/|\/api\/files/.test(r.name) && !r.name.includes("pose.json")]);
+    const wk = window.__workerPerf ? (await window.__workerPerf()).map(r => [...r, true]) : [];
+    const rs = page.concat(wk), cut = ms - 8000, idle = rs.filter(r => r[0] > cut);
+    const lastData = Math.max(0, ...rs.filter(r => r[3] && r[0] < cut).map(r => r[1])), lastLt = Math.max(0, ...lt.filter(t => t.startTime < cut).map(t => t.startTime + t.duration));
+    const o = { requests:rs.length - idle.length, kb:Math.round(rs.reduce((a, r) => a + r[2], 0) / 1024), longtasks:lt.length, longMs:Math.round(lt.reduce((a, t) => a + t.duration, 0)), longMax:Math.round(Math.max(0, ...lt.map(t => t.duration))), lastData:Math.round(lastData), full:Math.round(Math.max(lastData, lastLt)), idle8s:idle.length };
+    document.title = "PERF " + JSON.stringify(o);
+  }, ms); })();
+</script>
 <script src="/three.min.js"></script>
 <script src="/OrbitControls.js"></script>
 <script src="/GLTFLoader.js"></script>
@@ -158,6 +173,7 @@ let quality = QS.get("quality") || localStorage.getItem("sg_quality") || (WEAK_G
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
+  try { for (const p of gOct.children) octQuality(p.material); } catch (e) {}   // point map not set up yet
   if (typeof resize === "function") { resize(); invalidate(); }
 }
 renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
@@ -184,14 +200,15 @@ const gSurf = new THREE.Group(); scene.add(gSurf);     // surface map regions (T
 // circle of `radius` pixels and sums how much farther it is than they are in log2 view depth (minus a small tolerance, see n_edltol); colour × exp(−sum/8 · 300 · strength).
 // Object outlines, steps and creases darken, so a point map reads as solid surfaces. A background pixel next to geometry gets a soft
 // dark halo (Potree adds 100 per covered neighbour there).
-const edl = { rt:null, w:0, h:0, scene:new THREE.Scene(), cam:new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1) };
+const edl = { rt:null, acc:null, w:0, h:0, scene:new THREE.Scene(), cam:new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1) };
 edl.mat = new THREE.ShaderMaterial({
-  uniforms:{ tColor:{ value:null }, tDepth:{ value:null }, uPx:{ value:new THREE.Vector2() }, uNear:{ value:0.05 }, uFar:{ value:500 }, uStr:{ value:0.4 }, uRad:{ value:1.4 }, uTol:{ value:0.01 } },
+  uniforms:{ tColor:{ value:null }, tDepth:{ value:null }, tAcc:{ value:null }, uBlend:{ value:0 }, uPx:{ value:new THREE.Vector2() }, uNear:{ value:0.05 }, uFar:{ value:500 }, uStr:{ value:0.4 }, uRad:{ value:1.4 }, uTol:{ value:0.025 } },
   vertexShader:`varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
-  fragmentShader:`uniform sampler2D tColor; uniform sampler2D tDepth; uniform vec2 uPx; uniform float uNear; uniform float uFar; uniform float uStr; uniform float uRad; uniform float uTol; varying vec2 vUv;
+  fragmentShader:`uniform sampler2D tColor; uniform sampler2D tDepth; uniform sampler2D tAcc; uniform float uBlend; uniform vec2 uPx; uniform float uNear; uniform float uFar; uniform float uStr; uniform float uRad; uniform float uTol; varying vec2 vUv;
     float ld(float d){ if (d >= 1.0) return 0.0; float z = d * 2.0 - 1.0; return log2((2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear))); }
     void main(){
       vec4 c = texture2D(tColor, vUv); float l0 = ld(texture2D(tDepth, vUv).r), s = 0.0;
+      if (uBlend > 0.5) { vec4 a = texture2D(tAcc, vUv); if (a.a > 0.001) c.rgb = a.rgb / a.a; }   // blended point splats (see octMaterial)
       for (int i = 0; i < 8; i++) {
         float a = float(i) * 0.7853982;
         float ln = ld(texture2D(tDepth, vUv + vec2(cos(a), sin(a)) * uPx * uRad).r);
@@ -203,18 +220,41 @@ edl.mat = new THREE.ShaderMaterial({
     }`,
   depthTest:false, depthWrite:false });
 edl.scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), edl.mat));
+// High quality: point splats are blended instead of the nearest one winning (Potree's high-quality splats). Pass 1 draws the scene with
+// depth; pass 2 draws only the point map into a half-float target, adding colour × weight and weight (weight falls off from the splat
+// centre) for every splat fragment within a small depth band behind the nearest surface; the final pass divides. Kinect depth noise
+// then reads as one smooth surface instead of overlapping discs. Needs float colour targets; Low skips it (one pass, Pi 5).
+const canBlend = () => !!(renderer.capabilities.isWebGL2 ? renderer.extensions.get("EXT_color_buffer_float") : renderer.extensions.get("EXT_color_buffer_half_float"));
+const blendOn = () => quality === "high" && opt("c_blend") && gOct.visible && oct.drawn > 0 && canBlend();
+const _bm = { blending:THREE.CustomBlending, blendSrc:THREE.OneFactor, blendDst:THREE.OneFactor, blendEquation:THREE.AddEquation };
 function renderFrame() {
-  if (!opt("c_edl")) { renderer.render(scene, camera); return; }
+  octUni.near.value = camera.near; octUni.far.value = camera.far;
+  const blend = blendOn();
+  if (!opt("c_edl") && !blend) { renderer.render(scene, camera); return; }
   const s = renderer.getDrawingBufferSize(new THREE.Vector2());
   if (!edl.rt || edl.w !== s.x || edl.h !== s.y) {
     if (edl.rt) { edl.rt.depthTexture.dispose(); edl.rt.dispose(); }
+    if (edl.acc) { edl.acc.dispose(); edl.acc = null; }
     edl.rt = new THREE.WebGLRenderTarget(s.x, s.y); edl.rt.depthTexture = new THREE.DepthTexture(s.x, s.y);
     edl.w = s.x; edl.h = s.y;
   }
-  renderer.setRenderTarget(edl.rt); renderer.render(scene, camera); renderer.setRenderTarget(null);
+  renderer.setRenderTarget(edl.rt); renderer.render(scene, camera);
+  if (blend) {
+    if (!edl.acc) edl.acc = new THREE.WebGLRenderTarget(s.x, s.y, { type:THREE.HalfFloatType, depthBuffer:false, minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter });
+    const ou = octUni; ou.depth.value = edl.rt.depthTexture; ou.res.value.set(s.x, s.y); ou.near.value = camera.near; ou.far.value = camera.far; ou.pass.value = 1;
+    const ms = gOct.children.filter(p => p.visible).map(p => p.material);
+    for (const m of ms) { Object.assign(m, _bm); m.depthTest = false; m.depthWrite = false; m.transparent = true; }
+    const cc = renderer.getClearColor(new THREE.Color()), ca = renderer.getClearAlpha();
+    renderer.setRenderTarget(edl.acc); renderer.setClearColor(0x000000, 0); renderer.clear(true, false, false);
+    const keep = scene.fog; scene.fog = null; renderer.render(gOct, camera); scene.fog = keep;
+    renderer.setClearColor(cc, ca);
+    for (const m of ms) { m.blending = THREE.NormalBlending; m.depthTest = true; m.depthWrite = true; m.transparent = false; }
+    ou.pass.value = 0;
+  }
+  renderer.setRenderTarget(null);
   const u = edl.mat.uniforms;
-  u.tColor.value = edl.rt.texture; u.tDepth.value = edl.rt.depthTexture; u.uPx.value.set(1 / s.x, 1 / s.y);
-  u.uNear.value = camera.near; u.uFar.value = camera.far; u.uStr.value = opt("n_edl"); u.uTol.value = opt("n_edltol");
+  u.tColor.value = edl.rt.texture; u.tDepth.value = edl.rt.depthTexture; u.tAcc.value = blend ? edl.acc.texture : null; u.uBlend.value = blend ? 1 : 0; u.uPx.value.set(1 / s.x, 1 / s.y);
+  u.uNear.value = camera.near; u.uFar.value = camera.far; u.uStr.value = opt("c_edl") ? opt("n_edl") : 0; u.uTol.value = opt("n_edltol");
   renderer.render(edl.scene, edl.cam);
 }
 let needsRender = true;
@@ -382,19 +422,24 @@ function surfaceMode() {   // ?draw=points opens with point clouds
   if (!e.dataset.init) { e.dataset.init = 1; const q = new URLSearchParams(location.search).get("draw"); if (q) e.value = q; }
   return e.value === "surface";
 }
-function parsePly(buf) {
-  const u8 = new Uint8Array(buf);
-  let end = 0; const dec = new TextDecoder();
-  for (let i = 0; i < Math.min(u8.length, 2048); i++) if (u8[i] === 10 && dec.decode(u8.subarray(Math.max(0, i - 10), i + 1)).includes("end_header")) { end = i + 1; break; }
-  const head = dec.decode(u8.subarray(0, end)).split("\n");
+// ---------------- file loading off the main thread ----------------
+// One Web Worker (inline, no extra file) fetches and parses: PLY → typed arrays (+ vertex normals for meshes without them),
+// /api/files batches → per-file parts, JPEG atlases → ImageBitmap (decoded in the worker). Arrays and bitmaps are transferred,
+// so the page only wraps them in BufferGeometry/Texture objects and never blocks on parsing.
+const WORKER_SRC = `
+performance.setResourceTimingBufferSize(20000);
+const SIZE = { float:4, float32:4, double:8, uchar:1, uint8:1, char:1, int8:1, ushort:2, uint16:2, short:2, int16:2, int:4, int32:4, uint:4, uint32:4 };
+function parsePly(buf, normals) {
+  const u8 = new Uint8Array(buf); let end = 0;
+  for (let i = 9; i < Math.min(u8.length, 4096); i++) if (u8[i] === 10 && u8[i-1] === 114 && u8[i-2] === 101 && u8[i-3] === 100 && u8[i-4] === 97 && u8[i-5] === 101 && u8[i-6] === 104 && u8[i-7] === 95) { end = i + 1; break; }
+  const head = new TextDecoder().decode(u8.subarray(0, end)).split(String.fromCharCode(10));
   let n = 0, nf = 0, cur = ""; const props = [];
-  for (const l of head) { const t = l.trim().split(/\s+/); if (t[0] === "element") { cur = t[1]; if (cur === "vertex") n = +t[2]; else if (cur === "face") nf = +t[2]; } else if (t[0] === "property" && cur === "vertex") props.push({ type:t[1], name:t[2] }); }
-  const size = { float:4, float32:4, double:8, uchar:1, uint8:1, char:1, int8:1, ushort:2, uint16:2, short:2, int16:2, int:4, int32:4, uint:4, uint32:4 };
+  for (const l of head) { const t = l.trim().split(/ +/); if (t[0] === "element") { cur = t[1]; if (cur === "vertex") n = +t[2]; else if (cur === "face") nf = +t[2]; } else if (t[0] === "property" && cur === "vertex") props.push({ type:t[1], name:t[2] }); }
   let stride = 0; const off = {};
-  for (const p of props) { off[p.name] = { o:stride, t:p.type }; stride += size[p.type] || 4; }
+  for (const p of props) { off[p.name] = { o:stride, t:p.type }; stride += SIZE[p.type] || 4; }
   const dv = new DataView(buf, end);
   const pos = new Float32Array(n * 3), col = new Uint8Array(n * 3).fill(200);
-  const nrm = off.nx ? new Float32Array(n * 3) : null, uv = off.s ? new Float32Array(n * 2) : null;
+  let nrm = off.nx ? new Float32Array(n * 3) : null; const uv = off.s ? new Float32Array(n * 2) : null;
   const rd = (b, p) => { const t = p.t; return t === "float" || t === "float32" ? dv.getFloat32(b + p.o, true) : t === "double" ? dv.getFloat64(b + p.o, true) : dv.getUint8(b + p.o); };
   for (let i = 0; i < n; i++) {
     const b = i * stride;
@@ -403,18 +448,69 @@ function parsePly(buf) {
     if (nrm) { nrm[3*i] = rd(b, off.nx); nrm[3*i+1] = rd(b, off.ny); nrm[3*i+2] = rd(b, off.nz); }
     if (uv) { uv[2*i] = rd(b, off.s); uv[2*i+1] = rd(b, off.t); }
   }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
-  if (nrm) g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));   // textured surface regions carry smooth normals and atlas UVs
-  if (uv) g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
-  if (nf) {   // triangle faces (list uchar int): object surface mesh
-    const idx = new Uint32Array(nf * 3); let b = n * stride;
+  let idx = null;
+  if (nf) {   // triangle faces (list uchar int)
+    idx = new Uint32Array(nf * 3); let b = n * stride;
     for (let i = 0; i < nf; i++) { const k = dv.getUint8(b); b += 1; for (let j = 0; j < 3 && j < k; j++) idx[3*i+j] = dv.getInt32(b + 4*j, true); b += 4 * k; }
-    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    if (normals && !nrm) {   // area-weighted vertex normals (same as three.js computeVertexNormals)
+      nrm = new Float32Array(n * 3);
+      for (let f = 0; f < idx.length; f += 3) {
+        const a = 3 * idx[f], b2 = 3 * idx[f+1], c = 3 * idx[f+2];
+        const ex = pos[b2] - pos[a], ey = pos[b2+1] - pos[a+1], ez = pos[b2+2] - pos[a+2], fx = pos[c] - pos[a], fy = pos[c+1] - pos[a+1], fz = pos[c+2] - pos[a+2];
+        const nx = ey * fz - ez * fy, ny = ez * fx - ex * fz, nz = ex * fy - ey * fx;
+        for (const v of [a, b2, c]) { nrm[v] += nx; nrm[v+1] += ny; nrm[v+2] += nz; }
+      }
+      for (let v = 0; v < nrm.length; v += 3) { const l = Math.hypot(nrm[v], nrm[v+1], nrm[v+2]) || 1; nrm[v] /= l; nrm[v+1] /= l; nrm[v+2] /= l; }
+    }
   }
+  if (normals && !nrm) nrm = new Float32Array(n * 3);   // no faces: nothing to shade, the block merge still expects normals
+  return { pos, col, nrm, uv, idx };
+}
+const bufs = g => [g.pos, g.col, g.nrm, g.uv, g.idx].filter(Boolean).map(a => a.buffer);
+async function get(url) { const r = await fetch(url); if (!r.ok) throw new Error("http " + r.status); return r.arrayBuffer(); }
+onmessage = async e => {
+  const { id, kind, url, normals } = e.data;
+  if (kind === "perf") { postMessage({ id, rs:performance.getEntriesByType("resource").map(r => [r.startTime + performance.timeOrigin, r.responseEnd + performance.timeOrigin, r.transferSize || 0]) }); return; }
+  try {
+    if (kind === "ply") { const g = parsePly(await get(url), normals); postMessage({ id, g }, bufs(g)); return; }
+    // batch: u32 name length, name, u32 data length (0xffffffff = missing), data
+    const buf = await get(url), dv = new DataView(buf), dec = new TextDecoder(), parts = {}, tr = [];
+    for (let o = 0; o + 8 <= buf.byteLength;) {
+      const nl = dv.getUint32(o, true), name = dec.decode(new Uint8Array(buf, o + 4, nl)); o += 4 + nl;
+      const dl = dv.getUint32(o, true); o += 4;
+      if (dl === 0xffffffff) { parts[name] = null; continue; }
+      const b = buf.slice(o, o + dl); o += dl;
+      if (name.endsWith(".ply")) { const g = parsePly(b, normals); parts[name] = g; tr.push(...bufs(g)); }
+      else if (name.endsWith(".jpg")) { const bm = await createImageBitmap(new Blob([b], { type:"image/jpeg" }), { imageOrientation:"flipY" }); parts[name] = bm; tr.push(bm); }
+      else { parts[name] = b; tr.push(b); }
+    }
+    postMessage({ id, parts }, tr);
+  } catch (err) { postMessage({ id, err:String(err) }); }
+};`;
+const loader = { w:new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type:"text/javascript" }))), next:1, wait:new Map() };
+loader.w.onmessage = e => { const p = loader.wait.get(e.data.id); loader.wait.delete(e.data.id); if (!p) return; e.data.err ? p.fail(new Error(e.data.err)) : p.ok(e.data); };
+function work(msg) { return new Promise((ok, fail) => { const id = loader.next++; loader.wait.set(id, { ok, fail }); loader.w.postMessage({ ...msg, id, url:msg.url && new URL(msg.url, location.href).href }); }); }
+// parsed PLY arrays → geometry
+function geomFrom(a) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(a.pos, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(a.col, 3, true));
+  if (a.nrm) g.setAttribute("normal", new THREE.BufferAttribute(a.nrm, 3));   // textured regions carry smooth normals and atlas UVs
+  if (a.uv) g.setAttribute("uv", new THREE.BufferAttribute(a.uv, 2));
+  if (a.idx) g.setIndex(new THREE.BufferAttribute(a.idx, 1));
   g.computeBoundingSphere();
   return g;
+}
+async function loadPly(url, normals = false) { return geomFrom((await work({ kind:"ply", url, normals })).g); }
+// many files below the memory folder in one request (/api/files); value per path: parsed PLY arrays, ImageBitmap, ArrayBuffer or null
+async function loadBatch(paths, normals = false) { return (await work({ kind:"batch", url:"/api/files?p=" + paths.map(encodeURIComponent).join(","), normals })).parts; }
+// ?perf: the worker's requests in page time ([start, end, bytes]), for the load measurement
+window.__workerPerf = async () => (await work({ kind:"perf" })).rs.map(([a, b, n]) => [a - performance.timeOrigin, b - performance.timeOrigin, n]);
+function bitmapTexture(bm) {
+  const t = new THREE.Texture(bm); t.flipY = false;   // flipped while decoding
+  t.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy()); t.needsUpdate = true;
+  t.addEventListener("dispose", () => bm.close && bm.close());
+  return t;
 }
 
 async function ensurePoints(o) {
@@ -426,9 +522,7 @@ async function ensurePoints(o) {
   const entry = { stamp:src.stamp, loading:src.stamp, geom:c ? c.geom : null, failedAt:0 };
   plyCache.set(key, entry); pendingLoads++;
   try {
-    const r = await fetch("/file/" + src.path + "?v=" + src.stamp);
-    if (!r.ok) throw 0;
-    const g = parsePly(await r.arrayBuffer());
+    const g = await loadPly("/file/" + src.path + "?v=" + src.stamp);
     if (entry.geom) entry.geom.dispose();
     entry.geom = g; delete entry.loading;
     queueObjects();
@@ -465,9 +559,7 @@ async function loadSceneChunks(sp) {
   const run = sp.run;
   try {
     while (sceneChunks.run === run && sceneChunks.next < view.scene_points.chunks) {
-      const r = await fetch("/file/" + sp.prefix + sceneChunks.next + ".ply");
-      if (!r.ok) break;
-      const g = parsePly(await r.arrayBuffer());
+      let g; try { g = await loadPly("/file/" + sp.prefix + sceneChunks.next + ".ply"); } catch (e) { break; }
       if (sceneChunks.run !== run) { g.dispose(); break; }
       sceneChunks.geoms.push(g); sceneChunks.next++;
       addSceneChunk(g); mergeSceneChunks(); invalidate();
@@ -484,6 +576,7 @@ async function loadSceneChunks(sp) {
 // drawn. Node file: N × uint16 xyz (fraction of the node cube) then N × RGB, uploaded as normalised attributes without parsing.
 const gOct = new THREE.Group(); scene.add(gOct);
 const OCT_BUDGET = +(QS.get("budget") || 0);
+let octFitted = false;   // first octree framing done
 const oct = { run:null, ver:null, meta:null, nodes:new Map(), roots:[], busy:false, loading:0, loadedPts:0, drawn:0, nDrawn:0, box:null, tick:0 };
 function octBudget() { return OCT_BUDGET || (quality === "high" ? 3000000 : 800000); }
 function octReset() {
@@ -527,6 +620,9 @@ async function loadOctree(o) {
         }
         oct.box = box.isEmpty() ? null : box;
         oct.ver = o.ver;
+        // floor pad and grid go under the point map: framed before the octree list came (occupancy grid box, z 0 … 2), they sat
+        // above the map's floor and the half-transparent dark pad dimmed everything below it (a white desk drew grey)
+        if (oct.box) { if (!gSurf.children.length && !userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
         invalidate();
       }
     }
@@ -541,13 +637,16 @@ const VIS_W = 4096;
 const octVis = { data:new Uint8Array(VIS_W * 4), tex:null };
 octVis.tex = new THREE.DataTexture(octVis.data, VIS_W, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
 octVis.tex.magFilter = octVis.tex.minFilter = THREE.NearestFilter; octVis.tex.generateMipmaps = false;
-const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:50 }, vis:{ value:octVis.tex } };
+const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:50 }, vis:{ value:octVis.tex },
+                 pass:{ value:0 }, depth:{ value:null }, res:{ value:new THREE.Vector2(1, 1) }, near:{ value:0.05 }, far:{ value:500 }, band:{ value:1.5 } };
 function octMaterial() {
   // round splats sized by the local point spacing: neighbouring points overlap into a closed surface and EDL shades its edges;
-  // colours are drawn as stored (sRGB photo colours straight to the sRGB canvas)
-  return new THREE.ShaderMaterial({
-    uniforms:{ uIdx:{ value:0 }, uSpacing:{ value:0.01 }, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx },
-    vertexShader:`attribute vec3 color; uniform float uIdx; uniform float uSpacing; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC;
+  // colours are drawn as stored (sRGB photo colours straight to the sRGB canvas). Pass 1 (blended splats, see renderFrame): colour ×
+  // weight (1 − r², Potree) for splats within a depth band behind the nearest surface (band × splat radius, at least 0.6 % of the depth).
+  return octQuality(new THREE.ShaderMaterial({
+    uniforms:{ uIdx:{ value:0 }, uSpacing:{ value:0.01 }, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx,
+               uPass:octUni.pass, uDepth:octUni.depth, uRes:octUni.res, uNear:octUni.near, uFar:octUni.far, uBand:octUni.band },
+    vertexShader:`attribute vec3 color; uniform float uIdx; uniform float uSpacing; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC; varying float vR; varying float vZ;
       float bitAt(float m, float b){ return mod(floor(m / exp2(b)), 2.0); }
       void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position, 1.0);
         vec3 p = position; float idx = uIdx, d = 0.0;
@@ -561,35 +660,58 @@ function octMaterial() {
           idx += floor(t.g * 255.0 + 0.5) * 256.0 + floor(t.b * 255.0 + 0.5) + before;
           p = p * 2.0 - o; d += 1.0;
         }
-        gl_PointSize = clamp(uSpacing / exp2(d) * uK * uScale / -mv.z, uMin, uMax); gl_Position = projectionMatrix * mv; }`,
-    fragmentShader:`varying vec3 vC; void main(){ vec2 q = gl_PointCoord * 2.0 - 1.0; if (dot(q, q) > 1.0) discard; gl_FragColor = vec4(vC, 1.0); }` });
+        float px = uSpacing / exp2(d) * uK * uScale / -mv.z;
+        gl_PointSize = clamp(px, uMin, uMax); vR = 0.5 * gl_PointSize * -mv.z / uScale; vZ = -mv.z; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader:`uniform float uPass; uniform sampler2D uDepth; uniform vec2 uRes; uniform float uNear; uniform float uFar; uniform float uBand; varying vec3 vC; varying float vR; varying float vZ;
+      void main(){ vec2 q = gl_PointCoord * 2.0 - 1.0; float r2 = dot(q, q); if (r2 > 1.0) discard;
+        if (uPass < 0.5) {
+          gl_FragColor = vec4(vC, 1.0);
+#ifdef PARA
+          // paraboloid splat: depth grows towards the rim, so overlapping splats of one noisy surface meet in smooth curves instead of
+          // flat steps, and EDL shades the surface, not every disc
+          float zv = vZ + 0.5 * vR * r2, a = (uFar + uNear) / (uFar - uNear), b = 2.0 * uFar * uNear / (uFar - uNear);
+          gl_FragDepthEXT = 0.5 * (a - b / zv) + 0.5;
+#endif
+          return; }
+        float z = texture2D(uDepth, gl_FragCoord.xy / uRes).r * 2.0 - 1.0, front = 2.0 * uNear * uFar / (uFar + uNear - z * (uFar - uNear));
+        if (vZ > front + max(uBand * vR, 0.006 * front)) discard;
+        float w = 1.0 - r2; gl_FragColor = vec4(vC * w, w); }`, extensions:{ fragDepth:true } }));
 }
-async function octLoad(nd) {
-  nd.loading = true; oct.loading++;
-  const ver = nd.ver, run = oct.run;
+// High: paraboloid splat depth (gl_FragDepth turns off early depth rejection, so Low keeps flat discs for the Pi 5 GPU)
+function octQuality(m) { const on = quality === "high"; if (!!m.defines.PARA !== on) { if (on) m.defines.PARA = 1; else delete m.defines.PARA; m.needsUpdate = true; } return m; }
+// nodes come in batches (one /api/files request for up to 12 nodes or 300 k points, two batches in flight), largest on screen first
+const octFile = nd => oct.meta.dir + "/n" + nd.l + "_" + nd.x + "_" + nd.y + "_" + nd.z + ".bin";
+async function octLoad(nds) {
+  oct.loading++;
+  const run = oct.run, vers = nds.map(nd => nd.ver);
+  for (const nd of nds) nd.loading = true;
   try {
-    const r = await fetch("/file/" + oct.meta.dir + "/n" + nd.l + "_" + nd.x + "_" + nd.y + "_" + nd.z + ".bin?v=" + ver);
-    if (r.ok) {
-      const buf = await r.arrayBuffer(), N = Math.floor(buf.byteLength / 9);
-      if (oct.run === run && N > 0) {
-        const g = new THREE.BufferGeometry();
-        g.setAttribute("position", new THREE.BufferAttribute(new Uint16Array(buf, 0, N * 3), 3, true));
-        g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(buf, N * 6, N * 3), 3, true));
-        g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0.5, 0.5, 0.5), 0.87);
-        octUnload(nd);
-        const p = new THREE.Points(g, octMaterial());
-        p.position.set(nd.x * nd.size, nd.y * nd.size, nd.z * nd.size); p.scale.setScalar(nd.size); p.frustumCulled = false; p.visible = false;
-        p.updateMatrix(); p.matrixAutoUpdate = false;
-        nd.obj = p; nd.loadedN = N; nd.loadedVer = ver; oct.loadedPts += N; gOct.add(p);
-      }
-    }
+    const got = await loadBatch(nds.map(octFile));
+    nds.forEach((nd, i) => {
+      const buf = got[octFile(nd)], N = buf ? Math.floor(buf.byteLength / 9) : 0;
+      if (oct.run !== run || N <= 0) return;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(new Uint16Array(buf, 0, N * 3), 3, true));
+      g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(buf, N * 6, N * 3), 3, true));
+      g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0.5, 0.5, 0.5), 0.87);
+      octUnload(nd);
+      const p = new THREE.Points(g, octMaterial());
+      p.position.set(nd.x * nd.size, nd.y * nd.size, nd.z * nd.size); p.scale.setScalar(nd.size); p.frustumCulled = false; p.visible = false;
+      p.updateMatrix(); p.matrixAutoUpdate = false;
+      nd.obj = p; nd.loadedN = N; nd.loadedVer = vers[i]; oct.loadedPts += N; gOct.add(p);
+    });
   } catch (e) {}
-  nd.loading = false; oct.loading--; invalidate();
+  for (const nd of nds) nd.loading = false;
+  oct.loading--; invalidate();
   octPump();
 }
-// keep up to 6 node fetches in flight from the latest wanted list (largest on screen first)
 function octPump() {
-  while (oct.loading < 6 && oct.want && oct.want.length) { const nd = oct.want.shift(); if (!nd.loading && (!nd.obj || nd.loadedVer !== nd.ver) && oct.run !== null) octLoad(nd); }
+  while (oct.loading < 2 && oct.want && oct.want.length && oct.run !== null) {
+    const b = []; let pts = 0;
+    while (oct.want.length && b.length < 12 && pts < 300000) { const nd = oct.want.shift(); if (!nd.loading && (!nd.obj || nd.loadedVer !== nd.ver)) { b.push(nd); pts += nd.n; } }
+    if (!b.length) break;
+    octLoad(b);
+  }
 }
 const _frus = new THREE.Frustum(), _pm = new THREE.Matrix4();
 const oc = n => (n.x & 1) | ((n.y & 1) << 1) | ((n.z & 1) << 2);   // octant of a node inside its parent
@@ -722,17 +844,6 @@ function setTexRegion(key, x, y, z, ver, tv, g, tex) {   // textured region: its
   surf.have.set(key, { ver, tv });
   invalidate();
 }
-function loadTexture(url) {
-  return new Promise((ok, fail) => {
-    const img = new Image();
-    img.onload = () => {
-      const t = new THREE.Texture(img);
-      t.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
-      t.needsUpdate = true; ok(t);
-    };
-    img.onerror = fail; img.src = url;
-  });
-}
 function flushSurface() {
   clearTimeout(surf.timer); surf.timer = 0;
   for (const bk of surf.dirty) {
@@ -761,35 +872,31 @@ async function loadSurface(s) {
   const todo = s.regions.filter(([x, y, z, ver, tv]) => { const c = surf.have.get(x + "_" + y + "_" + z); return !c || c.ver !== ver || c.tv !== (tv || 0); });
   if (!todo.length) return;
   surf.busy = true; pendingLoads++;
-  // 바뀐 구역을 4 개씩 동시에 받는다(원격 접속이면 왕복 지연이 쌓이므로)
+  // changed regions come in batches of 16 (one /api/files request each: PLY + atlas JPEG), two batches in flight; the worker parses
+  // the PLYs, computes the vertex-colour regions' normals and decodes the atlases
   const run = s.run; let k = 0;
   const one = async () => {
     while (k < todo.length && surf.run === run) {
-      const [x, y, z, ver, tv] = todo[k++], key = x + "_" + y + "_" + z;
-      try {
+      const part = todo.slice(k, k + 16); k += 16;
+      const name = ([x, y, z, ver, tv]) => tv ? "mesh/t_" + x + "_" + y + "_" + z + "_" + tv : "mesh/r_" + x + "_" + y + "_" + z;
+      let got;
+      try { got = await loadBatch(part.flatMap(r => r[4] ? [name(r) + ".ply", name(r) + ".jpg"] : [name(r) + ".ply"]), true); } catch (e) { continue; }
+      if (surf.run !== run) { for (const v of Object.values(got)) if (v && v.close) v.close(); return; }
+      for (const r of part) {
+        const [x, y, z, ver, tv] = r, key = x + "_" + y + "_" + z, a = got[name(r) + ".ply"], bm = tv ? got[name(r) + ".jpg"] : null;
+        if (!a || (tv && !bm)) { if (bm) bm.close(); continue; }
+        const cur = surf.have.get(key);
         if (tv) {   // textured: mesh + atlas
-          const base = "/file/mesh/t_" + key + "_" + tv;
-          const [r, tex] = await Promise.all([fetch(base + ".ply"), loadTexture(base + ".jpg")]);
-          if (!r.ok) { tex.dispose(); continue; }
-          const g = parsePly(await r.arrayBuffer());
-          if (surf.run !== run) { g.dispose(); tex.dispose(); return; }
-          const cur = surf.have.get(key);
-          if (cur && (cur.ver > ver || (cur.ver === ver && cur.tv >= tv))) { g.dispose(); tex.dispose(); continue; }
-          setTexRegion(key, x, y, z, ver, tv, g, tex);
+          if (cur && (cur.ver > ver || (cur.ver === ver && cur.tv >= tv))) { bm.close(); continue; }
+          setTexRegion(key, x, y, z, ver, tv, geomFrom(a), bitmapTexture(bm));
           continue;
         }
-        const r = await fetch("/file/mesh/r_" + key + ".ply?v=" + ver);
-        if (!r.ok) continue;
-        const g = parsePly(await r.arrayBuffer());
-        if (surf.run !== run) { g.dispose(); return; }
-        g.computeVertexNormals();
-        const cur = surf.have.get(key);
         if (cur && cur.ver >= ver && !cur.tv) continue;
-        setRegion(key, x, y, z, ver, g);
-      } catch (e) {}
+        setRegion(key, x, y, z, ver, geomFrom(a));
+      }
     }
   };
-  await Promise.all([one(), one(), one(), one()]);
+  await Promise.all([one(), one()]);
   if (surf.run === run) { flushSurface(); if (!userMoved && !QS.get("cam")) fitView(false, !surfFitted); else { const b = contentBox(); if (b) stageFor(b); } surfFitted = true; }
   surf.busy = false; pendingLoads--; loadDone();
 }
@@ -1301,7 +1408,7 @@ function applyView(v) {
   view = v;
   // with a surface map the objects are already in the mesh (shape and colour): their point clouds only speckle it, so start them off.
   // Clicking an object still highlights its points.
-  if (pointsAuto && view.scene_points && view.scene_points.surface && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
+  if (pointsAuto && view.scene_points && (view.scene_points.surface || view.scene_points.octree) && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
   // presentation defaults (once per page, a URL value such as ?c_scene=1 wins): the surface already shows the scene, so the point map
   // only speckles it; a handheld camera marker is a debugging aid
   if (!presetDone) { presetDone = true;
@@ -1323,8 +1430,13 @@ function applyView(v) {
   if (!viewSeen) { viewSeen = true; fitView(false); const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
 }
 
-async function poll() {
-  if (document.hidden) { setTimeout(poll, 1000); return; }
+// Memory folder (not --ingest): the server watches view.json / pose.json and pushes over /stream (SSE) — `vv` = new view.json
+// version (fetched once), `fpose` = the fast camera pose. An idle viewer sends no requests. If the event stream is down, a slow
+// poll (every 2 s) keeps the page current until it reconnects.
+let viewBusy = false, viewAgain = false;
+async function fetchView() {
+  if (viewBusy) { viewAgain = true; return; }
+  viewBusy = true;
   try {
     const r = await fetch("/api/view?v=" + encodeURIComponent(viewVer));
     const j = await r.json();
@@ -1337,24 +1449,32 @@ async function poll() {
       updateWalls();
     }
   } catch (e) {}
-  setTimeout(poll, 250);
+  viewBusy = false;
+  if (viewAgain) { viewAgain = false; fetchView(); }
 }
 
 // fast camera pose (pose.json, a few hundred bytes, written every keyframe): the handheld camera moves without waiting for view.json
 let latestPose = null;
-let poseMissing = 0;   // no pose.json (not a live run): ask once a second instead of 20 times
-async function pollPose() {
-  if (!document.hidden && view && !LIVE) {
-    try {
-      const r = await fetch("/file/pose.json?t=" + Date.now());
-      poseMissing = r.ok ? 0 : poseMissing + 1;
-      if (r.ok) {
-        const j = await r.json();
-        if (j.cam && (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5)) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
-      }
-    } catch (e) {}
-  }
-  setTimeout(pollPose, poseMissing > 3 ? 1000 : 50);   // 20 /s: --fast-pose writes a pose for every camera frame
+function onFilePose(j) {
+  if (!view || LIVE || !j.cam) return;
+  if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
+}
+function startFileEvents() {
+  let up = false;
+  // ?poll=1: no event stream (headless screenshot tools wait for open connections and would never finish)
+  const es = QS.get("poll") === "1" ? { addEventListener() {} } : new EventSource("/stream");
+  es.onopen = () => { up = true; };
+  es.onerror = () => { up = false; };   // EventSource reconnects by itself; the slow poll covers the gap
+  es.addEventListener("vv", e => { up = true; if (JSON.parse(e.data) !== viewVer) fetchView(); });
+  es.addEventListener("fpose", e => { up = true; try { onFilePose(JSON.parse(e.data)); } catch (err) {} });
+  fetchView();
+  (async function slow() {
+    if (!up && !document.hidden) {
+      fetchView();
+      try { const r = await fetch("/file/pose.json?t=" + Date.now()); if (r.ok) onFilePose(await r.json()); } catch (e) {}
+    }
+    setTimeout(slow, 2000);
+  })();
 }
 
 
@@ -1486,7 +1606,7 @@ function stepChase(dt) {
   return controls.target.distanceTo(tgt) > 1e-3 || camera.position.distanceTo(pos) > 1e-3;
 }
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
-$("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
+$("c_blend").onchange = invalidate; $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
 $("n_octk").onchange = () => { octUni.sizeK.value = opt("n_octk"); invalidate(); };
 $("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); invalidate(); };
 $("c_shade").onchange = () => { surfUni.flatk.value = opt("c_shade") ? 0 : 1; invalidate(); };
@@ -1766,7 +1886,7 @@ loadRobotKind().then(invalidate);
 // 주소 뒤 ?c_surf=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
 for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); else if (e && e.type === "number") { e.value = v; e.dispatchEvent(new Event("change")); } }
 camFromQuery();
-startLive().then(live => { if (!live) { $("boot").classList.add("gone"); poll(); pollPose(); } });
+startLive().then(live => { if (!live) { $("boot").classList.add("gone"); startFileEvents(); } });
 </script>
 </body>
 </html>

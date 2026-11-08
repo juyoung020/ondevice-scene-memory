@@ -49,7 +49,11 @@ fn write_lazy(dst: &Path, job: Job) {
 
 fn write_now(dst: &Path, bytes: &[u8]) {
     let tmp = dst.with_extension("tmp");
-    std::fs::write(&tmp, bytes).expect("write");
+    if std::fs::write(&tmp, bytes).is_err() {
+        // 폴더가 지워졌으면(지도를 새로 쌓아 옛 판 폴더를 지움) 다시 만들어 씀
+        let _ = std::fs::create_dir_all(dst.parent().unwrap());
+        std::fs::write(&tmp, bytes).expect("write");
+    }
     replace(&tmp, dst);
 }
 

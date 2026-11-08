@@ -61,7 +61,10 @@ struct Args {
     scene_vox: f64,
     max_depth: f64,
     scene_step: usize, // 3D 지도에 쓸 화소 간격
+    pts_depth: f64,    // --pts-depth M: 점 지도에 넣을 최대 깊이(멀수록 깊이 잡음이 커 표면이 두꺼워짐)
+    pts_obs: u8,       // --pts-obs N: 고운 칸이 점이 되려면 키프레임 N 장 이상에서 보여야(한두 번 맞은 잡음 점을 거름)
     surface: bool,     // --surface: 점 대신 표면 지도(TSDF + Surface Nets)
+    points: bool,      // 점 지도(옥트리 LOD): 표면 지도가 아니면 늘, --surface 와 함께면 --points
     tsdf_vox: f64,
     stream: Option<String>, // --stream <파일|->: 연결 프로그램(bridge/)이 보내는 장면 스트림(위치·컬러·깊이)
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
@@ -103,7 +106,10 @@ fn args() -> Args {
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
+        pts_depth: get("--pts-depth").map_or(3.0, |s| s.parse().unwrap()),
+        pts_obs: get("--pts-obs").map_or(3, |s| s.parse().unwrap()),
         surface: v.iter().any(|x| x == "--surface"),
+        points: !v.iter().any(|x| x == "--surface") || v.iter().any(|x| x == "--points"),
         // 표면 칸 3 cm: 칸마다 측정이 더 모여 D435 깊이 잡음에도 면이 이어짐(2 cm 는 바닥·벽이 얼룩), 작은 물체(키보드·마우스)는 그대로
         tsdf_vox: get("--tsdf-vox").map_or(0.03, |s| s.parse().unwrap()),
         stream: get("--stream"),
@@ -365,6 +371,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
+    scene.min_obs = a.pts_obs;
     // 스트림 표면 지도(루프 클로저 반영)는 서브맵이 표면을 맡는다: 장면은 서브맵에 쌓고, 전체 표면은 서브맵을 합친 것
     let sub_mode = a.stream.is_some() && a.surface && a.rebuild_every >= 0.0;
     let mut tsdf = (a.surface && !sub_mode).then(|| tsdf::Tsdf::new(a.tsdf_vox));
@@ -389,7 +396,6 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let _ = std::fs::remove_dir_all(a.out.join("mesh"));
     std::fs::create_dir_all(a.out.join("mesh")).unwrap();
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
-    let (mut n_chunk, mut n_scene) = (0usize, 0usize);
     let mut last_pose = [0.0; 3];
     let t0 = Instant::now();
     // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
@@ -764,11 +770,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         if let Some(job) = rb_job.take_if(|j| j.is_finished()) {
             let mut rb = job.join().expect("다시 쌓기 스레드");
             install_surface(&mut subs, rb.surf.take());
+            let pre = rb.pts.take();
             install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
             (n_rebuild, last_merge) = (n_rebuild + 1, nkf);
             scene_json = match subs.as_mut() {
-                Some(s) => surface_outputs(&a.out, run_id, scene.vox, s, tex.as_ref()),
-                None => fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf),
+                Some(s) => { let mut j = surface_outputs(&a.out, run_id, scene.vox, s, tex.as_ref()); if a.points { j["octree"] = write_points(&a.out, &mut scene, PTS_BUDGET, pre); } j }
+                None => fresh_outputs(&a.out, &mut run_id, &mut scene, &mut tsdf, a.points, pre),
             };
             write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, true);
         }
@@ -1218,7 +1225,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         let t_sub = c_sub.elapsed().as_secs_f64();
         if map_ok && a.stream.is_some() && a.rebuild_every >= 0.0 {
-            kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, sub_mode);
+            kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, sub_mode && !a.points); // 점 지도는 다시 쌓을 때 온 깊이가 필요
             if let Some(tx) = tex.as_mut() {
                 tx.poll();
                 let (anc, rel) = kfs.rel_of(anchor, raw.0, raw.1);
@@ -1247,13 +1254,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             if scene_now || nkf == 1 || a.snaps.contains(&nkf) {
                 last_scene = Instant::now();
                 // 새로 확정된 칸만 조각 파일로: 뷰어는 아직 안 받은 조각만 받는다(원격 접속에서 지도 전체를 매번 받지 않게)
-                let pts = scene.new_points();
-                if !pts.is_empty() {
-                    n_scene += pts.len();
-                    out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), pts);
-                    n_chunk += 1;
+                scene_json = json!({"run": run_id, "voxel": scene.vox});
+                if a.points {
+                    scene_json["octree"] = write_points(&a.out, &mut scene, PTS_BUDGET, None);
                 }
-                scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
                 if let Some(ts) = surf(&mut tsdf, &mut subs) {
                     write_surface(&a.out, ts, tex.as_ref());
                     scene_json["surface"] = surface_json(ts, run_id, tex.as_ref());
@@ -1287,9 +1291,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     // 끝: 마지막 다시 쌓기 뒤에 노드가 또 움직였으면 끝난 그래프로 한 번 더(결과 지도·물체·poses_map.txt 가 최종 위치를 따름)
     let mut installed = false;
+    let mut end_pts: Option<PtsFiles> = None; // 마지막으로 갈아 끼운 점 지도의 노드 파일
     if let Some(job) = rb_job.take() {
         let mut rb = job.join().expect("다시 쌓기 스레드");
         install_surface(&mut subs, rb.surf.take());
+        end_pts = rb.pts.take();
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
         (n_rebuild, installed) = (n_rebuild + 1, true);
     }
@@ -1302,11 +1308,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let mut rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved, sj);
         kfs.clear_dirty();
         install_surface(&mut subs, rb.surf.take());
+        end_pts = rb.pts.take();
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, &mut scene, &mut mem, &mut traj, &mut map_traj);
         (n_rebuild, installed) = (n_rebuild + 1, true);
     }
     if installed && subs.is_none() {
-        fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf); // scene_json 은 아래 마지막 기록에서 다시 만듦
+        fresh_outputs(&a.out, &mut run_id, &mut scene, &mut tsdf, a.points, end_pts.take()); // scene_json 은 아래 마지막 기록에서 다시 만듦
     }
     if a.stream.is_some() {
         eprintln!("다시 쌓기 {n_rebuild} 번, 보관 장면 {} 개({:.0} MB)", kfs.len(), kfs.bytes() as f64 / 1048576.0);
@@ -1332,13 +1339,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let _ = std::fs::write(a.out.join("poses_map.txt"), s);
     }
     let seg = worker.join().expect("worker");
-    let pts = scene.new_points();
-    if !pts.is_empty() {
-        n_scene += pts.len();
-        out::ply(&a.out.join(format!("scene/c{n_chunk}.ply")), pts);
-        n_chunk += 1;
+    scene_json = json!({"run": run_id, "voxel": scene.vox});
+    if a.points {
+        scene_json["octree"] = write_points(&a.out, &mut scene, 0, end_pts.take());
     }
-    scene_json = json!({"run": run_id, "chunks": n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": n_scene});
     if let Some(ts) = surf(&mut tsdf, &mut subs) {
         write_surface(&a.out, ts, tex.as_ref());
         // 텍스처: 남은 구역을 모두 붙인 뒤 목록을 만든다
@@ -1349,7 +1353,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         scene_json["surface"] = surface_json(ts, run_id, tex.as_ref());
     }
-    let pts = scene.points();
+    let n_pts = scene.n_points();
     let t_end = traj.last().map_or(0.0, |x| x.0);
     for o in mem.objs.iter_mut().filter(|o| o.dirty) {
         o.cells_saved = 0; // 마지막 기록은 바뀐 물체를 모두 내보냄
@@ -1361,7 +1365,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         *by.entry(o.name.as_str()).or_default() += 1;
     }
     let mut summary = json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
-        "scene_points": pts.len(), "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
+        "scene_points": n_pts, "scene_mb": scene.bytes() as f64 / 1048576.0, "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
         "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "depth_scale_vs_kinect": scale_stats(&scales), "vo": vo_report(&ate, vo_fail), "vo_reject": vo_reject, "vo_keyframes": vo_nref, "vo_dvo": vo_dvo, "pose_only_frames": n_fast, "pose_only_ms": t_fast / (n_fast.max(1) as f64) * 1e3, "merged": mem.merged});
     if a.stream.is_some() {
         summary["stream_lost"] = json!(stream_lost);
@@ -1373,6 +1377,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
 
 /// 다시 쌓은 지도 한 벌(작업 스레드에서 만들어 본 스레드가 갈아 끼움)
 struct Rebuilt {
+    pts: Option<PtsFiles>, // 점 지도 노드 파일 전부
     grid: Grid,
     scene: SceneMap,
     surf: Option<submap::Done>, // 서브맵을 다시 합친 전체 표면(표면 지도)
@@ -1404,6 +1409,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let c0 = Instant::now();
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
+    scene.min_obs = a.pts_obs;
     let mut tsdf = None; // 표면은 서브맵이 맡음
     let mut mem = Memory::new(0.012, 0.04);
     mem.next = next_id;
@@ -1415,9 +1421,10 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
             mem.merge_pass();
         }
     }
+    let pts = a.points.then(|| export_points(&mut scene)); // 점 지도 옥트리 노드 파일도 작업 스레드에서
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
-    Rebuilt { grid, scene, surf: surf.map(|j| j.run()), mem, traj, map_traj, last_seq, n: snap.len(), secs, moved }
+    Rebuilt { pts, grid, scene, surf: surf.map(|j| j.run()), mem, traj, map_traj, last_seq, n: snap.len(), secs, moved }
 }
 
 /// 다시 쌓은 지도로 갈아 끼우고, 쌓는 동안 새로 보관한 장면을 지금 위치로 이어서 넣는다
@@ -1472,21 +1479,63 @@ fn surface_outputs(dir: &Path, run_id: u64, vox: f64, s: &mut submap::Submaps, t
     json!({"run": run_id, "chunks": 0, "prefix": "scene/c", "voxel": vox, "n": 0, "surface": surface_json(&s.global, run_id, tex)})
 }
 
+/// 점 지도: 한 번에 다시 쓸 노드의 점 수 상한(본 스레드가 오래 멈추지 않게, PC 약 30 ms)
+const PTS_BUDGET: usize = 300_000;
+
+/// 노드 파일 바이트: (수준, 노드 키, 바이트)
+type PtsFiles = Vec<(u32, u64, Vec<u8>)>;
+
+/// 다시 쌓은 점 지도의 노드를 모두 파일 바이트로(작업 스레드에서)
+fn export_points(scene: &mut SceneMap) -> PtsFiles {
+    scene.place();
+    scene.mark_all();
+    scene.take_dirty(0).into_iter().map(|(l, k)| (l, k, scene.node_bytes(l, k))).collect()
+}
+
+/// 점 지도 옥트리 출력: 새로 확정된 점을 노드에 넣고 점이 늘어난 노드 파일(scene/<판>/n<수준>_<x>_<y>_<z>.bin)과 노드 목록
+/// (scene/<판>/octree.json)을 쓴다. budget: 한 번에 다시 쓸 점 수 상한(0 = 모두), pre: 다시 쌓은 지도의 노드 전부(작업 스레드가 만든 바이트) — 새 판 폴더에 쓰고 옛 판 폴더는 지움
+fn write_points(dir: &Path, scene: &mut SceneMap, budget: usize, pre: Option<PtsFiles>) -> serde_json::Value {
+    let c0 = Instant::now();
+    let added = scene.place();
+    let sub = format!("scene/{}", scene.run);
+    let all = pre.is_some();
+    if all {
+        if let Ok(rd) = std::fs::read_dir(dir.join("scene")) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy() != scene.run.to_string() {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(dir.join(&sub)).unwrap();
+    let mut dirty: PtsFiles = pre.unwrap_or_default();
+    dirty.extend(scene.take_dirty(budget).into_iter().map(|(l, k)| (l, k, scene.node_bytes(l, k))));
+    for (l, k, b) in dirty.iter_mut() {
+        let c = maps::node_coord(*k);
+        out::write_owned(&dir.join(format!("{sub}/n{l}_{}_{}_{}.bin", c[0], c[1], c[2])), std::mem::take(b));
+    }
+    let idx = scene.index();
+    let ver: i64 = idx.iter().map(|n| n[5]).sum();
+    let j = json!({"run": scene.run, "ver": ver, "path": format!("{sub}/octree.json"), "dir": sub, "voxel": scene.vox, "g": maps::OCT_G, "depth": maps::OCT_DEPTH, "n": scene.n_points()});
+    if !dirty.is_empty() || all {
+        out::write_owned(&dir.join(format!("{sub}/octree.json")), serde_json::to_vec(&json!({"run": scene.run, "voxel": scene.vox, "g": maps::OCT_G, "depth": maps::OCT_DEPTH, "nodes": idx})).unwrap());
+    }
+    if std::env::var("MEMMAP_PTS_LOG").is_ok() {
+        eprintln!("점 지도: 새 점 {added}, 노드 {} 개 씀, 전체 {} 점 / 노드 {} 개, {:.1} ms, {:.0} MB", dirty.len(), scene.n_points(), idx.len(), c0.elapsed().as_secs_f64() * 1e3, scene.bytes() as f64 / 1048576.0);
+    }
+    j
+}
+
 /// 다시 쌓은 뒤 출력 새로: 실행 번호를 바꿔 뷰어가 받은 조각·표면을 비우게 하고, 옛 조각·면 파일을 지우고 지금 지도를 처음부터 씀
-fn fresh_outputs(dir: &Path, run_id: &mut u64, n_chunk: &mut usize, n_scene: &mut usize, scene: &mut SceneMap, tsdf: &mut Option<tsdf::Tsdf>) -> serde_json::Value {
+fn fresh_outputs(dir: &Path, run_id: &mut u64, scene: &mut SceneMap, tsdf: &mut Option<tsdf::Tsdf>, points: bool, pre: Option<PtsFiles>) -> serde_json::Value {
     *run_id += 1;
-    for d in ["scene", "mesh"] {
-        let _ = std::fs::remove_dir_all(dir.join(d));
-        std::fs::create_dir_all(dir.join(d)).unwrap();
+    let _ = std::fs::remove_dir_all(dir.join("mesh"));
+    std::fs::create_dir_all(dir.join("mesh")).unwrap();
+    let mut sj = json!({"run": *run_id, "voxel": scene.vox});
+    if points {
+        sj["octree"] = write_points(dir, scene, PTS_BUDGET, pre);
     }
-    (*n_chunk, *n_scene) = (0, 0);
-    let pts = scene.new_points();
-    if !pts.is_empty() {
-        *n_scene += pts.len();
-        out::ply(&dir.join("scene/c0.ply"), pts);
-        *n_chunk = 1;
-    }
-    let mut sj = json!({"run": *run_id, "chunks": *n_chunk, "prefix": "scene/c", "voxel": scene.vox, "n": *n_scene});
     if let Some(ts) = tsdf.as_mut() {
         write_surface(dir, ts, None);
         sj["surface"] = surface_json(ts, *run_id, None);
@@ -1529,27 +1578,29 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
         map_traj.push((t, pwc, r));
     }
     // 점 지도용 3D 점: 줄마다 나눠 상주 스레드 풀에서(표면 지도면 TSDF 가 깊이를 직접 쓰니 건너뜀)
-    let sp: Vec<(V3, [u8; 3], f32)> = if a.surface || !map_ok {
+    let sp: Vec<(V3, [u8; 3], f32)> = if !a.points || !map_ok {
         vec![]
     } else {
         use rayon::prelude::*;
-        let (step, maxd) = (a.scene_step, a.max_depth);
+        let (step, maxd) = (a.scene_step, a.max_depth.min(a.pts_depth));
         let rows: Vec<usize> = (0..h).step_by(step).collect();
         rows.par_iter()
             .flat_map_iter(|&v| {
                 let (depth, rgb) = (&depth, &rgb);
                 (0..w).step_by(step).filter_map(move |u| {
                     let pc = back(u, v)?;
-                    (pc[2] < maxd && !depth_edge(depth, w, h, u, v)).then(|| {
+                    (pc[2] < maxd && !depth_edge(depth, w, h, u, v) && facing(depth, w, h, k, u, v, &pc)).then(|| {
                         let o = (v * w + u) * 3;
                         (to_w(&pc), [rgb[o], rgb[o + 1], rgb[o + 2]], pc[2] as f32)
                     })
                 })
             })
             .collect()
-    };        if let (Some(ts), true) = (tsdf.as_mut(), map_ok) {
+    };
+    if let (Some(ts), true) = (tsdf.as_mut(), map_ok) {
         ts.integrate(&depth, &rgb, w, h, k, &r, &pwc, a.max_depth);
-    } else if !a.surface {
+    }
+    if !sp.is_empty() {
         scene.add(nkf, &sp);
     }
     let c3 = Instant::now();
@@ -1685,6 +1736,23 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
         view["scene_points"] = scene.clone();
     }
     out::write_owned(&dir.join("view.json"), serde_json::to_vec(&view).unwrap());
+}
+
+/// 표면이 시선과 이루는 각: 이웃 화소(±2)로 만든 법선과 시선의 코사인이 0.3(약 73°) 이상인 점만 — 비스듬히 본 면은 깊이 잡음이
+/// 시선 방향으로 길게 번져 줄무늬 껍질이 됨
+fn facing(d: &[f32], w: usize, h: usize, k: [f64; 4], u: usize, v: usize, pc: &V3) -> bool {
+    if u < 2 || v < 2 || u + 2 >= w || v + 2 >= h {
+        return false;
+    }
+    let [fx, fy, cx, cy] = k;
+    let b = |x: usize, y: usize| {
+        let z = d[y * w + x] as f64;
+        [(x as f64 - cx) / fx * z, (y as f64 - cy) / fy * z, z]
+    };
+    let (du, dv) = (sub(&b(u + 2, v), &b(u - 2, v)), sub(&b(u, v + 2), &b(u, v - 2)));
+    let n = cross(&du, &dv);
+    let nn = norm(&n) * norm(pc);
+    nn > 0.0 && dot(&n, pc).abs() / nn >= 0.3
 }
 
 /// 점 주변 5×5 깊이가 8 % 넘게 들쭉날쭉하면 경계

@@ -72,8 +72,9 @@
   <details open><summary>Display</summary>
     <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
     <label class="row" title="surface shading: soft light from above + sun on smooth normals (off = plain photo colours)"><input type="checkbox" id="c_shade" checked> Surface shading</label>
-    <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl"> Depth shading (EDL, quality high)</label>
-    <div class="num">EDL strength <input type="number" id="n_edl" value="1" min="0" max="5" step="0.1"></div>
+    <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl" checked> Depth shading (EDL)</label>
+    <div class="num">EDL strength <input type="number" id="n_edl" value="0.4" min="0" max="3" step="0.05"></div>
+    <div class="num" title="depth steps smaller than this (log2 view depth, 0.01 ≈ 0.7 %) are not shaded: the small depth jitter between overlapping splats of one surface stays unshaded, real edges and creases still darken">EDL tolerance <input type="number" id="n_edltol" value="0.01" min="0" max="0.1" step="0.002"></div>
     <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog" checked> Depth fog</label>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
     <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
@@ -81,6 +82,8 @@
     <label class="row">Point colour
       <select id="s_pcolor"><option>true colour</option><option>state colour</option></select></label>
     <label class="row"><input type="checkbox" id="c_scene" checked> 3D map points</label>
+    <div class="num" title="octree point map: splat diameter as a multiple of the local point spacing">3D map point size <input type="number" id="n_octk" value="1.3" min="0.5" max="4" step="0.1"></div>
+    <div id="octinfo" class="mono"></div>
     <div class="num">3D map opacity <input type="number" id="n_sop" value="1" min="0.05" max="1" step="0.05"></div>
     <div class="num" title="splat size / voxel: above 1.4 neighbouring points overlap into a surface">3D map splat × voxel <input type="number" id="n_ssize" value="1.35" min="0.3" max="4" step="0.1"></div>
     <div class="num">Objects as <select id="s_odraw"><option>points</option><option>surface</option></select></div>
@@ -147,14 +150,13 @@ const QS = new URLSearchParams(location.search);
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });   // transparent clear: the page gradient is the background
 renderer.setClearColor(0x000000, 0);
 host.appendChild(renderer.domElement);
-// Quality: "high" = depth shading pass (EDL) + device pixel ratio up to 2; "low" = one plain pass at pixel ratio 1.
-// Weak GPUs (Raspberry Pi V3D, mobile, software rasterisers) start at low: a full-screen post pass froze the Pi 5 V3D.
+// Quality: "high" = device pixel ratio up to 2 and a 3 M point budget for the octree point map; "low" = pixel ratio 1 and 0.8 M points.
+// Weak GPUs (Raspberry Pi V3D, mobile, software rasterisers) start at low. EDL depth shading stays on in both (one light full-screen pass).
 const GPU_NAME = (() => { try { const gl = renderer.getContext(), x = gl.getExtension("WEBGL_debug_renderer_info"); return String(gl.getParameter(x ? x.UNMASKED_RENDERER_WEBGL : gl.RENDERER)); } catch (e) { return ""; } })();
 const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShader|softpipe/i.test(GPU_NAME);
 let quality = QS.get("quality") || localStorage.getItem("sg_quality") || (WEAK_GPU ? "low" : "high");
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
-  const e = $("c_edl"); if (e) e.checked = quality === "high";
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
   if (typeof resize === "function") { resize(); invalidate(); }
 }
@@ -178,24 +180,26 @@ const gScene = new THREE.Group(); scene.add(gScene);   // 3D map chunks: kept ac
 const gSurf = new THREE.Group(); scene.add(gSurf);     // surface map regions (TSDF mesh): replaced only when a region's version changes
 
 // ---------------- EDL (eye-dome lighting) ----------------
-// Screen-space shading from the depth buffer (as in Potree / CloudCompare): each pixel is darkened by how much its
-// neighbours are closer (log depth), so object outlines, steps and creases show and the point map reads as surfaces.
+// Screen-space shading from the depth buffer, as in Potree (edl.fs, from CloudCompare qEDL): each pixel looks at 8 neighbours on a
+// circle of `radius` pixels and sums how much farther it is than they are in log2 view depth (minus a small tolerance, see n_edltol); colour × exp(−sum/8 · 300 · strength).
+// Object outlines, steps and creases darken, so a point map reads as solid surfaces. A background pixel next to geometry gets a soft
+// dark halo (Potree adds 100 per covered neighbour there).
 const edl = { rt:null, w:0, h:0, scene:new THREE.Scene(), cam:new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1) };
 edl.mat = new THREE.ShaderMaterial({
-  uniforms:{ tColor:{ value:null }, tDepth:{ value:null }, uPx:{ value:new THREE.Vector2() }, uNear:{ value:0.05 }, uFar:{ value:500 }, uStr:{ value:1 } },
+  uniforms:{ tColor:{ value:null }, tDepth:{ value:null }, uPx:{ value:new THREE.Vector2() }, uNear:{ value:0.05 }, uFar:{ value:500 }, uStr:{ value:0.4 }, uRad:{ value:1.4 }, uTol:{ value:0.01 } },
   vertexShader:`varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
-  fragmentShader:`uniform sampler2D tColor; uniform sampler2D tDepth; uniform vec2 uPx; uniform float uNear; uniform float uFar; uniform float uStr; varying vec2 vUv;
-    float lz(float d){ float z = d * 2.0 - 1.0; return log2((2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear))); }
+  fragmentShader:`uniform sampler2D tColor; uniform sampler2D tDepth; uniform vec2 uPx; uniform float uNear; uniform float uFar; uniform float uStr; uniform float uRad; uniform float uTol; varying vec2 vUv;
+    float ld(float d){ if (d >= 1.0) return 0.0; float z = d * 2.0 - 1.0; return log2((2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear))); }
     void main(){
-      vec4 c = texture2D(tColor, vUv); float d = texture2D(tDepth, vUv).r;
-      if (d >= 1.0) { gl_FragColor = c; return; }
-      float l0 = lz(d), s = 0.0;
+      vec4 c = texture2D(tColor, vUv); float l0 = ld(texture2D(tDepth, vUv).r), s = 0.0;
       for (int i = 0; i < 8; i++) {
-        float a = float(i) * 0.7853982; vec2 o = vec2(cos(a), sin(a)) * uPx * 1.4;
-        float dn = texture2D(tDepth, vUv + o).r;
-        s += max(0.0, l0 - (dn >= 1.0 ? l0 - 0.25 : lz(dn)));   // background neighbour = a small fixed step (thin grid lines stay light)
+        float a = float(i) * 0.7853982;
+        float ln = ld(texture2D(tDepth, vUv + vec2(cos(a), sin(a)) * uPx * uRad).r);
+        if (ln != 0.0) s += (l0 == 0.0) ? 100.0 : max(0.0, l0 - ln - uTol);
       }
-      gl_FragColor = vec4(c.rgb * exp(-s / 8.0 * 300.0 * uStr * 0.01), c.a);
+      float shade = exp(-s / 8.0 * 300.0 * uStr);
+      if (l0 == 0.0) { gl_FragColor = vec4(c.rgb * shade, max(c.a, (1.0 - shade) * 0.6)); return; }
+      gl_FragColor = vec4(c.rgb * shade, c.a);
     }`,
   depthTest:false, depthWrite:false });
 edl.scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), edl.mat));
@@ -210,7 +214,7 @@ function renderFrame() {
   renderer.setRenderTarget(edl.rt); renderer.render(scene, camera); renderer.setRenderTarget(null);
   const u = edl.mat.uniforms;
   u.tColor.value = edl.rt.texture; u.tDepth.value = edl.rt.depthTexture; u.uPx.value.set(1 / s.x, 1 / s.y);
-  u.uNear.value = camera.near; u.uFar.value = camera.far; u.uStr.value = opt("n_edl");
+  u.uNear.value = camera.near; u.uFar.value = camera.far; u.uStr.value = opt("n_edl"); u.uTol.value = opt("n_edltol");
   renderer.render(edl.scene, edl.cam);
 }
 let needsRender = true;
@@ -472,6 +476,175 @@ async function loadSceneChunks(sp) {
   sceneChunks.busy = false; pendingLoads--; loadDone();
 }
 
+// ---------------- 3D map point octree (Potree-style level of detail) ----------------
+// memmap writes the point map as an octree (scene/<run>/octree.json + one n<L>_<x>_<y>_<z>.bin per node). Level L keeps one point per
+// cell of spacing voxel·2^(depth−L); a node is G such cells wide and its eight children (level L+1) halve both. Each point lives in
+// exactly one node (the coarsest one whose cell was still free), so coarse nodes give the whole room sparsely and finer nodes add detail.
+// Every frame the visible nodes are chosen by screen size (largest first) until the point budget is reached; only those are fetched and
+// drawn. Node file: N × uint16 xyz (fraction of the node cube) then N × RGB, uploaded as normalised attributes without parsing.
+const gOct = new THREE.Group(); scene.add(gOct);
+const OCT_BUDGET = +(QS.get("budget") || 0);
+const oct = { run:null, ver:null, meta:null, nodes:new Map(), roots:[], busy:false, loading:0, loadedPts:0, drawn:0, nDrawn:0, box:null, tick:0 };
+function octBudget() { return OCT_BUDGET || (quality === "high" ? 3000000 : 800000); }
+function octReset() {
+  for (const n of oct.nodes.values()) octUnload(n);
+  Object.assign(oct, { run:null, ver:null, meta:null, nodes:new Map(), roots:[], loadedPts:0, drawn:0, nDrawn:0, box:null });
+}
+function octUnload(n) {
+  if (!n.obj) return;
+  gOct.remove(n.obj); n.obj.geometry.dispose(); n.obj.material.dispose(); oct.loadedPts -= n.loadedN; n.obj = null; n.loadedN = 0; n.loadedVer = -1;
+}
+async function loadOctree(o) {
+  if (oct.run !== o.run) { octReset(); oct.run = o.run; }
+  if (oct.busy || oct.ver === o.ver) return;
+  oct.busy = true; pendingLoads++;
+  try {
+    const r = await fetch("/file/" + o.path + "?v=" + o.ver);
+    if (r.ok) {
+      const j = await r.json();
+      if (oct.run === o.run && j.run === o.run) {
+        const m = { vox:j.voxel, g:j.g, depth:j.depth, dir:o.dir };
+        oct.meta = m;
+        const box = new THREE.Box3();
+        for (const [l, x, y, z, n, ver] of j.nodes) {
+          const key = l + "/" + x + "/" + y + "/" + z;
+          let nd = oct.nodes.get(key);
+          if (!nd) {
+            const size = m.vox * m.g * 2 ** (m.depth - l);
+            nd = { key, l, x, y, z, size, spacing:m.vox * 2 ** (m.depth - l), kids:[], obj:null, loadedN:0, loadedVer:-1, loading:false, used:0,
+                   box:new THREE.Box3(new THREE.Vector3(x * size, y * size, z * size), new THREE.Vector3((x + 1) * size, (y + 1) * size, (z + 1) * size)) };
+            nd.center = nd.box.getCenter(new THREE.Vector3()); nd.radius = size * 0.866;
+            oct.nodes.set(key, nd);
+          }
+          nd.n = n; nd.ver = ver;
+          if (l >= m.depth - 1) box.union(nd.box);
+        }
+        oct.roots = [];
+        for (const nd of oct.nodes.values()) nd.kids = [];
+        for (const nd of oct.nodes.values()) {
+          const p = oct.nodes.get((nd.l - 1) + "/" + Math.floor(nd.x / 2) + "/" + Math.floor(nd.y / 2) + "/" + Math.floor(nd.z / 2));
+          if (p) p.kids.push(nd); else oct.roots.push(nd);
+        }
+        oct.box = box.isEmpty() ? null : box;
+        oct.ver = o.ver;
+        invalidate();
+      }
+    }
+  } catch (e) {}
+  oct.busy = false; pendingLoads--; loadDone();
+}
+// Visible-node texture (Potree's adaptive point size): one texel per drawn node in breadth-first order, R = mask of drawn children
+// (bit = octant x + 2y + 4z), G·256 + B = index offset to its first drawn child (children follow in octant order). The vertex shader
+// walks down from its own node to the deepest drawn node at the point and takes that level's spacing, so a coarse point inside a
+// refined area is drawn as small as the fine points around it and the surface closes without blobs.
+const VIS_W = 4096;
+const octVis = { data:new Uint8Array(VIS_W * 4), tex:null };
+octVis.tex = new THREE.DataTexture(octVis.data, VIS_W, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+octVis.tex.magFilter = octVis.tex.minFilter = THREE.NearestFilter; octVis.tex.generateMipmaps = false;
+const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:50 }, vis:{ value:octVis.tex } };
+function octMaterial() {
+  // round splats sized by the local point spacing: neighbouring points overlap into a closed surface and EDL shades its edges;
+  // colours are drawn as stored (sRGB photo colours straight to the sRGB canvas)
+  return new THREE.ShaderMaterial({
+    uniforms:{ uIdx:{ value:0 }, uSpacing:{ value:0.01 }, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx },
+    vertexShader:`attribute vec3 color; uniform float uIdx; uniform float uSpacing; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC;
+      float bitAt(float m, float b){ return mod(floor(m / exp2(b)), 2.0); }
+      void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vec3 p = position; float idx = uIdx, d = 0.0;
+        for (int i = 0; i < 8; i++) {
+          vec4 t = texture2D(uVis, vec2((idx + 0.5) / ${VIS_W}.0, 0.5));
+          float m = floor(t.r * 255.0 + 0.5);
+          vec3 o = step(0.5, p); float oc = o.x + 2.0 * o.y + 4.0 * o.z;
+          if (bitAt(m, oc) < 0.5) break;
+          float before = 0.0;
+          for (int j = 0; j < 8; j++) { if (float(j) >= oc) break; before += bitAt(m, float(j)); }
+          idx += floor(t.g * 255.0 + 0.5) * 256.0 + floor(t.b * 255.0 + 0.5) + before;
+          p = p * 2.0 - o; d += 1.0;
+        }
+        gl_PointSize = clamp(uSpacing / exp2(d) * uK * uScale / -mv.z, uMin, uMax); gl_Position = projectionMatrix * mv; }`,
+    fragmentShader:`varying vec3 vC; void main(){ vec2 q = gl_PointCoord * 2.0 - 1.0; if (dot(q, q) > 1.0) discard; gl_FragColor = vec4(vC, 1.0); }` });
+}
+async function octLoad(nd) {
+  nd.loading = true; oct.loading++;
+  const ver = nd.ver, run = oct.run;
+  try {
+    const r = await fetch("/file/" + oct.meta.dir + "/n" + nd.l + "_" + nd.x + "_" + nd.y + "_" + nd.z + ".bin?v=" + ver);
+    if (r.ok) {
+      const buf = await r.arrayBuffer(), N = Math.floor(buf.byteLength / 9);
+      if (oct.run === run && N > 0) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.BufferAttribute(new Uint16Array(buf, 0, N * 3), 3, true));
+        g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(buf, N * 6, N * 3), 3, true));
+        g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0.5, 0.5, 0.5), 0.87);
+        octUnload(nd);
+        const p = new THREE.Points(g, octMaterial());
+        p.position.set(nd.x * nd.size, nd.y * nd.size, nd.z * nd.size); p.scale.setScalar(nd.size); p.frustumCulled = false; p.visible = false;
+        p.updateMatrix(); p.matrixAutoUpdate = false;
+        nd.obj = p; nd.loadedN = N; nd.loadedVer = ver; oct.loadedPts += N; gOct.add(p);
+      }
+    }
+  } catch (e) {}
+  nd.loading = false; oct.loading--; invalidate();
+  octPump();
+}
+// keep up to 6 node fetches in flight from the latest wanted list (largest on screen first)
+function octPump() {
+  while (oct.loading < 6 && oct.want && oct.want.length) { const nd = oct.want.shift(); if (!nd.loading && (!nd.obj || nd.loadedVer !== nd.ver) && oct.run !== null) octLoad(nd); }
+}
+const _frus = new THREE.Frustum(), _pm = new THREE.Matrix4();
+const oc = n => (n.x & 1) | ((n.y & 1) << 1) | ((n.z & 1) << 2);   // octant of a node inside its parent
+// choose the nodes to draw: largest on screen first, until the point budget; fetch the missing ones (6 in flight); free the least
+// recently used nodes when the loaded points exceed twice the budget
+function octUpdate() {
+  if (!oct.meta || !opt("c_scene")) { gOct.visible = false; oct.drawn = 0; return; }
+  gOct.visible = true;
+  camera.updateMatrixWorld(); _pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); _frus.setFromProjectionMatrix(_pm);
+  const proj = pointUniforms.scale.value, cam = camera.position, budget = octBudget(), minPx = oct.meta.g * (quality === "high" ? 1.0 : 1.6);   // refine while a node's point spacing on screen (2·radius / G) is above ~2 px (low: ~3 px)
+  const pr = nd => { const d = nd.center.distanceTo(cam); return d < nd.radius ? 1e9 : nd.radius * proj / d; };
+  const heap = [];   // binary max-heap on priority
+  const push = nd => { if (!_frus.intersectsBox(nd.box)) return; const e = [pr(nd), nd]; heap.push(e); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] >= e[0]) break; heap[i] = heap[p]; i = p; } heap[i] = e; };
+  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { let i = 0; for (;;) { let c = 2 * i + 1; if (c >= heap.length) break; if (c + 1 < heap.length && heap[c + 1][0] > heap[c][0]) c++; if (heap[c][0] <= last[0]) break; heap[i] = heap[c]; i = c; } heap[i] = last; } return top; };
+  for (const r of oct.roots) push(r);
+  const sel = new Set(), want = []; let pts = 0;
+  const tick = ++oct.tick;
+  while (heap.length) {
+    const [p, nd] = pop();
+    if (p < minPx && nd.l > 0) continue;
+    if (pts + nd.n > budget) break;
+    sel.add(nd); pts += nd.n; nd.used = tick;
+    if (!nd.obj || nd.loadedVer !== nd.ver) want.push(nd);
+    for (const k of nd.kids) push(k);
+  }
+  oct.want = want; octPump();
+  // drawn nodes in breadth-first order → visible-node texture (see octMaterial)
+  const isOn = nd => sel.has(nd) && nd.obj && nd.obj.geometry;
+  const order = [], q = oct.roots.filter(isOn);
+  for (let h = 0; h < q.length && q.length < VIS_W; h++) { const nd = q[h]; nd._i = h; order.push(nd); }
+  // breadth-first: children of each node in octant order, appended after everything queued so far
+  for (let h = 0; h < order.length && order.length < VIS_W; h++) {
+    const nd = order[h], kids = nd.kids.filter(isOn).sort((a, b) => oc(a) - oc(b));
+    let mask = 0; const first = order.length;
+    for (const k of kids) { if (order.length >= VIS_W) break; mask |= 1 << oc(k); k._i = order.length; order.push(k); }
+    const off = first - h, D = octVis.data;
+    D[4 * h] = mask; D[4 * h + 1] = (off >> 8) & 255; D[4 * h + 2] = off & 255; D[4 * h + 3] = 255;
+  }
+  octVis.tex.needsUpdate = true;
+  const drawSet = new Set(order);
+  let drawn = 0, nDrawn = 0;
+  for (const nd of oct.nodes.values()) {
+    if (!nd.obj) continue;
+    const on = drawSet.has(nd);
+    nd.obj.visible = on;
+    if (on) { const u = nd.obj.material.uniforms; u.uIdx.value = nd._i; u.uSpacing.value = nd.spacing; drawn += nd.loadedN; nDrawn++; }
+  }
+  oct.drawn = drawn; oct.nDrawn = nDrawn; oct.selPts = pts;
+  if (oct.loadedPts > 2 * budget) {
+    const old = [...oct.nodes.values()].filter(n => n.obj && !sel.has(n)).sort((a, b) => a.used - b.used);
+    for (const n of old) { if (oct.loadedPts <= 1.5 * budget) break; octUnload(n); }
+  }
+  const el = $("octinfo"); if (el) el.textContent = `points ${(drawn / 1e6).toFixed(2)} M drawn (${nDrawn} nodes) · budget ${(budget / 1e6).toFixed(1)} M · map ${oct.nodes.size} nodes`;
+}
+
 // Surface map (TSDF + Surface Nets): regions [x, y, z, version] or [x, y, z, version, texture]; only regions whose version
 // (or texture number) changed are fetched again.
 // Vertex-colour regions are drawn in blocks of SB³ regions (3.84 m at 3 cm voxels): one mesh, one draw call per block. A changed
@@ -628,7 +801,9 @@ function drawObjects() {  invalidate();
   gSurf.visible = opt("c_surf");
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor)
     const sp = view.scene_points, mat = () => pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") });
-    if (sp.chunks != null) {   // chunked map: only chunks not yet fetched are downloaded and appended to gScene (not rebuilt here)
+    if (sp.octree) {   // octree map: the level-of-detail pass (octUpdate) picks and fetches nodes every frame
+      loadOctree(sp.octree);
+    } else if (sp.chunks != null) {   // chunked map: only chunks not yet fetched are downloaded and appended to gScene (not rebuilt here)
       loadSceneChunks(sp);
     } else {
       const so = { id:"scene", points:sp };
@@ -1044,6 +1219,7 @@ renderer.domElement.addEventListener("pointerleave", () => { if (hoverId != null
 function contentBox() {
   const b = new THREE.Box3();
   for (const m of gSurf.children) { if (!m.geometry.boundingBox) m.geometry.computeBoundingBox(); b.union(m.geometry.boundingBox); }
+  if (oct.box && opt("c_scene")) b.union(oct.box);
   if (b.isEmpty() && view && view.grid) {
     const g = view.grid; b.set(new THREE.Vector3(g.origin[0], g.origin[1], 0), new THREE.Vector3(g.origin[0] + g.width * g.resolution, g.origin[1] + g.height * g.resolution, 2));
   }
@@ -1135,7 +1311,7 @@ function applyView(v) {
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
   let sObj = ""; for (const o of view.objects) sObj += o.id + "|" + o.state + "|" + o.pos[0] + "," + o.pos[1] + "," + o.pos[2] + "|" + o.extent[0] + "," + o.extent[1] + "," + o.extent[2] + "|" + (o.points ? o.points.stamp : "") + "|" + (o.rgbd ? 1 : 0) + "|" + (o.room ?? "") + ";";
-  if (view.scene_points) sObj += "scene|" + (view.scene_points.chunks ?? view.scene_points.stamp) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3] * 1000 + (r[4] || 0)).reduce((a, b) => a + b, 0) : "");
+  if (view.scene_points) sObj += "scene|" + (view.scene_points.octree ? "o" + view.scene_points.octree.run + ":" + view.scene_points.octree.ver : (view.scene_points.chunks ?? view.scene_points.stamp)) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3] * 1000 + (r[4] || 0)).reduce((a, b) => a + b, 0) : "");
   const sGraph = JSON.stringify(view.graph), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
   const objChanged = sObj !== prev.obj, graphChanged = objChanged || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
   if (objChanged) { fillSelect(); drawObjects(); }
@@ -1310,7 +1486,8 @@ function stepChase(dt) {
   return controls.target.distanceTo(tgt) > 1e-3 || camera.position.distanceTo(pos) > 1e-3;
 }
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
-$("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate;
+$("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
+$("n_octk").onchange = () => { octUni.sizeK.value = opt("n_octk"); invalidate(); };
 $("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); invalidate(); };
 $("c_shade").onchange = () => { surfUni.flatk.value = opt("c_shade") ? 0 : 1; invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
@@ -1581,13 +1758,13 @@ $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar
   needsRender = false;
   const tr = performance.now();
   { const d = camera.position.distanceTo(controls.target); surfUni.fogR.value.set(d * 1.15, d * 3.2); scene.fog.near = d * 0.6; scene.fog.far = opt("c_fog") ? d * 2.2 : 1e6; }   // fog follows the viewing distance: the focus stays clear at any zoom
-  updatePointScale(); renderFrame(); updateLabels();
+  updatePointScale(); octUpdate(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
 })();
 loadRobotModel();
 loadRobotKind().then(invalidate);
-// 주소 뒤 ?c_surf=0&c_edl=1 처럼 체크 상자 초기값을 정할 수 있음(시험·시연용)
-for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); }
+// 주소 뒤 ?c_surf=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
+for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); else if (e && e.type === "number") { e.value = v; e.dispatchEvent(new Event("change")); } }
 camFromQuery();
 startLive().then(live => { if (!live) { $("boot").classList.add("gone"); poll(); pollPose(); } });
 </script>

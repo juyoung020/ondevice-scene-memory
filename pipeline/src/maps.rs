@@ -18,68 +18,180 @@ pub fn coarse_of(k: u64, ratio: i64) -> u64 {
     (g(42) << 42) | (g(21) << 21) | g(0)
 }
 
-// ------------------------------------------------------------------ 장면 3D 점 지도
+// ------------------------------------------------------------------ 장면 3D 점 지도 + 옥트리(LOD)
 
+/// 칸 하나(13 바이트): 칸 안 평균 위치(칸 크기의 1/255 단위), 가까이서 본 색의 평균, 위치·색 평균에 넣은 점 수, 본 키프레임 수·마지막 키프레임, 가장 가까운 거리(mm)
 #[derive(Clone, Copy)]
 struct SV {
-    sum: [f32; 3],
-    n: u32,
+    off: [u8; 3],
     col: [u8; 3],
-    best: f32, // 이 칸을 본 가장 가까운 거리(색은 그 관측 것)
+    n: u8,
+    nc: u8,
+    nf: u8,
+    last: u16,
+    best: u16,
+}
+
+/// Potree 식 옥트리: 수준 L 의 점 간격 = vox·2^(DEPTH−L), 노드 한 변 = 간격 × G. 점은 자기 칸(수준 L 간격)이 아직 비어 있는
+/// 가장 굵은 수준의 노드 하나에만 들어간다(겹침 없음) → 뷰어는 굵은 노드부터 받아 화면 크기 순으로 더 고운 노드를 더한다.
+pub const OCT_DEPTH: u32 = 5;
+pub const OCT_G: i64 = 32;
+
+pub struct Node {
+    keys: Vec<u64>, // 고운 칸 키
+    pub ver: u32,
+    pub written: usize, // 마지막으로 파일에 쓴 점 수
 }
 
 pub struct SceneMap {
     pub vox: f64,
-    ratio: i64, // 지지 칸 = vox × ratio
     cells: FastMap<u64, SV>,
-    support: FastMap<u64, (u32, u32)>, // 굵은 칸 → (본 키프레임 수, 마지막 키프레임)
-    pub min_frames: u32,
-    sent: FastSet<u64>, // 이미 조각 파일로 내보낸 칸
+    pub min_obs: u8, // 고운 칸을 본 키프레임 수 하한
+    pending: Vec<u64>, // 막 확정된 칸(본 키프레임 수가 min_obs 에 닿은 칸): 다음 place 에서 옥트리로
+    occ: Vec<FastSet<u64>>, // 수준별 차지한 칸
+    pub nodes: FastMap<(u32, u64), Node>,
+    pub run: u64, // 이 지도의 번호: 새로 쌓으면 바뀌어 뷰어가 받은 노드를 비움
+    pub n_placed: usize,
 }
 
+static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl SceneMap {
-    pub fn new(vox: f64, sup: f64) -> SceneMap {
-        SceneMap { vox, ratio: (sup / vox).round() as i64, cells: FastMap::default(), support: FastMap::default(), min_frames: 2, sent: FastSet::default() }
+    pub fn new(vox: f64, _sup: f64) -> SceneMap {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let run = t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16;
+        SceneMap {
+            vox, cells: FastMap::default(), min_obs: 2, pending: vec![],
+            occ: (0..OCT_DEPTH).map(|_| FastSet::default()).collect(), nodes: FastMap::default(), run, n_placed: 0,
+        }
     }
     /// 한 키프레임의 점: (세계 점, 색, 카메라 거리)
     pub fn add(&mut self, kf: u32, pts: &[(V3, [u8; 3], f32)]) {
+        let vox = self.vox;
         for (p, c, d) in pts {
-            let k = key(p, self.vox);
-            let e = self.cells.entry(k).or_insert(SV { sum: [0.0; 3], n: 0, col: *c, best: f32::MAX });
-            e.sum[0] += p[0] as f32;
-            e.sum[1] += p[1] as f32;
-            e.sum[2] += p[2] as f32;
-            e.n += 1;
-            if *d < e.best {
-                e.best = *d;
-                e.col = *c;
+            let k = key(p, vox);
+            let dmm = (d * 1000.0).clamp(0.0, 65535.0) as u16;
+            let q = |i: usize| (((p[i] / vox - (p[i] / vox).floor()) * 255.0).round() as i32).clamp(0, 255);
+            let e = self.cells.entry(k).or_insert(SV { off: [0; 3], col: *c, n: 0, nc: 0, nf: 0, last: u16::MAX, best: u16::MAX });
+            // 칸 안 평균: 이어 더하는 평균(16 번 넘으면 최근 쪽 무게를 둔 평균)
+            let n = (e.n as i32 + 1).min(16);
+            for i in 0..3 {
+                let m = e.off[i] as i32;
+                e.off[i] = (m + (q(i) - m) / n).clamp(0, 255) as u8;
             }
-            let s = self.support.entry(coarse_of(k, self.ratio)).or_insert((0, u32::MAX));
-            if s.1 != kf {
-                s.0 += 1;
-                s.1 = kf;
+            e.n = n as u8;
+            if e.last != kf as u16 {
+                e.last = kf as u16;
+                e.nf = e.nf.saturating_add(1);
+                if e.nf == self.min_obs {
+                    self.pending.push(k);
+                }
+            }
+            // 색: 가장 가까운 거리의 2 배 안에서 본 관측의 평균(가까운 쪽 사진이 선명하고, 비슷한 거리 여러 장의 평균이 노출·잡음을 고름).
+            // 훨씬 가까운 관측이 오면 그 색에서 다시 시작
+            if (dmm as u32) * 2 < e.best as u32 || e.best == u16::MAX {
+                e.best = dmm;
+                e.col = *c;
+                e.nc = 1;
+            } else if dmm as u32 <= (e.best as u32) * 2 {
+                e.nc = e.nc.saturating_add(1).min(16);
+                for i in 0..3 {
+                    let m = e.col[i] as i32;
+                    e.col[i] = (m + (c[i] as i32 - m) / e.nc as i32) as u8;
+                }
+                e.best = e.best.min(dmm);
             }
         }
     }
-    /// 지난번 이후 새로 확정된 칸만(조각 파일용): 뷰어가 지도 전체를 다시 받지 않게
-    pub fn new_points(&mut self) -> Vec<([f32; 3], [u8; 3])> {
-        let mut out = vec![];
-        for (k, v) in &self.cells {
-            if !self.sent.contains(k) && self.support.get(&coarse_of(*k, self.ratio)).map_or(0, |s| s.0) >= self.min_frames {
-                out.push(([v.sum[0] / v.n as f32, v.sum[1] / v.n as f32, v.sum[2] / v.n as f32], v.col));
-                self.sent.insert(*k);
+    fn pos(&self, k: u64, v: &SV) -> [f32; 3] {
+        let f = |s: u32, i: usize| ((((k >> s) & 0x1F_FFFF) as i64 - (1 << 20)) as f64 + v.off[i] as f64 / 255.0) * self.vox;
+        [f(42, 0) as f32, f(21, 1) as f32, f(0, 2) as f32]
+    }
+    /// 새로 확정된 칸을 옥트리 노드에 넣는다. 돌려줌: 넣은 점 수
+    pub fn place(&mut self) -> usize {
+        let pend = std::mem::take(&mut self.pending);
+        let mut n = 0;
+        for k in pend {
+            let mut lv = OCT_DEPTH;
+            for l in 0..OCT_DEPTH {
+                if self.occ[l as usize].insert(coarse_of(k, 1 << (OCT_DEPTH - l))) {
+                    lv = l;
+                    break;
+                }
             }
+            let nk = coarse_of(k, OCT_G << (OCT_DEPTH - lv));
+            self.nodes.entry((lv, nk)).or_insert(Node { keys: vec![], ver: 0, written: 0 }).keys.push(k);
+            n += 1;
+        }
+        self.n_placed += n;
+        n
+    }
+    /// 수준 L 노드 한 변 길이(m)
+    pub fn node_size(&self, l: u32) -> f64 {
+        self.vox * (OCT_G << (OCT_DEPTH - l)) as f64
+    }
+    /// 노드 파일 바이트: 점마다 u16×3 위치(노드 원점에서 한 변의 1/65535 단위) 다음 RGB(전체: 위치 블록 뒤 색 블록)
+    pub fn node_bytes(&self, l: u32, nk: u64) -> Vec<u8> {
+        let nd = &self.nodes[&(l, nk)];
+        let size = self.node_size(l);
+        let o = node_coord(nk).map(|c| c as f64 * size);
+        let mut b = Vec::with_capacity(nd.keys.len() * 9);
+        let mut cols = Vec::with_capacity(nd.keys.len() * 3);
+        for k in &nd.keys {
+            let v = &self.cells[k];
+            let p = self.pos(*k, v);
+            for i in 0..3 {
+                let q = ((p[i] as f64 - o[i]) / size * 65535.0).round().clamp(0.0, 65535.0) as u16;
+                b.extend_from_slice(&q.to_le_bytes());
+            }
+            cols.extend_from_slice(&v.col);
+        }
+        b.extend_from_slice(&cols);
+        b
+    }
+    /// 다시 쓸 노드(쓸 때 판 번호 +1): 아직 안 쓴 노드가 먼저, 그다음 점이 많이 는 순. 점이 10 % 넘게(또는 처음) 는 노드만,
+    /// 고른 노드의 점 합이 budget 을 넘으면 멈춤(남은 노드는 다음 번에) — 본 스레드가 한 번에 오래 멈추지 않게. budget 0 = 바뀐 노드 모두
+    pub fn take_dirty(&mut self, budget: usize) -> Vec<(u32, u64)> {
+        let mut c: Vec<(f64, (u32, u64))> = self.nodes.iter().filter_map(|(k, n)| {
+            let (a, b) = (n.keys.len(), n.written);
+            let grow = if b == 0 { f64::MAX } else { (a - b) as f64 / b as f64 };
+            (a != b && (budget == 0 || grow >= 0.1)).then_some((grow, *k))
+        }).collect();
+        c.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+        let mut out = vec![];
+        let mut sum = 0;
+        for (_, k) in c {
+            if budget > 0 && sum >= budget {
+                break;
+            }
+            let n = self.nodes.get_mut(&k).unwrap();
+            sum += n.keys.len();
+            n.written = n.keys.len();
+            n.ver += 1;
+            out.push(k);
         }
         out
     }
-    /// 여러 키프레임에서 본 칸만: (점, 색)
-    pub fn points(&self) -> Vec<([f32; 3], [u8; 3])> {
-        self.cells
-            .iter()
-            .filter(|(k, _)| self.support.get(&coarse_of(**k, self.ratio)).map_or(0, |s| s.0) >= self.min_frames)
-            .map(|(_, v)| ([v.sum[0] / v.n as f32, v.sum[1] / v.n as f32, v.sum[2] / v.n as f32], v.col))
-            .collect()
+    /// 노드 목록(JSON 용): [수준, x, y, z, 점 수, 판]
+    pub fn index(&self) -> Vec<[i64; 6]> {
+        self.nodes.iter().filter(|(_, n)| n.written > 0).map(|((l, k), n)| {
+            let c = node_coord(*k);
+            [*l as i64, c[0], c[1], c[2], n.written as i64, n.ver as i64]
+        }).collect()
     }
+    /// 여러 키프레임에서 본 칸 수
+    pub fn n_points(&self) -> usize {
+        self.n_placed
+    }
+    pub fn bytes(&self) -> usize {
+        self.cells.capacity() * 24 + self.occ.iter().map(|s| s.capacity() * 9).sum::<usize>()
+            + self.nodes.values().map(|n| n.keys.capacity() * 8 + 48).sum::<usize>() + self.pending.capacity() * 8
+    }
+}
+
+/// 키 → 칸 좌표(부호 있는 정수)
+pub fn node_coord(k: u64) -> [i64; 3] {
+    [42, 21, 0].map(|s| ((k >> s) & 0x1F_FFFF) as i64 - (1 << 20))
 }
 
 // ------------------------------------------------------------------ 2D 점유 격자
@@ -474,6 +586,15 @@ impl Memory {
             if o.miss >= miss_need {
                 o.state = "gone";
             }
+        }
+    }
+}
+
+impl SceneMap {
+    /// 노드를 모두 다시 쓰게 표시(지도를 새로 쌓은 뒤)
+    pub fn mark_all(&mut self) {
+        for n in self.nodes.values_mut() {
+            n.written = 0;
         }
     }
 }

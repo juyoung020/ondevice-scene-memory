@@ -46,7 +46,22 @@ impl Kf {
         }
         let (qw, qh) = (self.w.div_ceil(Q), self.h.div_ceil(Q));
         let q = unpack_depth(&self.depth_z, qw, qh);
-        let mut d: Vec<f32> = (0..self.w * self.h).map(|i| q[(i / self.w / Q) * qw + (i % self.w) / Q] as f32 * 1e-3).collect();
+        // 4 화소 간격 깊이를 늘려 채움: 줄마다 Q 칸씩 같은 값을 채우고, 같은 줄 묶음의 나머지 줄은 첫 줄을 복사
+        // (화소마다 나눗셈 두 번 하던 것과 같은 값, 다시 쌓기 풀기 시간의 대부분이었음)
+        let w = self.w;
+        let mut d = vec![0f32; w * self.h];
+        for y in 0..self.h {
+            if y % Q == 0 {
+                let (qrow, row) = (&q[(y / Q) * qw..(y / Q + 1) * qw], &mut d[y * w..(y + 1) * w]);
+                for (qx, &v) in qrow.iter().enumerate() {
+                    let x0 = qx * Q;
+                    row[x0..(x0 + Q).min(w)].fill(v as f32 * 1e-3);
+                }
+            } else {
+                let src = (y - y % Q) * w;
+                d.copy_within(src..src + w, y * w);
+            }
+        }
         for c in &self.crops {
             let z = unpack_depth(&c.depth_z, c.w, c.h);
             for y in 0..c.h {
@@ -296,6 +311,20 @@ mod tests {
             }
         }
         assert!((d2[3 * w + 2] - mm(d[0])).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sparse_fill_matches_per_pixel() {
+        // 줄 복사로 늘린 깊이가 화소마다 계산하던 값과 비트까지 같은지(가로·세로가 Q 의 배수가 아닌 경우 포함)
+        let (w, h) = (63, 47);
+        let d: Vec<f32> = (0..w * h).map(|i| 0.3 + (i % 89) as f32 * 0.013).collect();
+        let mut st = KfStore::new(100);
+        st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &vec![0; w * h * 3], &d, &None, true);
+        let kf = &st.kfs()[0];
+        let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
+        let q = unpack_depth(&kf.depth_z, qw, qh);
+        let old: Vec<f32> = (0..w * h).map(|i| q[(i / w / Q) * qw + (i % w) / Q] as f32 * 1e-3).collect();
+        assert_eq!(kf.depth().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), old.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     }
 
     #[test]

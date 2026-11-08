@@ -304,6 +304,42 @@ impl Memory {
     /// 기하: 굵은 칸(4 cm) 3D IoU, 작은 쪽 기준 겹침 비율. 의미: 이름 투표 분포 코사인. 생김새: 점 색 히스토그램 코사인.
     /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8). 반환: 합친 수
     /// 잠깐 잡혔다 사라진 검출 지우기: 두 번 이하로 보였고 3 초 넘게 다시 안 보인 물체(한두 장면의 잘못된 검출이 화면을 어지럽힘)
+    /// 다시 쌓은 물체에 옛 물체의 id 를 물려준다(같은 이름, 가장 가까운 것, 크기 절반 + 15 cm 안, 한 번씩만).
+    /// 뷰어는 같은 물체를 계속 같은 것으로 보고(선택 유지), 사진이 그대로면 PNG 세 장을 다시 짜지·받지 않는다.
+    /// 판 번호(stamp·crop_ver)는 옛 값에서 이어 가 뷰어가 바뀐 파일을 다시 받는다. 짝이 없는 물체는 받은 id 그대로.
+    pub fn adopt_ids(&mut self, old: &Memory) -> usize {
+        let mut taken = vec![false; old.objs.len()];
+        let mut n = 0;
+        for o in self.objs.iter_mut() {
+            let reach = 0.5 * o.extent.iter().cloned().fold(0.0, f64::max) + 0.15;
+            let best = old
+                .objs
+                .iter()
+                .enumerate()
+                .filter(|(j, p)| !taken[*j] && p.name == o.name)
+                .map(|(j, p)| (j, crate::geom::norm(&crate::geom::sub(&p.pos, &o.pos))))
+                .filter(|&(_, d)| d < reach)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let Some((j, _)) = best else { continue };
+            taken[j] = true;
+            let p = &old.objs[j];
+            o.id = p.id;
+            o.stamp = p.stamp;
+            let same_crop = match (&o.crop, &p.crop) {
+                (Some(a), Some(b)) => a.w == b.w && a.h == b.h && a.rgb == b.rgb && a.mask == b.mask && a.depth == b.depth,
+                (None, None) => true,
+                _ => false,
+            };
+            if same_crop && p.crop_saved == p.crop_ver {
+                (o.crop_ver, o.crop_saved) = (p.crop_ver, p.crop_saved);
+            } else {
+                (o.crop_ver, o.crop_saved) = (p.crop_ver + 1, p.crop_saved);
+            }
+            n += 1;
+        }
+        n
+    }
+
     pub fn prune(&mut self, now: f64) -> usize {
         let n0 = self.objs.len();
         self.objs.retain(|o| !(o.n_obs <= 2 && now - o.last_seen > 3.0));

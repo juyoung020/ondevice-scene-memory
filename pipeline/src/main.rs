@@ -749,6 +749,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut kfs = kfstore::KfStore::new(a.kf_store_mb);
     let mut last_rebuild = Instant::now();
     let mut n_rebuild = 0u32;
+    let mut prune_objs = false;
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, anchor, graph }) = rx.recv() {
@@ -771,6 +772,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 None => fresh_outputs(&a.out, &mut run_id, &mut n_chunk, &mut n_scene, &mut scene, &mut tsdf),
             };
             write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, true);
+            prune_objs = true; // 옛 id 파일은 다음 기록 때 지움(뷰어가 지금 view.json 을 받기 전 옛 것을 읽는 동안은 남겨 둠)
         }
         let surf_dirty = subs.as_ref().is_some_and(|s| s.dirty);
         if rb_job.is_none() && (kfs.dirty || surf_dirty) && a.rebuild_every > 0.0 && last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every {
@@ -778,7 +780,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
             let sj = subs.as_mut().map(|s| s.plan(&|id| node_map(&kfs, &stream_fix, z0.unwrap_or(0.0), id)));
             kfs.clear_dirty();
-            rb_job = Some(std::thread::spawn(move || rebuild_maps(&ar, k, &snap, next, moved, sj)));
+            rb_job = Some(std::thread::spawn(move || { out::background_thread(); rebuild_maps(&ar, k, &snap, next, moved, sj) }));
             last_rebuild = Instant::now();
         }
         let raw = (r, p); // 받은 위치(수평 맞춤 전): 다시 쌓기용 보관
@@ -1265,6 +1267,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 last_merge = nkf;
             }
             write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, merge);
+            if std::mem::take(&mut prune_objs) {
+                prune_object_files(&a.out, &mem);
+            }
         }
         if a.snaps.contains(&nkf) {
             let sd = PathBuf::from(format!("{}_snap", a.out.display())).join(format!("kf{nkf:04}"));
@@ -1311,6 +1316,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     if a.stream.is_some() {
         eprintln!("다시 쌓기 {n_rebuild} 번, 보관 장면 {} 개({:.0} MB)", kfs.len(), kfs.bytes() as f64 / 1048576.0);
     }
+    eprintln!("{}", out::stats::report());
     if let Some(s) = subs.as_ref() {
         eprintln!("서브맵 {} 개({:.0} MB), 전체 표면 {:.0} MB", s.len(), s.bytes() as f64 / 1048576.0, s.global.bytes() as f64 / 1048576.0);
     }
@@ -1355,6 +1361,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         o.cells_saved = 0; // 마지막 기록은 바뀐 물체를 모두 내보냄
     }
     write_view(&a.out, &grid, &mut mem, &traj, t_end, last_pose, &cam_json, &scene_json, true);
+    if n_rebuild > 0 {
+        prune_object_files(&a.out, &mem);
+    }
     let n = clock.n.max(1) as f64;
     let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
     for o in &mem.objs {
@@ -1408,8 +1417,14 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let mut mem = Memory::new(0.012, 0.04);
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
+    let (mut t_dec, mut t_map, mut t_obj) = (0.0f64, 0.0f64, 0.0f64);
     for (i, (kf, r, pwc)) in snap.iter().enumerate() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, i as u32, true, &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+        let cd = Instant::now();
+        let (kd, kr) = (kf.depth(), kf.rgb());
+        t_dec += cd.elapsed().as_secs_f64();
+        let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kf.dets, i as u32, true, &mut grid, &mut scene, &mut tsdf, &mut mem, &mut traj, &mut map_traj);
+        t_map += (c3 - cd).as_secs_f64();
+        t_obj += (c4 - c3).as_secs_f64();
         if (i + 1) % 15 == 0 {
             mem.prune(kf.t);
             mem.merge_pass();
@@ -1417,6 +1432,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     }
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
+    eprintln!("다시 쌓기 나눔: 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초, 합 {secs:.2} 초(병합 포함)", t_map - t_dec);
     Rebuilt { grid, scene, surf: surf.map(|j| j.run()), mem, traj, map_traj, last_seq, n: snap.len(), secs, moved }
 }
 
@@ -1425,13 +1441,15 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
 fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3, z0: f64, grid: &mut Grid, scene: &mut SceneMap,
            mem: &mut Memory, traj: &mut Vec<(f64, [f64; 3])>, map_traj: &mut Vec<(f64, V3, M3)>) {
     let next = mem.next.max(rb.mem.next);
-    (*grid, *scene, *mem, *traj, *map_traj) = (rb.grid, rb.scene, rb.mem, rb.traj, rb.map_traj);
+    let mut rmem = rb.mem;
+    let kept = rmem.adopt_ids(mem);
+    (*grid, *scene, *mem, *traj, *map_traj) = (rb.grid, rb.scene, rmem, rb.traj, rb.map_traj);
     mem.next = next;
     let newer: Snap = snapshot(kfs, fix, z0).into_iter().filter(|s| s.0.seq > rb.last_seq).collect();
     for (i, (kf, r, pwc)) in newer.iter().enumerate() {
         map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, (rb.n + i) as u32, true, grid, scene, &mut None, mem, traj, map_traj);
     }
-    eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음, 물체 {} 개",
+    eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음, 물체 {} 개(id 이어받음 {kept})",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, newer.len(), mem.objs.len());
 }
 
@@ -1628,6 +1646,20 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
     (c3, c4)
 }
 #[allow(clippy::too_many_arguments)]
+/// 지금 기억에 없는 물체의 파일(objects/O<id>_*)을 지운다: 다시 쌓기·병합으로 사라진 id 의 점·사진이 쌓여
+/// 사무실 스트림 끝에 objects/ 가 1,292 개 파일·64 MB 가 되던 것
+fn prune_object_files(dir: &Path, mem: &Memory) {
+    let live: HashSet<u32> = mem.objs.iter().map(|o| o.id).collect();
+    let Ok(rd) = std::fs::read_dir(dir.join("objects")) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(id) = name.to_str().and_then(|s| s.strip_prefix('O')).and_then(|s| s.split('_').next()).and_then(|s| s.parse::<u32>().ok()) else { continue };
+        if !live.contains(&id) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])], stamp: f64, pose: [f64; 3],
               cam: &serde_json::Value, scene: &serde_json::Value, merge: bool) {
     if merge {
@@ -1761,7 +1793,24 @@ fn tr(m: &M3) -> M3 {
     [0, 1, 2].map(|i| [0, 1, 2].map(|j| m[j][i]))
 }
 
+/// glibc 는 스레드마다 malloc 구역(arena)을 새로 만들어(최대 코어 수 × 8) 작업 스레드(텍스처·다시 쌓기·기록·rayon)가
+/// 잠깐 쓴 큰 버퍼가 구역마다 남는다 → 구역 2 개로 묶는다(사무실 스트림 최대 메모리 1.54 → 1.35 GB, 속도 같음).
+/// MALLOC_ARENA_MAX 를 직접 주면 그 값을 따른다.
+fn limit_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_ARENA_MAX: i32 = -8;
+        unsafe {
+            mallopt(M_ARENA_MAX, 2);
+        }
+    }
+}
+
 fn main() {
+    limit_malloc_arenas();
     let a = args();
     if a.live > 0.0 {
         out::start_writer(); // 실시간: 파일 쓰기는 기록 스레드가

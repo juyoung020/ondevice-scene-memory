@@ -63,6 +63,7 @@ struct Args {
     stream_rate: f64,   // --stream-rate R: 스트림을 찍은 시각대로 R 배속으로 내보냄(0 = 최대 속도), 밀림(지연) 기록
     seg_min_ms: f64,    // --seg-min-ms M: 분할이 적어도 M ms 걸린 것처럼 기다림(보드 NPU 분할 97 ms 흉내)
     no_drop: bool,      // --no-drop: 스트림이 밀려도 장면을 버리지 않음(재생 결과가 늘 같게)
+    seg_skip: Option<(f64, f64, usize)>, // --seg-skip M,DEG[,N]: 스트림에서 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
     scene_vox: f64,
     max_depth: f64,
     scene_step: usize, // 3D 지도에 쓸 화소 간격
@@ -113,6 +114,10 @@ fn args() -> Args {
         stream_rate: get("--stream-rate").map_or(0.0, |s| s.parse().unwrap()),
         seg_min_ms: get("--seg-min-ms").map_or(0.0, |s| s.parse().unwrap()),
         no_drop: v.iter().any(|x| x == "--no-drop"),
+        seg_skip: get("--seg-skip").filter(|s| s != "off").map(|s| {
+            let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect();
+            (v[0], v[1], v.get(2).map_or(4, |n| *n as usize))
+        }),
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
@@ -473,12 +478,15 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let drop_late = !a.no_drop;
     let drop_n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let drop_r = drop_n.clone();
+    let seg_n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seg_n_r = seg_n.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(1);
     let worker = {
         let seq = seq.clone();
         let (every, conf, live, no_skip, seg_every, npu_par, sp_every) = (a.every, a.conf, a.live, a.no_skip, a.seg_every.max(1), a.npu_par, a.sp_every.max(1));
         let (fast_pose, depth_every, depth_lag) = (a.fast_pose, a.depth_every.max(1), a.depth_lag);
         let seg_min = a.seg_min_ms / 1e3;
+        let seg_skip = a.seg_skip;
         let mut dnet = make_depth(&a.depth);
         // --fast-pose 는 위치를 모두 직접 방식으로 구하니 SuperPoint 는 돌리지 않는다(NPU 작업 하나 줄임)
         let mut spnet = (a.vo && !a.dvo && !a.fast_pose).then(|| make_sp(&a.sp));
@@ -493,6 +501,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let (mut next, mut n, mut read_s, mut n_corr) = (Some(first), 0usize, 0.0f64, 0u32);
                 // 건너뛴 장면 앞에 온 그래프 노드는 다음에 보내는 장면에 붙임(노드 위치를 하나도 잃지 않게)
                 let mut graph: Vec<stream::Node> = vec![];
+                let mut last_seg: Option<([f64; 3], [[f64; 3]; 3], usize)> = None;
+                let mut n_seg = 0usize;
                 while let Some(mut sf) = next.take() {
                     // 지도 보정이 바뀐 장면(루프 클로저): 이후 장면은 새 보정으로 오고, 지난 장면은 그래프 블록의 노드 위치로 다시 쌓는다
                     n_corr += (sf.flags & stream::MAP_CORRECTED != 0) as u32;
@@ -519,9 +529,27 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             eprintln!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
                         }
                         let depth_m = sf.depth_m();
-                        let (pd, dets, feat) = if lost { (None, None, None) } else { run_models(&mut dnet, &mut seg, &mut spnet, &sf.rgb, w, h, conf, true, npu_par, true) };
+                        // --seg-skip: 직전 분할 키프레임에서 조금만 움직였으면 화면이 거의 같으니 분할을 건너뜀(물체 기억은 그 장면을 안 본 것으로)
+                        let do_seg = match (seg_skip, &last_seg) {
+                            (Some((dm, ddeg, nmax)), Some((lp, lr, ns))) => {
+                                let dp = ((sf.p[0] - lp[0]).powi(2) + (sf.p[1] - lp[1]).powi(2) + (sf.p[2] - lp[2]).powi(2)).sqrt();
+                                let tr: f64 = (0..3).map(|i| (0..3).map(|j| lr[j][i] * sf.r[j][i]).sum::<f64>()).sum();
+                                let ang = ((tr - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees();
+                                dp > dm || ang > ddeg || ns + 1 >= nmax
+                            }
+                            _ => true,
+                        };
+                        let (pd, dets, feat) = if lost { (None, None, None) } else { run_models(&mut dnet, &mut seg, &mut spnet, &sf.rgb, w, h, conf, do_seg, npu_par, true) };
+                        if !lost {
+                            if do_seg {
+                                last_seg = Some((sf.p, sf.r, 0));
+                                n_seg += 1;
+                            } else if let Some(l) = last_seg.as_mut() {
+                                l.2 += 1;
+                            }
+                        }
                         let pad = seg_min - c1.elapsed().as_secs_f64();
-                        if pad > 0.0 && !lost {
+                        if pad > 0.0 && !lost && do_seg {
                             std::thread::sleep(std::time::Duration::from_secs_f64(pad));
                         }
                         let depth = pd.unwrap_or(depth_m);
@@ -543,7 +571,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                                     scale: f64::NAN, feat: None, track_only: false, lost: true, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
-                eprintln!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번");
+                eprintln!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
+                seg_n_r.store(n_seg as u32, std::sync::atomic::Ordering::Relaxed);
                 return seg;
             }
             if let Some(cp) = cam_path {
@@ -1586,6 +1615,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     summary["frame_parts"] = clock.parts_json();
     summary["degraded_frames"] = json!(n_behind);
     summary["dropped_late"] = json!(drop_n.load(std::sync::atomic::Ordering::Relaxed));
+    summary["seg_runs"] = json!(seg_n.load(std::sync::atomic::Ordering::Relaxed));
     let span = (clock.t_span.1 - clock.t_span.0).max(1e-6);
     summary["stream_kf_per_s"] = json!(clock.n as f64 / span);
     if !clock.lag.is_empty() {
@@ -2095,6 +2125,9 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
 
     // 물체
     let mut seen = HashSet::new();
+    if dets.is_some() && map_ok {
+        mem.n_seg += 1;
+    }
     for d in dets.iter().flatten().filter(|_| map_ok) {
         let name = seg::COCO.get(d.cls).copied().unwrap_or("object");
         if name == "person" {

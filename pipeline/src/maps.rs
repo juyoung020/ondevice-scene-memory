@@ -528,6 +528,59 @@ impl Memory {
             let thr = if o.n_obs < 3 { 1 } else { (0.15 * o.n_obs as f64).ceil().clamp(2.0, 10.0) as u32 };
             o.support.iter().filter(|(_, n)| **n >= thr).map(|(k, _)| *k).collect()
         };
+        // 맞닿은 조각: 한 물체가 보는 방향마다 다른 부분(의자 등받이·앉는 판)만 잡혀 칸이 거의 안 겹친 채 둘셋으로 남는다.
+        // 같은 이름이고 굳은 칸끼리 맞닿아 있으며(사이 빈 칸 없이 이웃 칸 5 개 이상) 합친 굳은 칸 상자(축마다 5–95 %)가 그 이름의 전형 크기 안이면 합침.
+        // 나란한 의자 둘(중심 1.4 m)은 합친 상자가 의자 하나보다 커서 남는다. 전형 크기를 모르는 이름은 이 규칙을 쓰지 않음
+        let sup = self.sup;
+        let typical = |name: &str| -> Option<[f64; 3]> {
+            // 큰 순서 세 변(m), 넉넉하게: 수평은 비스듬히 놓인 대각선까지
+            Some(match name {
+                "chair" => [1.2, 0.9, 0.9],
+                "couch" => [2.4, 1.1, 1.1],
+                "bottle" => [0.4, 0.15, 0.15],
+                "cup" => [0.2, 0.15, 0.15],
+                "book" => [0.45, 0.35, 0.15],
+                "tv" => [1.0, 0.7, 0.3],
+                "laptop" => [0.5, 0.4, 0.35],
+                "keyboard" => [0.55, 0.25, 0.1],
+                "teddy bear" => [0.7, 0.5, 0.5],
+                "potted plant" => [1.0, 0.7, 0.7],
+                _ => return None,
+            })
+        };
+        let unkey = |k: u64| [42u32, 21, 0].map(|s| ((k >> s) & 0x1F_FFFF) as i64 - (1 << 20));
+        let touching = |a: &Obj, b: &Obj, sa: &[u64], sb: &[u64]| -> bool {
+            let Some(lim) = typical(&a.name) else { return false };
+            if a.name != b.name || sa.len() < 3 || sb.len() < 3 {
+                return false;
+            }
+            // 맞닿음: 작은 쪽 굳은 칸 중 큰 쪽 굳은 칸과 같거나 이웃(26 방향)인 칸
+            let (s, l) = if sa.len() <= sb.len() { (sa, sb) } else { (sb, sa) };
+            let lset: crate::geom::FastSet<u64> = l.iter().copied().collect();
+            let near = s
+                .iter()
+                .filter(|&&k| {
+                    let c = unkey(k);
+                    (-1i64..=1).any(|x| (-1i64..=1).any(|y| (-1i64..=1).any(|z| {
+                        let p = [(c[0] + x) as f64 + 0.5, (c[1] + y) as f64 + 0.5, (c[2] + z) as f64 + 0.5].map(|v| v * sup);
+                        lset.contains(&key(&p, sup))
+                    })))
+                })
+                .count();
+            if near < 5 {
+                return false;
+            }
+            let cs: Vec<[i64; 3]> = sa.iter().chain(sb).map(|&k| unkey(k)).collect();
+            let mut ext: Vec<f64> = (0..3)
+                .map(|ax| {
+                    let mut v: Vec<i64> = cs.iter().map(|c| c[ax]).collect();
+                    v.sort_unstable();
+                    (v[v.len() * 19 / 20] - v[v.len() / 20] + 1) as f64 * sup
+                })
+                .collect();
+            ext.sort_by(|x, y| y.partial_cmp(x).unwrap());
+            (0..3).all(|k| ext[k] <= lim[k])
+        };
         let mut merged = 0;
         loop {
             // 사라짐으로 표시된 물체도 후보: 정지 장면에서 잘못 사라짐 처리된 물체 자리에 같은 물체가 새로 생기면 둘로 남았다(중복 대부분이 이 경우).
@@ -543,7 +596,12 @@ impl Memory {
                     }
                     let (sa, sb) = if a.support.len() <= b.support.len() { (&a.support, &b.support) } else { (&b.support, &a.support) };
                     let inter = sa.keys().filter(|k| sb.contains_key(k)).count() as f32;
+                    let touch = || votes_cos(a, b) >= 0.5 && touching(a, b, &solid(a), &solid(b));
                     if inter == 0.0 {
+                        if touch() {
+                            pair = Some((i, j));
+                            break 'outer;
+                        }
                         continue;
                     }
                     let iou = inter / ((sa.len() + sb.len()) as f32 - inter).max(1.0);
@@ -558,7 +616,7 @@ impl Memory {
                         sc.len() >= 3 && sc.iter().filter(|k| l.support.contains_key(k)).count() as f32 >= frag_in * sc.len() as f32
                     };
                     let geo = iou >= 0.5 || ovl >= 0.6 || (ovl >= frag_ovl && frag());
-                    if if any_gone { sem >= 0.5 && geo } else { iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) || (sem >= 0.5 && ovl >= frag_ovl && frag()) } {
+                    if if any_gone { sem >= 0.5 && geo } else { iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) || (sem >= 0.5 && ovl >= frag_ovl && frag()) } || touch() {
                         pair = Some((i, j));
                         break 'outer;
                     }

@@ -259,6 +259,7 @@ pub fn thread_role(r: Role) {
             fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
         }
         let tid = gettid();
+        cpu::enter(tid, r as usize);
         setpriority(0, tid as u32, nice); // PRIO_PROCESS + 스레드 id = 그 스레드만
         let mask = if mask == 0 { FULL.get().copied().unwrap_or(0) } else { mask };
         if mask != 0 {
@@ -283,5 +284,68 @@ pub fn slow(c0: std::time::Instant) {
         while c1.elapsed() < until {
             std::hint::spin_loop();
         }
+    }
+}
+
+/// 역할별 CPU 시간: 스레드가 역할을 맡은 동안 쓴 CPU 를 역할마다 더한다(끝 요약의 `cpu_s`, `--slow` 로 붙잡은 시간 포함). 리눅스만
+pub mod cpu {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static DONE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6]; // 역할을 내려놓았거나 끝난 스레드 몫(ns)
+    static LIVE: std::sync::Mutex<Vec<(i32, usize, u64)>> = std::sync::Mutex::new(Vec::new()); // (스레드 id, 역할, 역할을 맡을 때의 CPU ns)
+
+    /// 시계 id: 2 = 프로세스 전체, 3 = 지금 스레드, `of_thread(tid)` = 다른 스레드
+    fn clock_ns(id: i32) -> u64 {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            unsafe extern "C" {
+                fn clock_gettime(id: i32, ts: *mut [i64; 2]) -> i32;
+            }
+            let mut ts = [0i64; 2];
+            if clock_gettime(id, &mut ts) == 0 {
+                return ts[0] as u64 * 1_000_000_000 + ts[1] as u64;
+            }
+        }
+        let _ = id;
+        0
+    }
+    fn of_thread(tid: i32) -> i32 {
+        (!tid << 3) | 6
+    }
+
+    /// 스레드가 끝날 때 남은 몫을 역할에 넘김
+    struct Guard(std::cell::Cell<i32>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let mut l = LIVE.lock().unwrap();
+            if let Some(i) = l.iter().position(|e| e.0 == self.0.get()) {
+                let (_, role, base) = l.swap_remove(i);
+                DONE[role].fetch_add(clock_ns(3).saturating_sub(base), Relaxed);
+            }
+        }
+    }
+    thread_local! { static GUARD: Guard = const { Guard(std::cell::Cell::new(0)) }; }
+
+    /// 지금 스레드(tid)가 이 역할을 맡음: 앞 역할 몫은 닫는다
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn enter(tid: i32, role: usize) {
+        GUARD.with(|g| g.0.set(tid));
+        let now = clock_ns(3);
+        let mut l = LIVE.lock().unwrap();
+        match l.iter_mut().find(|e| e.0 == tid) {
+            Some(e) => {
+                DONE[e.1].fetch_add(now.saturating_sub(e.2), Relaxed);
+                *e = (tid, role, now);
+            }
+            None => l.push((tid, role, now)),
+        }
+    }
+
+    /// (역할별 CPU 초, 프로세스 전체 CPU 초). 전체 − 역할 합 = 역할 없는 스레드(rayon 풀·분할 추론 스레드)
+    pub fn report() -> ([f64; 6], f64) {
+        let mut ns: [u64; 6] = std::array::from_fn(|k| DONE[k].load(Relaxed));
+        for &(tid, role, base) in LIVE.lock().unwrap().iter() {
+            ns[role] += clock_ns(of_thread(tid)).saturating_sub(base);
+        }
+        (ns.map(|v| v as f64 * 1e-9), clock_ns(2) as f64 * 1e-9)
     }
 }

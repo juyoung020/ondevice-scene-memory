@@ -17,6 +17,7 @@ mod out;
 mod rec;
 mod scale;
 mod seg;
+mod segsim;
 mod stream;
 mod submap;
 mod texture;
@@ -60,8 +61,10 @@ struct Args {
     depth_lag: usize,   // --fast-pose 로 TUM 을 돌릴 때 깊이 장면을 위치만 추적 장면 몇 장 뒤에 넣을지(보드의 모델 지연 흉내) // SuperPoint 는 N 장마다(사이 장면은 RGB-D 직접 방식으로 위치)
     threads: String,    // --threads: 스레드 우선순위·코어 배치(auto · none · 역할=nice[:코어],…)
     slow: f32,          // --slow F: 보드 흉내, 본·점·텍스처·다시 쌓기 스레드 일을 F 배로(코어를 붙잡고 기다림)
-    stream_rate: f64,   // --stream-rate R: 스트림을 찍은 시각대로 R 배속으로 내보냄(0 = 최대 속도), 밀림(지연) 기록
+    stream_rate: f64,   // --stream-rate R: 스트림을 찍은 시각대로 R 배속으로 내보냄(0 = 받는 대로)
     seg_min_ms: f64,    // --seg-min-ms M: 분할이 적어도 M ms 걸린 것처럼 기다림(보드 NPU 분할 97 ms 흉내)
+    seg_cache: Option<PathBuf>, // --seg-cache DIR: 보드 흉내, 장면별 분할 결과를 폴더에 남기고 있으면 읽어 씀(추론이 코어를 쓰지 않음)
+    seg_cpu_ms: f64,    // --seg-cpu-ms M: --seg-cache 로 읽어 온 장면마다 읽기 스레드가 M ms 코어를 붙잡음(보드 분할의 CPU 전·후처리 몫)
     no_drop: bool,      // --no-drop: 스트림이 밀려도 장면을 버리지 않음(재생 결과가 늘 같게)
     seg_skip: Option<(f64, f64, usize, f64)>, // --seg-skip M,DEG[,N[,L]] (기본 0.10,10,4,0.1, off 로 끔): 스트림이 L 초(기본 0.1) 넘게 밀렸을 때만, 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
     scene_vox: f64,
@@ -113,6 +116,8 @@ fn args() -> Args {
         slow: get("--slow").map_or(1.0, |s| s.parse().unwrap()),
         stream_rate: get("--stream-rate").map_or(0.0, |s| s.parse().unwrap()),
         seg_min_ms: get("--seg-min-ms").map_or(0.0, |s| s.parse().unwrap()),
+        seg_cache: get("--seg-cache").map(Into::into),
+        seg_cpu_ms: get("--seg-cpu-ms").map_or(0.0, |s| s.parse().unwrap()),
         no_drop: v.iter().any(|x| x == "--no-drop"),
         // 기본 켬(0.10,10,4,0.1): 밀리지 않으면 늘 분할하므로 빠른 PC 에선 동작 그대로, "off" 로 끔
         seg_skip: match get("--seg-skip") { Some(s) if s == "off" => None, s => { let s = s.unwrap_or_else(|| "0.10,10,4,0.1".into());
@@ -203,7 +208,7 @@ struct Clock {
     part_max: [f32; NPART],
     part_sum: [f64; NPART],
     worst: Vec<(f32, u32, [f32; NPART])>, // 가장 긴 장면 몇 개: (ms, 장면 번호, 단계별 ms)
-    lag: Vec<f32>, // --stream-rate: 장면을 끝낸 시각 − 나올 시각(초)
+    lag: Vec<f32>, // 밀림: 장면을 끝낸 시각 − 나올 시각(초)
     t_span: (f64, f64), // 지도에 넣은 장면의 첫·끝 찍은 시각
 }
 
@@ -473,9 +478,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
     // 실시간 재생의 속도 맞춤(앞서면 기다리고, 밀리면 건너뛰기)도 그쪽에서 한다.
     let seq = std::sync::Arc::new(seq);
-    // --stream-rate: 장면 i 가 나올 시각 = pace0 + (t_i − t_첫) / R. 본 스레드가 장면을 끝낸 시각과의 차이 = 밀림
+    // 장면 i 가 나올 시각 = pace0 + (t_i − t_첫) / R(R = 밀림 기준 배속). 본 스레드가 장면을 끝낸 시각과의 차이 = 밀림
     let (pace0, pace_t0, rate) = (Instant::now(), stream_first.as_ref().map_or(0.0, |f| f.t), a.stream_rate);
     let drop_late = !a.no_drop;
+    // 밀림 기준 배속: --stream-rate 없이 받는 스트림(연결 프로그램에서 바로 오는 실시간 입력)은 찍은 시각 그대로(1 배속). --stream-rate 없는 --no-drop 재생은 밀림을 재지 않고 늘 분할(결과가 늘 같게)
+    let lag_rate = if rate > 0.0 { rate } else { 1.0 };
+    let lag_on = rate > 0.0 || (a.stream.is_some() && drop_late);
     let drop_n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let drop_r = drop_n.clone();
     let seg_n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -532,7 +540,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         // --seg-skip: 직전 분할 키프레임에서 조금만 움직였으면 화면이 거의 같으니 분할을 건너뜀(물체 기억은 그 장면을 안 본 것으로)
                         let do_seg = match (seg_skip, &last_seg) {
                             // 밀리지 않았으면(NPU 가 따라감) 늘 분할: 생략은 밀릴 때 지연을 줄이는 데만 쓴다(안 밀려도 건너뛰면 물체 관측만 줄어 물체를 잃음)
-                            (Some((_, _, _, lmax)), Some(_)) if rate > 0.0 && late <= lmax => true,
+                            (Some((_, _, _, lmax)), Some(_)) if !lag_on || late <= lmax => true,
                             (Some((dm, ddeg, nmax, _)), Some((lp, lr, ns))) => {
                                 let dp = ((sf.p[0] - lp[0]).powi(2) + (sf.p[1] - lp[1]).powi(2) + (sf.p[2] - lp[2]).powi(2)).sqrt();
                                 let tr: f64 = (0..3).map(|i| (0..3).map(|j| lr[j][i] * sf.r[j][i]).sum::<f64>()).sum();
@@ -879,6 +887,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut prune_objs = false;
     let mut view_due = false; // 다음 장면에서 view.json 쓰기
     let mut n_behind = 0u32; // 밀려서 가볍게 처리한 장면 수
+    let mut lag_rb = (0u32, 0f32); // 다시 쌓기가 도는 동안 끝낸 장면 수·그중 밀림 최대
     let (mut write_due, mut scene_due, mut surf_due) = (false, false, false); // 미룬 정기 기록·표면 쓰기, 갈아 끼운 뒤 표면 면 파일
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
@@ -886,8 +895,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let c_top = Instant::now();
         clock.part = [0.0; NPART];
         let view_late = std::mem::take(&mut view_due); // 앞 장면에서 미룬 view.json
-        // 밀림(--stream-rate): 장면이 나올 시각보다 LAG_DEGRADE 초 넘게 늦으면 가볍게 — 점 격자 일부만, 새 다시 쌓기 미룸, view.json 15 장마다
-        let behind = rate > 0.0 && pace0.elapsed().as_secs_f64() - (t - pace_t0) / rate > LAG_DEGRADE;
+        // 밀림: 장면이 나올 시각보다 LAG_DEGRADE 초 넘게 늦으면 가볍게 — 점 격자 일부만, 새 다시 쌓기 미룸, view.json 15 장마다
+        let behind = lag_on && pace0.elapsed().as_secs_f64() - (t - pace_t0) / lag_rate > LAG_DEGRADE;
         n_behind += behind as u32;
         let (write_late, scene_late) = (std::mem::take(&mut write_due), std::mem::take(&mut scene_due));
         let mut busy = false; // 이 장면에서 갈아 끼우기 일을 했으면 정기 기록은 다음 장면으로
@@ -1509,8 +1518,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         clock.end_frame(c_top.elapsed().as_secs_f32() * 1e3, nkf);
         if clock.t_span.0 == 0.0 { clock.t_span.0 = t; }
         clock.t_span.1 = t;
-        if rate > 0.0 {
-            clock.lag.push((pace0.elapsed().as_secs_f64() - (t - pace_t0) / rate) as f32);
+        if lag_on {
+            let l = (pace0.elapsed().as_secs_f64() - (t - pace_t0) / lag_rate) as f32;
+            clock.lag.push(l);
+            if rb_job.is_some() {
+                lag_rb = (lag_rb.0 + 1, lag_rb.1.max(l));
+            }
         }
         if nkf % 25 == 0 {
             let n = clock.n as f64;
@@ -1624,8 +1637,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let l = &clock.lag;
         let mut s = l.clone();
         s.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        summary["lag_s"] = json!({"p50": s[s.len() / 2], "p95": s[(s.len() - 1) * 95 / 100], "max": s[s.len() - 1], "end": l[l.len() - 1],
+        summary["lag_s"] = json!({"p50": s[s.len() / 2], "p95": s[(s.len() - 1) * 95 / 100], "max": s[s.len() - 1], "end": l[l.len() - 1], "rebuild_frames": lag_rb.0, "rebuild_max": lag_rb.1,
             "every_10pct": (1..=10).map(|i| l[(l.len() - 1) * i / 10]).collect::<Vec<_>>()});
+    }
+    let (cpu, cpu_all) = out::cpu::report();
+    if cpu_all > 0.0 {
+        summary["cpu_s"] = json!({"main": cpu[0], "reader": cpu[1], "pts": cpu[2], "tex": cpu[3], "rebuild": cpu[4], "writer": cpu[5], "other": cpu_all - cpu.iter().sum::<f64>(), "total": cpu_all});
     }
     println!("{summary}");
     seg
@@ -1765,7 +1782,7 @@ fn surface_outputs(dir: &Path, run_id: u64, vox: f64, s: &mut submap::Submaps, t
     (json!({"run": run_id, "chunks": 0, "prefix": "scene/c", "voxel": vox, "n": 0, "surface": surface_json(&s.global, run_id, tex)}), more)
 }
 
-/// 스트림이 이만큼(초) 밀리면 가볍게 처리(--stream-rate 일 때)
+/// 스트림이 이만큼(초) 밀리면 가볍게 처리
 const LAG_DEGRADE: f64 = 0.5;
 /// 스트림 장면이 찍은 시각보다 이만큼(초) 늦으면 버림(--no-drop 이 아니면)
 const DROP_LATE: f64 = 0.2;
@@ -2395,7 +2412,10 @@ fn main() {
     }
     // 분할 모델(ORT 스레드)은 읽기 스레드 역할의 코어에서 만든다(ORT 스레드가 만든 스레드의 코어 묶음을 물려받음)
     out::thread_role(out::Role::Reader);
-    let mut seg = make_seg(&a.seg);
+    let mut seg = match &a.seg_cache {
+        Some(dir) => { let path = a.seg.clone(); Box::new(segsim::CachedSeg::new(dir, a.seg_cpu_ms, Box::new(move || make_seg(&path)))) as Box<dyn seg::Segmenter + Send> }
+        None => make_seg(&a.seg),
+    };
     out::thread_role(out::Role::Main);
     loop {
         seg = run(&a, seg);

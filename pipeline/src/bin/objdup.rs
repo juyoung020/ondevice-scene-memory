@@ -58,6 +58,15 @@ fn main() {
     let boxes: Vec<_> = objs.iter().map(|o| bbox(&o.2)).collect();
     let cen = |b: &([f32; 3], [f32; 3])| [0, 1, 2].map(|k| 0.5 * (b.0[k] + b.1[k]));
     let mut ndup = 0;
+    // 중복 짝을 이은 묶음 하나를 실제 물체 하나로 셈(union-find)
+    let mut par: Vec<usize> = (0..objs.len()).collect();
+    fn root(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
     for i in 0..objs.len() {
         for j in i + 1..objs.len() {
             if objs[i].1 != objs[j].1 {
@@ -82,6 +91,8 @@ fn main() {
             let dup = near >= 0.3 || bov >= 0.5;
             if dup {
                 ndup += 1;
+                let (ri, rj) = (root(&mut par, i), root(&mut par, j));
+                par[ri] = rj;
             }
             if dup || (all && d < 1.5) {
                 println!(
@@ -92,5 +103,6 @@ fn main() {
             }
         }
     }
-    println!("물체 {} 개, 중복 짝 {} 개", objs.len(), ndup);
+    let uniq = (0..objs.len()).filter(|&i| root(&mut par, i) == i).count();
+    println!("물체 {} 개, 중복 짝 {} 개, 중복 묶음을 하나로 센 물체 {} 개", objs.len(), ndup, uniq);
 }

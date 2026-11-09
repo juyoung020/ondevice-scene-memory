@@ -63,7 +63,7 @@ struct Args {
     stream_rate: f64,   // --stream-rate R: 스트림을 찍은 시각대로 R 배속으로 내보냄(0 = 최대 속도), 밀림(지연) 기록
     seg_min_ms: f64,    // --seg-min-ms M: 분할이 적어도 M ms 걸린 것처럼 기다림(보드 NPU 분할 97 ms 흉내)
     no_drop: bool,      // --no-drop: 스트림이 밀려도 장면을 버리지 않음(재생 결과가 늘 같게)
-    seg_skip: Option<(f64, f64, usize)>, // --seg-skip M,DEG[,N]: 스트림에서 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
+    seg_skip: Option<(f64, f64, usize, f64)>, // --seg-skip M,DEG[,N[,L]]: 스트림이 L 초(기본 0.1) 넘게 밀렸을 때만, 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
     scene_vox: f64,
     max_depth: f64,
     scene_step: usize, // 3D 지도에 쓸 화소 간격
@@ -116,7 +116,7 @@ fn args() -> Args {
         no_drop: v.iter().any(|x| x == "--no-drop"),
         seg_skip: get("--seg-skip").filter(|s| s != "off").map(|s| {
             let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect();
-            (v[0], v[1], v.get(2).map_or(4, |n| *n as usize))
+            (v[0], v[1], v.get(2).map_or(4, |n| *n as usize), v.get(3).copied().unwrap_or(0.1))
         }),
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
@@ -531,7 +531,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         let depth_m = sf.depth_m();
                         // --seg-skip: 직전 분할 키프레임에서 조금만 움직였으면 화면이 거의 같으니 분할을 건너뜀(물체 기억은 그 장면을 안 본 것으로)
                         let do_seg = match (seg_skip, &last_seg) {
-                            (Some((dm, ddeg, nmax)), Some((lp, lr, ns))) => {
+                            // 밀리지 않았으면(NPU 가 따라감) 늘 분할: 생략은 밀릴 때 지연을 줄이는 데만 쓴다(안 밀려도 건너뛰면 물체 관측만 줄어 물체를 잃음)
+                            (Some((_, _, _, lmax)), Some(_)) if rate > 0.0 && late <= lmax => true,
+                            (Some((dm, ddeg, nmax, _)), Some((lp, lr, ns))) => {
                                 let dp = ((sf.p[0] - lp[0]).powi(2) + (sf.p[1] - lp[1]).powi(2) + (sf.p[2] - lp[2]).powi(2)).sqrt();
                                 let tr: f64 = (0..3).map(|i| (0..3).map(|j| lr[j][i] * sf.r[j][i]).sum::<f64>()).sum();
                                 let ang = ((tr - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees();

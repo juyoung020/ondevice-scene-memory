@@ -2,7 +2,7 @@
 //! 보드는 추론을 NPU 가 맡아 CPU 는 전·후처리만 쓴다. PC 의 CPU 분할(ORT)은 memmap 몫 코어를 추론에 쓰므로,
 //! 코어 2 개 흉내에서는 추론을 읽어 오기로 바꾸고 전·후처리 몫만 `--seg-cpu-ms` 만큼 읽기 스레드가 코어를 붙잡는다.
 //! 같은 장면은 늘 같은 검출이 나와 실행끼리 물체 수를 견주기도 쉽다.
-use crate::seg::{Det, Segmenter};
+use crate::seg::{Det, SegIn, SegRaw, Segmenter};
 use std::path::{Path, PathBuf};
 
 type Make = Box<dyn FnOnce() -> Box<dyn Segmenter + Send> + Send>;
@@ -20,6 +20,13 @@ impl CachedSeg {
     pub fn new(dir: &Path, cpu_ms: f64, make: Make) -> CachedSeg {
         std::fs::create_dir_all(dir).expect("--seg-cache 폴더");
         CachedSeg { make: Some(make), inner: None, dir: dir.to_path_buf(), cpu_ms, hits: 0, misses: 0 }
+    }
+    /// 진짜 모델(처음 쓸 때 만든다)
+    fn model(&mut self) -> &mut (dyn Segmenter + Send) {
+        if let Some(make) = self.make.take() {
+            self.inner = Some(make());
+        }
+        self.inner.as_deref_mut().expect("분할 모델")
     }
 }
 
@@ -70,7 +77,16 @@ fn unpack(z: &[u8]) -> Option<Vec<Det>> {
 }
 
 impl Segmenter for CachedSeg {
+    fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw) {
+        self.model().infer(inp, raw)
+    }
+    fn scratch(&mut self) -> &mut (SegIn, SegRaw) {
+        self.model().scratch()
+    }
     fn run(&mut self, rgb: &[u8], w: usize, h: usize, conf: f32) -> Vec<Det> {
+        self.direct(rgb, w, h, conf).unwrap()
+    }
+    fn direct(&mut self, rgb: &[u8], w: usize, h: usize, conf: f32) -> Option<Vec<Det>> {
         let c0 = std::time::Instant::now();
         let path = self.dir.join(format!("{:016x}.seg", key(rgb, w, h, conf)));
         if let Some(dets) = std::fs::read(&path).ok().and_then(|z| unpack(&z)) {
@@ -79,19 +95,16 @@ impl Segmenter for CachedSeg {
             while c0.elapsed().as_secs_f64() * 1e3 < self.cpu_ms {
                 std::hint::spin_loop();
             }
-            return dets;
+            return Some(dets);
         }
-        if let Some(make) = self.make.take() {
-            self.inner = Some(make());
-        }
-        let dets = self.inner.as_mut().expect("분할 모델").run(rgb, w, h, conf);
+        let dets = self.model().run(rgb, w, h, conf);
         self.misses += 1;
         // 여러 실행이 같은 폴더를 써도 반쯤 쓴 파일을 읽지 않게 임시 이름으로 쓴 뒤 바꿈
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, pack(&dets)).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
-        dets
+        Some(dets)
     }
 }
 

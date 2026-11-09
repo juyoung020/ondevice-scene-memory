@@ -190,11 +190,13 @@ pub fn flush_writer() {
 
 /// 스레드 역할: 우선순위(nice)·코어 묶기를 역할마다 정한다(`--threads`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Role { Main, Reader, Points, Texture, Rebuild, Writer }
-pub const ROLE_NAMES: [&str; 6] = ["main", "reader", "pts", "tex", "rebuild", "writer"];
+pub enum Role { Main, Reader, Points, Texture, Rebuild, Writer, Infer }
+pub const ROLE_NAMES: [&str; 7] = ["main", "reader", "pts", "tex", "rebuild", "writer", "infer"];
+/// 역할별 기본 nice(묶지 않음)
+const NICE: [(i32, u64); 7] = [(0, 0), (0, 0), (5, 0), (10, 0), (10, 0), (5, 0), (0, 0)];
 
 /// 역할별 (nice, 코어 묶음 비트). 묶음 0 = 프로세스가 받은 코어 전부
-static LAYOUT: std::sync::OnceLock<[(i32, u64); 6]> = std::sync::OnceLock::new();
+static LAYOUT: std::sync::OnceLock<[(i32, u64); 7]> = std::sync::OnceLock::new();
 static FULL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// 프로세스가 쓸 수 있는 코어(taskset 으로 준 것)
@@ -212,25 +214,25 @@ pub fn allowed_cpus() -> Vec<usize> {
     (0..std::thread::available_parallelism().map_or(1, |n| n.get())).collect()
 }
 
-/// `--threads` 해석. 기본(auto): nice 는 본 스레드·읽기 0, 점 +5, 기록 +5, 텍스처·다시 쌓기 +10.
-/// 코어 4 개 이상이면 본 스레드·읽기(분할)를 앞 코어 둘에, 점·텍스처·다시 쌓기·기록을 나머지 코어에 묶는다.
+/// `--threads` 해석. 기본(auto): nice 는 본 스레드·읽기·추론 0, 점 +5, 기록 +5, 텍스처·다시 쌓기 +10.
+/// 코어 4 개 이상이면 본 스레드·읽기(분할 전·후처리)·추론(모델을 부르는 스레드, PC 는 ONNX Runtime 스레드도)을 앞 코어 둘에, 점·텍스처·다시 쌓기·기록을 나머지 코어에 묶는다.
 /// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔). 직접 주기: `main=0:0,pts=5:2-3,tex=10:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
 pub fn set_layout(spec: &str) {
     let cpus = allowed_cpus();
     let bits = |v: &[usize]| v.iter().fold(0u64, |m, &c| if c < 64 { m | 1 << c } else { m });
-    let mut l: [(i32, u64); 6] = [(0, 0), (0, 0), (5, 0), (10, 0), (10, 0), (5, 0)];
+    let mut l = NICE;
     match spec {
-        "none" => l = [(0, 0); 6],
+        "none" => l = [(0, 0); 7],
         "auto" => {
             if cpus.len() >= 4 {
                 let (fg, bg) = (bits(&cpus[..2]), bits(&cpus[2..]));
-                l = [(0, fg), (0, fg), (5, bg), (10, bg), (10, bg), (5, bg)];
+                l = [(0, fg), (0, fg), (5, bg), (10, bg), (10, bg), (5, bg), (0, fg)];
             }
         }
         s => {
             for part in s.split(',') {
                 let (name, rest) = part.split_once('=').expect("--threads: 역할=nice[:코어]");
-                let i = ROLE_NAMES.iter().position(|n| *n == name).expect("--threads: 역할 이름(main reader pts tex rebuild writer)");
+                let i = ROLE_NAMES.iter().position(|n| *n == name).expect("--threads: 역할 이름(main reader pts tex rebuild writer infer)");
                 let (nice, cores) = rest.split_once(':').map_or((rest, None), |(a, b)| (a, Some(b)));
                 let mut cs = vec![];
                 for r in cores.unwrap_or("").split('+').filter(|x| !x.is_empty()) {
@@ -250,7 +252,7 @@ pub fn set_layout(spec: &str) {
 
 /// 지금 스레드를 역할에 맞게(우선순위·코어). 리눅스만, 실패해도 그대로 진행
 pub fn thread_role(r: Role) {
-    let (nice, mask) = LAYOUT.get().copied().unwrap_or([(0, 0), (0, 0), (5, 0), (10, 0), (10, 0), (5, 0)])[r as usize];
+    let (nice, mask) = LAYOUT.get().copied().unwrap_or(NICE)[r as usize];
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
@@ -290,7 +292,7 @@ pub fn slow(c0: std::time::Instant) {
 /// 역할별 CPU 시간: 스레드가 역할을 맡은 동안 쓴 CPU 를 역할마다 더한다(끝 요약의 `cpu_s`, `--slow` 로 붙잡은 시간 포함). 리눅스만
 pub mod cpu {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static DONE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6]; // 역할을 내려놓았거나 끝난 스레드 몫(ns)
+    static DONE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]; // 역할을 내려놓았거나 끝난 스레드 몫(ns)
     static LIVE: std::sync::Mutex<Vec<(i32, usize, u64)>> = std::sync::Mutex::new(Vec::new()); // (스레드 id, 역할, 역할을 맡을 때의 CPU ns)
 
     /// 시계 id: 2 = 프로세스 전체, 3 = 지금 스레드, `of_thread(tid)` = 다른 스레드
@@ -341,8 +343,8 @@ pub mod cpu {
     }
 
     /// (역할별 CPU 초, 프로세스 전체 CPU 초). 전체 − 역할 합 = 역할 없는 스레드(rayon 풀·분할 추론 스레드)
-    pub fn report() -> ([f64; 6], f64) {
-        let mut ns: [u64; 6] = std::array::from_fn(|k| DONE[k].load(Relaxed));
+    pub fn report() -> ([f64; 7], f64) {
+        let mut ns: [u64; 7] = std::array::from_fn(|k| DONE[k].load(Relaxed));
         for &(tid, role, base) in LIVE.lock().unwrap().iter() {
             ns[role] += clock_ns(of_thread(tid)).saturating_sub(base);
         }

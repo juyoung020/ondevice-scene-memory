@@ -63,7 +63,7 @@ struct Args {
     stream_rate: f64,   // --stream-rate R: 스트림을 찍은 시각대로 R 배속으로 내보냄(0 = 최대 속도), 밀림(지연) 기록
     seg_min_ms: f64,    // --seg-min-ms M: 분할이 적어도 M ms 걸린 것처럼 기다림(보드 NPU 분할 97 ms 흉내)
     no_drop: bool,      // --no-drop: 스트림이 밀려도 장면을 버리지 않음(재생 결과가 늘 같게)
-    seg_skip: Option<(f64, f64, usize, f64)>, // --seg-skip M,DEG[,N[,L]]: 스트림이 L 초(기본 0.1) 넘게 밀렸을 때만, 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
+    seg_skip: Option<(f64, f64, usize, f64)>, // --seg-skip M,DEG[,N[,L]] (기본 0.10,10,4,0.1, off 로 끔): 스트림이 L 초(기본 0.1) 넘게 밀렸을 때만, 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
     scene_vox: f64,
     max_depth: f64,
     scene_step: usize, // 3D 지도에 쓸 화소 간격
@@ -114,10 +114,10 @@ fn args() -> Args {
         stream_rate: get("--stream-rate").map_or(0.0, |s| s.parse().unwrap()),
         seg_min_ms: get("--seg-min-ms").map_or(0.0, |s| s.parse().unwrap()),
         no_drop: v.iter().any(|x| x == "--no-drop"),
-        seg_skip: get("--seg-skip").filter(|s| s != "off").map(|s| {
+        // 기본 켬(0.10,10,4,0.1): 밀리지 않으면 늘 분할하므로 빠른 PC 에선 동작 그대로, "off" 로 끔
+        seg_skip: match get("--seg-skip") { Some(s) if s == "off" => None, s => { let s = s.unwrap_or_else(|| "0.10,10,4,0.1".into());
             let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect();
-            (v[0], v[1], v.get(2).map_or(4, |n| *n as usize), v.get(3).copied().unwrap_or(0.1))
-        }),
+            Some((v[0], v[1], v.get(2).map_or(4, |n| *n as usize), v.get(3).copied().unwrap_or(0.1))) } },
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),

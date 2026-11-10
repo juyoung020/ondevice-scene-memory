@@ -102,6 +102,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | `--no-drop` | 밀려도 장면을 버리지 않음(재생 결과를 늘 같게) |
 | `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · tex · rebuild · writer · infer) |
 | `--seg-pipe off` | 스트림 분할의 전처리 → 추론 → 후처리를 한 스레드에서 차례로(기본: 단계마다 스레드를 두어 겹침) |
+| `--npu-jobs K` | 스트림 분할 장면을 NPU 에 K 장까지 함께 올림(NPU 코어 여럿이 나눠 돎, 기본 4, `1` 은 한 장씩) |
 | `--seg-check N` | 지도는 만들지 않고, 스트림 분할 장면 N 장으로 분할 전·후처리 결과가 기준 구현과 같은지와 단계별 시간을 확인 |
 | `--seg <모델>` / `--conf 0.35` | 물체 분할 모델 / 물체로 인정할 확신도 |
 | `--max-depth` | 지도에 넣을 최대 거리(m) |

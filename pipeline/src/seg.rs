@@ -320,6 +320,14 @@ pub trait Segmenter: Send {
     fn direct(&mut self, _rgb: &[u8], _w: usize, _h: usize, _conf: f32) -> Option<Vec<Det>> {
         None
     }
+    /// 추론을 올려만 두고 돌아올 수 있으면 작업 번호를 준다(NPU 코어 여럿에 여러 장을 함께 올림, `--npu-jobs`). 결과는 `collector` 가 준 함수로 받는다.
+    fn submit(&mut self, _inp: &SegIn) -> Option<i32> {
+        None
+    }
+    /// `submit` 한 작업의 결과를 다른 스레드에서 받는 함수. 실행기보다 먼저 없앤다.
+    fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
+        None
+    }
     fn run(&mut self, rgb: &[u8], w: usize, h: usize, conf: f32) -> Vec<Det> {
         let (mut inp, mut raw) = std::mem::take(self.scratch());
         seg_pre(rgb, w, h, &mut inp);
@@ -551,6 +559,8 @@ pub mod dx {
         fn dxrt_engine_create(path: *const c_char, opts: *const Options, out: *mut *mut c_void) -> c_int;
         fn dxrt_engine_destroy(e: *mut c_void);
         fn dxrt_engine_run(e: *mut c_void, input: *const c_void, output: *mut c_void) -> c_int;
+        fn dxrt_engine_run_async(e: *mut c_void, input: *const c_void, user_arg: *mut c_void, output: *mut c_void, job_id: *mut c_int) -> c_int;
+        fn dxrt_engine_wait(e: *mut c_void, job_id: c_int, output: *mut c_void) -> c_int;
         fn dxrt_engine_get_output_size(e: *mut c_void, size: *mut u64) -> c_int;
         fn dxrt_engine_get_output_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
         fn dxrt_last_error_message() -> *const c_char;
@@ -606,6 +616,20 @@ pub mod dx {
                 }
             }
         }
+        /// 추론 하나를 NPU 에 올려 두고 바로 돌아옴(작업 번호). 입력 버퍼는 `Waiter::wait_into` 가 끝날 때까지 그대로 둔다.
+        pub fn submit(&mut self, input: &[u8]) -> i32 {
+            let mut id: c_int = 0;
+            unsafe {
+                if dxrt_engine_run_async(self.e, input.as_ptr() as *const c_void, std::ptr::null_mut(), std::ptr::null_mut(), &mut id) != 0 {
+                    panic!("dxrt run_async: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
+                }
+            }
+            id
+        }
+        /// 올려 둔 작업의 결과를 다른 스레드에서 받는 손잡이. 엔진보다 먼저 없앤다.
+        pub fn waiter(&self) -> Waiter {
+            Waiter { e: self.e, len: self.out.len() }
+        }
         /// 텐서 i 의 (f32 시작, 길이)
         pub fn f32_span(&self, i: usize) -> (usize, usize) {
             let (_, shape, off) = &self.tensors[i];
@@ -625,6 +649,23 @@ pub mod dx {
         }
     }
     unsafe impl Send for Engine {}
+
+    pub struct Waiter {
+        e: *mut c_void,
+        len: usize,
+    }
+    impl Waiter {
+        /// 작업이 끝날 때까지 기다려 결과(f32, 모든 텐서 이어 붙임)를 받음
+        pub fn wait_into(&self, id: i32, out: &mut Vec<f32>) {
+            out.resize(self.len.div_ceil(4), 0.0);
+            unsafe {
+                if dxrt_engine_wait(self.e, id, out.as_mut_ptr() as *mut c_void) != 0 {
+                    panic!("dxrt wait: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
+                }
+            }
+        }
+    }
+    unsafe impl Send for Waiter {}
 }
 
 #[cfg(feature = "dxrt")]
@@ -692,6 +733,19 @@ impl Segmenter for DxSeg {
         raw.proto = self.eng.f32_span(1);
         let ps = &self.eng.tensors[1].1;
         (raw.pc, raw.ph, raw.pw) = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+    }
+    fn submit(&mut self, inp: &SegIn) -> Option<i32> {
+        Some(self.eng.submit(&inp.u8))
+    }
+    fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
+        let (w, det, proto) = (self.eng.waiter(), self.eng.f32_span(0), self.eng.f32_span(1));
+        let ps = &self.eng.tensors[1].1;
+        let p = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+        Some(Box::new(move |id, raw| {
+            w.wait_into(id, &mut raw.buf);
+            (raw.det, raw.proto) = (det, proto);
+            (raw.pc, raw.ph, raw.pw) = p;
+        }))
     }
 }
 

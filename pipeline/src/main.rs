@@ -55,6 +55,7 @@ struct Args {
     rec: Option<PathBuf>,
     seg_every: usize,
     npu_par: bool,
+    npu_jobs: usize,    // --npu-jobs K: 스트림 분할 추론을 NPU 에 K 장까지 함께 올림(코어 여럿이 나눠 돎, 기본 4, 1 = 한 장씩)
     sp_every: usize,
     fast_pose: bool,   // 모든 장면은 위치만 먼저 추적, 깊이·분할은 따로(카메라: 모델이 쉬는 대로 최신 장면에)
     depth_every: usize, // --fast-pose 로 TUM 을 돌릴 때 깊이 장면 간격
@@ -111,6 +112,7 @@ fn args() -> Args {
         rec: get("--rec").map(PathBuf::from),
         seg_every: get("--seg-every").map_or(1, |s| s.parse().unwrap()),
         npu_par: v.iter().any(|x| x == "--npu-par"),
+        npu_jobs: get("--npu-jobs").and_then(|s| s.parse().ok()).unwrap_or(4).clamp(1, 8),
         sp_every: get("--sp-every").map_or(1, |s| s.parse().unwrap()),
         fast_pose: v.iter().any(|x| x == "--fast-pose"),
         depth_every: get("--depth-every").map_or(3, |s| s.parse().unwrap()),
@@ -460,7 +462,7 @@ struct SegJob {
     t: [f64; 3],  // 전처리, 추론, 후처리
 }
 
-/// 분할 단계 2 — 모델 호출: 분할 추론(깊이·특징점 모델을 쓰면 그것도). NPU 는 한 번에 하나라 스레드 하나가 차례로 부른다.
+/// 분할 단계 2 — 모델 호출: 분할 추론(깊이·특징점 모델을 쓰면 그것도). 한 장씩 차례로 부른다(`--npu-jobs` 로 여러 장을 함께 올릴 때는 스트림 쪽에서 올리기·받기를 나눠 한다).
 struct InferStage {
     seg: Box<dyn seg::Segmenter + Send>,
     dnet: Option<Box<dyn seg::DepthNet>>,
@@ -666,7 +668,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let seq = seq.clone();
         let (every, conf, live, no_skip, seg_every, npu_par, sp_every) = (a.every, a.conf, a.live, a.no_skip, a.seg_every.max(1), a.npu_par, a.sp_every.max(1));
         let (fast_pose, depth_every, depth_lag) = (a.fast_pose, a.depth_every.max(1), a.depth_lag);
-        let (seg_min, infer_min, seg_pipe) = (a.seg_min_ms / 1e3, a.infer_min_ms / 1e3, a.seg_pipe);
+        let (seg_min, infer_min, seg_pipe, npu_jobs) = (a.seg_min_ms / 1e3, a.infer_min_ms / 1e3, a.seg_pipe, a.npu_jobs);
         let seg_skip = a.seg_skip;
         let mut dnet = make_depth(&a.depth);
         // --fast-pose 는 위치를 모두 직접 방식으로 구하니 SuperPoint 는 돌리지 않는다(NPU 작업 하나 줄임)
@@ -688,15 +690,50 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     Pipe(std::sync::mpsc::SyncSender<SegJob>, std::thread::JoinHandle<InferStage>, std::thread::JoinHandle<()>),
                 }
                 let inf_ema = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)); // 추론 단계가 한 장에 걸린 시간(초, f64 비트)의 이동 평균
+                let mut in_flight = 1u64; // 추론 단계에 함께 들어가 있을 수 있는 장면 수(--npu-jobs)
                 let (buf_tx, buf_rx) = std::sync::mpsc::channel::<(seg::SegIn, seg::SegRaw)>();
                 let mut sink = if seg_pipe {
                     let (to_inf, from_pre) = std::sync::mpsc::sync_channel::<SegJob>(0);
                     let (to_post, from_inf) = std::sync::mpsc::sync_channel::<SegJob>(0);
                     let (ema, mut stage2) = (inf_ema.clone(), stage2);
+                    // --npu-jobs K(2 이상): 추론 스레드는 NPU 에 올리기만 하고 받기 스레드가 순서대로 결과를 받아 넘긴다 — K 장까지 함께 돌아 NPU 코어 여럿을 쓴다.
+                    // 분할 말고 다른 모델을 같이 돌리거나 시간을 흉내 낼 때는 한 장씩.
+                    let mut coll = (npu_jobs > 1 && stage2.dnet.is_none() && stage2.spnet.is_none() && infer_min <= 0.0 && seg_min <= 0.0).then(|| stage2.seg.collector()).flatten();
+                    let jobs = if coll.is_some() { npu_jobs } else { 1 };
+                    in_flight = jobs as u64;
+                    let (to_coll, from_sub) = std::sync::mpsc::sync_channel::<(SegJob, Option<i32>, Instant)>(jobs.saturating_sub(2));
                     let h_inf = std::thread::Builder::new().name("seg-infer".into()).spawn(move || {
                         out::thread_role(out::Role::Infer);
+                        let h_coll = coll.take().map(|mut wait| {
+                            let (ema, to_post) = (ema.clone(), to_post.clone());
+                            std::thread::Builder::new().name("seg-collect".into()).spawn(move || {
+                                out::thread_role(out::Role::Infer);
+                                while let Ok((mut j, id, c)) = from_sub.recv() {
+                                    if let Some(id) = id {
+                                        wait(id, &mut j.bufs.1);
+                                        j.t[1] = c.elapsed().as_secs_f64();
+                                        // 한 장이 NPU 를 차지한 몫: 올려서 받기까지 걸린 시간 / 함께 올린 수
+                                        let (d, e) = (j.t[1] / jobs as f64, f64::from_bits(ema.load(Relaxed)));
+                                        ema.store((if e == 0.0 { d } else { 0.8 * e + 0.2 * d }).to_bits(), Relaxed);
+                                    }
+                                    if to_post.send(j).is_err() {
+                                        break;
+                                    }
+                                }
+                            }).unwrap()
+                        });
                         while let Ok(mut j) = from_pre.recv() {
                             let c = Instant::now();
+                            if h_coll.is_some() {
+                                let id = if j.do_seg && !j.sf.lost() { stage2.seg.submit(&j.bufs.0) } else { None };
+                                if id.is_none() {
+                                    stage2.run(&mut j);
+                                }
+                                if to_coll.send((j, id, c)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
                             stage2.run(&mut j);
                             if j.do_seg {
                                 let (d, e) = (c.elapsed().as_secs_f64(), f64::from_bits(ema.load(Relaxed)));
@@ -705,6 +742,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             if to_post.send(j).is_err() {
                                 break;
                             }
+                        }
+                        drop(to_coll);
+                        if let Some(h) = h_coll {
+                            h.join().expect("분할 받기 스레드");
                         }
                         stage2
                     }).unwrap();
@@ -808,9 +849,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                                 let t_hand = Instant::now();
                                 pool.extend(buf_rx.try_iter());
                                 picked += 1;
-                                // 다음 장면은 ① 앞앞 장면까지 본 스레드가 받아 간 뒤에 고른다: 본 스레드가 밀릴 때 끝난 장면이 차례 실행보다 더 쌓이지 않게
+                                // 다음 장면은 ① 앞앞 장면(여러 장을 함께 올리면 그 수만큼 더 앞)까지 본 스레드가 받아 간 뒤에 고른다: 본 스레드가 밀릴 때 끝난 장면이 차례 실행보다 더 쌓이지 않게
                                 let mut g = taken_r.n.lock().unwrap();
-                                while ok && *g + 1 < picked && !taken_r.dead.load(Relaxed) {
+                                while ok && *g + in_flight < picked && !taken_r.dead.load(Relaxed) {
                                     g = taken_r.cv.wait_timeout(g, std::time::Duration::from_millis(20)).unwrap().0;
                                 }
                                 drop(g);

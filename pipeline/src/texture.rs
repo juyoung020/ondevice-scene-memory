@@ -901,7 +901,7 @@ impl Worker {
                 let cams = self.cams();
                 let todo: Vec<Reg> = self.regs.iter().filter(|(_, st)| self.stale(st)).map(|(r, _)| *r).collect();
                 let c0 = Instant::now();
-                let res: Vec<(Reg, Option<TexMesh>, f64)> = todo.par_iter().map(|&r| { let (m, s) = self.texture(r, &cams); (r, m, s) }).collect();
+                let res: Vec<(Reg, Option<TexMesh>, f64)> = crate::out::par(|| todo.par_iter().map(|&r| { let (m, s) = self.texture(r, &cams); (r, m, s) }).collect());
                 let wall = c0.elapsed().as_secs_f64();
                 let n_final = res.len();
                 for (r, m, s) in res {

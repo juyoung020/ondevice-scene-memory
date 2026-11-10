@@ -136,7 +136,7 @@ impl Tsdf {
             }
             changed
         };
-        work.par_iter_mut().for_each(|(key, blk, ch)| *ch = one(*key, blk));
+        crate::out::par(|| work.par_iter_mut().for_each(|(key, blk, ch)| *ch = one(*key, blk)));
         for (key, blk, ch) in work {
             if ch {
                 self.dirty.insert((div_floor(key.0, R), div_floor(key.1, R), div_floor(key.2, R)));
@@ -169,7 +169,7 @@ impl Tsdf {
         let this = &*self;
         let mut out: Vec<_> = {
             use rayon::prelude::*;
-            regions.par_iter().map(|&reg| { let (v, t) = this.mesh_region(reg); (reg, v, t) }).collect()
+            crate::out::par(|| regions.par_iter().map(|&reg| { let (v, t) = this.mesh_region(reg); (reg, v, t) }).collect())
         };
         for (reg, _, _) in &out {
             *self.ver.entry(*reg).or_insert(0) += 1;
@@ -514,7 +514,8 @@ impl Tsdf {
         let p = pose.1;
         // 대상 블록끼리 독립(원본은 읽기만): 코어마다 나눠 보간
         type Samp = Vec<(u16, f32, f32, [f32; 3])>;
-        let res: Vec<(BKey, Samp)> = tv
+        let res: Vec<(BKey, Samp)> = crate::out::par(|| {
+        tv
             .par_iter()
             .filter_map(|&tk| {
                 let mut out: Samp = vec![];
@@ -557,7 +558,8 @@ impl Tsdf {
                 }
                 (!out.is_empty()).then_some((tk, out))
             })
-            .collect();
+            .collect()
+        });
         for (tk, out) in res {
             let tb = self.blocks.entry(tk).or_insert_with(empty_block);
             for (i, d, w, c) in out {

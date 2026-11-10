@@ -15,15 +15,49 @@ pub fn replace(tmp: &Path, dst: &Path) {
 /// 기록할 내용: 바로 쓸 바이트, 또는 기록 스레드에서 만들 바이트(PLY 짜기·PNG 압축 등 무거운 것)
 type Job = Box<dyn FnOnce() -> Vec<u8> + Send>;
 
-/// 비동기 기록: 켜 두면 파일 쓰기(와 PNG 압축)를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜)
-static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(std::path::PathBuf, Job)>> = std::sync::OnceLock::new();
+/// 비동기 기록: 켜 두면 파일 쓰기(와 PNG 압축)를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜).
+/// 줄이 WRITE_Q 개 차면 작업 스레드(점·텍스처·다시 쌓기)는 자리가 날 때까지 기다리고, 본 스레드는 기다림 없이 줄 끝에 넣는다
+static WRITER: std::sync::OnceLock<WriteQ> = std::sync::OnceLock::new();
+const WRITE_Q: usize = 256;
+
+struct WriteQ {
+    q: std::sync::Mutex<std::collections::VecDeque<(std::path::PathBuf, Job)>>,
+    item: std::sync::Condvar,
+    space: std::sync::Condvar,
+}
+
+impl WriteQ {
+    fn send(&self, p: std::path::PathBuf, job: Job, wait: bool) {
+        let mut q = self.q.lock().unwrap();
+        while wait && q.len() >= WRITE_Q {
+            q = self.space.wait(q).unwrap();
+        }
+        q.push_back((p, job));
+        self.item.notify_one();
+    }
+    fn recv(&self) -> (std::path::PathBuf, Job) {
+        let mut q = self.q.lock().unwrap();
+        loop {
+            if let Some(x) = q.pop_front() {
+                self.space.notify_one();
+                return x;
+            }
+            q = self.item.wait(q).unwrap();
+        }
+    }
+}
 
 pub fn start_writer() {
-    WRITER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(std::path::PathBuf, Job)>(256);
+    let mut first = false;
+    let w = WRITER.get_or_init(|| {
+        first = true;
+        WriteQ { q: Default::default(), item: std::sync::Condvar::new(), space: std::sync::Condvar::new() }
+    });
+    if first {
         std::thread::spawn(move || {
             thread_role(Role::Writer);
-            for (p, job) in rx {
+            loop {
+                let (p, job) = w.recv();
                 if p.as_os_str().is_empty() {
                     job(); // flush_writer 표시
                     continue;
@@ -31,8 +65,7 @@ pub fn start_writer() {
                 run_job(&p, job);
             }
         });
-        tx
-    });
+    }
 }
 
 pub fn write_atomic(dst: &Path, bytes: &[u8]) {
@@ -47,7 +80,7 @@ pub fn write_owned(dst: &Path, bytes: Vec<u8>) {
 /// 바이트를 기록 스레드에서 만들어 쓴다(기록 스레드가 없으면 바로)
 fn write_lazy(dst: &Path, job: Job) {
     match WRITER.get() {
-        Some(tx) => tx.send((dst.to_path_buf(), job)).expect("writer"),
+        Some(w) => w.send(dst.to_path_buf(), job, BG.with(|b| b.get())),
         None => run_job(dst, job),
     }
 }
@@ -181,9 +214,9 @@ pub mod stats {
 
 /// 기록 스레드에 밀린 파일을 모두 쓸 때까지 기다림(끝낼 때)
 pub fn flush_writer() {
-    if let Some(tx) = WRITER.get() {
+    if let Some(w) = WRITER.get() {
         let (dt, dr) = std::sync::mpsc::channel::<()>();
-        let _ = tx.send((std::path::PathBuf::new(), Box::new(move || { let _ = dt.send(()); vec![] })));
+        w.send(std::path::PathBuf::new(), Box::new(move || { let _ = dt.send(()); vec![] }), false);
         let _ = dr.recv();
     }
 }
@@ -192,8 +225,8 @@ pub fn flush_writer() {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role { Main, Reader, Points, Texture, Rebuild, Writer, Infer }
 pub const ROLE_NAMES: [&str; 7] = ["main", "reader", "pts", "tex", "rebuild", "writer", "infer"];
-/// 역할별 기본 nice(묶지 않음)
-const NICE: [(i32, u64); 7] = [(0, 0), (0, 0), (5, 0), (10, 0), (10, 0), (5, 0), (0, 0)];
+/// 역할별 기본 nice(묶지 않음: 본 스레드와 같은 코어를 나눠 쓰므로 작업 스레드를 크게 낮춤)
+const NICE: [(i32, u64); 7] = [(0, 0), (0, 0), (10, 0), (19, 0), (19, 0), (10, 0), (0, 0)];
 
 /// 역할별 (nice, 코어 묶음 비트). 묶음 0 = 프로세스가 받은 코어 전부
 static LAYOUT: std::sync::OnceLock<[(i32, u64); 7]> = std::sync::OnceLock::new();
@@ -214,9 +247,9 @@ pub fn allowed_cpus() -> Vec<usize> {
     (0..std::thread::available_parallelism().map_or(1, |n| n.get())).collect()
 }
 
-/// `--threads` 해석. 기본(auto): nice 는 본 스레드·읽기·추론 0, 점 +5, 기록 +5, 텍스처·다시 쌓기 +10.
+/// `--threads` 해석. 기본(auto): 코어 4 개 이상이면 nice 는 본 스레드·읽기·추론 0, 점 +5, 기록 +5, 텍스처·다시 쌓기 +10.
 /// 코어 4 개 이상이면 본 스레드·읽기(분할 전·후처리)·추론(모델을 부르는 스레드, PC 는 ONNX Runtime 스레드도)을 앞 코어 둘에, 점·텍스처·다시 쌓기·기록을 나머지 코어에 묶는다.
-/// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔). 직접 주기: `main=0:0,pts=5:2-3,tex=10:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
+/// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔: 점·기록 +10, 텍스처·다시 쌓기 +19). 직접 주기: `main=0:0,pts=5:2-3,tex=10:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
 pub fn set_layout(spec: &str) {
     let cpus = allowed_cpus();
     let bits = |v: &[usize]| v.iter().fold(0u64, |m, &c| if c < 64 { m | 1 << c } else { m });
@@ -253,6 +286,7 @@ pub fn set_layout(spec: &str) {
 /// 지금 스레드를 역할에 맞게(우선순위·코어). 리눅스만, 실패해도 그대로 진행
 pub fn thread_role(r: Role) {
     let (nice, mask) = LAYOUT.get().copied().unwrap_or(NICE)[r as usize];
+    BG.with(|b| b.set(matches!(r, Role::Points | Role::Texture | Role::Rebuild | Role::Writer)));
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
@@ -271,6 +305,55 @@ pub fn thread_role(r: Role) {
         }
     }
     let _ = (nice, mask);
+}
+
+/// 스레드 하나의 우선순위·코어 묶음(묶음 0 = 프로세스 코어 전부). 리눅스만
+fn apply(nice: i32, mask: u64) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+            fn gettid() -> i32;
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+        }
+        let tid = gettid();
+        setpriority(0, tid as u32, nice);
+        let mask = if mask == 0 { FULL.get().copied().unwrap_or(0) } else { mask };
+        if mask != 0 {
+            let mut m = [0u64; 16];
+            m[0] = mask;
+            sched_setaffinity(tid, 128, m.as_ptr());
+        }
+    }
+    let _ = (nice, mask);
+}
+
+thread_local! {
+    /// 이 스레드가 뒤쪽 역할(점·텍스처·다시 쌓기·기록)인지
+    static BG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+static BG_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+/// 나눠 돌리는 스레드 풀 둘: 기본 풀은 본 스레드 역할의 우선순위·코어(장면 넣기·면 뽑기·분할 전후처리),
+/// 뒤쪽 풀은 점 역할의 우선순위·코어(점 고르기·다시 합치기·텍스처 마무리). 뒤쪽 일은 뒤쪽 풀에서만 줄 선다.
+/// `set_layout` 뒤에 한 번 부른다
+pub fn start_pools() {
+    let l = LAYOUT.get().copied().unwrap_or(NICE);
+    let full = FULL.get().copied().unwrap_or(0);
+    let n = |m: u64| (if m == 0 { full } else { m }).count_ones().max(1) as usize;
+    let ((n0, m0), (n1, m1)) = (l[Role::Main as usize], l[Role::Points as usize]);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(n(m0)).start_handler(move |_| apply(n0, m0)).build_global();
+    if let Ok(p) = rayon::ThreadPoolBuilder::new().num_threads(n(m1)).start_handler(move |_| apply(n1, m1)).build() {
+        let _ = BG_POOL.set(p);
+    }
+}
+
+/// 나눠 돌리는 일(rayon)을 부르는 스레드의 역할에 맞는 풀에서 돌린다
+pub fn par<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match BG_POOL.get() {
+        Some(p) if BG.with(|b| b.get()) => p.install(f),
+        _ => f(),
+    }
 }
 
 /// 보드 흉내(`--slow F`): 이 구간이 F 배 걸린 것처럼 코어를 붙잡고 기다림(잠들지 않아 코어 다툼도 그대로)

@@ -1170,6 +1170,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut n_behind = 0u32; // 밀려서 가볍게 처리한 장면 수
     let mut lag_rb = (0u32, 0f32); // 다시 쌓기가 도는 동안 끝낸 장면 수·그중 밀림 최대
     let (mut write_due, mut scene_due, mut surf_due) = (false, false, false); // 미룬 정기 기록·표면 쓰기, 갈아 끼운 뒤 표면 면 파일
+    let mut surf_left = false; // 면 파일을 아직 못 뽑은 구역이 남음(다음 장면들에서 SURF_REGIONS 개씩)
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, anchor, graph }) = rx.recv() {
@@ -1188,9 +1189,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             if let Some(s) = subs.as_mut() {
                 let more;
                 (scene_json, more) = surface_outputs(&a.out, run_id, a.scene_vox, s, tex.as_ref());
-                if more {
-                    (write_due, scene_due) = (true, true);
-                }
+                surf_left = more;
                 if let Some(p) = pw.as_ref() {
                     scene_json["octree"] = p.json();
                 }
@@ -1757,7 +1756,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     scene_json["octree"] = p.json();
                 }
                 if let Some(ts) = surf(&mut tsdf, &mut subs) {
-                    write_surface(&a.out, ts, tex.as_ref());
+                    // 바뀐 구역이 많으면 SURF_REGIONS 개만 뽑고 나머지는 다음 장면들에 나눠서(스냅샷 장면은 모두)
+                    let max = if a.snaps.contains(&nkf) || nkf == 1 { usize::MAX } else { SURF_REGIONS };
+                    surf_left = write_surface_max(&a.out, ts, tex.as_ref(), max);
                     scene_json["surface"] = surface_json(ts, run_id, tex.as_ref());
                 }
             }
@@ -1785,6 +1786,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 prune_object_files(&a.out, &mem);
             }
             clock.add(P::Prune, c_p);
+        } else if surf_left && !busy {
+            // 기록이 없는 장면: 남은 구역의 면 파일을 이어서 뽑음(다음 view.json 에 실림)
+            let c_sc = Instant::now();
+            if let Some(ts) = subs.as_mut().map(|s| &mut s.global).or(tsdf.as_mut()) {
+                surf_left = write_surface_max(&a.out, ts, tex.as_ref(), SURF_REGIONS);
+                scene_json["surface"] = surface_json(ts, run_id, tex.as_ref());
+            }
+            clock.add(P::Scene, c_sc);
         }
         if a.snaps.contains(&nkf) {
             let sd = PathBuf::from(format!("{}_snap", a.out.display())).join(format!("kf{nkf:04}"));
@@ -2081,7 +2090,7 @@ const DROP_LATE: f64 = 0.2;
 /// view.json 한 번에 점 파일을 다시 만들 물체 수 상한(다시 쌓은 뒤 물체가 모두 바뀌어도 한 장면에 몰리지 않게, 나머지는 다음 기록에)
 const VIEW_REFRESH: usize = 8;
 /// 표면 면 파일을 한 장면에 다시 뽑을 구역 수 상한(남으면 다음 장면에 이어서)
-const SURF_REGIONS: usize = 24;
+const SURF_REGIONS: usize = 12;
 /// 점 지도: 한 번에 다시 쓸 노드의 점 수 상한(점 작업 스레드가 한 번에 오래 붙잡지 않게)
 const PTS_BUDGET: usize = 300_000;
 /// 점 작업 스레드에 밀린 장면이 이만큼이면 스트림 장면은 점 지도를 건너뜀(본 스레드는 기다리지 않음)
@@ -2130,7 +2139,7 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
     let (gw, gh) = ((w - off[0]).div_ceil(step), (h - off[1]).div_ceil(step));
     let mut d = vec![0f32; gw * gh];
     let mut c = vec![0u8; gw * gh * 3];
-    d.par_chunks_mut(gw).zip(c.par_chunks_mut(gw * 3)).enumerate().for_each(|(gy, (dr, cr))| {
+    out::par(|| d.par_chunks_mut(gw).zip(c.par_chunks_mut(gw * 3)).enumerate().for_each(|(gy, (dr, cr))| {
         let v = off[1] + gy * step;
         for gx in 0..gw {
             let u = off[0] + gx * step;
@@ -2145,7 +2154,7 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
                 cr[gx * 3..gx * 3 + 3].copy_from_slice(&rgb[o..o + 3]);
             }
         }
-    });
+    }));
     PtsGrid { step, off, gw, gh, d, rgb: c }
 }
 
@@ -2697,6 +2706,7 @@ fn main() {
     limit_malloc_arenas();
     let a = args();
     out::set_layout(&a.threads);
+    out::start_pools();
     out::set_slow(a.slow);
     out::thread_role(out::Role::Main);
     if a.live > 0.0 || a.stream.is_some() {

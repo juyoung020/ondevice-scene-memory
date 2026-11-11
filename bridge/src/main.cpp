@@ -234,8 +234,9 @@ static int run(int argc, char** argv) {
         Transform pose = odom->process(data, &info);
         double odom_ms = ms_since(c1);
 
+        // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다. 놓친 장면(위치 없음)은 놓침으로만 보내 Odom/ResetCountdown 동안 같은 지도에서 다시 잡게 둔다
         bool new_map = false;
-        if (!fresh && !info.reg.covariance.empty() && info.reg.covariance.at<double>(0, 0) >= 9999) {
+        if (!fresh && !pose.isNull() && !info.reg.covariance.empty() && info.reg.covariance.at<double>(0, 0) >= 9999) {
             std::fprintf(stderr, "장면 %ld: 위치 추적 다시 시작 → 새 지도\n", n);
             int id = rtabmap.triggerNewMap();
             map_id = id >= 0 ? (uint32_t)id : map_id + 1;

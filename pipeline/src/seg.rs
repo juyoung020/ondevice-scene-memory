@@ -428,9 +428,6 @@ fn session(path: &str) -> ort::session::Session {
     // directml 기능이면 그래픽카드로(안 되면 ORT 가 CPU 로 물러남). 입력 크기를 고정해 두면 DirectML 이 빠르다.
     #[cfg(feature = "directml")]
     let mut b = b.with_execution_providers([ort::ep::DirectML::default().build()]).unwrap().with_dimension_override("batch", 1).unwrap();
-    // cuda 기능이면 NVIDIA 그래픽카드로(라이브러리가 없으면 ORT 가 경고를 내고 CPU 로 물러남)
-    #[cfg(feature = "cuda")]
-    let mut b = b.with_execution_providers([ort::ep::CUDA::default().build()]).unwrap();
     b.commit_from_file(path).unwrap_or_else(|e| panic!("onnx model {path}: {e}"))
 }
 

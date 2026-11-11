@@ -19,8 +19,6 @@ default = ["onnx"]
 onnx = ["dep:ort", "dep:ndarray"]
 # 윈도우 PC 그래픽카드(DirectML)로 ONNX 모델 실행
 directml = ["onnx", "ort/directml"]
-# 리눅스 PC NVIDIA 그래픽카드(CUDA)로 ONNX 모델 실행
-cuda = ["onnx", "ort/cuda"]
 dxrt = []
 cam = ["dep:v4l"]
 

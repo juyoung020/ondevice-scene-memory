@@ -7,8 +7,6 @@
 ## [Unreleased]
 
 ### Added
-- README 에 리눅스 PC + D435 실행 방법.
-- 리눅스 PC 에서 NVIDIA 그래픽카드로 분할(`--features cuda`).
 - 뷰어 리셋 아이콘(오른쪽 아래): 위치를 다시 잡고 지도를 처음부터(`rtab_bridge --reset-file`).
 
 ### Changed

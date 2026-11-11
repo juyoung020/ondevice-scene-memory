@@ -9,6 +9,7 @@
 //! GET /                      the page
 //! GET /api/view?v=<ver>      {"v": ver, "map_v": ver, "view": <view.json>} or {"unchanged": true} (poll; ver = mtime+size)
 //! GET /api/map[?since=<ver>] PGM pixels (row 0 = max y); with since only the changed rows (X-Y0/X-Y1/X-Full)
+//! GET /api/reset             ask the running pipeline to start over (writes reset.req in the memory dir)
 //! GET /api/walls?x=&y=&yaw=  {"segments": [[ax,ay,bx,by]..], "state": [56 floats], "pose": [x,y,yaw]}
 //! GET /api/depth?path=<rel>  16-bit grey PNG → u16 little-endian pixels (X-W / X-H)
 //! GET /file/<relative path>  any file below the memory dir (PNG crops, PLY points)
@@ -629,6 +630,11 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         },
         "/OrbitControls.js" => respond_static(&mut s, "application/javascript", ORBIT_JS),
         "/favicon.ico" => respond(&mut s, 204, "image/x-icon", "", b""),
+        // Reset button: leave a request file in the memory dir; rtab_bridge (--reset-file) picks it up, restarts tracking and tells memmap to start an empty map
+        "/api/reset" => match std::fs::write(st.dir.join("reset.req"), b"") {
+            Ok(()) => respond(&mut s, 200, "application/json", "", b"{\"ok\":true}"),
+            Err(e) => respond(&mut s, 500, "text/plain", "", e.to_string().as_bytes()),
+        },
         "/api/mode" => respond(&mut s, 200, "application/json", "", format!("{{\"live\":{}}}", st.live_mode).as_bytes()),
         "/api/robot" => {
             let body = match robot_kind(&st) {

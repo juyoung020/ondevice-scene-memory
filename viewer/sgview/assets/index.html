@@ -64,7 +64,7 @@
 <div id="tip"></div>
 <div id="title"><div class="t1">Scene Memory</div><div class="t2" id="subtitle">3D map · on-device</div></div>
 <div id="keys"><b>drag</b>orbit · <b>F</b>fit · <b>T</b>top · <b>R</b>demo · <b>G</b>settings · <b>H</b>hide UI</div>
-<div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
+<div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_reset" title="Start over: re-acquire the camera pose and rebuild the map from empty">Reset</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
 <div id="panel">
   <div id="status">waiting for view.json …</div>
   <div id="hud" class="mono"></div>
@@ -1422,6 +1422,7 @@ let userMoved = false;
 function setDemo(on) { controls.autoRotate = on; $("b_demo").classList.toggle("on", on); invalidate(); }
 function togglePanel(on) { document.body.classList.toggle("panel-open", on); $("b_panel").classList.toggle("on", document.body.classList.contains("panel-open")); }
 $("b_demo").onclick = () => setDemo(!controls.autoRotate);
+$("b_reset").onclick = () => { const b = $("b_reset"); b.disabled = true; fetch("/api/reset").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_panel").onclick = () => togglePanel();
 $("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; localStorage.setItem("sg_quality", quality); applyQuality(); };
 if (QS.get("ui") === "0") document.body.classList.add("ui-off");

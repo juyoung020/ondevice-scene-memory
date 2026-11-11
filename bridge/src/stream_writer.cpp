@@ -36,11 +36,12 @@ void encode_header(const OutFrame& f, uint8_t* o) {
     put<uint32_t>(o, 172, f.anchor);
 }
 
-std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes) {
+std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes, bool reset) {
     std::vector<uint8_t> b(kGraphHeaderBytes + nodes.size() * (8 + 96), 0);
     std::memcpy(b.data(), "MMG1", 4);
     put<uint32_t>(b.data(), 4, kGraphHeaderBytes);
     put<uint32_t>(b.data(), 8, (uint32_t)nodes.size());
+    put<uint32_t>(b.data(), 12, reset ? 1u : 0u);
     size_t o = kGraphHeaderBytes;
     for (const GraphNode& n : nodes) {
         put<uint32_t>(b.data(), o, n.id);
@@ -127,7 +128,7 @@ void Writer::run() {
             cv_.notify_all();
         }
         if (f.is_graph()) {
-            std::vector<uint8_t> b = encode_graph(f.graph);
+            std::vector<uint8_t> b = encode_graph(f.graph, f.reset);
             if (!write_all(b.data(), b.size())) {
                 std::lock_guard<std::mutex> lk(m_);
                 broken_ = true;

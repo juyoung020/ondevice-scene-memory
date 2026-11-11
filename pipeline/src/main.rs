@@ -2765,6 +2765,11 @@ fn main() {
     }
     loop {
         seg = run(&a, seg);
+        // 리셋 블록으로 끝났으면 같은 스트림을 이어 읽어 빈 지도에서 다시 시작
+        if stream::reset_pending() {
+            eprintln!("리셋: 지도를 비우고 다시 시작");
+            continue;
+        }
         if !a.looping {
             break;
         }

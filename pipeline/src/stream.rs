@@ -8,7 +8,7 @@ pub const HEADER: usize = 176;
 pub const LOST: u32 = 1;
 pub const NEW_MAP: u32 = 2;
 pub const MAP_CORRECTED: u32 = 4;
-/// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 예약 4), 노드마다 id u32 + 예약 u32 + 3×4 f64
+/// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 리셋 표시 4), 노드마다 id u32 + 예약 u32 + 3×4 f64
 const GRAPH_HEADER: usize = 16;
 const GRAPH_NODE: usize = 8 + 96;
 
@@ -50,20 +50,32 @@ fn pose_of(t3x4: &[f64]) -> (M3, V3) {
     ([[t3x4[0], t3x4[1], t3x4[2]], [t3x4[4], t3x4[5], t3x4[6]], [t3x4[8], t3x4[9], t3x4[10]]], [t3x4[3], t3x4[7], t3x4[11]])
 }
 
+/// 리셋 블록을 만난 읽기 쪽이 여기 맡겨 두면 다음 open 이 이어서 읽는다(같은 파이프, 버퍼에 남은 바이트 포함)
+static HANDOVER: std::sync::Mutex<Option<Box<dyn Read + Send>>> = std::sync::Mutex::new(None);
+
+/// 리셋 블록으로 끝난 스트림이 이어 읽기를 기다리는지(물으면 그대로 둠: open 이 가져감)
+pub fn reset_pending() -> bool {
+    HANDOVER.lock().unwrap().is_some()
+}
+
 pub struct StreamReader {
-    src: Box<dyn Read + Send>,
+    /// None = 리셋 블록을 만나 HANDOVER 에 넘김(이 읽기는 끝)
+    src: Option<Box<dyn Read + Send>>,
     graph: Vec<Node>,
 }
 
 impl StreamReader {
     /// "-" = 표준입력, 그 밖은 파일·이름 있는 파이프
     pub fn open(path: &str) -> StreamReader {
+        if let Some(src) = HANDOVER.lock().unwrap().take() {
+            return StreamReader { src: Some(src), graph: vec![] };
+        }
         let src: Box<dyn Read + Send> = if path == "-" {
             Box::new(std::io::BufReader::with_capacity(1 << 22, std::io::stdin()))
         } else {
             Box::new(std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(path).unwrap_or_else(|e| panic!("--stream {path}: {e}"))))
         };
-        StreamReader { src, graph: vec![] }
+        StreamReader { src: Some(src), graph: vec![] }
     }
 
     /// 스트림이 끝난 뒤 남은 그래프 노드(마지막 장면 뒤에 온 블록)
@@ -75,7 +87,7 @@ impl StreamReader {
     pub fn next(&mut self) -> Option<StreamFrame> {
         loop {
             let mut m = [0u8; 4];
-            self.src.read_exact(&mut m).ok()?;
+            self.src.as_mut()?.read_exact(&mut m).ok()?;
             match &m {
                 b"MMF1" => return self.frame(),
                 b"MMG1" => self.graph_block()?,
@@ -86,12 +98,18 @@ impl StreamReader {
 
     fn graph_block(&mut self) -> Option<()> {
         let mut h = [0u8; GRAPH_HEADER - 4];
-        self.src.read_exact(&mut h).ok()?;
+        self.src.as_mut()?.read_exact(&mut h).ok()?;
         let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         assert_eq!(u32_at(0) as usize, GRAPH_HEADER, "모르는 그래프 블록 머리 크기");
         let n = u32_at(4) as usize;
+        // 리셋 블록(예약 칸 1): 여기서 스트림을 끝내고, 읽던 곳을 다음 실행에 넘긴다
+        if u32_at(8) == 1 {
+            *HANDOVER.lock().unwrap() = self.src.take();
+            self.graph.clear();
+            return None;
+        }
         let mut b = vec![0u8; n * GRAPH_NODE];
-        self.src.read_exact(&mut b).ok()?;
+        self.src.as_mut()?.read_exact(&mut b).ok()?;
         for c in b.chunks_exact(GRAPH_NODE) {
             let id = u32::from_le_bytes(c[0..4].try_into().unwrap());
             let t: Vec<f64> = (0..12).map(|i| f64::from_le_bytes(c[8 + 8 * i..16 + 8 * i].try_into().unwrap())).collect();
@@ -104,7 +122,7 @@ impl StreamReader {
     fn frame(&mut self) -> Option<StreamFrame> {
         let mut h = [0u8; HEADER];
         h[0..4].copy_from_slice(b"MMF1");
-        self.src.read_exact(&mut h[4..]).ok()?;
+        self.src.as_mut()?.read_exact(&mut h[4..]).ok()?;
         let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         let f32_at = |o: usize| f32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         let f64_at = |o: usize| f64::from_le_bytes(h[o..o + 8].try_into().unwrap());
@@ -114,7 +132,7 @@ impl StreamReader {
         let (w, hh) = (u32_at(160) as usize, u32_at(164) as usize);
         let mut rgb = vec![0u8; w * hh * 3];
         let mut db = vec![0u8; w * hh * 2];
-        if self.src.read_exact(&mut rgb).is_err() || self.src.read_exact(&mut db).is_err() {
+        if self.src.as_mut()?.read_exact(&mut rgb).is_err() || self.src.as_mut()?.read_exact(&mut db).is_err() {
             return None; // 장면 중간에 끊김
         }
         let depth = db.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();

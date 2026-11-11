@@ -36,11 +36,13 @@ struct OutFrame {
     uint32_t anchor = 0;  // 기준 지도 노드 id(0 = 없음): 장면 위치 = 노드 위치 × 상대 위치
     // 비어 있지 않으면 장면이 아니라 그래프 블록(MMG1): 새로 생기거나 움직인 노드. 큐가 차도 버리지 않음
     std::vector<GraphNode> graph;
-    bool is_graph() const { return !graph.empty(); }
+    // 리셋 블록(노드 0 개 MMG1, 예약 칸 1): 받는 쪽이 지도를 비우고 처음부터 다시 쌓는다. 그래프 블록처럼 버리지 않음
+    bool reset = false;
+    bool is_graph() const { return reset || !graph.empty(); }
 };
 
 // 그래프 블록(MMG1) 바이트: 머리 16 + 노드마다 id u32 + 예약 u32 + 3×4 f64
-std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes);
+std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes, bool reset = false);
 
 // 머리 176 바이트를 버퍼에 채움(리틀 엔디언 기계 기준)
 void encode_header(const OutFrame& f, uint8_t* out);

@@ -71,11 +71,11 @@ static void usage() {
     std::fprintf(stderr,
                  "rtab_bridge (--tum <폴더> [--rate R] | --realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30])\n"
                  "            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n"
-                 "            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--db <파일>] [--max-frames N] [--Group/Name 값 ...]\n");
+                 "            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--db <파일>] [--max-frames N] [--reset-file <파일>] [--Group/Name 값 ...]\n");
 }
 
 static int run(int argc, char** argv) {
-    std::string tum, config, out = "-", poses_path, final_path, stats_path, db, align = "rs2", serial;
+    std::string tum, config, out = "-", poses_path, final_path, stats_path, db, align = "rs2", serial, reset_file;
     bool realsense = false;
     int block = -1;  // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
     double rate = 0;
@@ -111,6 +111,7 @@ static int run(int argc, char** argv) {
         else if (a == "--stats") stats_path = val();
         else if (a == "--db") db = val();
         else if (a == "--max-frames") max_frames = std::stol(val());
+        else if (a == "--reset-file") reset_file = val();
         else if (a.rfind("--", 0) == 0 && a.find('/') != std::string::npos) {
             std::string name = a.substr(2);
             if (Parameters::getDefaultParameters().count(name) == 0) {
@@ -193,6 +194,7 @@ static int run(int argc, char** argv) {
     long n = 0, n_lost = 0, n_newmap = 0, n_loop = 0, n_corr = 0, n_graph = 0, n_graph_nodes = 0;
     std::map<int, Transform> sent_nodes;  // memmap 에 보낸 노드 위치(지도 몸체 축)
     uint32_t map_id = 0;
+    bool fresh = true;  // 처음이거나 리셋 직후의 장면: 위치 추적이 새로 시작하는 것이 정상
     double prev_stamp = 0;
     Transform prev_corr = Transform::getIdentity();
     auto t_run = clk::now();
@@ -200,6 +202,21 @@ static int run(int argc, char** argv) {
     while (!g_stop && (max_frames < 0 || n < max_frames)) {
         auto c0 = clk::now();
         if (!src->next(fr)) break;
+        // 리셋 요청(뷰어의 Reset 버튼이 이 파일을 만듦): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
+        if (!reset_file.empty() && ::access(reset_file.c_str(), F_OK) == 0) {
+            ::unlink(reset_file.c_str());
+            std::fprintf(stderr, "장면 %ld: 리셋 → 위치 추적·지도를 처음부터\n", n);
+            odom->reset();
+            rtabmap.resetMemory();
+            sent_nodes.clear();
+            map_id = 0;
+            prev_stamp = 0;
+            prev_corr = Transform::getIdentity();
+            fresh = true;
+            stream::OutFrame rf;
+            rf.reset = true;
+            if (!writer.push(std::move(rf))) break;
+        }
         double read_ms = src->last_read_ms();
         // RTAB-Map 용 깊이: 밀리미터 u16(TUM 5000/m 은 rtabmap-rgbd_dataset 처럼 5 로 나눔)
         cv::Mat depth_mm = fr.depth;
@@ -218,13 +235,14 @@ static int run(int argc, char** argv) {
         double odom_ms = ms_since(c1);
 
         bool new_map = false;
-        if (n != 0 && !info.reg.covariance.empty() && info.reg.covariance.at<double>(0, 0) >= 9999) {
+        if (!fresh && !info.reg.covariance.empty() && info.reg.covariance.at<double>(0, 0) >= 9999) {
             std::fprintf(stderr, "장면 %ld: 위치 추적 다시 시작 → 새 지도\n", n);
             int id = rtabmap.triggerNewMap();
             map_id = id >= 0 ? (uint32_t)id : map_id + 1;
             new_map = true;
             ++n_newmap;
         }
+        fresh = false;
         bool process = true;
         if (detection_rate > 0 && prev_stamp > 0 && data.stamp() > prev_stamp && data.stamp() - prev_stamp < 1.0 / detection_rate) process = false;
         if (process) prev_stamp = data.stamp();

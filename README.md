@@ -96,11 +96,11 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 - **준비:** `rtab_bridge` 빌드([docs/bridge.md](docs/bridge.md)), `models/yolo26s-seg.onnx`, [ONNX Runtime 리눅스 배포판](https://github.com/microsoft/onnxruntime/releases)을 풀고 `export ORT_DYLIB_PATH=<경로>/lib/libonnxruntime.so`.
 - **그래픽카드(CUDA):** ONNX Runtime 은 `onnxruntime-linux-x64-gpu` 배포판을 받고, CUDA 12·cuDNN 9 실행 라이브러리(cublas·cudart·curand·cufft·cudnn·nvrtc·nvjitlink) 폴더와 ONNX Runtime `lib` 폴더를 `LD_LIBRARY_PATH` 에 넣습니다. 빌드 기능은 `cuda,ort/load-dynamic`.
 - **전원:** 어댑터를 꽂고 전원 모드를 성능으로 둡니다(`powerprofilesctl set performance`). 절전 모드는 CPU 속도를 절반으로 묶어 지도 갱신이 느려지고 위치 추적이 자주 끊깁니다.
-- **카메라가 보는 곳:** 무늬가 있는 곳을 0.3 m 넘게 떨어져 비춥니다. 꺼진 모니터처럼 검고 매끈한 면이 화면을 채우면 위치를 놓칩니다(뷰어의 원뿔이 빨간색). 지도가 어긋났으면 뷰어의 `Reset` 을 누릅니다.
+- **카메라가 보는 곳:** 무늬가 있는 곳을 0.3 m 넘게 떨어져 비춥니다. 꺼진 모니터처럼 검고 매끈한 면이 화면을 채우면 위치를 놓칩니다(뷰어의 원뿔이 빨간색). 지도가 어긋났으면 뷰어 오른쪽 아래의 리셋 아이콘을 누릅니다.
 
 ```bash
 cargo build --release --features cuda,ort/load-dynamic --manifest-path pipeline/Cargo.toml   # CPU 만 쓰면 cuda 를 뺌. ONNX Runtime 은 ORT_DYLIB_PATH 에서 읽음
-rtab_bridge --realsense --config docs/rtabmap_pc.ini --send-every 2 --reset-file data/memory/live/reset.req \
+rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req \
   | pipeline/target/release/memmap --stream - --every 1 --live 1 --surface --points \
       --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/live
 ```
@@ -124,9 +124,10 @@ rtab_bridge --realsense --config docs/rtabmap_pc.ini --send-every 2 --reset-file
 ## 뷰어 보는 법
 
 - **마우스:** 끌면 돌리기, 휠은 확대·축소, 오른쪽 끌기는 이동.
-- **오른쪽 위 도구줄:** `Fit`(전체 맞추기) · `Top`(위에서 보기) · `Demo`(천천히 자동 회전) · `Reset`(위치를 다시 잡고 지도를 처음부터) · `High/Low`(화질) · `Settings`(설정 패널).
+- **오른쪽 위 도구줄:** `Fit`(전체 맞추기) · `Top`(위에서 보기) · `Demo`(천천히 자동 회전) · `High/Low`(화질) · `Settings`(설정 패널).
+- **오른쪽 아래 새로고침 아이콘:** 리셋. 위치를 다시 잡고 지도를 처음부터 쌓습니다.
 - **화질:** High는 PC용(점 섞기로 가까이서도 면처럼 보임), Low는 보드·폰용입니다. Low는 돌리는 동안 절반 해상도로 가볍게 그리고 멈추면 0.2초 뒤 원래 화질로 다시 그립니다.
-- **화면 구성:** 텍스처 표면 또는 색 점이 3D 지도, 파란 원뿔이 지금 카메라(위치를 놓친 동안은 빨간색), 위쪽 층이 물체와 방 노드입니다.
+- **화면 구성:** 색 점이 3D 지도(기본은 빨리 갱신되는 점 지도, 텍스처 표면은 설정 패널의 `Surface map`), 파란 원뿔이 지금 카메라(위치를 놓친 동안은 빨간색), 위쪽 층이 물체와 방 노드입니다.
 - **물체 색:** 초록 = 지금 보임, 주황 = 옮겨짐, 회색 = 그 자리에서 사라짐.
 - **설정 패널에서 켜고 끄기:** `Surface map`(표면), `3D map points`(점 지도), `Object name labels`(이름표), `Show graph layers`(물체·방 층), `Depth fog`(거리 안개) 등.
 - **시연할 때:** `Follow the handheld camera (behind)`를 켜면 시점이 손카메라 뒤에서 따라갑니다(마우스로 돌리면 꺼짐).

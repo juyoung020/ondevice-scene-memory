@@ -9,8 +9,10 @@
 ### Added
 - README 에 리눅스 PC + D435 실행 방법.
 - 리눅스 PC 에서 NVIDIA 그래픽카드로 분할(`--features cuda`).
-- 뷰어 `Reset` 버튼: 위치를 다시 잡고 지도를 처음부터(`rtab_bridge --reset-file`).
-- 리눅스 PC 용 RTAB-Map 설정 `docs/rtabmap_pc.ini`(가벼운 위치 추적, 놓쳐도 1 초는 같은 지도에서 다시 잡음).
+- 뷰어 리셋 아이콘(오른쪽 아래): 위치를 다시 잡고 지도를 처음부터(`rtab_bridge --reset-file`).
+
+### Changed
+- 뷰어 기본 지도를 표면에서 점 지도로(더 빨리 갱신됨, 표면은 설정에서 켬).
 
 ### Fixed
 - NPU 없는 PC 에서 CPU 분할이 코어 둘에 묶여 지도 갱신이 느리던 문제.

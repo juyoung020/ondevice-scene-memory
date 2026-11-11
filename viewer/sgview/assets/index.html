@@ -51,10 +51,17 @@
   #title .t2 { font-size:12px; color:var(--mute); margin-top:2px; }
   #keys { position:absolute; left:18px; bottom:14px; z-index:4; color:#6b7387; font-size:11px; pointer-events:none; letter-spacing:.02em; }
   #keys b { color:#9aa3b5; font-weight:600; border:1px solid #333a4a; border-radius:4px; padding:0 4px; margin-right:3px; }
-  body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys { display:none; }
+  #b_reset { position:absolute; right:14px; bottom:14px; z-index:7; width:42px; height:42px; display:flex; align-items:center; justify-content:center; padding:0;
+    background:var(--panel); border:1px solid var(--line); border-radius:50%; color:#cfd5e2; cursor:pointer; }
+  body.panel-open #b_reset { right:348px; }
+  #b_reset:hover { background:rgba(255,120,120,.16); color:#fff; border-color:rgba(255,120,120,.45); }
+  #b_reset:disabled { opacity:.45; cursor:default; }
+  #b_reset:disabled svg { animation:rspin 1s linear infinite; }
+  @keyframes rspin { to { transform:rotate(360deg); } }
+  body.ui-off #b_reset, body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys { display:none; }
   canvas.crop { max-width:100%; image-rendering:pixelated; border:1px solid var(--line); display:block; }
   .stats { color:var(--mute); font-size:11px; }
-  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } #keys { display:none; } }
+  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } body.panel-open #b_reset { right:14px; bottom:calc(45% + 24px); } #keys { display:none; } }
 </style>
 </head>
 <body>
@@ -64,7 +71,8 @@
 <div id="tip"></div>
 <div id="title"><div class="t1">Scene Memory</div><div class="t2" id="subtitle">3D map · on-device</div></div>
 <div id="keys"><b>drag</b>orbit · <b>F</b>fit · <b>T</b>top · <b>R</b>demo · <b>G</b>settings · <b>H</b>hide UI</div>
-<div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_reset" title="Start over: re-acquire the camera pose and rebuild the map from empty">Reset</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
+<button id="b_reset" title="Reset: re-acquire the camera pose and rebuild the map from empty" aria-label="Reset map"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></button>
+<div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
 <div id="panel">
   <div id="status">waiting for view.json …</div>
   <div id="hud" class="mono"></div>
@@ -948,7 +956,7 @@ const hasSurface = () => !!(view && view.scene_points && view.scene_points.surfa
 function drawObjects() {  invalidate();
   disposeGroup(gObjs);
   gObjs.visible = true;
-  if (view && view.scene_points && view.scene_points.surface) loadSurface(view.scene_points.surface);
+  if (view && view.scene_points && view.scene_points.surface && opt("c_surf")) loadSurface(view.scene_points.surface);   // hidden surface: nothing fetched
   gSurf.visible = opt("c_surf");
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor)
     const sp = view.scene_points, mat = () => pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") });
@@ -1477,10 +1485,13 @@ function applyView(v) {
   // with a surface map the objects are already in the mesh (shape and colour): their point clouds only speckle it, so start them off.
   // Clicking an object still highlights its points.
   if (pointsAuto && view.scene_points && (view.scene_points.surface || view.scene_points.octree) && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
-  // presentation defaults (once per page, a URL value such as ?c_scene=1 wins): the surface already shows the scene, so the point map
+  // presentation defaults (once per page, a URL value such as ?c_surf=1 wins): one map at a time, since the point map over the surface
   // only speckles it
   if (!presetDone) { presetDone = true;
-    if (view.scene_points && view.scene_points.surface && !QS.has("c_scene") && $("c_scene").checked) { $("c_scene").checked = false; rebuildScene(); } }
+    const sp = view.scene_points;
+    // with both maps the point map is the default: new points show at once, the surface follows a moment later (Settings > Surface map)
+    if (sp && sp.surface && sp.octree) { if (!QS.has("c_surf") && $("c_surf").checked) { $("c_surf").checked = false; gSurf.visible = false; } }
+    else if (sp && sp.surface && !QS.has("c_scene") && $("c_scene").checked) { $("c_scene").checked = false; rebuildScene(); } }
   objs.clear(); for (const o of view.objects) objs.set(o.id, o);
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
@@ -1687,7 +1698,7 @@ function stepChase(dt) {
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
 $("c_blend").onchange = invalidate; $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
 $("n_octk").onchange = () => { octUni.sizeK.value = opt("n_octk"); invalidate(); };
-$("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); invalidate(); };
+$("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); if (opt("c_surf") && view && view.scene_points && view.scene_points.surface) loadSurface(view.scene_points.surface); invalidate(); };
 $("c_shade").onchange = () => { surfUni.flatk.value = opt("c_shade") ? 0 : 1; invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
   if (!$("c_follow").checked || !robotGrp) return false;

@@ -41,7 +41,7 @@ rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rta
 | `--queue N`, `--block`·`--drop` | 쓰기 큐 길이(기본 4), 큐가 차면 기다림·가장 오래된 장면 버림. 기본은 최대 속도 재생 = 기다림, 카메라·`--rate` = 버림 |
 | `--poses <파일>` | 보낸 위치(TUM 형식, OpenCV 카메라 → RTAB-Map 지도) |
 | `--final-poses <파일>` | 끝에 최적화된 지도 노드 위치(TUM 형식, 같은 좌표) |
-| `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(뷰어 `Reset` 버튼이 기억 폴더의 `reset.req` 를 만듦) |
+| `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(뷰어 리셋 아이콘이 기억 폴더의 `reset.req` 를 만듦) |
 | `--stats <파일>` | 장면별 시간·놓침·새 지도·지도 보정·특징 수(CSV) |
 | `--db <파일>` | RTAB-Map 데이터베이스로 남김(`rtabmap-databaseViewer` 로 볼 수 있음) |
 
@@ -105,7 +105,6 @@ memmap 출력은 TUM 입력과 같고, 스트림이면 `poses_est.txt`(받아 �
 
 - 위치를 못 구한 장면은 상태 1 로 보내고 memmap 은 지도·물체에 넣지 않는다(개수는 결과 JSON `stream_lost`).
 - `Odom/ResetCountdown 1` 이면 놓친 다음 장면에서 위치 추적이 마지막 위치로 다시 시작하고, 연결 프로그램은 `triggerNewMap()` 으로 새 지도를 연다(도구와 같음). 그 장면은 위치가 "마지막 위치"로 채워질 뿐이라 놓침 + 새 지도(1 + 2)로 보낸다. 이후 장면은 새 지도에서 이어지고, 옛 지도와 루프가 닫히면 RTAB-Map 이 두 지도를 한 좌표로 합친다.
-- `Odom/ResetCountdown 30`(`docs/rtabmap_pc.ini`)이면 놓친 장면을 상태 1 로만 보내며 30 장 동안 같은 지도에서 다시 잡기를 기다리고, 그래도 못 잡으면 위처럼 새 지도를 연다.
 - 루프 클로저로 지도 보정이 바뀌면 그 장면부터 위치가 보정된 좌표로 오고(상태 4), 그 앞에 움직인 노드를 담은 그래프 블록이 온다.
 
 ### 루프 클로저 뒤 다시 쌓기(memmap)

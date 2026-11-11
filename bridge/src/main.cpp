@@ -18,6 +18,7 @@
 #include <rtabmap/core/OdometryEvent.h>
 #include <rtabmap/core/OdometryInfo.h>
 #include <rtabmap/core/Parameters.h>
+#include <rtabmap/core/RegistrationVis.h>
 #include <rtabmap/core/Rtabmap.h>
 #include <rtabmap/core/SensorData.h>
 #include <rtabmap/core/Signature.h>
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -71,12 +73,13 @@ static void usage() {
     std::fprintf(stderr,
                  "rtab_bridge (--tum <폴더> [--rate R] | --realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30])\n"
                  "            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n"
-                 "            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--db <파일>] [--max-frames N] [--reset-file <파일>] [--Group/Name 값 ...]\n");
+                 "            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--db <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--Group/Name 값 ...]\n");
 }
 
 static int run(int argc, char** argv) {
     std::string tum, config, out = "-", poses_path, final_path, stats_path, db, align = "rs2", serial, reset_file;
     bool realsense = false;
+    double reloc_wait = 1.0;  // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도
     int block = -1;  // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
     double rate = 0;
     int send_every = 1, queue = 4, w = 640, h = 480, fps = 30;
@@ -112,6 +115,7 @@ static int run(int argc, char** argv) {
         else if (a == "--db") db = val();
         else if (a == "--max-frames") max_frames = std::stol(val());
         else if (a == "--reset-file") reset_file = val();
+        else if (a == "--reloc-wait") reloc_wait = std::stod(val());
         else if (a.rfind("--", 0) == 0 && a.find('/') != std::string::npos) {
             std::string name = a.substr(2);
             if (Parameters::getDefaultParameters().count(name) == 0) {
@@ -171,7 +175,30 @@ static int run(int argc, char** argv) {
     for (auto& kv : params) std::fprintf(stderr, " %s=%s", kv.first.c_str(), kv.second.c_str());
     std::fprintf(stderr, "\n출력: %s (%s, 큐 %d, %d 장마다)\n", out.c_str(), block ? "받는 쪽을 기다림" : "밀리면 오래된 장면 버림", queue, send_every);
 
-    std::unique_ptr<Odometry> odom(Odometry::create(params));
+    // 놓쳤을 때 다시 잡기는 아래에서 직접 한다: 위치 추적이 혼자 '마지막 위치'에서 다시 시작하지 않게 함
+    ParametersMap odom_params = params;
+    odom_params[Parameters::kOdomResetCountdown()] = "0";
+    std::unique_ptr<Odometry> odom(Odometry::create(odom_params));
+    // 다시 잡기: 놓치기 전의 장면(기준 장면)과 지금 장면의 특징점을 직접 맞춰 위치를 구함
+    ParametersMap reloc_params = params;
+    {
+        int mi = Parameters::defaultVisMinInliers();
+        Parameters::parse(params, Parameters::kVisMinInliers(), mi);
+        reloc_params[Parameters::kVisMinInliers()] = std::to_string(std::max(mi, 25));
+    }
+    RegistrationVis reloc(reloc_params);
+    struct Ref {
+        Signature sig;
+        Transform pose;  // 위치 추적 좌표
+        double t;
+    };
+    std::deque<Ref> refs;
+    size_t ref_next = 0;
+    double lost_since = -1;
+    double good_t0 = -1, good_t1 = -1;  // 믿는 지도의 첫·마지막 장면 시각
+    bool restart = false;
+    long n_reloc = 0;
+    Summary s_reloc;
     Rtabmap rtabmap;
     rtabmap.init(params, db);
 
@@ -195,6 +222,10 @@ static int run(int argc, char** argv) {
     std::map<int, Transform> sent_nodes;  // memmap 에 보낸 노드 위치(지도 몸체 축)
     uint32_t map_id = 0;
     bool fresh = true;  // 처음이거나 리셋 직후의 장면: 위치 추적이 새로 시작하는 것이 정상
+    // 다시 시작한 뒤의 위치는 "마지막 위치에서 이어 붙인" 값이라 그동안 카메라가 움직였으면 틀리다.
+    // 믿던 지도의 노드(good_id)와 루프 클로저로 다시 이어질 때까지 그 장면들은 놓침으로 보낸다
+    bool anchored = true;
+    int good_id = -1;
     double prev_stamp = 0;
     Transform prev_corr = Transform::getIdentity();
     auto t_run = clk::now();
@@ -203,15 +234,23 @@ static int run(int argc, char** argv) {
         auto c0 = clk::now();
         if (!src->next(fr)) break;
         // 리셋 요청(뷰어의 Reset 버튼이 이 파일을 만듦): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
-        if (!reset_file.empty() && ::access(reset_file.c_str(), F_OK) == 0) {
-            ::unlink(reset_file.c_str());
-            std::fprintf(stderr, "장면 %ld: 리셋 → 위치 추적·지도를 처음부터\n", n);
+        // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다
+        bool reset_req = !reset_file.empty() && ::access(reset_file.c_str(), F_OK) == 0;
+        if (reset_req) ::unlink(reset_file.c_str());
+        if (reset_req || restart) {
+            std::fprintf(stderr, "장면 %ld: %s → 위치 추적·지도를 처음부터\n", n, reset_req ? "리셋" : "지도가 작을 때 놓침");
+            restart = false;
+            good_t0 = good_t1 = -1;
             odom->reset();
             rtabmap.resetMemory();
             sent_nodes.clear();
             map_id = 0;
             prev_stamp = 0;
             prev_corr = Transform::getIdentity();
+            anchored = true;
+            good_id = -1;
+            refs.clear();
+            lost_since = -1;
             fresh = true;
             stream::OutFrame rf;
             rf.reset = true;
@@ -232,20 +271,57 @@ static int run(int argc, char** argv) {
         auto c1 = clk::now();
         OdometryInfo info;
         Transform pose = odom->process(data, &info);
+        bool relocalized = false;
+        if (pose.isNull() || info.lost) {
+            pose = Transform();
+            if (lost_since < 0) lost_since = fr.t;
+            auto cr = clk::now();
+            // 기준 장면을 최근 것부터 한 장면에 둘씩 돌아가며 맞춰 봄
+            for (int k = 0; anchored && k < 2 && k < (int)refs.size(); ++k) {
+                Ref& r = refs[refs.size() - 1 - (ref_next++ % refs.size())];
+                Signature cur(data);
+                RegistrationInfo ri;
+                Transform t = reloc.computeTransformationMod(r.sig, cur, Transform(), &ri);
+                if (t.isNull()) continue;
+                Transform p = r.pose * t;
+                odom->reset(p);
+                OdometryInfo info2;
+                pose = odom->process(data, &info2);
+                if (pose.isNull()) continue;
+                info = info2;
+                info.reg.covariance = ri.covariance;
+                info.reg.inliers = ri.inliers;
+                relocalized = true;
+                ++n_reloc;
+                std::fprintf(stderr, "장면 %ld: 같은 지도에서 다시 잡음(%.2f 초 전 장면, 맞은 점 %d)\n", n, fr.t - r.t, ri.inliers);
+                break;
+            }
+            s_reloc.add(ms_since(cr));
+            // 기다려도 못 잡으면 마지막 위치에서 다시 시작 → 새 지도(이전 지도와 이어질 때까지 보내지 않음)
+            if (!relocalized && (!anchored || fr.t - lost_since > reloc_wait)) {
+                // 믿는 지도가 3 초 몫도 안 되면 붙들 것이 없다: 처음부터 다시
+                if (anchored && good_t1 - good_t0 < 3.0) restart = true;
+                else odom->reset(odom->getPose());
+                lost_since = -1;
+            }
+        }
+        if (!pose.isNull()) lost_since = -1;
         double odom_ms = ms_since(c1);
 
-        // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다. 놓친 장면(위치 없음)은 놓침으로만 보내 Odom/ResetCountdown 동안 같은 지도에서 다시 잡게 둔다
+        // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다. 놓친 장면(위치 없음)은 놓침으로만 보내고 그동안 같은 지도에서 다시 잡는다
         bool new_map = false;
-        if (!fresh && !pose.isNull() && !info.reg.covariance.empty() && info.reg.covariance.at<double>(0, 0) >= 9999) {
+        if (!fresh && !relocalized && !pose.isNull() && !info.reg.covariance.empty() && info.reg.covariance.at<double>(0, 0) >= 9999) {
             std::fprintf(stderr, "장면 %ld: 위치 추적 다시 시작 → 새 지도\n", n);
             int id = rtabmap.triggerNewMap();
             map_id = id >= 0 ? (uint32_t)id : map_id + 1;
             new_map = true;
+            if (good_id > 0) anchored = false;
             ++n_newmap;
         }
         fresh = false;
         bool process = true;
-        if (detection_rate > 0 && prev_stamp > 0 && data.stamp() > prev_stamp && data.stamp() - prev_stamp < 1.0 / detection_rate) process = false;
+        const float det_rate = anchored ? detection_rate : std::max(detection_rate, 4.f);  // 이어지기를 기다리는 동안은 더 자주 찾아봄
+        if (det_rate > 0 && prev_stamp > 0 && data.stamp() > prev_stamp && data.stamp() - prev_stamp < 1.0 / det_rate) process = false;
         if (process) prev_stamp = data.stamp();
         if (!process) {
             data.setId(-1);  // 중간 장면(지도 노드 아님)
@@ -261,6 +337,21 @@ static int run(int argc, char** argv) {
             slam_ms = ms_since(c2);
             loop = rtabmap.getLoopClosureId() > 0;
             n_loop += loop;
+            const auto& lp = rtabmap.getLocalOptimizedPoses();
+            if (!anchored && lp.count(good_id)) {
+                anchored = true;
+                std::fprintf(stderr, "장면 %ld: 이전 지도와 다시 이어짐\n", n);
+            }
+            if (anchored && lp.count(rtabmap.getLastLocationId())) good_id = rtabmap.getLastLocationId();
+        }
+        // 기준 장면: 믿는 위치의 장면을 0.4 초마다 하나씩, 최근 6 개
+        if (anchored && !pose.isNull() && !new_map) {
+            if (good_t0 < 0) good_t0 = fr.t;
+            good_t1 = fr.t;
+        }
+        if (anchored && !pose.isNull() && !new_map && (refs.empty() || fr.t - refs.back().t >= 0.4)) {
+            refs.push_back(Ref{Signature(SensorData(fr.bgr.clone(), depth_mm.clone(), model, (int)n + 1, fr.t)), pose, fr.t});
+            if (refs.size() > 6) refs.pop_front();
         }
         // 이번 장면의 지도 위치 = 지도 보정 × 오도메트리 위치 × 광학 축
         Transform corr = rtabmap.getMapCorrection();
@@ -271,13 +362,13 @@ static int run(int argc, char** argv) {
             prev_corr = corr;
             ++n_corr;
         }
-        // 놓친 장면: 위치를 못 구함. Odom/ResetCountdown 으로 다시 시작한 장면도 위치가 '마지막 위치'로 채워질 뿐이라 놓침으로 표시
-        bool lost = pose.isNull() || info.lost || new_map;
+        // 놓친 장면: 위치를 못 구함. 다시 시작한 새 지도의 장면도 믿던 지도와 이어지기 전에는 놓침으로 표시
+        bool lost = pose.isNull() || info.lost || new_map || !anchored;
         n_lost += lost;
 
         // 그래프 블록: 지도 갱신 뒤 새로 생기거나 움직인(행렬 원소 1e-3 = 1 mm·약 0.06° 넘게) 노드를 이 장면보다 먼저 보낸다.
         // memmap 은 장면을 기준 노드와 함께 보관했다가 노드가 움직이면 고친 위치로 지도·물체를 다시 쌓는다
-        if (process) {
+        if (process && anchored) {
             std::vector<stream::GraphNode> upd;
             for (const auto& [id, P] : rtabmap.getLocalOptimizedPoses()) {
                 if (id <= 0 || P.isNull()) continue;
@@ -374,6 +465,7 @@ static int run(int argc, char** argv) {
 
     std::fprintf(stderr, "장면 %ld 개, %.1f 초(%.1f 장/초), 놓침 %ld, 새 지도 %ld, 루프 클로저 %ld, 지도 보정 바뀜 %ld\n", n, wall, n / std::max(wall, 1e-9), n_lost, n_newmap,
                  n_loop, n_corr);
+    std::fprintf(stderr, "같은 지도에서 다시 잡음 %ld 번, ms/회 %s\n", n_reloc, s_reloc.str().c_str());
     if (auto* ts = dynamic_cast<TumSource*>(src.get())) std::fprintf(stderr, "재생에서 밀려 건너뛴 장면 %zu\n", ts->skipped());
     std::fprintf(stderr, "보냄 %zu, 밀려 버림 %zu, 그래프 블록 %ld 개(노드 %ld 개)\n", writer.written(), writer.dropped(), n_graph, n_graph_nodes);
     std::fprintf(stderr, "ms/장  읽기    %s\n", s_read.str().c_str());

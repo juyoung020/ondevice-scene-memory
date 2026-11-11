@@ -105,7 +105,7 @@ A 대비 바꾼 것만 적음. F2M = `Odom/Strategy 0`(기본), F2F = `Odom/Stra
 | `Odom/ImageDecimation` | 1 | 2 는 D435 복도에서 놓침 |
 | `Rtabmap/DetectionRate` | 1 | 지도 갱신 1 초에 1 번 |
 | `Reg/Force3DoF` | false | 손카메라(6 자유도) |
-| `Odom/ResetCountdown` | 1 | 놓치면 바로 새 지도로 이어감(측정 도구와 같은 동작), 루프 클로저로 다시 합침 |
+| `Odom/ResetCountdown` | 0(연결 프로그램이 정함) | 놓치면 연결 프로그램이 같은 지도에서 다시 잡고, 안 되면 새 지도로 시작해 루프 클로저로 이어질 때까지 기다림([`bridge.md`](bridge.md)) |
 
 **정확도 우선: C-BA3** (30 장/초 시연에는 쓰지 않음: 보드 위치 추적이 장당 27–30 ms 라 +3 ms(보드 약 +9 ms)면 30 장/초 예산을 넘음) — F2M + `Vis/MaxFeatures 400`, `Kp/MaxFeatures 300`, `OdomF2M/MaxSize 1000`, `OdomF2M/BundleAdjustmentMaxFrames 3`. 사무실 2.1–2.3 cm, 책상 2.7–3.1 cm 로 추천보다 조금 정확하고 장면당 2.5 ms 더 듦. ini 안에 주석으로 넣어 둠. WSL 연결 프로그램(BRIEF + GTSAM, 세 번)으로는 추천 2.4–2.7 cm·책상 3.6–3.7 cm, 정확도 우선 1.9–2.0 cm·책상 3.4–4.5 cm, 위치 추적 10.0–11.9 → 12.9–15.7 ms/장([bridge.md](bridge.md) "특징·최적화기 비교").
 
@@ -126,6 +126,6 @@ A 대비 바꾼 것만 적음. F2M = `Odom/Strategy 0`(기본), F2F = `Odom/Stra
 1. **배율 실측**: 같은 세 시퀀스를 Pi 에서 `taskset -c 1 rtabmap-rgbd_dataset --Rtabmap/DetectionRate 1 ...` 로 돌려 위 PC 숫자와 나눔(2–3 배 가정 확인).
 2. **카메라 경로 비용**: 이 측정의 `camera=` 는 PNG 읽기. 보드는 librealsense 프레임 수신 + 깊이를 컬러에 맞추는 정렬(CPU)이 따로 듦(정렬 PC 0.6–0.9 ms, Pi 환산 약 2 ms: [`realsense_input.md`](realsense_input.md)). 640×480@30 에서 보드 정렬 시간(`bench_align`, `rs_align_check`)과 USB3 연결 확인.
 3. **동시 부하**: NPU YOLO 분할 + 표면 지도와 함께 돌릴 때 추적 코어가 빼앗기지 않는지(코어 고정), 열로 클럭이 내려가는지(`vcgencmd measure_clock arm`).
-4. **빠른 손 움직임**: fr1 책상 정도는 통과. 실제 D435 로 빠르게 돌릴 때 놓침과 `Odom/ResetCountdown 1` 재시작 뒤 지도 합침 확인.
+4. **빠른 손 움직임**: fr1 책상 정도는 통과. 실제 D435 로 빠르게 돌릴 때 놓침과 다시 잡기·지도 이어짐 확인.
 5. **D435 깊이 범위·잡음**(3 m 넘으면 잡음이 큼): 무늬 적은 벽·먼 곳에서 특징 수(`quality=x/y` 의 y)가 100 아래로 자주 떨어지는지.
 6. **ini 적용**: `rtabmap --params` 출력이나 실행 로그의 Parameters 목록에 `Odom/Strategy=1` 등이 찍히는지.

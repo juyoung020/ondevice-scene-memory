@@ -34,6 +34,10 @@ TumSource::TumSource(const std::string& dir, double rate) : dir_(dir), rate_(rat
     } else {
         k_[0] = 535.4; k_[1] = 539.2; k_[2] = 320.1; k_[3] = 247.6;
     }
+    // 폴더에 calibration.txt(fx fy cx cy, ETH3D 형식)가 있으면 그 값을 씀
+    std::ifstream cal(dir + "/calibration.txt");
+    double c[4];
+    if (cal && (cal >> c[0] >> c[1] >> c[2] >> c[3])) std::copy(c, c + 4, k_);
 }
 
 std::string TumSource::describe() const {

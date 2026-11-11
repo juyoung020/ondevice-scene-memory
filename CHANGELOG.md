@@ -8,6 +8,7 @@
 
 ### Added
 - README 에 리눅스 PC + D435 실행 방법.
+- 리눅스 PC 에서 NVIDIA 그래픽카드로 분할(`--features cuda`).
 
 ### Fixed
 - NPU 없는 PC 에서 CPU 분할이 코어 둘에 묶여 지도 갱신이 느리던 문제.

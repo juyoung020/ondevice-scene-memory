@@ -201,7 +201,6 @@ impl KfStore {
             Some(n) => (anchor, inv_mul(n, &(r, p))),
             None => (0, (r, p)),
         };
-        let mm16 = |d: f32| (d * 1000.0).round().clamp(0.0, 65535.0) as u16;
         let (rgb_z, depth_z, crops) = if sparse {
             let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
             let q: Vec<u16> = (0..qw * qh).map(|i| mm16(depth[(i / qw) * Q * w + (i % qw) * Q])).collect();
@@ -221,7 +220,7 @@ impl KfStore {
             }).collect();
             (vec![], pack_depth(&q, qw, qh), crops)
         } else {
-            (pack_rgb(rgb, w, h), pack_depth(&depth.iter().map(|&d| mm16(d)).collect::<Vec<_>>(), w, h), vec![])
+            (pack_rgb(rgb, w, h), pack_depth_m(depth, w, h), vec![])
         };
         let kf = Kf {
             seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
@@ -268,6 +267,60 @@ impl KfStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 묶기 함수가 풀어 쓴 기준 계산과 같은 바이트를 내는지(크기 여럿, 값은 고정 난수)
+    #[test]
+    fn pack_matches_reference() {
+        let ref_rgb = |rgb: &[u8], w: usize, h: usize| {
+            let n = w * h;
+            let mut b = vec![0u8; n * 3];
+            for c in 0..3 {
+                for y in 0..h {
+                    let mut prev = 0u8;
+                    for x in 0..w {
+                        let v = rgb[(y * w + x) * 3 + c];
+                        b[c * n + y * w + x] = v.wrapping_sub(prev);
+                        prev = v;
+                    }
+                }
+            }
+            lz4_flex::compress_prepend_size(&b)
+        };
+        let ref_depth = |d: &[u16], w: usize, h: usize| {
+            let n = w * h;
+            let mut b = vec![0u8; n * 2];
+            for y in 0..h {
+                let mut prev = 0u16;
+                for x in 0..w {
+                    let i = y * w + x;
+                    let v = d[i].wrapping_sub(prev);
+                    prev = d[i];
+                    b[i] = v as u8;
+                    b[n + i] = (v >> 8) as u8;
+                }
+            }
+            lz4_flex::compress_prepend_size(&b)
+        };
+        let mut s = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // 큰 것 다음에 작은 것: 다시 쓰는 작업 버퍼에 앞 장면 값이 남아도 결과가 같아야 함
+        for (w, h) in [(640, 480), (1, 1), (7, 3), (160, 120), (0, 0), (33, 1), (1, 29)] {
+            let rgb: Vec<u8> = (0..w * h * 3).map(|i| if i % 5 == 0 { rnd() as u8 } else { (i / 7) as u8 }).collect();
+            let dm: Vec<f32> = (0..w * h).map(|i| if i % 11 == 0 { 0.0 } else { (rnd() % 70000) as f32 / 1000.0 - 0.5 }).collect();
+            let d16: Vec<u16> = dm.iter().map(|&v| mm16(v)).collect();
+            assert_eq!(pack_rgb(&rgb, w, h), ref_rgb(&rgb, w, h), "컬러 {w}x{h}");
+            assert_eq!(pack_depth(&d16, w, h), ref_depth(&d16, w, h), "깊이 {w}x{h}");
+            assert_eq!(pack_depth_m(&dm, w, h), ref_depth(&d16, w, h), "깊이(미터) {w}x{h}");
+            assert_eq!(unpack_rgb(&pack_rgb(&rgb, w, h), w, h), rgb);
+            assert_eq!(unpack_depth(&pack_depth(&d16, w, h), w, h), d16);
+        }
+    }
+
 
     fn rz(a: f64) -> M3 {
         let (s, c) = a.sin_cos();
@@ -374,21 +427,33 @@ mod tests {
     }
 }
 
+
+thread_local! {
+    /// 묶기 작업 버퍼(스레드마다 하나, 장면마다 다시 씀)
+    static PACK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// 컬러 압축: 채널마다 면으로 모으고 줄 안에서 왼쪽 화소와의 차(u8 감싸기) → LZ4. 손실 없음.
 pub fn pack_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
     let n = w * h;
-    let mut b = vec![0u8; n * 3];
-    for c in 0..3 {
-        for y in 0..h {
-            let mut prev = 0u8;
-            for x in 0..w {
-                let v = rgb[(y * w + x) * 3 + c];
-                b[c * n + y * w + x] = v.wrapping_sub(prev);
-                prev = v;
+    assert_eq!(rgb.len(), n * 3);
+    PACK_BUF.with_borrow_mut(|b| {
+        b.resize(n * 3, 0);
+        if n > 0 {
+            let (r, gb) = b.split_at_mut(n);
+            let (g, bl) = gb.split_at_mut(n);
+            for (((src, r), g), bl) in rgb.chunks_exact(w * 3).zip(r.chunks_exact_mut(w)).zip(g.chunks_exact_mut(w)).zip(bl.chunks_exact_mut(w)) {
+                let mut prev = [0u8; 3];
+                for (((px, r), g), bl) in src.chunks_exact(3).zip(r).zip(g).zip(bl) {
+                    *r = px[0].wrapping_sub(prev[0]);
+                    *g = px[1].wrapping_sub(prev[1]);
+                    *bl = px[2].wrapping_sub(prev[2]);
+                    prev = [px[0], px[1], px[2]];
+                }
             }
         }
-    }
-    lz4_flex::compress_prepend_size(&b)
+        lz4_flex::compress_prepend_size(b)
+    })
 }
 
 pub fn unpack_rgb(z: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -407,21 +472,42 @@ pub fn unpack_rgb(z: &[u8], w: usize, h: usize) -> Vec<u8> {
     rgb
 }
 
+
 /// 깊이 압축: 줄 안에서 왼쪽 화소와의 차(u16 감싸기)를 아래 바이트 면·위 바이트 면으로 → LZ4. 손실 없음.
 pub fn pack_depth(d: &[u16], w: usize, h: usize) -> Vec<u8> {
+    assert_eq!(d.len(), w * h);
+    pack_depth_it(d.iter().copied(), w, h)
+}
+
+/// 깊이(미터) → mm u16 으로 바꾸면서 바로 압축(`pack_depth` 와 같은 바이트)
+pub fn pack_depth_m(d: &[f32], w: usize, h: usize) -> Vec<u8> {
+    assert_eq!(d.len(), w * h);
+    pack_depth_it(d.iter().map(|&v| mm16(v)), w, h)
+}
+
+fn mm16(d: f32) -> u16 {
+    (d * 1000.0).round().clamp(0.0, 65535.0) as u16
+}
+
+fn pack_depth_it(mut d: impl Iterator<Item = u16>, w: usize, h: usize) -> Vec<u8> {
     let n = w * h;
-    let mut b = vec![0u8; n * 2];
-    for y in 0..h {
-        let mut prev = 0u16;
-        for x in 0..w {
-            let i = y * w + x;
-            let v = d[i].wrapping_sub(prev);
-            prev = d[i];
-            b[i] = v as u8;
-            b[n + i] = (v >> 8) as u8;
+    PACK_BUF.with_borrow_mut(|b| {
+        b.resize(n * 2, 0);
+        if n > 0 {
+            let (lo, hi) = b.split_at_mut(n);
+            for (lo, hi) in lo.chunks_exact_mut(w).zip(hi.chunks_exact_mut(w)) {
+                let mut prev = 0u16;
+                for (lo, hi) in lo.iter_mut().zip(hi) {
+                    let cur = d.next().unwrap();
+                    let v = cur.wrapping_sub(prev);
+                    prev = cur;
+                    *lo = v as u8;
+                    *hi = (v >> 8) as u8;
+                }
+            }
         }
-    }
-    lz4_flex::compress_prepend_size(&b)
+        lz4_flex::compress_prepend_size(b)
+    })
 }
 
 pub fn unpack_depth(z: &[u8], w: usize, h: usize) -> Vec<u16> {

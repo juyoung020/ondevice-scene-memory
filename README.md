@@ -93,11 +93,11 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 보드 없이 리눅스 노트북에 D435 를 꽂아 실시간으로 돌립니다. 분할을 CPU 로 하므로 보드보다 느립니다(6 코어 노트북에서 지도 갱신 초당 5 장면 안팎).
 
-- **준비:** `rtab_bridge` 빌드([docs/bridge.md](docs/bridge.md)), `models/yolo26s-seg.onnx`, ONNX Runtime 을 따로 받았으면 `export ORT_DYLIB_PATH=<경로>/libonnxruntime.so`.
+- **준비:** `rtab_bridge` 빌드([docs/bridge.md](docs/bridge.md)), `models/yolo26s-seg.onnx`, [ONNX Runtime 리눅스 배포판](https://github.com/microsoft/onnxruntime/releases)을 풀고 `export ORT_DYLIB_PATH=<경로>/lib/libonnxruntime.so`.
 - **전원:** 어댑터를 꽂고 전원 모드를 성능으로 둡니다(`powerprofilesctl set performance`). 절전 모드는 CPU 속도를 절반으로 묶어 지도 갱신이 느려지고 위치 추적이 자주 끊깁니다.
 
 ```bash
-cargo build --release --manifest-path pipeline/Cargo.toml
+cargo build --release --features ort/load-dynamic --manifest-path pipeline/Cargo.toml   # ONNX Runtime 을 ORT_DYLIB_PATH 에서 읽음(Ubuntu 22.04 는 이 방식만 링크됨)
 rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 \
   | pipeline/target/release/memmap --stream - --every 1 --live 1 --surface --points \
       --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/live

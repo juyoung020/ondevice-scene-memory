@@ -31,7 +31,8 @@ struct OutFrame {
     double T[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};  // 3×4 행 우선: OpenCV 카메라 → 세계
     double fx = 0, fy = 0, cx = 0, cy = 0;
     float depth_per_m = 1000.f;
-    cv::Mat bgr;    // CV_8UC3 BGR (쓸 때 RGB 로 바꿈)
+    cv::Mat bgr;    // CV_8UC3 BGR (rgb 가 비었으면 쓸 때 RGB 로 바꿈)
+    cv::Mat rgb;    // CV_8UC3 RGB: 있으면 그대로 씀
     cv::Mat depth;  // CV_16UC1
     uint32_t anchor = 0;  // 기준 지도 노드 id(0 = 없음): 장면 위치 = 노드 위치 × 상대 위치
     // 비어 있지 않으면 장면이 아니라 그래프 블록(MMG1): 새로 생기거나 움직인 노드. 큐가 차도 버리지 않음

@@ -225,6 +225,8 @@ memmap 출력은 TUM 입력과 같고, 스트림이면 `poses_est.txt`(받아 �
 
 [performance_log.md](performance_log.md) "연결 프로그램 시간". PC 코어 하나에서 연결 프로그램 18 ms/장(그중 위치 추적 9.8 ms, TUM PNG 읽기 8 ms), 지도 갱신 1 초에 한 번 14 ms(최대 44 ms). 30 장/초 재생에서 위치 추적은 장면을 놓치지 않고, memmap 이 느리면 쓰기 큐에서 장면이 버려진다.
 
+장면 넘기기(쓰기 스레드 0.8 ms/장 + memmap 읽기 스레드 0.5 ms/장)는 본 스레드 밖에서 돈다. 파이프 버퍼는 1 MB, 카메라가 준 RGB 사진은 그대로 쓰고, 큐에 든 장면은 저마다 제 버퍼를 가진다. memmap 은 사진·깊이를 받을 자리에 바로 읽는다.
+
 ## 깊이 정렬 바꿔 끼우기
 
 깊이를 컬러 격자로 옮기는 곳은 `bridge/src/depth_align.cpp` 하나다. `DepthAligner::align(const rs2::frameset&) → cv::Mat(CV_16UC1, 컬러 크기)` 를 구현한 클래스를 `make_aligner` 에 이름으로 더하고 `--align <이름>` 으로 고른다. 지금은 `rs2`(librealsense `rs2::align`, CPU).

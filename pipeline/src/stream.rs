@@ -11,6 +11,8 @@ pub const MAP_CORRECTED: u32 = 4;
 /// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 리셋 표시 4), 노드마다 id u32 + 예약 u32 + 3×4 f64
 const GRAPH_HEADER: usize = 16;
 const GRAPH_NODE: usize = 8 + 96;
+/// 읽기 버퍼: 머리·그래프 블록용. 사진은 이보다 커서 버퍼를 거치지 않고 받을 자리에 바로 읽힌다
+const READ_BUF: usize = 1 << 16;
 
 /// 그래프 노드: (RTAB-Map 노드 id, 자세, 위치) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표
 pub type Node = (u32, M3, V3);
@@ -71,9 +73,9 @@ impl StreamReader {
             return StreamReader { src: Some(src), graph: vec![] };
         }
         let src: Box<dyn Read + Send> = if path == "-" {
-            Box::new(std::io::BufReader::with_capacity(1 << 22, std::io::stdin()))
+            Box::new(std::io::BufReader::with_capacity(READ_BUF, std::io::stdin()))
         } else {
-            Box::new(std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(path).unwrap_or_else(|e| panic!("--stream {path}: {e}"))))
+            Box::new(std::io::BufReader::with_capacity(READ_BUF, std::fs::File::open(path).unwrap_or_else(|e| panic!("--stream {path}: {e}"))))
         };
         StreamReader { src: Some(src), graph: vec![] }
     }
@@ -131,11 +133,14 @@ impl StreamReader {
         let (r, p) = pose_of(&t3x4);
         let (w, hh) = (u32_at(160) as usize, u32_at(164) as usize);
         let mut rgb = vec![0u8; w * hh * 3];
-        let mut db = vec![0u8; w * hh * 2];
-        if self.src.as_mut()?.read_exact(&mut rgb).is_err() || self.src.as_mut()?.read_exact(&mut db).is_err() {
+        // 깊이는 리틀 엔디언 u16 이라 받을 자리에 바로 읽는다
+        #[cfg(not(target_endian = "little"))]
+        compile_error!("스트림 깊이를 바로 읽는 것은 리틀 엔디언 기계 기준");
+        let mut depth = vec![0u16; w * hh];
+        let db = unsafe { std::slice::from_raw_parts_mut(depth.as_mut_ptr() as *mut u8, w * hh * 2) };
+        if self.src.as_mut()?.read_exact(&mut rgb).is_err() || self.src.as_mut()?.read_exact(db).is_err() {
             return None; // 장면 중간에 끊김
         }
-        let depth = db.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         Some(StreamFrame {
             flags: u32_at(8),
             map_id: u32_at(12),

@@ -71,6 +71,7 @@ bool TumSource::next(RgbdFrame& f) {
         else if (j > 0 && std::abs(depth_[j].first - t) >= std::abs(t - depth_[j - 1].first)) j = j - 1;
         f.t = t;
         f.bgr = cv::imread(dir_ + "/" + rel, cv::IMREAD_COLOR);
+        f.rgb.release();
         f.depth = cv::imread(dir_ + "/" + depth_[j].second, cv::IMREAD_UNCHANGED);
         if (f.bgr.empty() || f.depth.empty() || f.depth.type() != CV_16UC1) throw std::runtime_error("장면 읽기 실패: " + rel);
         f.depth_per_m = 5000.f;

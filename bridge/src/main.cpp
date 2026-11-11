@@ -421,6 +421,7 @@ static int run(int argc, char** argv) {
         if (n % send_every == 0) {
             auto c3 = clk::now();
             of.bgr = fr.bgr;
+            of.rgb = fr.rgb;
             of.depth = fr.depth;
             if (!writer.push(std::move(of))) {
                 std::fprintf(stderr, "받는 쪽이 닫힘: 끝냄\n");

@@ -45,7 +45,11 @@ bool RealSenseSource::next(RgbdFrame& f) {
     f.depth = aligner_->align(fs);
     auto c2 = clk::now();
     cv::Mat rgb(color.get_height(), color.get_width(), CV_8UC3, const_cast<void*>(color.get_data()), (size_t)color.get_stride_in_bytes());
-    cv::cvtColor(rgb, f.bgr, cv::COLOR_RGB2BGR);
+    // 장면마다 새 버퍼에 담는다: 쓰기 큐·RTAB-Map 이 들고 있는 앞 장면과 메모리를 나누지 않게
+    f.rgb = rgb.clone();
+    cv::Mat bgr;
+    cv::cvtColor(f.rgb, bgr, cv::COLOR_RGB2BGR);
+    f.bgr = bgr;
     f.t = color.get_timestamp() * 1e-3;
     f.depth_per_m = depth_per_m_;
     f.fx = color_k_.fx;

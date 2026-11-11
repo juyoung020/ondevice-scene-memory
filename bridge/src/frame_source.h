@@ -6,6 +6,7 @@
 struct RgbdFrame {
     double t = 0.0;          // 초
     cv::Mat bgr;             // CV_8UC3, BGR
+    cv::Mat rgb;             // 카메라가 RGB 로 준 장면이면 그 사진(스트림에 그대로 씀), 아니면 빔
     cv::Mat depth;           // CV_16UC1, 컬러 화소 격자에 맞춘 깊이, 0 = 없음
     float depth_per_m = 1000.f;  // 깊이 값 / 미터 (RealSense 1000, TUM 5000)
     double fx = 0, fy = 0, cx = 0, cy = 0;  // 컬러 카메라 보정값(왜곡 없음)

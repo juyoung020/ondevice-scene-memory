@@ -61,6 +61,8 @@ Writer::Writer(const std::string& path, int fd, size_t queue, bool block) : cap_
         own_fd_ = true;
         if (fd_ < 0) throw std::runtime_error("스트림 열기 실패: " + path + ": " + std::strerror(errno));
     }
+    // 파이프면 버퍼를 1 MB 로(기본 64 kB): 장면 하나(약 1.5 MB)를 쓰고 읽는 시스템 호출·스레드 전환이 준다. 파일이면 실패하고 넘어감
+    ::fcntl(fd_, F_SETPIPE_SZ, 1 << 20);
     th_ = std::thread(&Writer::run, this);
 }
 
@@ -138,10 +140,14 @@ void Writer::run() {
             continue;
         }
         auto c0 = std::chrono::steady_clock::now();
-        cv::cvtColor(f.bgr, rgb, cv::COLOR_BGR2RGB);
+        cv::Mat out = f.rgb.isContinuous() ? f.rgb : f.rgb.clone();  // 카메라가 준 RGB 는 그대로
+        if (out.empty()) {
+            cv::cvtColor(f.bgr, rgb, cv::COLOR_BGR2RGB);
+            out = rgb;
+        }
         cv::Mat depth = f.depth.isContinuous() ? f.depth : f.depth.clone();
         encode_header(f, head);
-        bool ok = write_all(head, sizeof(head)) && write_all(rgb.data, rgb.total() * 3) && write_all(depth.data, depth.total() * 2);
+        bool ok = write_all(head, sizeof(head)) && write_all(out.data, out.total() * 3) && write_all(depth.data, depth.total() * 2);
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         std::lock_guard<std::mutex> lk(m_);
         if (!ok) {

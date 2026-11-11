@@ -89,6 +89,20 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.
 - **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'memmap --'`.
 
+## 리눅스 PC에서 카메라로 실행 — NPU 없이 CPU 분할
+
+보드 없이 리눅스 노트북에 D435 를 꽂아 실시간으로 돌립니다. 분할을 CPU 로 하므로 보드보다 느립니다(6 코어 노트북에서 지도 갱신 초당 5 장면 안팎).
+
+- **준비:** `rtab_bridge` 빌드([docs/bridge.md](docs/bridge.md)), `models/yolo26s-seg.onnx`, ONNX Runtime 을 따로 받았으면 `export ORT_DYLIB_PATH=<경로>/libonnxruntime.so`.
+- **전원:** 어댑터를 꽂고 전원 모드를 성능으로 둡니다(`powerprofilesctl set performance`). 절전 모드는 CPU 속도를 절반으로 묶어 지도 갱신이 느려지고 위치 추적이 자주 끊깁니다.
+
+```bash
+cargo build --release --manifest-path pipeline/Cargo.toml
+rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 \
+  | pipeline/target/release/memmap --stream - --every 1 --live 1 --surface --points \
+      --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/live
+```
+
 ## 주요 옵션 (memmap)
 
 | 옵션 | 뜻 |

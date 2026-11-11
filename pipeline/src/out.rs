@@ -248,7 +248,7 @@ pub fn allowed_cpus() -> Vec<usize> {
 }
 
 /// `--threads` 해석. 기본(auto): 코어 4 개 이상이면 nice 는 본 스레드·읽기·추론 0, 점 +5, 기록 +5, 텍스처·다시 쌓기 +10.
-/// 코어 4 개 이상이면 본 스레드·읽기(분할 전·후처리)·추론(모델을 부르는 스레드, PC 는 ONNX Runtime 스레드도)을 앞 코어 둘에, 점·텍스처·다시 쌓기·기록을 나머지 코어에 묶는다.
+/// 코어 4 개 이상이면 본 스레드·읽기(분할 전·후처리)를 앞 코어 둘에, 점·텍스처·다시 쌓기·기록을 나머지 코어에 묶는다. 추론은 보드(NPU)면 앞 코어 둘, ONNX(CPU)면 나머지 코어(ONNX Runtime 스레드 포함).
 /// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔: 점·기록 +10, 텍스처·다시 쌓기 +19). 직접 주기: `main=0:0,pts=5:2-3,tex=10:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
 pub fn set_layout(spec: &str) {
     let cpus = allowed_cpus();
@@ -259,7 +259,9 @@ pub fn set_layout(spec: &str) {
         "auto" => {
             if cpus.len() >= 4 {
                 let (fg, bg) = (bits(&cpus[..2]), bits(&cpus[2..]));
-                l = [(0, fg), (0, fg), (5, bg), (10, bg), (10, bg), (5, bg), (0, fg)];
+                // 추론: 보드는 NPU 가 하므로 부르는 스레드만 앞 코어에, ONNX(CPU) 는 모델 계산이 무거우니 나머지 코어 전부에
+                let inf = if cfg!(feature = "onnx") { bg } else { fg };
+                l = [(0, fg), (0, fg), (5, bg), (10, bg), (10, bg), (5, bg), (0, inf)];
             }
         }
         s => {

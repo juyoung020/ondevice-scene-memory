@@ -6,25 +6,32 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-12
+
 ### Added
-- 뷰어 리셋 아이콘(오른쪽 아래): 위치를 다시 잡고 지도를 처음부터(`rtab_bridge --reset-file`).
+- 방 사이 문(위치·폭)과 방↔방 연결(`view.json` 의 `doors`).
+- 방 이름에 종류별 확률과 근거 물체(`view.json` 의 `rooms[].probs`·`evidence`).
 - 위치를 놓치면 같은 지도에서 바로 다시 잡는다(`rtab_bridge --reloc-wait`).
+- 뷰어 리셋 아이콘(오른쪽 아래): 위치를 다시 잡고 지도를 처음부터(`rtab_bridge --reset-file`).
 - `--tum` 재생이 폴더의 `calibration.txt` 보정값을 읽는다(ETH3D 영상).
-- 방 사이 문(위치·폭)과 방↔방 연결, 방 이름의 종류별 확률·근거 물체(`view.json` 의 `doors`, `rooms[].probs`·`evidence`).
 
 ### Changed
-- 연결 프로그램 → memmap 장면 넘기기의 복사를 줄임(결과 값은 같음).
-- **호환 변경:** 방 나누기를 Hydra room finder 의 2D 판으로 바꿈. 방 번호는 1 부터이고 지도가 자라도 유지되며, 같은 종류의 방은 번호가 붙는다(kitchen 2).
+- **호환 변경:** 방 나누기를 Hydra room finder 의 2D 판으로 바꿈(문처럼 좁은 목에서 끊음).
+- **호환 변경:** 방 번호가 1 부터이고 지도가 자라도 유지된다. 같은 종류의 방은 번호가 붙는다(kitchen 2).
+- 방은 벽으로만 나뉜다(책상·의자 같은 낮은 가구는 방 안).
+- 3D 지도는 점 지도 하나이고 옵션 없이 늘 만든다. 뷰어도 점 지도로 열린다.
+- 장면 넘기기와 보관 장면 압축이 가벼워짐(결과 값은 같음).
 
 ### Removed
-- **호환 변경:** 표면 지도(`--surface`, TSDF 서브맵·사진 텍스처)와 도구 `surfcmp`·`meshshot`. 3D 지도는 점 지도 하나이고 옵션 없이 늘 만든다(`--points` 도 없어짐).
+- **호환 변경:** 표면 지도(`--surface`, TSDF 서브맵·사진 텍스처)와 옵션 `--points`, 도구 `surfcmp`·`meshshot`.
 
 ### Fixed
+- 가구 때문에 한 방이 여러 방으로 쪼개지던 문제.
 - NPU 없는 PC 에서 CPU 분할이 코어 둘에 묶여 지도 갱신이 느리던 문제.
 - 위치를 놓친 장면마다 새 지도를 열어 지도가 조각나던 문제.
 - 위치를 놓친 뒤 틀린 위치로 지도를 쌓아 천장·벽이 엉뚱한 곳에 찍히던 문제.
-- 카메라 입력에서 memmap 이 밀릴 때 큐에 든 장면의 컬러가 다음 장면으로 덮이던 문제.
-- 카메라를 켠 직후의 어두운 첫 장면이 위치 추적의 기준이 되어 바로 놓치던 문제(첫 30 장면을 버림, 컬러 노출이 장면 수를 낮추지 않게 함).
+- memmap 이 밀릴 때 큐에 든 장면의 컬러가 다음 장면으로 덮이던 문제.
+- 카메라를 켠 직후의 어두운 첫 장면 때문에 위치를 바로 놓치던 문제.
 
 ## [0.4.0] - 2026-11-11
 
@@ -102,7 +109,6 @@
 - 바닥 높이 추정과 사라짐 판정을 더 엄격히.
 
 ### Fixed
-- 실시간에서 3D 지도 조각이 몇 초씩 안 나가던 문제(이제 1 초마다).
 - ADVIO 영상과 IMU 시각이 0.318 s 어긋나 VIO 가 시작되지 않던 문제.
 
 ## [0.1.0] - 2026-10-29
@@ -112,10 +118,10 @@
 - YOLO26s-seg C++/CUDA 학습기 `train/ObjectSAM`.
 
 ### Fixed
-- 실시간에서 3D 지도 조각이 몇 초씩 안 나가던 문제(이제 1 초마다).
 - 모델 설정 필드 순서로 초기화가 깨지던 문제.
 
-[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.1.0...v0.2.0

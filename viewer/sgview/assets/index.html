@@ -1477,7 +1477,7 @@ function status() {
   $("status").textContent = `stamp ${view.stamp.toFixed(1)} s · objects ${view.objects.length} · rooms ${(view.rooms || []).length} · trajectory ${c("agent")} poses`;
 }
 // Redraw only the parts of a new summary (view.json content) that changed: string compare is far cheaper than rebuilding geometry.
-let presetDone = false, viewSeen = false;
+let presetDone = false, presetSurfOnly = false, mapTouched = false, viewSeen = false;   // mapTouched: the user chose a map in Settings
 let pointsAuto = true;   // the user has not touched 'Segment points' yet
 function applyView(v) {
   const first = !view;
@@ -1487,11 +1487,15 @@ function applyView(v) {
   if (pointsAuto && view.scene_points && (view.scene_points.surface || view.scene_points.octree) && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
   // presentation defaults (once per page, a URL value such as ?c_surf=1 wins): one map at a time, since the point map over the surface
   // only speckles it
-  if (!presetDone) { presetDone = true;
+  if (!presetDone && !mapTouched) {
     const sp = view.scene_points;
-    // with both maps the point map is the default: new points show at once, the surface follows a moment later (Settings > Surface map)
-    if (sp && sp.surface && sp.octree) { if (!QS.has("c_surf") && $("c_surf").checked) { $("c_surf").checked = false; gSurf.visible = false; } }
-    else if (sp && sp.surface && !QS.has("c_scene") && $("c_scene").checked) { $("c_scene").checked = false; rebuildScene(); } }
+    // with both maps the point map is the default: new points show at once, the surface follows a moment later (Settings > Surface map).
+    // A live run may list the surface before the point map (or no map at all in its first summary): the choice is made when the maps
+    // are there, and a surface-only start switches to the point map as soon as that one arrives.
+    if (sp && sp.surface && sp.octree) { presetDone = true;
+      if (presetSurfOnly && !$("c_scene").checked) { $("c_scene").checked = true; rebuildScene(); }
+      if (!QS.has("c_surf") && $("c_surf").checked) { $("c_surf").checked = false; gSurf.visible = false; } }
+    else if (sp && sp.surface && !presetSurfOnly && !QS.has("c_scene") && $("c_scene").checked) { presetSurfOnly = true; $("c_scene").checked = false; rebuildScene(); } }
   objs.clear(); for (const o of view.objects) objs.set(o.id, o);
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
@@ -1943,6 +1947,7 @@ async function startLive() {
 $("c_fog").onchange = () => { surfUni.fogK.value = opt("c_fog") ? 1 : 0; invalidate(); };
 applyQuality();
 $("c_points").addEventListener("change", () => { pointsAuto = false; });
+for (const id of ["c_surf", "c_scene"]) $(id).addEventListener("change", () => { mapTouched = true; });
 for (const id of ["c_points", "c_scene", "n_sop", "n_ssize", "s_odraw", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { rebuildScene(); drawObjects(); drawGraph(); };
 for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra", "g_inter", "n_objz", "n_h", "n_thumb"]) $(id).onchange = drawGraph;
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };

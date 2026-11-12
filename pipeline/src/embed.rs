@@ -1,0 +1,188 @@
+//! 물체 사진 → 검색용 벡터. SigLIP2 영상 인코더(vision_model.onnx)가 사진 한 장을 768 차원 벡터로 바꾸고,
+//! 길이를 1 로 맞춰 `objects/O<id>_emb.bin`(f32 리틀 엔디언 768 개)에 남긴다. 뷰어의 검색이 글 벡터와 내적해 닮은 물체를 찾는다.
+//! 지도 쌓기와 따로 도는 스레드 하나가 맡는다: 사진이 바뀐 물체만 받아, 밀리면 물체마다 가장 새 사진만 계산한다.
+use std::path::{Path, PathBuf};
+
+/// 인코더 입력 한 변(화소)
+pub const SIZE: usize = 256;
+/// 벡터 차원
+pub const DIM: usize = 768;
+
+/// w×h RGB 를 256×256 으로 늘려(작아질 땐 넓게 평균) NCHW, 값 −1..1 (SigLIP 전처리: (x/255 − 0.5)/0.5)
+pub fn preprocess(rgb: &[u8], w: u32, h: u32, out: &mut Vec<f32>) {
+    let img = image::RgbImage::from_raw(w, h, rgb.to_vec()).expect("crop size");
+    let r = image::imageops::resize(&img, SIZE as u32, SIZE as u32, image::imageops::FilterType::Triangle);
+    let n = SIZE * SIZE;
+    out.clear();
+    out.resize(3 * n, 0.0);
+    for (i, p) in r.pixels().enumerate() {
+        for c in 0..3 {
+            out[c * n + i] = p.0[c] as f32 / 127.5 - 1.0;
+        }
+    }
+}
+
+/// 길이 1 로 맞춤(0 벡터는 그대로)
+pub fn normalize(v: &mut [f32]) {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        v.iter_mut().for_each(|x| *x /= n);
+    }
+}
+
+/// 물체 번호 → 가장 새 벡터. 계산 스레드가 채우고 물체 병합(maps::merge_pass)이 읽는다
+static LATEST: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
+
+/// 그 물체의 가장 새 사진 벡터(길이 1). 아직 계산 전이면 None
+pub fn get(id: u32) -> Option<Vec<f32>> {
+    LATEST.lock().unwrap().as_ref()?.get(&id).cloned()
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn put(id: u32, v: Vec<f32>) {
+    LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
+}
+
+/// 벡터 파일 경로(기억 폴더 기준 상대 경로)
+pub fn rel_path(id: u32) -> String {
+    format!("objects/O{id}_emb.bin")
+}
+
+#[cfg(feature = "onnx")]
+mod worker {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{mpsc, Mutex};
+
+    struct Job {
+        id: u32,
+        path: PathBuf,
+        w: u32,
+        h: u32,
+        rgb: Vec<u8>,
+    }
+    type Handle = (mpsc::Sender<Job>, std::thread::JoinHandle<()>);
+    static W: Mutex<Option<Handle>> = Mutex::new(None);
+    /// 맡겼지만 아직 끝나지 않은 사진 수
+    static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn start(model: &str) {
+        // 지도 쌓기·분할과 코어를 다투지 않게 스레드 둘만
+        let mut sess = ort::session::Session::builder(crate::seg::ort_env()).unwrap().with_intra_threads(2).unwrap()
+            .commit_from_file(model).unwrap_or_else(|e| panic!("embed model {model}: {e}"));
+        let (tx, rx) = mpsc::channel::<Job>();
+        let th = std::thread::Builder::new().name("embed".into()).spawn(move || {
+            let (mut buf, mut n, mut ms) = (Vec::new(), 0u32, 0.0f64);
+            while let Ok(first) = rx.recv() {
+                // 밀린 일은 물체(파일)마다 가장 새 사진만
+                let mut jobs: HashMap<PathBuf, Job> = HashMap::new();
+                jobs.insert(first.path.clone(), first);
+                let mut taken = 1;
+                while let Ok(j) = rx.try_recv() {
+                    jobs.insert(j.path.clone(), j);
+                    taken += 1;
+                }
+                for j in jobs.into_values() {
+                    let t = std::time::Instant::now();
+                    preprocess(&j.rgb, j.w, j.h, &mut buf);
+                    let inp = ort::value::TensorRef::from_array_view(([1usize, 3, SIZE, SIZE], &buf[..])).unwrap();
+                    let out = sess.run(ort::inputs![inp]).expect("embed run");
+                    let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().unwrap();
+                    assert_eq!(v.len(), DIM, "embed model output");
+                    let mut v = v.to_vec();
+                    normalize(&mut v);
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
+                    let tmp = j.path.with_extension("bin.tmp");
+                    if std::fs::write(&tmp, bytes).is_ok() {
+                        let _ = std::fs::rename(&tmp, &j.path);
+                    }
+                    put(j.id, v);
+                    n += 1;
+                    ms += t.elapsed().as_secs_f64() * 1e3;
+                }
+                PENDING.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
+            }
+            eprintln!("embed: {n} vectors, {:.1} ms each", ms / n.max(1) as f64);
+        }).unwrap();
+        *W.lock().unwrap() = Some((tx, th));
+    }
+
+    pub fn on() -> bool {
+        W.lock().unwrap().is_some()
+    }
+
+    pub fn submit(dir: &Path, id: u32, w: u32, h: u32, rgb: &[u8]) {
+        if let Some((tx, _)) = &*W.lock().unwrap() {
+            PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(Job { id, path: dir.join(rel_path(id)), w, h, rgb: rgb.to_vec() });
+        }
+    }
+
+    /// 맡긴 사진이 모두 벡터가 될 때까지 기다린다(끝낼 때 마지막 병합 앞에서)
+    pub fn drain() {
+        while PENDING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    pub fn finish() {
+        if let Some((tx, th)) = W.lock().unwrap().take() {
+            drop(tx);
+            let _ = th.join();
+        }
+    }
+}
+
+/// 인코더를 올리고 계산 스레드를 띄운다(`--embed <vision_model.onnx>`)
+#[cfg(feature = "onnx")]
+pub use worker::{drain, finish, on, start, submit};
+
+#[cfg(not(feature = "onnx"))]
+pub fn start(_model: &str) {
+    panic!("--embed: 이 빌드에는 ONNX 실행기가 없다(onnx 기능으로 빌드)");
+}
+#[cfg(not(feature = "onnx"))]
+pub fn on() -> bool {
+    false
+}
+#[cfg(not(feature = "onnx"))]
+pub fn submit(_dir: &Path, _id: u32, _w: u32, _h: u32, _rgb: &[u8]) {}
+#[cfg(not(feature = "onnx"))]
+pub fn finish() {}
+#[cfg(not(feature = "onnx"))]
+pub fn drain() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preprocess_range_and_layout() {
+        // 왼쪽 절반 빨강, 오른쪽 절반 파랑인 4×2 사진
+        let mut rgb = vec![];
+        for _ in 0..2 {
+            for x in 0..4 {
+                rgb.extend_from_slice(if x < 2 { &[255, 0, 0] } else { &[0, 0, 255] });
+            }
+        }
+        let mut out = vec![];
+        preprocess(&rgb, 4, 2, &mut out);
+        let n = SIZE * SIZE;
+        assert_eq!(out.len(), 3 * n);
+        let at = |c: usize, x: usize, y: usize| out[c * n + y * SIZE + x];
+        assert!((at(0, 10, 100) - 1.0).abs() < 1e-4 && (at(2, 10, 100) + 1.0).abs() < 1e-4);
+        assert!((at(0, 245, 100) + 1.0).abs() < 1e-4 && (at(2, 245, 100) - 1.0).abs() < 1e-4);
+        assert!(out.iter().all(|v| (-1.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn normalize_unit_length() {
+        let mut v = vec![3.0, 4.0];
+        normalize(&mut v);
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        let mut z = vec![0.0; 4];
+        normalize(&mut z);
+        assert!(z.iter().all(|x| *x == 0.0));
+    }
+}

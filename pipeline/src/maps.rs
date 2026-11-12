@@ -319,6 +319,11 @@ pub struct OV {
 }
 
 /// 썸네일: w×h RGB, 마스크(0/255), 깊이(mm)
+/// 사진 벡터로 합치는 문턱(fr1_room 실측, docs/performance_log.md): 같은 물체의 두 이름 0.92, 의자와 그 위 인형 0.85, 겹친 다른 물체 0.74–0.82
+pub const LOOK_COS: f32 = 0.88;
+/// 작은 쪽 굳은 칸 중 큰 쪽 굳은 칸과 겹쳐야 하는 비율(같은 물체 0.33, 나란한 모니터 둘 0.14)
+pub const LOOK_OVL: f32 = 0.25;
+
 pub struct Crop {
     pub w: u32,
     pub h: u32,
@@ -467,10 +472,6 @@ impl Memory {
         o.id
     }
 
-    /// 병합 후처리(HOV-SG·ConceptGraphs 방식): 따로 생긴 두 물체가 같은 것이면 합친다.
-    /// 기하: 굵은 칸(4 cm) 3D IoU, 작은 쪽 기준 겹침 비율. 의미: 이름 투표 분포 코사인. 생김새: 점 색 히스토그램 코사인.
-    /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8), 또는 이름 ≥ 0.5 이고 작은 쪽 굳은 칸 70 % 가 큰 쪽 칸 안(겹침 ≥ 0.2).
-    /// 사라짐 표시된 물체도 후보(이름 ≥ 0.5 일 때만). 반환: 합친 수
     /// 잠깐 잡혔다 사라진 검출 지우기: 두 번 이하로 보였고 3 초 넘게 다시 안 보인 물체(한두 장면의 잘못된 검출이 화면을 어지럽힘)
     /// 다시 쌓은 물체에 옛 물체의 id 를 물려준다(같은 이름, 가장 가까운 것, 크기 절반 + 15 cm 안, 한 번씩만).
     /// 뷰어는 같은 물체를 계속 같은 것으로 보고(선택 유지), 사진이 그대로면 PNG 세 장을 다시 짜지·받지 않는다.
@@ -516,7 +517,19 @@ impl Memory {
         n0 - self.objs.len()
     }
 
+    /// 병합 후처리(HOV-SG·ConceptGraphs 방식): 따로 생긴 두 물체가 같은 것이면 합친다.
+    /// 기하: 굵은 칸(4 cm) 3D IoU, 작은 쪽 기준 겹침 비율. 의미: 이름 투표 분포 코사인. 생김새: 점 색 히스토그램 코사인.
+    /// 합치는 조건: IoU ≥ 0.5, 또는 겹침 ≥ 0.6 이면서 (이름 ≥ 0.5 또는 생김새 ≥ 0.8), 또는 이름 ≥ 0.5 이고 작은 쪽 굳은 칸 70 % 가 큰 쪽 칸 안(겹침 ≥ 0.2).
+    /// 사라짐 표시된 물체도 후보(이름 ≥ 0.5 일 때만).
+    /// 사진 벡터(embed, 있을 때): 이름이 달라도 두 사진 벡터 코사인 ≥ LOOK_COS 이고 작은 쪽 굳은 칸의 LOOK_OVL 이상이 큰 쪽 굳은 칸과 겹치면 합침
+    /// (한 물체가 보는 방향에 따라 다른 이름으로 잡혀 둘로 남은 경우). 벡터는 종류까지만 가려서(나란한 모니터 둘도 0.92) 겹침 없이 벡터만으로는 합치지 않는다.
+    /// 반환: 합친 수
     pub fn merge_pass(&mut self) -> usize {
+        self.merge_pass_with(&crate::embed::get)
+    }
+
+    /// merge_pass 본체. emb: 물체 번호 → 사진 벡터(길이 1)
+    pub fn merge_pass_with(&mut self, emb: &dyn Fn(u32) -> Option<Vec<f32>>) -> usize {
         let (frag_in, frag_ovl) = (0.7f32, 0.2f32); // 조각: 굳은 칸 70 % 가 상대 칸 안, 전체 칸 겹침 20 % 이상
         let hist = |o: &Obj| -> Vec<f32> {
             let mut h = vec![0f32; 64];
@@ -623,8 +636,26 @@ impl Memory {
                         let sc = solid(s);
                         sc.len() >= 3 && sc.iter().filter(|k| l.support.contains_key(k)).count() as f32 >= frag_in * sc.len() as f32
                     };
+                    // 사진 벡터가 닮았고 몸통이 실제로 겹침(이름 무관)
+                    let look = || {
+                        let (Some(ea), Some(eb)) = (emb(a.id), emb(b.id)) else { return false };
+                        let cos = ea.iter().zip(&eb).map(|(x, y)| x * y).sum::<f32>();
+                        if ea.len() != eb.len() || cos < LOOK_COS {
+                            return false;
+                        }
+                        let (ca, cb) = (solid(a), solid(b));
+                        let (s, l) = if ca.len() <= cb.len() { (ca, cb) } else { (cb, ca) };
+                        let lset: FastSet<u64> = l.into_iter().collect();
+                        let hit = s.iter().filter(|k| lset.contains(k)).count() as f32;
+                        let ok = s.len() >= 3 && hit >= LOOK_OVL * s.len() as f32;
+                        if ok {
+                            // 다른 조건이 모두 아닐 때만 여기까지 온다: 사진 벡터가 정한 병합
+                            eprintln!("merge(look): {}#{} + {}#{} cos {cos:.2} overlap {:.2}", a.name, a.id, b.name, b.id, hit / s.len() as f32);
+                        }
+                        ok
+                    };
                     let geo = iou >= 0.5 || ovl >= 0.6 || (ovl >= frag_ovl && frag());
-                    if if any_gone { sem >= 0.5 && geo } else { iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) || (sem >= 0.5 && ovl >= frag_ovl && frag()) } || touch() {
+                    if if any_gone { sem >= 0.5 && geo } else { iou >= 0.5 || (ovl >= 0.6 && (sem >= 0.5 || app >= 0.8)) || (sem >= 0.5 && ovl >= frag_ovl && frag()) } || touch() || look() {
                         pair = Some((i, j));
                         break 'outer;
                     }
@@ -765,5 +796,49 @@ impl SceneMap {
         for n in self.nodes.values_mut() {
             n.written = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// x0 부터 nx 칸 × 5 × 5 칸(4 cm) 덩어리 한 번 관측
+    fn block(m: &mut Memory, name: &str, x0: i32, nx: i32) -> u32 {
+        let mut pts = vec![];
+        for x in x0..x0 + nx {
+            for y in 0..5 {
+                for z in 0..5 {
+                    pts.push(([x as f64 * 0.04 + 0.02, y as f64 * 0.04 + 0.02, z as f64 * 0.04 + 0.02], [128u8, 128, 128]));
+                }
+            }
+        }
+        m.update(name, 0.9, &pts, 1.0, 0.0, 1, || Crop { w: 1, h: 1, rgb: vec![0; 3], mask: vec![255], depth: vec![0] }, None)
+    }
+
+    /// 두 벡터의 코사인이 c 가 되게
+    fn vecs(a: u32, b: u32, c: f32) -> impl Fn(u32) -> Option<Vec<f32>> {
+        move |id| if id == a { Some(vec![1.0, 0.0]) } else if id == b { Some(vec![c, (1.0 - c * c).sqrt()]) } else { None }
+    }
+
+    #[test]
+    fn look_merges_two_names_of_one_thing() {
+        // 이름이 다른 두 덩어리, 작은 쪽의 40 % 가 겹침
+        let mut m = Memory::new(0.012, 0.04);
+        let (a, b) = (block(&mut m, "teddy bear", 0, 10), block(&mut m, "chair", 8, 5));
+        assert_eq!(m.objs.len(), 2);
+        assert_eq!(m.merge_pass_with(&|_| None), 0, "벡터가 없으면 그대로");
+        assert_eq!(m.merge_pass_with(&vecs(a, b, 0.80)), 0, "덜 닮은 사진은 그대로");
+        assert_eq!(m.merge_pass_with(&vecs(a, b, 0.95)), 1);
+        assert_eq!(m.objs.len(), 1);
+    }
+
+    #[test]
+    fn look_alone_does_not_merge_neighbours() {
+        // 닮은 사진이어도 몸통이 거의 안 겹치면(작은 쪽의 20 %) 둘로 둔다: 나란한 모니터
+        let mut m = Memory::new(0.012, 0.04);
+        let (a, b) = (block(&mut m, "tv", 0, 10), block(&mut m, "laptop", 9, 5));
+        assert_eq!(m.merge_pass_with(&vecs(a, b, 0.95)), 0);
+        assert_eq!(m.objs.len(), 2);
     }
 }

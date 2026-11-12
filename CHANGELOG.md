@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-12
+
+### Added
+- 글로 물체 찾기: 뷰어 검색창에 아무 말이나 치면(의자, something to drink) 닮은 물체를 점수 순으로 보여 주고 지도에 표시한다(`sgview --search-model`, `GET /api/search`).
+- 물체 사진 벡터(`memmap --embed`, SigLIP2): `objects/O<id>_emb.bin`, `view.json` 물체의 `emb`.
+- 분할 모델이 낼 수 있는 이름 목록 `vocab.json`.
+
+### Changed
+- 물체 병합이 사진 벡터도 본다: 한 물체가 두 이름으로 따로 남으면(인형이 의자로도 잡힘) 사진이 닮고 자리가 겹칠 때 하나로 합친다.
+
 ## [0.5.0] - 2026-11-12
 
 ### Added
@@ -120,7 +130,8 @@
 ### Fixed
 - 모델 설정 필드 순서로 초기화가 깨지던 문제.
 
-[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.2.0...v0.3.0

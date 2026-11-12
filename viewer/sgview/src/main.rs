@@ -1,10 +1,10 @@
 //! sgview — scene-graph viewer server (Rust). Replaces the Python/viser viewer.
 //!
 //! Reads the folder scenemap writes (`view.json`, `map.pgm` + `map.yaml`, `objects/O<id>_*`) and serves it to a three.js page.
-//! No Python, no Spark-DSG, no crates besides std: everything the page needs comes from `view.json`, which already carries
+//! Everything the page needs comes from `view.json`, which already carries
 //! objects, rooms, the compact graph, robot pose and grid info. Walls as 2D lines / numbers come from scenemap's C++ (`walls.cpp`).
 //!
-//!   sgview <memory_dir> [--port 8080] [--bind 0.0.0.0]
+//!   sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir with text_model*.onnx + tokenizer.json>]
 //!
 //! GET /                      the page
 //! GET /api/view?v=<ver>      {"v": ver, "map_v": ver, "view": <view.json>} or {"unchanged": true} (poll; ver = mtime+size)
@@ -13,8 +13,11 @@
 //! GET /api/walls?x=&y=&yaw=  {"segments": [[ax,ay,bx,by]..], "state": [56 floats], "pose": [x,y,yaw]}
 //! GET /api/depth?path=<rel>  16-bit grey PNG → u16 little-endian pixels (X-W / X-H)
 //! GET /file/<relative path>  any file below the memory dir (PNG crops, PLY points)
+//! GET /api/search?q=<text>   objects ranked against the text (see search.rs); optional k (20) and min score (0.2)
 //! GET /api/files?p=a,b,..   many files below the memory dir in one reply (see pack_files)
 //! GET /stream               SSE: live stream (--ingest), else folder events vv (view.json version) / fpose (pose.json)
+mod search;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -136,6 +139,8 @@ struct State {
     live_mode: bool,                      // --ingest: the C++ side streams here, no files
     live: Mutex<Live>,
     clients: Mutex<Vec<SyncSender<Arc<String>>>>,
+    #[cfg(feature = "search")]
+    text_enc: std::sync::OnceLock<search::TextEnc>, // --search-model: set once the model is loaded (search is by the letters of the name until then)
 }
 
 /// Live state fed by the C++ stream (scenemap/stream.hpp): the grid, the latest summary and pose, and the wall segments derived from them.
@@ -635,6 +640,18 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
             Ok(()) => respond(&mut s, 200, "application/json", "", b"{\"ok\":true}"),
             Err(e) => respond(&mut s, 500, "text/plain", "", e.to_string().as_bytes()),
         },
+        "/api/search" => {
+            let Some((_, text)) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") };
+            let Ok(view) = serde_json::from_str::<serde_json::Value>(&text) else { return respond(&mut s, 500, "text/plain", "", b"view.json") };
+            #[cfg(feature = "search")]
+            let enc = |t: &str| st.text_enc.get().and_then(|e| e.encode(t).map_err(|e| eprintln!("search: {e}")).ok());
+            #[cfg(not(feature = "search"))]
+            let enc = |_: &str| None;
+            let k = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(20);
+            let min = q.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.2);
+            let body = search::search(&st.dir, &view, q.get("q").map_or("", |v| v.as_str()), &enc, k, min).to_string();
+            respond(&mut s, 200, "application/json", "", body.as_bytes())
+        }
         "/api/mode" => respond(&mut s, 200, "application/json", "", format!("{{\"live\":{}}}", st.live_mode).as_bytes()),
         "/api/robot" => {
             let body = match robot_kind(&st) {
@@ -987,28 +1004,53 @@ fn main() {
     let mut dir: Option<String> = None;
     let (mut port, mut bind) = (8080u16, "0.0.0.0".to_string());
     let mut ingest: Option<String> = None;
+    let mut search_model: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "--bind" => bind = it.next().unwrap_or(bind),
             "--ingest" => ingest = it.next(),
+            "--search-model" => search_model = it.next(),
             _ => dir = Some(a),
         }
     }
     let dir = match dir {
         Some(d) => PathBuf::from(d),
         None => {
-            eprintln!("usage: sgview <memory_dir> [--port 8080] [--bind 0.0.0.0]");
+            eprintln!("usage: sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>]");
             std::process::exit(2);
         }
     };
-    let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new((String::new(), Arc::new(String::new()))), maps: Mutex::new(MapHist { vers: Vec::new() }), live_mode: ingest.is_some(), live: Mutex::new(Live { w: 0, h: 0, res: 0.05, ox: 0.0, oy: 0.0, cells: Vec::new(), view: None, pose: None, joints: None, ig: Vec::new(), segs: Vec::new(), theta: 0.0, seg_ver: 0, seg_sent: 0, segs_dirty: false, last_walls: Instant::now() }), clients: Mutex::new(Vec::new()) });
+    let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new((String::new(), Arc::new(String::new()))), maps: Mutex::new(MapHist { vers: Vec::new() }), live_mode: ingest.is_some(), live: Mutex::new(Live { w: 0, h: 0, res: 0.05, ox: 0.0, oy: 0.0, cells: Vec::new(), view: None, pose: None, joints: None, ig: Vec::new(), segs: Vec::new(), theta: 0.0, seg_ver: 0, seg_sent: 0, segs_dirty: false, last_walls: Instant::now() }), clients: Mutex::new(Vec::new()),
+        #[cfg(feature = "search")]
+        text_enc: std::sync::OnceLock::new() });
     let l = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("cannot listen on {}:{}: {}", bind, port, e);
         std::process::exit(1);
     });
     let _ = SystemTime::now();
+    #[cfg(feature = "search")]
+    if let Some(m) = search_model {
+        // the model takes seconds to load: the page is served meanwhile
+        let st2 = st.clone();
+        std::thread::spawn(move || match search::TextEnc::load(Path::new(&m)) {
+            Ok(e) => {
+                // class names are asked on every query: encode them once now
+                let names: Vec<String> = fs::read_to_string(st2.dir.join("vocab.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                for n in &names {
+                    let _ = e.encode(n);
+                }
+                let _ = st2.text_enc.set(e);
+                eprintln!("search: text encoder ready ({m})");
+            }
+            Err(e) => eprintln!("search: {e} — searching by name only"),
+        });
+    }
+    #[cfg(not(feature = "search"))]
+    if search_model.is_some() {
+        eprintln!("search: built without the search feature — searching by name only");
+    }
     eprintln!("sgview: http://localhost:{}  (memory dir {})", port, st.dir.display());
     if let Some(a) = ingest {
         let st2 = st.clone();

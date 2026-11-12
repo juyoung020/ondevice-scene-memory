@@ -58,10 +58,26 @@
   #b_reset:disabled { opacity:.45; cursor:default; }
   #b_reset:disabled svg { animation:rspin 1s linear infinite; }
   @keyframes rspin { to { transform:rotate(360deg); } }
-  body.ui-off #b_reset, body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys { display:none; }
+  #find { position:absolute; left:18px; top:64px; width:330px; z-index:8; }   /* left column: the middle of the map stays free for the match the camera flies to */
+  #f_q { width:100%; box-sizing:border-box; padding:8px 30px 8px 14px; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:12px; font:inherit; font-size:13px;
+    outline:none; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); box-shadow:0 6px 24px rgba(0,0,0,.35); }
+  #f_q:focus { border-color:rgba(106,168,255,.6); }
+  #f_x { position:absolute; right:6px; top:5px; padding:2px 7px; background:transparent; border:none; color:var(--mute); display:none; }
+  #f_out { margin-top:6px; max-height:calc(100vh - 170px); overflow-y:auto; background:var(--panel); border:1px solid var(--line); border-radius:12px; display:none;
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); box-shadow:0 10px 40px rgba(0,0,0,.45); scrollbar-width:thin; scrollbar-color:#3a4152 transparent; }
+  #f_note { padding:6px 12px; color:var(--mute); font-size:11.5px; }
+  .hit { display:flex; align-items:center; gap:10px; padding:6px 12px; cursor:pointer; border-top:1px solid var(--line); }
+  .hit:hover, .hit.on { background:rgba(106,168,255,.12); }
+  .hit img { width:40px; height:40px; object-fit:cover; border-radius:6px; background:#11151e; flex:none; }
+  .hit .nm { flex:1; min-width:0; } .hit .nm b { font-weight:600; } .hit .nm span { color:var(--mute); font-size:11px; }
+  .hit .bar { height:3px; border-radius:2px; background:#232a3a; margin-top:4px; overflow:hidden; } .hit .bar i { display:block; height:100%; background:#4ade80; }
+  .hit .pc { font-variant-numeric:tabular-nums; font-weight:600; width:38px; text-align:right; }
+  .hit .by { font-size:10.5px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:#c9cfdc; }
+  .lbl.find { border-color:rgba(74,222,128,.6); }
+  body.ui-off #b_reset, body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys, body.ui-off #find { display:none; }
   canvas.crop { max-width:100%; image-rendering:pixelated; border:1px solid var(--line); display:block; }
   .stats { color:var(--mute); font-size:11px; }
-  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } body.panel-open #b_reset { right:14px; bottom:calc(45% + 24px); } #keys { display:none; } }
+  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } body.panel-open #b_reset { right:14px; bottom:calc(45% + 24px); } #keys { display:none; } #find { left:8px; right:8px; top:56px; width:auto; } #f_out { max-height:30vh; } }
 </style>
 </head>
 <body>
@@ -70,7 +86,9 @@
 <div id="labels"></div>
 <div id="tip"></div>
 <div id="title"><div class="t1">Scene Memory</div><div class="t2" id="subtitle">3D map · on-device</div></div>
-<div id="keys"><b>drag</b>orbit · <b>F</b>fit · <b>T</b>top · <b>R</b>demo · <b>G</b>settings · <b>H</b>hide UI</div>
+<div id="find"><input id="f_q" type="text" autocomplete="off" spellcheck="false" placeholder="Search objects in any words · 의자, something to drink …  ( / )"><button id="f_x" title="Clear (Esc)">✕</button>
+  <div id="f_out"><div id="f_note"></div><div id="f_list"></div></div></div>
+<div id="keys"><b>drag</b>orbit · <b>/</b>search · <b>F</b>fit · <b>T</b>top · <b>R</b>demo · <b>G</b>settings · <b>H</b>hide UI</div>
 <button id="b_reset" title="Reset: re-acquire the camera pose and rebuild the map from empty" aria-label="Reset map"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></button>
 <div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
 <div id="panel">
@@ -323,6 +341,7 @@ let view = null, viewVer = "", mapVer = "";
 const prev = {};
 const objs = new Map();             // id -> object (from view.json)
 let selected = null;
+const find = { q:"", hits:[], ids:new Set(), key:"", timer:0, seq:0, last:0 };   // search box state: query, matches (see "search" below)
 const plyCache = new Map();         // id -> {stamp, geom, n}
 const thumbCache = new Map();       // url -> THREE.Texture
 const texLoader = new THREE.TextureLoader();
@@ -1053,6 +1072,11 @@ function updateLabels() {
       put("h" + o.id, `${o.name} · ${o.state}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.08], "obj hot");
       const e = labelEls.get("h" + o.id); if (e) e.style.setProperty("--c", "#" + new THREE.Color(STATE_COL[o.state] ?? 0xc83cc8).getHexString());
     }
+    for (const h of find.hits) {   // search matches: name and score
+      const o = objs.get(h.id); if (!o || o.id === selected || o.id === hoverId) continue;
+      put("f" + o.id, `${o.name} · ${Math.round(h.score * 100)}%`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.08], "obj find");
+      const e = labelEls.get("f" + o.id); if (e) e.style.setProperty("--c", "#4ade80");
+    }
     if (opt("g_on") && opt("g_rooms")) for (const r of view.rooms || []) put("r" + r.id, (r.name || ("room " + r.id)) + (r.objects ? ` · ${r.objects.length} objects` : ""), [r.centroid[0], r.centroid[1], zOf("room") + 0.6], "room");
     if (opt("g_on") && trajInfo && opt("g_agents")) put("traj", `${robotLabel()} ${trajInfo.len.toFixed(1)} m`, trajInfo.last, "traj");
     if (opt("c_llabels")) {
@@ -1061,7 +1085,7 @@ function updateLabels() {
       if (opt("g_on")) for (const [kind, text] of [["object", "물체"], ["room", "방"]]) putLayer("L" + kind, text, graphNodes.filter(n => n.kind === kind).map(n => [n.x, n.y, n.z]));
     }
     const nMax = opt("n_olmax");
-    let olist = view.objects.filter(o => objVisible(o) && o.id !== selected && o.id !== hoverId && (nMax <= 0 || o.state !== "gone"));
+    let olist = view.objects.filter(o => objVisible(o) && o.id !== selected && o.id !== hoverId && !find.ids.has(o.id) && (nMax <= 0 || o.state !== "gone"));
     if (nMax > 0) olist = olist.sort((a, b) => b.extent[0] * b.extent[1] * b.extent[2] - a.extent[0] * a.extent[1] * a.extent[2]).filter((o, i, l) => l.findIndex(q => q.name === o.name) === i).slice(0, nMax);   // one label per name, the largest
     if (opt("c_olabels")) for (const o of olist) {
       put("o" + o.id, nMax > 0 ? o.name : `${o.name}#${o.id}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.1], "obj", true);
@@ -1074,6 +1098,7 @@ function updateLabels() {
 // ---------------- selection / panel ----------------
 function select(id) {
   selected = id; $("s_obj").value = id == null ? "" : String(id);
+  for (const row of $("f_list").children) row.classList.toggle("on", +row.dataset.id === id);
   drawObjects(); renderInfo(); drawHighlight();
 }
 let infoTimer = 0;
@@ -1211,15 +1236,62 @@ let hoverId = null;
 const gHi = new THREE.Group(); scene.add(gHi);
 let hiKey = "";
 function drawHighlight() {
-  const key = hoverId + "|" + selected; if (key === hiKey) return; hiKey = key;
+  const key = hoverId + "|" + selected + "|" + find.key; if (key === hiKey) return; hiKey = key;
   disposeGroup(gHi);
-  for (const [id, col, op] of [[selected, 0xffd166, 0.95], [hoverId !== selected ? hoverId : null, 0x6aa8ff, 0.85]]) {
+  const marks = find.hits.filter(h => h.id !== selected && h.id !== hoverId).map(h => [h.id, 0x4ade80, 0.35 + 0.6 * h.score]);   // search matches: green, stronger with the score
+  for (const [id, col, op] of [...marks, [selected, 0xffd166, 0.95], [hoverId !== selected ? hoverId : null, 0x6aa8ff, 0.85]]) {
     const o = id != null && objs.get(id); if (!o) continue;
     const b = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(...o.extent.map(v => Math.max(v, 0.05) + 0.04))), new THREE.LineBasicMaterial({ color:col, transparent:true, opacity:op, depthTest:false, fog:false }));
     b.position.set(...o.pos); b.renderOrder = 10; gHi.add(b);
   }
   invalidate();
 }
+// ---------------- search ----------------
+// The box asks /api/search (text → class names and object pictures, see sgview search.rs); matches get a green outline and a label on the map.
+function flyTo(o) {   // keep the compass direction, look down from at least 40°, stay far enough to see what stands around the object
+  const dir = camera.position.clone().sub(controls.target).normalize(), d = Math.max(2.5, Math.max(...o.extent) * 5);
+  if (dir.z < 0.64) { const h = Math.hypot(dir.x, dir.y) || 1; dir.set(dir.x / h * 0.77, dir.y / h * 0.77, 0.64); }
+  const target = new THREE.Vector3(...o.pos);
+  autoFit = false; camGoal = { pos:target.clone().addScaledVector(dir, d), target }; invalidate();
+}
+function findShow(r) {
+  find.hits = r.results.filter(h => objs.has(h.id)); find.ids = new Set(find.hits.map(h => h.id));
+  find.key = find.hits.map(h => h.id + ":" + h.score).join(",");
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+  const read = (r.names || []).map(n => esc(n.name)).join(", ");
+  $("f_note").innerHTML = !r.semantic ? "No text model loaded: matching the letters of the stored names only."
+    : find.hits.length ? `${find.hits.length} match${find.hits.length > 1 ? "es" : ""}${read ? " · read as <b>" + read + "</b>" : " · matched by look"}`
+    : `Nothing in the memory matches${read ? " (read as <b>" + read + "</b>)" : ""}.`;
+  $("f_list").innerHTML = find.hits.map(h => { const o = objs.get(h.id), img = o.rgbd && o.rgbd.rgb ? `<img src="/file/${o.rgbd.rgb}?v=${o.rgbd.v ?? o.last_seen}" alt="">` : "<img alt=''>";
+    return `<div class="hit${h.id === selected ? " on" : ""}" data-id="${h.id}">${img}<div class="nm"><b>${esc(o.name)}</b> <span>#${h.id} · ${esc(o.state)}</span><div class="bar"><i style="width:${Math.round(h.score * 100)}%"></i></div></div>` +
+      `<span class="by" title="name: the query means this class name (${h.p_name}) · look: the query describes this object's picture (${h.p_look})">${h.by}</span><span class="pc">${Math.round(h.score * 100)}%</span></div>`; }).join("");
+  $("f_out").style.display = "block";
+  drawHighlight(); invalidate();
+}
+function findClear(keepText) {
+  find.q = ""; find.hits = []; find.ids = new Set(); find.key = ""; find.seq++;
+  if (!keepText) $("f_q").value = "";
+  $("f_out").style.display = "none"; $("f_x").style.display = $("f_q").value ? "block" : "none";
+  drawHighlight(); invalidate();
+}
+async function findRun() {
+  const q = $("f_q").value.trim(); $("f_x").style.display = $("f_q").value ? "block" : "none";
+  if (!q) { findClear(true); return null; }
+  const seq = ++find.seq; find.q = q; find.last = performance.now();
+  try {
+    const r = await (await fetch("/api/search?q=" + encodeURIComponent(q))).json();
+    if (seq !== find.seq) return null;   // a newer query is on its way
+    findShow(r); return r;
+  } catch (e) { if (seq === find.seq) { $("f_note").textContent = "search failed: " + e.message; $("f_list").innerHTML = ""; $("f_out").style.display = "block"; } return null; }
+}
+$("f_q").addEventListener("input", () => { clearTimeout(find.timer); find.timer = setTimeout(findRun, 180); });
+$("f_q").addEventListener("keydown", async e => {
+  if (e.key === "Escape") { findClear(); $("f_q").blur(); }
+  if (e.key === "Enter") { clearTimeout(find.timer); await findRun(); const h = find.hits[0]; if (h) { select(h.id); flyTo(objs.get(h.id)); } }   // Enter: go to the best match
+});
+$("f_x").onclick = () => { findClear(); $("f_q").focus(); };
+$("f_list").addEventListener("click", e => { const row = e.target.closest(".hit"); if (!row) return; const o = objs.get(+row.dataset.id); if (o) { select(o.id); flyTo(o); } });
+function findRefresh() { if (find.q && performance.now() - find.last > 2000) findRun(); }   // the memory changed: ask again, at most every 2 s
 let down = null;
 renderer.domElement.addEventListener("pointerdown", e => { down = [e.clientX, e.clientY]; });
 renderer.domElement.addEventListener("pointerup", e => {
@@ -1295,6 +1367,7 @@ addEventListener("keydown", e => {
   if (k === "g") togglePanel();
   if (k === "h") document.body.classList.toggle("ui-off");
   if (k === "escape") select(null);
+  if (k === "/") { e.preventDefault(); $("f_q").focus(); $("f_q").select(); }
 });
 
 // floor: fine grid that fades into the fog + a soft dark pad under the map (contact shadow), both well below the map's contrast
@@ -1336,7 +1409,7 @@ function applyView(v) {
   if (view.scene_points) sObj += "scene|" + (view.scene_points.octree ? "o" + view.scene_points.octree.run + ":" + view.scene_points.octree.ver : (view.scene_points.chunks ?? view.scene_points.stamp)) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3] * 1000 + (r[4] || 0)).reduce((a, b) => a + b, 0) : "");
   const sGraph = JSON.stringify(view.graph), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
   const objChanged = sObj !== prev.obj, graphChanged = objChanged || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
-  if (objChanged) { fillSelect(); drawObjects(); }
+  if (objChanged) { fillSelect(); drawObjects(); findRefresh(); }
   if (graphChanged) drawGraph();
   if (!objChanged && selected != null) renderInfoSoon();
   if (!LIVE) { const sPose = JSON.stringify(view.pose); if (sPose !== prev.pose) drawRobot(); prev.pose = sPose; }

@@ -9,6 +9,7 @@
 #[cfg(feature = "cam")]
 mod cam;
 mod dvo;
+mod embed;
 mod geom;
 mod graph;
 mod kfstore;
@@ -77,6 +78,7 @@ struct Args {
     stream: Option<String>, // --stream <파일|->: 연결 프로그램(bridge/)이 보내는 장면 스트림(위치·컬러·깊이)
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
+    embed: Option<String>,  // --embed <vision_model.onnx>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -87,6 +89,7 @@ fn args() -> Args {
         tum: get("--tum").unwrap_or_default().into(),
         out: get("--out").or_else(|| get("--seg-check").map(|_| String::new())).expect("--out <dir>").into(), // --seg-check 는 쓰는 파일이 없음
         seg: get("--seg").unwrap_or("models/yolo26s-seg.onnx".into()),
+        embed: get("--embed"),
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
@@ -581,6 +584,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let _ = std::fs::remove_dir_all(a.out.join("scene"));
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
+    // 분할 모델이 낼 수 있는 이름 전체: 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
+    let _ = std::fs::write(a.out.join("vocab.json"), serde_json::to_string(&seg::COCO[..]).unwrap());
     let mut last_pose = [0.0; 3];
     let t0 = Instant::now();
     // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
@@ -1801,11 +1806,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     for o in mem.objs.iter_mut().filter(|o| o.dirty) {
         o.cells_saved = 0; // 마지막 기록은 바뀐 물체를 모두 내보냄
     }
+    embed::drain(); // 마지막 병합이 모든 물체의 사진 벡터를 보게
     write_view(&a.out, &grid, &mut mem, &mut room_tr, &traj, t_end, last_pose, &cam_json, &scene_json, true, usize::MAX);
     if n_rebuild > 0 {
         prune_object_files(&a.out, &mem);
     }
     out::flush_writer();
+    embed::finish();
     let n = clock.n.max(1) as f64;
     let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
     for o in &mem.objs {
@@ -2423,6 +2430,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
                 out::png_rgb(&dir.join(format!("{base}_rgb.png")), c.w, c.h, &c.rgb);
                 out::png_gray(&dir.join(format!("{base}_mask.png")), c.w, c.h, &c.mask);
                 out::png_u16(&dir.join(format!("{base}_depth.png")), c.w, c.h, &c.depth);
+                embed::submit(dir, o.id, c.w, c.h, &c.rgb);
             }
             o.crop_saved = o.crop_ver;
         }
@@ -2431,6 +2439,9 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
             "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox, "n": o.n_pts}});
         if o.crop.is_some() {
             e["rgbd"] = json!({"rgb": format!("{base}_rgb.png"), "mask": format!("{base}_mask.png"), "depth": format!("{base}_depth.png"), "v": o.crop_ver});
+            if embed::on() {
+                e["emb"] = json!(embed::rel_path(o.id));
+            }
         }
         objs.push(e);
     }
@@ -2562,6 +2573,9 @@ fn limit_malloc_arenas() {
 fn main() {
     limit_malloc_arenas();
     let a = args();
+    if let Some(m) = &a.embed {
+        embed::start(m);
+    }
     out::set_layout(&a.threads);
     out::start_pools();
     out::set_slow(a.slow);

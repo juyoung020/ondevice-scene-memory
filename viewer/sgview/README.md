@@ -17,7 +17,7 @@ Rust 서버(std + `serde_json`·`flate2`)가 `view.json`,
 
 ```bash
 cd src/scene_graph/sgview && cargo build --release
-target/release/sgview <memory_dir> [--port 8080] [--bind 0.0.0.0]
+target/release/sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <폴더>]
 ```
 브라우저에서 http://localhost:8080 . 서버가 폴더의 `view.json`·`pose.json` 을 50 ms 마다 살펴 바뀌면 `/stream`(SSE)으로 알리고(`vv` 판 번호 · `fpose` 빠른 카메라 자세), 페이지는 그때만 `/api/view` 를 한 번 받는다. 가만히 있는 뷰어는 요청을 보내지 않는다(10 s 마다 keepalive 한 줄). 이벤트 스트림이 끊기면 다시 붙을 때까지 2 s 마다 폴링한다.
 
@@ -31,7 +31,8 @@ target/release/sgview <memory_dir> [--port 8080] [--bind 0.0.0.0]
 - 물체: 마우스를 올리면 파란 윤곽 상자 + 알약 모양 이름표(이름 · 상태), 클릭하면 노란 윤곽으로 선택, 빈 곳 클릭·Esc 로 해제.
 - 우상단 도구줄: Fit · Top · Demo(천천히 자동 회전) · 화질(High/Low) · Settings(설정 패널, 기본은 접힘).
 - 오른쪽 아래 둥근 새로고침 아이콘: 리셋(위치 추적과 지도를 처음부터, `GET /api/reset`). 누르면 3 초 동안 돌며 잠긴다.
-- 단축키: F 맞춤, T 위에서, R 데모 회전, G 설정 패널, H 화면 글자·버튼 전부 숨김.
+- 위쪽 검색창: 글로 물체 찾기(`GET /api/search?q=<글>&k=20&min=0.2`). 결과는 왼쪽에 점수 순(사진 · 이름 · 점수 · name/look 중 무엇으로 맞았는지), 지도에는 초록 윤곽과 이름표. 줄을 누르거나 Enter 면 그 물체로 간다. `--search-model` 폴더(`text_model_fp16.onnx`·`tokenizer.json`)가 있으면 뜻으로, 없으면 이름 글자로 찾는다. 점수 계산은 `src/search.rs` 머리말.
+- 단축키: / 검색, F 맞춤, T 위에서, R 데모 회전, G 설정 패널, H 화면 글자·버튼 전부 숨김.
 - 깊이 음영(EDL)은 두 화질 모두 켜져 있다(전체 화면 후처리 한 장).
 - 화질: High = 화소 비율 최대 2 + 점 지도 예산 3 M 점 + 점 섞기(포물면 점·가중 평균), Low = 화소 비율 1 + 0.8 M 점·노드를 덜 세밀하게(화면 점 간격 약 4 화소, 적응 점 크기가 면을 메움). 약한 GPU 는 캔버스 다중 샘플링 없이 만든다(장면은 다중 샘플링 없는 EDL 목표에 그려지므로 화면 차이 없음). 약한 GPU(Pi 5 V3D·모바일·소프트웨어 렌더러)는 Low 로 시작하고, 고른 값은 브라우저에 기억된다.
 - **움직이는 동안 가볍게(Low 기본, `?lod=0|1`)**: 카메라가 움직이는 동안 장면을 캔버스의 절반 해상도(`?lodscale=`)로 그리고 EDL(이웃 4 개)도 그 크기에서 한 뒤 한 번에 늘려 붙인다. 점 크기·노드 세밀함이 그 해상도를 따라 점 지도는 한 수준 굵게(점 약 1/4) 고르고. 멈추고 0.2 s 뒤 원래 화질로 한 번 다시 그린다. 그래서 Pi 5 기본(Low)이 돌릴 때 25 장/초 이상을 낸다. High 는 가만히 있을 때와 같은 화질로 돈다.

@@ -30,6 +30,7 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 - 물체 찾기(COCO 80종: 의자·컵·노트북·책 …) — 보드 NPU
 - 카메라 위치 추정과 루프 클로저 — RTAB-Map(BRIEF 특징 + GTSAM 최적화)
 - 3D 점 지도, 물체 기억(옮겨짐·사라짐 표시)
+- 글로 물체 찾기: 지도에 chair 로 저장돼 있어도 "의자"·"앉을 것"으로 찾습니다(물체 사진 벡터 + 글 벡터, SigLIP2)
 - 방 나누기(Hydra 방식: 문처럼 좁은 목에서 끊음)와 문 찾기, 방 이름(물체 구성으로: 사무실·주방·거실 …, 확률·근거 포함), 방↔물체·방↔방·물체↔물체 연결
 - 보드 실시간(NPU 코어 여럿에 장면을 함께 올림), PC·폰·보드 화면 브라우저 뷰어(High/Low 화질)
 
@@ -64,11 +65,13 @@ cargo build --release --manifest-path viewer/sgview/Cargo.toml
 # TUM 영상 → RTAB-Map → memmap(점 지도 + 물체)
 rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
   | pipeline/target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx \
-      --max-depth 3.5 --out data/memory/office
+      --embed models/siglip2-base-patch32-256/vision_model.onnx --max-depth 3.5 --out data/memory/office
 
 # 다른 창에서 뷰어 → 브라우저로 http://127.0.0.1:8091
-viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.0.1
+viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.0.1   --search-model models/siglip2-base-patch32-256
 ```
+
+검색 모델은 Hugging Face 의 SigLIP2 base patch32-256 을 ONNX 로 내보낸 것으로, `models/siglip2-base-patch32-256/` 에 `vision_model.onnx`(memmap 이 물체 사진에), `text_model_fp16.onnx`·`tokenizer.json`(뷰어가 검색어에) 을 둡니다. `--embed`·`--search-model` 을 빼면 검색창은 저장된 이름의 글자만 비교합니다.
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 
@@ -98,6 +101,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · rebuild · writer · infer) |
 | `--npu-jobs K` | 스트림 분할 장면을 NPU 에 K 장까지 함께 올림(NPU 코어 여럿이 나눠 돎, 기본 4, `1` 은 한 장씩) |
 | `--seg <모델>` / `--conf 0.35` | 물체 분할 모델 / 물체로 인정할 확신도 |
+| `--embed <vision_model.onnx>` | 물체 사진마다 검색용 벡터를 남김(뷰어 검색, 물체 병합에 씀) |
 | `--max-depth` | 지도에 넣을 최대 거리(m) |
 | `--every N` | 받은 장면 N장마다 처리 |
 | `--live 1` / `--loop` | 실제 속도로 재생하며 뷰어에 계속 갱신 / 끝나면 반복 |
@@ -107,6 +111,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 - **마우스:** 끌면 돌리기, 휠은 확대·축소, 오른쪽 끌기는 이동.
 - **오른쪽 위 도구줄:** `Fit`(전체 맞추기) · `Top`(위에서 보기) · `Demo`(천천히 자동 회전) · `High/Low`(화질) · `Settings`(설정 패널).
+- **위쪽 검색창(`/` 키):** 찾을 물체를 아무 말로나 칩니다. 맞는 물체가 점수 순으로 왼쪽에 뜨고 지도에 초록 윤곽으로 표시됩니다. Enter 는 가장 맞는 물체로 이동.
 - **오른쪽 아래 새로고침 아이콘:** 리셋. 위치를 다시 잡고 지도를 처음부터 쌓습니다.
 - **화질:** High는 PC용(점 섞기로 가까이서도 면처럼 보임), Low는 보드·폰용입니다. Low는 돌리는 동안 절반 해상도로 가볍게 그리고 멈추면 0.2초 뒤 원래 화질로 다시 그립니다.
 - **화면 구성:** 색 점이 3D 점 지도, 파란 원뿔이 지금 카메라(위치를 놓친 동안은 빨간색), 위쪽 층이 물체와 방 노드입니다.

@@ -1,6 +1,6 @@
 //! 지도에 넣은 장면 보관 + RTAB-Map 노드 위치: 루프 클로저로 노드가 움직이면 보관한 장면을 고친 위치로 다시 쌓는다.
 //! 장면 위치 = 기준 노드의 지금 위치 × (받을 때 기준 노드에서 본 상대 위치). 노드 위치는 스트림 그래프 블록(MMG1)으로 온다.
-//! 줄인 보관(표면 지도: 표면은 서브맵이 맡음): 점유 격자·물체에 쓰는 것만 — 깊이는 4 화소 간격, 검출 상자 안은 컬러·깊이 그대로.
+//! 줄인 보관: 점유 격자·물체에 쓰는 것만 — 깊이는 4 화소 간격, 검출 상자 안은 컬러·깊이 그대로.
 //! 점유 격자는 16 화소 간격(8 + 16k)만 읽어 4 화소 간격 깊이와 같은 값이고, 물체 점·사진은 상자 안만 읽는다.
 use crate::geom::*;
 use crate::seg::Det;
@@ -174,19 +174,6 @@ impl KfStore {
                     self.moved = (self.moved.0.max(dt), self.moved.1.max(dr));
                 }
             }
-        }
-    }
-
-    /// 노드의 지금 위치(수평 맞춤 전, RTAB-Map 지도 좌표)
-    pub fn node(&self, id: u32) -> Option<(M3, V3)> {
-        self.nodes.get(&id).copied()
-    }
-
-    /// 장면 위치를 기준 노드에서 본 상대 위치로(노드를 모르면 기준 0 + 받은 위치 그대로)
-    pub fn rel_of(&self, anchor: u32, r: M3, p: V3) -> (u32, (M3, V3)) {
-        match self.nodes.get(&anchor) {
-            Some(n) => (anchor, inv_mul(n, &(r, p))),
-            None => (0, (r, p)),
         }
     }
 

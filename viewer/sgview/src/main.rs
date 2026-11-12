@@ -569,7 +569,7 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(p)
 }
 
-/// One connection: HTTP/1.1 keep-alive, so the page's requests (view on change, batched mesh/point files, object files) at
+/// One connection: HTTP/1.1 keep-alive, so the page's requests (view on change, batched point files, object files) at
 /// load reuse one socket and one thread instead of a TCP handshake + thread spawn per request. Idle connections close after 15 s.
 fn handle(s: TcpStream, st: Arc<State>) {
     let mut s = s;
@@ -702,7 +702,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 _ => respond(&mut s, 404, "text/plain", "", b"not a grey png"),
             }
         }
-        // many files in one reply (first load: dozens of surface regions / point nodes): see pack_files
+        // many files in one reply (first load: dozens of point nodes): see pack_files
         "/api/files" => {
             let rels: Vec<&str> = q.get("p").map(|s| s.split(',').filter(|r| !r.is_empty()).take(256).collect()).unwrap_or_default();
             let vers: Vec<String> = rels.iter().map(|r| safe_join(&st.dir, r).and_then(|p| file_ver(&p)).unwrap_or_default()).collect();
@@ -716,7 +716,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         },
         _ if path.starts_with("/file/") => {
             let rel = &path["/file/".len()..];
-            // ETag = mtime + size: a page reload (or a second viewer) revalidates the meshes/objects it already has with 304
+            // ETag = mtime + size: a page reload (or a second viewer) revalidates the map/objects it already has with 304
             match safe_join(&st.dir, rel).and_then(|p| file_ver(&p).map(|v| (p, v))) {
                 Some((p, ver)) => respond_tagged(&mut s, content_type(rel), &ver, || fs::read(p).ok().map(std::borrow::Cow::Owned)),
                 None => respond(&mut s, 404, "text/plain", "", b"not found"),
@@ -1068,14 +1068,14 @@ mod tests {
     #[test]
     fn pack_files_layout() {
         let d = std::env::temp_dir().join(format!("sgview_pack_{}", std::process::id()));
-        fs::create_dir_all(d.join("mesh")).unwrap();
-        fs::write(d.join("mesh/a.ply"), b"abc").unwrap();
-        let b = pack_files(&d, &["mesh/a.ply", "mesh/none.ply", "../x"]);
+        fs::create_dir_all(d.join("data")).unwrap();
+        fs::write(d.join("data/a.ply"), b"abc").unwrap();
+        let b = pack_files(&d, &["data/a.ply", "data/none.ply", "../x"]);
         let mut i = 0;
         let mut rd = |n: usize| { let s = &b[i..i + n]; i += n; s.to_vec() };
         let u = |v: Vec<u8>| u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
         assert_eq!(u(rd(4)), 10);
-        assert_eq!(rd(10), b"mesh/a.ply");
+        assert_eq!(rd(10), b"data/a.ply");
         assert_eq!(u(rd(4)), 3);
         assert_eq!(rd(3), b"abc");
         assert_eq!(u(rd(4)), 13);

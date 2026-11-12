@@ -1,4 +1,4 @@
-//! 경로 맞추기 공용(ate·surfcmp): TUM 위치 파일 읽기, 시각 짝, Horn 사원수 방법 회전·이동.
+//! 경로 맞추기(ate): TUM 위치 파일 읽기, 시각 짝, Horn 사원수 방법 회전·이동.
 #![allow(dead_code)]
 
 pub type V3 = [f64; 3];

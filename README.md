@@ -4,7 +4,7 @@
 
 RealSense D435 깊이 카메라를 손에 들고 방을 한 바퀴 훑으면, 라즈베리파이 5와 DEEPX DX-M1 NPU 보드가 다음 세 가지를 실시간으로 만들어 기억합니다.
 
-- **3D 지도:** 사진 텍스처를 입힌 표면 지도, 3D 점 지도, 바닥 점유 지도
+- **3D 지도:** 3D 점 지도, 바닥 점유 지도
 - **물체 목록:** 무엇이 어디에 있는지(3D 위치, 사진, 마지막으로 본 시각)
 - **씬그래프:** 방 → 물체, 물체 ↔ 물체 관계(위·옆)
 
@@ -22,15 +22,14 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 ```
 
 - **위치:** RTAB-Map이 장면마다 카메라 위치를 구하고, 한 바퀴 돌아 아까 본 곳을 알아보면(루프 클로저) 지나온 위치를 다시 맞춥니다. 자세한 형식은 [docs/bridge.md](docs/bridge.md).
-- **표면 지도:** 20초 단위 TSDF 서브맵으로 쌓습니다. 루프 클로저로 위치가 고쳐지면 서브맵을 통째로 옮겨 약 0.1초 만에 지도가 바로잡힙니다. 표면에는 장면 사진을 입힙니다(사진 경계는 밝기를 맞춰 섞음).
-- **점 지도:** Potree 방식(옥트리 단계별 상세도 + 둥근 점 + EDL 음영)으로 저장해, 뷰어는 화면에 필요한 만큼만 받아 그립니다.
-- **실시간:** 처리가 밀리면 쌓인 장면을 건너뛰고 최신 장면부터 처리합니다(위치 정보는 버리지 않음). 지도 작업·텍스처·다시 쌓기는 본 스레드 밖에서 돕니다.
+- **점 지도:** Potree 방식(옥트리 단계별 상세도 + 둥근 점 + EDL 음영)으로 저장해, 뷰어는 화면에 필요한 만큼만 받아 그립니다. 루프 클로저로 위치가 고쳐지면 보관한 장면으로 지도와 물체를 다시 쌓습니다.
+- **실시간:** 처리가 밀리면 쌓인 장면을 건너뛰고 최신 장면부터 처리합니다(위치 정보는 버리지 않음). 지도 작업·다시 쌓기는 본 스레드 밖에서 돕니다.
 
 ## 되는 것
 
 - 물체 찾기(COCO 80종: 의자·컵·노트북·책 …) — 보드 NPU
 - 카메라 위치 추정과 루프 클로저 — RTAB-Map(BRIEF 특징 + GTSAM 최적화)
-- 텍스처 표면 지도, 3D 점 지도, 물체 기억(옮겨짐·사라짐 표시)
+- 3D 점 지도, 물체 기억(옮겨짐·사라짐 표시)
 - 방 나누기와 방 종류(물체 구성으로: 사무실·주방·거실 …), 방↔물체·물체↔물체 연결
 - 보드 실시간(NPU 코어 여럿에 장면을 함께 올림), PC·폰·보드 화면 브라우저 뷰어(High/Low 화질)
 
@@ -62,9 +61,9 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 cargo build --release --features directml --manifest-path pipeline/Cargo.toml
 cargo build --release --manifest-path viewer/sgview/Cargo.toml
 
-# TUM 영상 → RTAB-Map → memmap(텍스처 표면 + 점 지도)
+# TUM 영상 → RTAB-Map → memmap(점 지도 + 물체)
 rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
-  | pipeline/target/release/memmap --stream - --every 2 --surface --points --seg models/yolo26s-seg.onnx \
+  | pipeline/target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx \
       --max-depth 3.5 --out data/memory/office
 
 # 다른 창에서 뷰어 → 브라우저로 http://127.0.0.1:8091
@@ -79,7 +78,7 @@ M=~/dx-all-suite_my/workspace/res/models
 
 # D435 → RTAB-Map → memmap(실시간)
 rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req \
-  | pipeline/target/release/memmap --stream - --every 1 --live 1 --surface --points \
+  | pipeline/target/release/memmap --stream - --every 1 --live 1 \
       --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live
 
 # 뷰어: 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
@@ -94,10 +93,9 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | 옵션 | 뜻 |
 |---|---|
 | `--stream -\|<파일>` | `rtab_bridge` 장면 스트림 입력(표준입력 또는 남겨 둔 파일) |
-| `--surface` / `--points` | 텍스처 표면 지도 / 3D 점 지도(둘 다 켤 수 있음) |
 | `--rebuild-every S` / `--no-rebuild` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5) / 끄기 |
 | `--no-drop` | 밀려도 장면을 버리지 않음(재생 결과를 늘 같게) |
-| `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · tex · rebuild · writer · infer) |
+| `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · rebuild · writer · infer) |
 | `--npu-jobs K` | 스트림 분할 장면을 NPU 에 K 장까지 함께 올림(NPU 코어 여럿이 나눠 돎, 기본 4, `1` 은 한 장씩) |
 | `--seg <모델>` / `--conf 0.35` | 물체 분할 모델 / 물체로 인정할 확신도 |
 | `--max-depth` | 지도에 넣을 최대 거리(m) |
@@ -111,9 +109,9 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 - **오른쪽 위 도구줄:** `Fit`(전체 맞추기) · `Top`(위에서 보기) · `Demo`(천천히 자동 회전) · `High/Low`(화질) · `Settings`(설정 패널).
 - **오른쪽 아래 새로고침 아이콘:** 리셋. 위치를 다시 잡고 지도를 처음부터 쌓습니다.
 - **화질:** High는 PC용(점 섞기로 가까이서도 면처럼 보임), Low는 보드·폰용입니다. Low는 돌리는 동안 절반 해상도로 가볍게 그리고 멈추면 0.2초 뒤 원래 화질로 다시 그립니다.
-- **화면 구성:** 색 점이 3D 지도(기본은 빨리 갱신되는 점 지도, 텍스처 표면은 설정 패널의 `Surface map`), 파란 원뿔이 지금 카메라(위치를 놓친 동안은 빨간색), 위쪽 층이 물체와 방 노드입니다.
+- **화면 구성:** 색 점이 3D 점 지도, 파란 원뿔이 지금 카메라(위치를 놓친 동안은 빨간색), 위쪽 층이 물체와 방 노드입니다.
 - **물체 색:** 초록 = 지금 보임, 주황 = 옮겨짐, 회색 = 그 자리에서 사라짐.
-- **설정 패널에서 켜고 끄기:** `Surface map`(표면), `3D map points`(점 지도), `Object name labels`(이름표), `Show graph layers`(물체·방 층), `Depth fog`(거리 안개) 등.
+- **설정 패널에서 켜고 끄기:** `3D map points`(점 지도), `Object name labels`(이름표), `Show graph layers`(물체·방 층) 등.
 - **시연할 때:** `Follow the handheld camera (behind)`를 켜면 시점이 손카메라 뒤에서 따라갑니다(마우스로 돌리면 꺼짐).
 
-설명 문서: 연결·서브맵·루프 클로저는 [docs/bridge.md](docs/bridge.md), 뷰어 세부는 [viewer/sgview/README.md](viewer/sgview/README.md).
+설명 문서: 연결·루프 클로저·다시 쌓기는 [docs/bridge.md](docs/bridge.md), 뷰어 세부는 [viewer/sgview/README.md](viewer/sgview/README.md).

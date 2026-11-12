@@ -78,13 +78,10 @@
   <div id="hud" class="mono"></div>
 
   <details open><summary>Display</summary>
-    <label class="row" title="surface map (TSDF mesh, memmap --surface)"><input type="checkbox" id="c_surf" checked> Surface map</label>
-    <label class="row" title="surface shading: soft light from above + sun on smooth normals (off = plain photo colours)"><input type="checkbox" id="c_shade" checked> Surface shading</label>
     <label class="row" title="High quality: overlapping point splats are blended into one smooth surface instead of the nearest disc winning (one extra pass of the point map)"><input type="checkbox" id="c_blend" checked> Blend point splats (High)</label>
     <label class="row" title="eye-dome lighting: shades edges and depth steps so the point map reads as 3D surfaces"><input type="checkbox" id="c_edl" checked> Depth shading (EDL)</label>
     <div class="num">EDL strength <input type="number" id="n_edl" value="0.4" min="0" max="3" step="0.05"></div>
     <div class="num" title="depth steps smaller than this (log2 view depth, 0.025 ≈ 1.7 %: Kinect depth noise between neighbouring splats) are not shaded: the small depth jitter between overlapping splats of one surface stays unshaded, real edges and creases still darken">EDL tolerance <input type="number" id="n_edltol" value="0.025" min="0" max="0.1" step="0.002"></div>
-    <label class="row" title="distance fog toward the background"><input type="checkbox" id="c_fog"> Depth fog</label>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
     <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
     <div class="num" title="label only the N largest objects still in place, one per name (0 = every object with its id); labels that would overlap another are left out">Max object name labels <input type="number" id="n_olmax" value="0" min="0" max="200" step="1"></div>
@@ -97,7 +94,6 @@
     <div id="octinfo" class="mono"></div>
     <div class="num">3D map opacity <input type="number" id="n_sop" value="1" min="0.05" max="1" step="0.05"></div>
     <div class="num" title="splat size / voxel: above 1.4 neighbouring points overlap into a surface">3D map splat × voxel <input type="number" id="n_ssize" value="1.35" min="0.3" max="4" step="0.1"></div>
-    <div class="num">Objects as <select id="s_odraw"><option>points</option><option>surface</option></select></div>
     <div class="num">Point size × voxel <input type="number" id="n_psize" value="1.1" min="0.2" max="5" step="0.1"></div>
     <label class="row"><input type="checkbox" id="c_boxes"> Boxes (objects w/o points)</label>
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
@@ -200,12 +196,11 @@ controls.target.set(0, 0, 4);
 controls.enableDamping = true; controls.dampingFactor = 0.09; controls.autoRotateSpeed = 0.6;
 controls.update();
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-const sun = new THREE.DirectionalLight(0xffffff, 0.45); sun.position.set(0.4, -0.6, 1); scene.add(sun);   // lit materials (robot model); the surface map has its own shader (surfMaterial), point/line materials are unlit
+const sun = new THREE.DirectionalLight(0xffffff, 0.45); sun.position.set(0.4, -0.6, 1); scene.add(sun);   // lit materials (robot model); point/line materials are unlit
 
 const gMap = new THREE.Group(), gObjs = new THREE.Group(), gGraph = new THREE.Group(), gWalls = new THREE.Group(), gRobot = new THREE.Group();
 scene.add(gMap, gObjs, gGraph, gWalls, gRobot);
 const gScene = new THREE.Group(); scene.add(gScene);   // 3D map chunks: kept across object redraws, new chunks are appended
-const gSurf = new THREE.Group(); scene.add(gSurf);     // surface map regions (TSDF mesh): replaced only when a region's version changes
 
 // ---------------- EDL (eye-dome lighting) ----------------
 // Screen-space shading from the depth buffer, as in Potree (edl.fs, from CloudCompare qEDL): each pixel looks at 8 neighbours on a
@@ -458,15 +453,10 @@ function drawAligned() {
 }
 
 // ---------------- object point clouds ----------------
-function surfaceMode() {   // ?draw=points opens with point clouds
-  const e = document.getElementById("s_odraw"); if (!e) return true;
-  if (!e.dataset.init) { e.dataset.init = 1; const q = new URLSearchParams(location.search).get("draw"); if (q) e.value = q; }
-  return e.value === "surface";
-}
 // ---------------- file loading off the main thread ----------------
-// One Web Worker (inline, no extra file) fetches and parses: PLY → typed arrays (+ vertex normals for meshes without them),
-// /api/files batches → per-file parts, JPEG atlases → ImageBitmap (decoded in the worker). Arrays and bitmaps are transferred,
-// so the page only wraps them in BufferGeometry/Texture objects and never blocks on parsing.
+// One Web Worker (inline, no extra file) fetches and parses: PLY → typed arrays (+ vertex normals for PLYs with faces),
+// /api/files batches → per-file parts. Arrays are transferred,
+// so the page only wraps them in BufferGeometry objects and never blocks on parsing.
 const WORKER_SRC = `
 performance.setResourceTimingBufferSize(20000);
 const SIZE = { float:4, float32:4, double:8, uchar:1, uint8:1, char:1, int8:1, ushort:2, uint16:2, short:2, int16:2, int:4, int32:4, uint:4, uint32:4 };
@@ -522,7 +512,6 @@ onmessage = async e => {
       if (dl === 0xffffffff) { parts[name] = null; continue; }
       const b = buf.slice(o, o + dl); o += dl;
       if (name.endsWith(".ply")) { const g = parsePly(b, normals); parts[name] = g; tr.push(...bufs(g)); }
-      else if (name.endsWith(".jpg")) { const bm = await createImageBitmap(new Blob([b], { type:"image/jpeg" }), { imageOrientation:"flipY" }); parts[name] = bm; tr.push(bm); }
       else { parts[name] = b; tr.push(b); }
     }
     postMessage({ id, parts }, tr);
@@ -536,7 +525,7 @@ function geomFrom(a) {
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(a.pos, 3));
   g.setAttribute("color", new THREE.BufferAttribute(a.col, 3, true));
-  if (a.nrm) g.setAttribute("normal", new THREE.BufferAttribute(a.nrm, 3));   // textured regions carry smooth normals and atlas UVs
+  if (a.nrm) g.setAttribute("normal", new THREE.BufferAttribute(a.nrm, 3));
   if (a.uv) g.setAttribute("uv", new THREE.BufferAttribute(a.uv, 2));
   if (a.idx) g.setIndex(new THREE.BufferAttribute(a.idx, 1));
   g.computeBoundingSphere();
@@ -555,7 +544,7 @@ function bitmapTexture(bm) {
 }
 
 async function ensurePoints(o) {
-  const src = surfaceMode() && o.mesh ? o.mesh : o.points, key = (surfaceMode() && o.mesh ? "m" : "p") + o.id;
+  const src = o.points, key = "p" + o.id;
   if (!src || !src.path) return null;
   const c = plyCache.get(key);
   if (c && c.stamp === src.stamp && !(c.failedAt && performance.now() - c.failedAt > 1500)) return c;
@@ -663,7 +652,7 @@ async function loadOctree(o) {
         oct.ver = o.ver;
         // floor pad and grid go under the point map: framed before the octree list came (occupancy grid box, z 0 … 2), they sat
         // above the map's floor and the half-transparent dark pad dimmed everything below it (a white desk drew grey)
-        if (oct.box) { if (!gSurf.children.length && !userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
+        if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
         invalidate();
       }
     }
@@ -815,149 +804,9 @@ function octUpdate() {
   const el = $("octinfo"); if (el) el.textContent = `points ${(drawn / 1e6).toFixed(2)} M drawn (${nDrawn} nodes) · budget ${(budget / 1e6).toFixed(1)} M · map ${oct.nodes.size} nodes`;
 }
 
-// Surface map (TSDF + Surface Nets): regions [x, y, z, version] or [x, y, z, version, texture]; only regions whose version
-// (or texture number) changed are fetched again.
-// Vertex-colour regions are drawn in blocks of SB³ regions (3.84 m at 3 cm voxels): one mesh, one draw call per block. A changed
-// region rebuilds only its block; each block has its own bounding sphere, so blocks off screen are skipped.
-// Textured regions (photo atlas mesh/t_x_y_z_n.jpg + mesh/t_x_y_z_n.ply with UVs and smooth normals) are one mesh each.
-const SB = 4;
-const surf = { run:null, have:new Map(), blocks:new Map(), dirty:new Set(), tex:new Map(), timer:0, busy:false };
-// Surface shading: hemisphere light (bright from above, darker from below) + one sun, from smooth vertex normals.
-// Textured: atlas × vertex colour × 2 (vertex colour = per-vertex exposure match). Cheap enough for the Pi 5 GPU (no extra passes).
-const surfUni = { sun:{ value:new THREE.Vector3(0.45, -0.55, 0.9).normalize() }, flatk:{ value:0 }, fogC:{ value:new THREE.Color(0x161b26) }, fogR:{ value:new THREE.Vector2(8, 40) }, fogK:{ value:0 } };
-const SURF_VS = `varying vec3 vN; varying vec3 vC; varying float vD;
-#ifdef TEX
-varying vec2 vUv;
-#endif
-void main() {
-  vN = normal; vC = color;
-#ifdef TEX
-  vUv = uv;
-#endif
-  vec4 mv = modelViewMatrix * vec4(position, 1.0); vD = -mv.z;
-  gl_Position = projectionMatrix * mv;
-}`;
-// Hemisphere (sky above, darker bounce below) + wrapped sun; back faces (seen through holes and ragged rims) are shaded dark so
-// they read as shadowed inside instead of bright patches; distance fog toward the page background gives depth.
-const SURF_FS = `uniform vec3 sun; uniform float flatk; uniform vec3 fogC; uniform vec2 fogR; uniform float fogK; varying vec3 vN; varying vec3 vC; varying float vD;
-#ifdef TEX
-uniform sampler2D map; varying vec2 vUv;
-#endif
-void main() {
-  vec3 n = normalize(vN); float back = gl_FrontFacing ? 0.0 : 1.0; if (back > 0.5) n = -n;
-  float hemi = mix(0.62, 1.0, 0.5 + 0.5 * n.z);
-  float l = hemi * 0.74 + 0.30 * max((dot(n, sun) + 0.25) / 1.25, 0.0);
-  l = mix(l, 1.0, flatk);
-  l *= mix(1.0, 0.38, back);
-#ifdef TEX
-  vec3 c = texture2D(map, vUv).rgb * vC * 2.0;
-#else
-  vec3 c = vC;
-#endif
-  c = min(c * l, 1.0);
-  c = mix(c, c * c * (3.0 - 2.0 * c), 0.25);   // gentle S-curve: a little contrast for the photo atlases
-  float f = fogK * smoothstep(fogR.x, fogR.y, vD) * 0.75;
-  gl_FragColor = vec4(mix(c, fogC, f), 1.0);
-}`;
-function surfMaterial(tex) {
-  return new THREE.ShaderMaterial({ uniforms:{ sun:surfUni.sun, flatk:surfUni.flatk, fogC:surfUni.fogC, fogR:surfUni.fogR, fogK:surfUni.fogK, map:{ value:tex || null } }, defines:tex ? { TEX:1 } : {},
-    vertexShader:SURF_VS, fragmentShader:SURF_FS, vertexColors:true, side:THREE.DoubleSide });
-}
-const surfMat = surfMaterial(null);
-let surfFitted = false;   // first surface framing is instant, later growth flies
-function dropTexRegion(key) {
-  const t = surf.tex.get(key); if (!t) return;
-  gSurf.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh.material.dispose(); t.tex.dispose(); surf.tex.delete(key);
-}
-function resetSurface() {
-  for (const b of surf.blocks.values()) if (b.mesh) { gSurf.remove(b.mesh); b.mesh.geometry.dispose(); }
-  for (const k of [...surf.tex.keys()]) dropTexRegion(k);
-  surf.have.clear(); surf.blocks.clear(); surf.dirty.clear(); clearTimeout(surf.timer); surf.timer = 0;
-}
-function blockKey(x, y, z) { return Math.floor(x / SB) + "_" + Math.floor(y / SB) + "_" + Math.floor(z / SB); }
-function setRegion(key, x, y, z, ver, g) {   // keep the region's arrays (CPU only) and mark its block for rebuilding
-  const bk = blockKey(x, y, z);
-  dropTexRegion(key);
-  surf.have.set(key, { ver, tv:0, pos:g.attributes.position.array, col:g.attributes.color.array, nrm:g.attributes.normal.array, idx:g.index ? g.index.array : null });
-  let b = surf.blocks.get(bk); if (!b) { b = { keys:new Set(), mesh:null }; surf.blocks.set(bk, b); }
-  b.keys.add(key); surf.dirty.add(bk);
-  if (!surf.timer) surf.timer = setTimeout(flushSurface, 250);   // while loading, blocks are rebuilt at most 4 times a second
-}
-function setTexRegion(key, x, y, z, ver, tv, g, tex) {   // textured region: its own mesh, taken out of its vertex-colour block
-  const b = surf.blocks.get(blockKey(x, y, z));
-  if (b && b.keys.delete(key)) { surf.dirty.add(blockKey(x, y, z)); if (!surf.timer) surf.timer = setTimeout(flushSurface, 250); }
-  dropTexRegion(key);
-  const mesh = new THREE.Mesh(g, surfMaterial(tex));
-  gSurf.add(mesh); surf.tex.set(key, { mesh, tex });
-  surf.have.set(key, { ver, tv });
-  invalidate();
-}
-function flushSurface() {
-  clearTimeout(surf.timer); surf.timer = 0;
-  for (const bk of surf.dirty) {
-    const b = surf.blocks.get(bk), rs = [...b.keys].map(k => surf.have.get(k));
-    let nv = 0, ni = 0; for (const r of rs) { nv += r.pos.length / 3; ni += r.idx ? r.idx.length : 0; }
-    if (!ni) { if (b.mesh) { gSurf.remove(b.mesh); b.mesh.geometry.dispose(); b.mesh = null; } continue; }
-    const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), col = new Uint8Array(nv * 3), idx = nv < 65536 ? new Uint16Array(ni) : new Uint32Array(ni);
-    let v = 0, i = 0;
-    for (const r of rs) {
-      pos.set(r.pos, v * 3); nrm.set(r.nrm, v * 3); col.set(r.col, v * 3);
-      if (r.idx) { for (let j = 0; j < r.idx.length; j++) idx[i + j] = r.idx[j] + v; i += r.idx.length; }
-      v += r.pos.length / 3;
-    }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
-    g.setAttribute("color", new THREE.BufferAttribute(col, 3, true)); g.setIndex(new THREE.BufferAttribute(idx, 1));
-    g.computeBoundingSphere();
-    if (b.mesh) { b.mesh.geometry.dispose(); b.mesh.geometry = g; } else { b.mesh = new THREE.Mesh(g, surfMat); gSurf.add(b.mesh); }
-  }
-  surf.dirty.clear(); invalidate();
-}
-async function loadSurface(s) {
-  if (surf.run !== s.run) { resetSurface(); surf.run = s.run; }
-  surfUni.flatk.value = opt("c_shade") ? 0 : 1;
-  if (surf.busy) return;
-  const todo = s.regions.filter(([x, y, z, ver, tv]) => { const c = surf.have.get(x + "_" + y + "_" + z); return !c || c.ver !== ver || c.tv !== (tv || 0); });
-  if (!todo.length) return;
-  surf.busy = true; pendingLoads++;
-  // changed regions come in batches of 16 (one /api/files request each: PLY + atlas JPEG), two batches in flight; the worker parses
-  // the PLYs, computes the vertex-colour regions' normals and decodes the atlases
-  const run = s.run; let k = 0;
-  const one = async () => {
-    while (k < todo.length && surf.run === run) {
-      const part = todo.slice(k, k + 16); k += 16;
-      const name = ([x, y, z, ver, tv]) => tv ? "mesh/t_" + x + "_" + y + "_" + z + "_" + tv : "mesh/r_" + x + "_" + y + "_" + z;
-      let got;
-      try { got = await loadBatch(part.flatMap(r => r[4] ? [name(r) + ".ply", name(r) + ".jpg"] : [name(r) + ".ply"]), true); } catch (e) { continue; }
-      if (surf.run !== run) { for (const v of Object.values(got)) if (v && v.close) v.close(); return; }
-      for (const r of part) {
-        const [x, y, z, ver, tv] = r, key = x + "_" + y + "_" + z, a = got[name(r) + ".ply"], bm = tv ? got[name(r) + ".jpg"] : null;
-        if (!a || (tv && !bm)) { if (bm) bm.close(); continue; }
-        const cur = surf.have.get(key);
-        if (tv) {   // textured: mesh + atlas
-          if (cur && (cur.ver > ver || (cur.ver === ver && cur.tv >= tv))) { bm.close(); continue; }
-          queueUpload(bm.width * bm.height * 4 + a.pos.byteLength * 3, () => {
-            const c2 = surf.have.get(key);
-            if (surf.run !== run || (c2 && (c2.ver > ver || (c2.ver === ver && c2.tv >= tv)))) { bm.close(); return; }
-            const tex = bitmapTexture(bm); setTexRegion(key, x, y, z, ver, tv, geomFrom(a), tex); renderer.initTexture(tex);
-          });
-          continue;
-        }
-        if (cur && cur.ver >= ver && !cur.tv) continue;
-        setRegion(key, x, y, z, ver, geomFrom(a));
-      }
-    }
-  };
-  await Promise.all([one(), one()]);
-  if (surf.run === run) { flushSurface(); if (!userMoved && !QS.get("cam")) fitView(false, !surfFitted); else { const b = contentBox(); if (b) stageFor(b); } surfFitted = true; }
-  surf.busy = false; pendingLoads--; loadDone();
-}
-const hasSurface = () => !!(view && view.scene_points && view.scene_points.surface);
 function drawObjects() {  invalidate();
   disposeGroup(gObjs);
   gObjs.visible = true;
-  if (view && view.scene_points && view.scene_points.surface && opt("c_surf")) loadSurface(view.scene_points.surface);   // hidden surface: nothing fetched
-  gSurf.visible = opt("c_surf");
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor)
     const sp = view.scene_points, mat = () => pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") });
     if (sp.octree) {   // octree map: the level-of-detail pass (octUpdate) picks and fetches nodes every frame
@@ -974,20 +823,16 @@ function drawObjects() {  invalidate();
     if (!objVisible(o)) continue;
     const st = STATE_COL[o.state] ?? 0xc83cc8;
     if (o.points) ensurePoints(o);
-    const ent = plyCache.get((surfaceMode() && o.mesh ? "m" : "p") + o.id);
+    const ent = plyCache.get("p" + o.id);
     const sel = selected === o.id;
-    if (surfaceMode() && o.mesh && ent && ent.geom && ent.geom.index && opt("c_points")) {   // surface: textured triangle mesh
-      const mesh = new THREE.Mesh(ent.geom, new THREE.MeshBasicMaterial({ vertexColors:opt("s_pcolor") === "true colour", color:opt("s_pcolor") === "true colour" ? 0xffffff : st, side:THREE.DoubleSide }));
-      mesh.userData.shared = true; gObjs.add(mesh);
-      if (sel) { const w = new THREE.Mesh(ent.geom, new THREE.MeshBasicMaterial({ color:0xffe14a, wireframe:true, transparent:true, opacity:0.35 })); w.userData.shared = true; gObjs.add(w); }
-    } else if (o.points && ent && ent.geom && (opt("c_points") || (sel && !hasSurface()))) {   // points off: only the selected object, highlighted (with a surface map the outline box marks it)
+    if (o.points && ent && ent.geom && (opt("c_points") || sel)) {   // points off: only the selected object, highlighted
       const true_ = opt("s_pcolor") === "true colour";
       if (opt("c_points")) {
         const m = pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * (sel ? 1.25 : 1), vertexColors:true_, color:st, square:false });
         const pts = new THREE.Points(ent.geom, m); pts.userData.shared = true;   // geometry belongs to plyCache
         gObjs.add(pts);
       }
-      if (sel && !hasSurface()) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
+      if (sel) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
     } else if (!o.points || !ent || !ent.geom) {
       // no points (yet): draw nothing at the object's place — the object is still its node in the graph layer.
       // A stand-in sphere here looked like a graph node that had dropped to the floor. Optional box only.
@@ -1397,10 +1242,9 @@ renderer.domElement.addEventListener("pointermove", e => {
 renderer.domElement.addEventListener("pointerleave", () => { if (hoverId != null) { hoverId = null; drawHighlight(); } });
 
 // toolbar: top view / fit
-// Content box: the surface map when there is one (that is what the demo shows), else the occupancy grid.
+// Content box: the point map when there is one, else the occupancy grid.
 function contentBox() {
   const b = new THREE.Box3();
-  for (const m of gSurf.children) { if (!m.geometry.boundingBox) m.geometry.computeBoundingBox(); b.union(m.geometry.boundingBox); }
   if (oct.box && opt("c_scene")) b.union(oct.box);
   if (b.isEmpty() && view && view.grid) {
     const g = view.grid; b.set(new THREE.Vector3(g.origin[0], g.origin[1], 0), new THREE.Vector3(g.origin[0] + g.width * g.resolution, g.origin[1] + g.height * g.resolution, 2));
@@ -1442,7 +1286,7 @@ function camFromQuery() {
   const v = q.split(",").map(Number); if (v.length !== 6 || v.some(isNaN)) return false;
   camera.position.set(v[0], v[1], v[2]); controls.target.set(v[3], v[4], v[5]); controls.update(); invalidate(); return true;
 }
-$("b_top").onclick = () => { autoFit = false; fitView(true, false); }; $("b_fit").onclick = () => { autoFit = true; if (LIVE && liveGrid && !gSurf.children.length) fitViewTo(liveGrid); else fitView(false, false); };
+$("b_top").onclick = () => { autoFit = false; fitView(true, false); }; $("b_fit").onclick = () => { autoFit = true; if (LIVE && liveGrid && !oct.box) fitViewTo(liveGrid); else fitView(false, false); };
 addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.ctrlKey || e.metaKey || e.altKey) return;
   const k = e.key.toLowerCase();
@@ -1456,7 +1300,7 @@ addEventListener("keydown", e => {
 // floor: fine grid that fades into the fog + a soft dark pad under the map (contact shadow), both well below the map's contrast
 const grid = new THREE.GridHelper(80, 160, 0x323b52, 0x232a3a); grid.rotation.x = Math.PI / 2; grid.position.z = -0.02;
 grid.material.transparent = true; grid.material.opacity = 0.45; grid.material.depthWrite = false; scene.add(grid);
-scene.fog = new THREE.Fog(0x141924, 10, 45);   // built-in materials (grid, lines, robot); the surface shader has its own fog
+scene.fog = new THREE.Fog(0x141924, 10, 45);   // built-in materials (grid, lines, robot)
 const floorPad = (() => {
   const c = document.createElement("canvas"); c.width = c.height = 256; const g = c.getContext("2d");
   const r = g.createRadialGradient(128, 128, 10, 128, 128, 128); r.addColorStop(0, "rgba(0,0,0,0.55)"); r.addColorStop(0.55, "rgba(0,0,0,0.32)"); r.addColorStop(1, "rgba(0,0,0,0)");
@@ -1477,25 +1321,14 @@ function status() {
   $("status").textContent = `stamp ${view.stamp.toFixed(1)} s · objects ${view.objects.length} · rooms ${(view.rooms || []).length} · trajectory ${c("agent")} poses`;
 }
 // Redraw only the parts of a new summary (view.json content) that changed: string compare is far cheaper than rebuilding geometry.
-let presetDone = false, presetSurfOnly = false, mapTouched = false, viewSeen = false;   // mapTouched: the user chose a map in Settings
+let viewSeen = false;
 let pointsAuto = true;   // the user has not touched 'Segment points' yet
 function applyView(v) {
   const first = !view;
   view = v;
-  // with a surface map the objects are already in the mesh (shape and colour): their point clouds only speckle it, so start them off.
+  // with a point map the objects are already in it (shape and colour): their own point clouds only speckle it, so start them off.
   // Clicking an object still highlights its points.
-  if (pointsAuto && view.scene_points && (view.scene_points.surface || view.scene_points.octree) && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
-  // presentation defaults (once per page, a URL value such as ?c_surf=1 wins): one map at a time, since the point map over the surface
-  // only speckles it
-  if (!presetDone && !mapTouched) {
-    const sp = view.scene_points;
-    // with both maps the point map is the default: new points show at once, the surface follows a moment later (Settings > Surface map).
-    // A live run may list the surface before the point map (or no map at all in its first summary): the choice is made when the maps
-    // are there, and a surface-only start switches to the point map as soon as that one arrives.
-    if (sp && sp.surface && sp.octree) { presetDone = true;
-      if (presetSurfOnly && !$("c_scene").checked) { $("c_scene").checked = true; rebuildScene(); }
-      if (!QS.has("c_surf") && $("c_surf").checked) { $("c_surf").checked = false; gSurf.visible = false; } }
-    else if (sp && sp.surface && !presetSurfOnly && !QS.has("c_scene") && $("c_scene").checked) { presetSurfOnly = true; $("c_scene").checked = false; rebuildScene(); } }
+  if (pointsAuto && view.scene_points && view.scene_points.octree && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
   objs.clear(); for (const o of view.objects) objs.set(o.id, o);
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
@@ -1702,8 +1535,6 @@ function stepChase(dt) {
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
 $("c_blend").onchange = invalidate; $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
 $("n_octk").onchange = () => { octUni.sizeK.value = opt("n_octk"); invalidate(); };
-$("c_surf").onchange = () => { gSurf.visible = opt("c_surf"); if (opt("c_surf") && view && view.scene_points && view.scene_points.surface) loadSurface(view.scene_points.surface); invalidate(); };
-$("c_shade").onchange = () => { surfUni.flatk.value = opt("c_shade") ? 0 : 1; invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
   if (!$("c_follow").checked || !robotGrp) return false;
   const tgt = new THREE.Vector3(robotGrp.position.x, robotGrp.position.y, 0.2);
@@ -1925,7 +1756,7 @@ async function startLive() {
     if (mapState) { mapState.tex.dispose(); mapState.mesh.geometry.dispose(); mapState.mesh.material.dispose(); gMap.remove(mapState.mesh); mapState = null; }
     dropAligned(); alignTheta = 0;
     trailN = 0; trailLast = null; if (trail) trail.geometry.setDrawRange(0, 0);
-    view = null; objs.clear(); selected = null; hoverId = null; viewSeen = false; surfFitted = false; drawHighlight(); poseCur.init = false; poseTgt.has = false; hhCur.init = false; hhTgt.has = false; robotGrp = null; liveGrid = null;
+    view = null; objs.clear(); selected = null; hoverId = null; viewSeen = false; drawHighlight(); poseCur.init = false; poseTgt.has = false; hhCur.init = false; hhTgt.has = false; robotGrp = null; liveGrid = null;
     // Detach the LIMO + OMX URDF model before clearing: disposing gRobot with the model inside freed its meshes, and after a
     // stream reset (e.g. a looping replay) the robot came back as the box stand-in or not at all.
     if (robotModel && robotModel.root.parent) robotModel.root.parent.remove(robotModel.root);
@@ -1944,11 +1775,9 @@ async function startLive() {
 }
 
 // controls
-$("c_fog").onchange = () => { surfUni.fogK.value = opt("c_fog") ? 1 : 0; invalidate(); };
 applyQuality();
 $("c_points").addEventListener("change", () => { pointsAuto = false; });
-for (const id of ["c_surf", "c_scene"]) $(id).addEventListener("change", () => { mapTouched = true; });
-for (const id of ["c_points", "c_scene", "n_sop", "n_ssize", "s_odraw", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { rebuildScene(); drawObjects(); drawGraph(); };
+for (const id of ["c_points", "c_scene", "n_sop", "n_ssize", "s_pcolor", "n_psize", "c_boxes", "c_struct", "c_gone", "c_ceil"]) $(id).onchange = () => { rebuildScene(); drawObjects(); drawGraph(); };
 for (const id of ["g_on", "g_objs", "g_thumbs", "g_agents", "g_rooms", "g_intra", "g_inter", "n_objz", "n_h", "n_thumb"]) $(id).onchange = drawGraph;
 $("c_walls").onchange = () => { gWalls.visible = $("c_walls").checked; invalidate(); };
 $("c_map").onchange = () => { gMap.visible = $("c_map").checked; invalidate(); };
@@ -1956,7 +1785,7 @@ $("c_robot").onchange = () => { gRobot.visible = $("c_robot").checked; robotEdge
 $("c_labels").onchange = invalidate; $("c_olabels").onchange = invalidate; $("c_llabels").onchange = invalidate; $("n_olmax").onchange = invalidate;
 $("n_rscale").onchange = () => { if (robotModel) robotModel.root.scale.setScalar(opt("n_rscale")); invalidate(); };
 
-// GPU uploads (new point nodes, textured surface regions) are queued and spread over frames: at most UP_BYTES and UP_MS per frame, so a
+// GPU uploads (new point nodes) are queued and spread over frames: at most UP_BYTES and UP_MS per frame, so a
 // burst of live map updates does not stall the orbit.
 const upQ = [], UP_BYTES = WEAK_GPU ? 1.5e6 : 16e6, UP_MS = WEAK_GPU ? 4 : 8;
 let upKick = 0;
@@ -1968,17 +1797,6 @@ function drainUploads(t0) {
   while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); n++; }
   if (n) invalidate();   // uploaded pieces must be drawn even when the camera is still
   if (!upQ.length && oct.want && oct.want.length) octPump();
-}
-// while moving (LOD frames) textured surface regions smaller than 2 px on screen are skipped; three.js frustum-culls the rest by bounding sphere
-const _sph = new THREE.Sphere();
-function surfCull() {
-  const k = pointUniforms.scale.value;
-  for (const t of surf.tex.values()) {
-    if (!lodOn) { t.mesh.visible = true; continue; }
-    const g = t.mesh.geometry; if (!g.boundingSphere) g.computeBoundingSphere();
-    const d = Math.max(1e-3, g.boundingSphere.center.distanceTo(camera.position) - g.boundingSphere.radius);
-    t.mesh.visible = g.boundingSphere.radius * k / d >= 2;
-  }
 }
 // render only when something changed (camera moved, data/options changed): an idle viewer costs nothing
 function frame() {
@@ -2000,14 +1818,14 @@ function frame() {
   if (!needsRender) return;
   needsRender = false;
   const tr = performance.now();
-  { const d = camera.position.distanceTo(controls.target); surfUni.fogR.value.set(d * 1.15, d * 3.2); scene.fog.near = d * 0.6; scene.fog.far = d * 2.2; }   // fog follows the viewing distance: the focus stays clear at any zoom
-  updatePointScale(); octUpdate(); surfCull(); renderFrame(); updateLabels();
+  { const d = camera.position.distanceTo(controls.target); scene.fog.near = d * 0.6; scene.fog.far = d * 2.2; }   // fog follows the viewing distance: the focus stays clear at any zoom
+  updatePointScale(); octUpdate(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
 }
 (function loop() { requestAnimationFrame(loop); frame(); })();
 loadRobotModel();
 loadRobotKind().then(invalidate);
-// 주소 뒤 ?c_surf=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
+// 주소 뒤 ?c_scene=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
 for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); else if (e && e.type === "number") { e.value = v; e.dispatchEvent(new Event("change")); } }
 camFromQuery();
 startLive().then(live => { if (!live) { $("boot").classList.add("gone"); startFileEvents(); } });

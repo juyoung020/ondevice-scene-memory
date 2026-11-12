@@ -17,8 +17,6 @@
 | ![](pi_webcam_live.png) | 보드 웹캠 실시간 |
 | ![](pc_vs_pi.png) | PC 와 보드 같은 시점 |
 | ![](pc_fr1desk_onnx.png) | PC 판(ONNX) 책상 영상 |
-| ![](surface_map.png) | 표면 지도(`--surface`, Kinect 깊이·카메라만으로 위치): 책상·모니터·의자 |
-| ![](surface_live.png) | 표면 지도 실시간, 손카메라 따라가기 시점 |
 | ![](depthcam_sim.png) | 깊이 카메라 시뮬(점 지도), 보드 실시간 |
 
 속도 개선 단계: [../performance_log.md](../performance_log.md).

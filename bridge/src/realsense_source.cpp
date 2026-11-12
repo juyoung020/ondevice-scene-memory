@@ -12,6 +12,8 @@ RealSenseSource::RealSenseSource(int w, int h, int fps, const std::string& align
     rs2::pipeline_profile prof = pipe_.start(cfg);
     rs2::device dev = prof.get_device();
     for (rs2::sensor& s : dev.query_sensors()) {
+        // 컬러 자동 노출이 어두울 때 장면 수를 낮추지 않게(위치 추적은 고른 30 장/초가 낫다)
+        if (s.is<rs2::color_sensor>() && s.supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY)) s.set_option(RS2_OPTION_AUTO_EXPOSURE_PRIORITY, 0.f);
         if (rs2::depth_sensor ds = s.as<rs2::depth_sensor>()) {
             depth_per_m_ = 1.0f / ds.get_depth_scale();
             if (ds.supports(RS2_OPTION_EMITTER_ENABLED)) ds.set_option(RS2_OPTION_EMITTER_ENABLED, 1.f);
@@ -26,6 +28,8 @@ RealSenseSource::RealSenseSource(int w, int h, int fps, const std::string& align
       << ", 깊이 " << depth_per_m_ << "/m, 컬러 보정 fx " << color_k_.fx << " fy " << color_k_.fy << " cx " << color_k_.ppx
       << " cy " << color_k_.ppy << " 왜곡 모델 " << rs2_distortion_to_string(color_k_.model) << ", 정렬 " << aligner_->name();
     desc_ = s.str();
+    // 자동 노출이 자리 잡을 때까지 첫 장면들은 버린다(어두운 첫 장면이 위치 추적의 기준이 되면 바로 놓침)
+    for (int i = 0; i < 30; ++i) pipe_.wait_for_frames(5000);
 }
 
 RealSenseSource::~RealSenseSource() {

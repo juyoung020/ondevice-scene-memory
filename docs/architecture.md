@@ -15,7 +15,8 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
   병합 후처리(15 장마다): 따로 생긴 두 물체를 3D IoU·겹침 비율·이름 분포·색 분포로 판단해 합침
   루프 클로저 뒤 다시 쌓기(뒤 스레드): 보관한 장면으로 점유 지도·점 지도·물체를 새 위치로
         ▼
-  씬그래프: 빈 공간으로 방 나누기 → 방→물체, 물체 위·옆 관계, 방 종류는 방 안 물체 구성으로(예: 노트북·키보드·마우스 → office)
+  씬그래프: 방 나누기(Hydra room finder 의 2D 판 — 벽까지 여유가 큰 곳부터 채워 가며 문처럼 좁은 목에서 끊음. 벽은 높이 1.3 m 넘는 막힘만 — 책상·의자는 방 안으로 본다) → 방→물체, 방↔방(문), 물체 위·옆 관계
+  방 이름: 방 안 물체 이름으로 종류별 점수 → 확률·근거(예: 노트북·키보드·마우스 → office), 같은 종류는 번호(kitchen 2), 방 번호는 지도가 자라도 유지
         ▼
   기억 폴더(view.json · 점 노드 · 물체 사진) → 웹 뷰어(변화를 SSE 로 밀어 줌)
 ```
@@ -35,7 +36,8 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 | `pipeline/src/stream.rs` | 장면 스트림 입력(`--stream`) |
 | `pipeline/src/kfstore.rs` | 다시 쌓기용 장면 보관(압축) |
 | `pipeline/src/maps.rs` | 누적 지도·물체 트래커 |
-| `pipeline/src/graph.rs` | 방 나누기·씬그래프 연결 |
+| `pipeline/src/rooms.rs` | 방 나누기·문·방 번호 잇기·물체 배정·방 이름 |
+| `pipeline/src/graph.rs` | 씬그래프 연결(방→물체, 방↔방, 물체↔물체) |
 | `pipeline/src/seg.rs` | 분할 모델 실행(ONNX·NPU) |
 | `bridge/` | 연결 프로그램 `rtab_bridge`(C++, RealSense·TUM → RTAB-Map → 장면 스트림) |
 | `viewer/sgview/` | 웹 뷰어(Rust 서버 + three.js) |

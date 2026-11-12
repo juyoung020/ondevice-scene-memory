@@ -241,7 +241,7 @@ pub fn node_coord(k: u64) -> [i64; 3] {
 
 pub struct Grid {
     pub res: f64,
-    cells: FastMap<(i32, i32), (u32, u32)>, // (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수)
+    cells: FastMap<(i32, i32), (u32, u32, u32)>, // (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수, 그중 가구보다 높은 막힘을 본 수)
 }
 
 pub struct GridImg {
@@ -250,15 +250,18 @@ pub struct GridImg {
     pub x0: i32,
     pub y0: i32,
     pub px: Vec<u8>, // 254 빔, 0 막힘, 205 모름; 위가 +y
+    pub wall: Vec<bool>, // 막힌 칸 중 가구보다 높은 것(벽·문틀·키 큰 장) — 방은 이것으로만 나뉜다
 }
 
 impl Grid {
     pub fn new(res: f64) -> Grid {
         Grid { res, cells: FastMap::default() }
     }
-    pub fn add(&mut self, cam: (f64, f64), occ: &[(f64, f64)], floor: &[(f64, f64)]) {
+    /// occ: (x, y, 가구보다 높은 점인지)
+    pub fn add(&mut self, cam: (f64, f64), occ: &[(f64, f64, bool)], floor: &[(f64, f64)]) {
         let c = |x: f64, y: f64| ((x / self.res).floor() as i32, (y / self.res).floor() as i32);
         let o: FastSet<(i32, i32)> = occ.iter().map(|p| c(p.0, p.1)).collect();
+        let tall: FastSet<(i32, i32)> = occ.iter().filter(|p| p.2).map(|p| c(p.0, p.1)).collect();
         let mut f: FastSet<(i32, i32)> = floor.iter().map(|p| c(p.0, p.1)).collect();
         let (cx, cy) = c(cam.0, cam.1);
         for &(x, y) in &o {
@@ -268,10 +271,13 @@ impl Grid {
             }
         }
         for k in &o {
-            self.cells.entry(*k).or_insert((0, 0)).0 += 1;
+            self.cells.entry(*k).or_insert((0, 0, 0)).0 += 1;
+        }
+        for k in &tall {
+            self.cells.entry(*k).or_insert((0, 0, 0)).2 += 1;
         }
         for k in f.difference(&o) {
-            self.cells.entry(*k).or_insert((0, 0)).1 += 1;
+            self.cells.entry(*k).or_insert((0, 0, 0)).1 += 1;
         }
     }
     pub fn image(&self) -> Option<GridImg> {
@@ -288,15 +294,17 @@ impl Grid {
         let (x0, y0, x1, y1) = (x0 - 5, y0 - 5, x1 + 5, y1 + 5);
         let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
         let mut px = vec![205u8; w * h];
-        for (&(x, y), &(hit, free)) in &self.cells {
+        let mut wall = vec![false; w * h];
+        for (&(x, y), &(hit, free, tall)) in &self.cells {
             let i = (h - 1 - (y - y0) as usize) * w + (x - x0) as usize;
             if hit >= 2 && hit >= free {
                 px[i] = 0;
+                wall[i] = tall >= 2;
             } else if free > 0 {
                 px[i] = 254;
             }
         }
-        Some(GridImg { w, h, x0, y0, px })
+        Some(GridImg { w, h, x0, y0, px, wall })
     }
 }
 

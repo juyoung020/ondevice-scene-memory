@@ -10,9 +10,11 @@
 - 뷰어 리셋 아이콘(오른쪽 아래): 위치를 다시 잡고 지도를 처음부터(`rtab_bridge --reset-file`).
 - 위치를 놓치면 같은 지도에서 바로 다시 잡는다(`rtab_bridge --reloc-wait`).
 - `--tum` 재생이 폴더의 `calibration.txt` 보정값을 읽는다(ETH3D 영상).
+- 방 사이 문(위치·폭)과 방↔방 연결, 방 이름의 종류별 확률·근거 물체(`view.json` 의 `doors`, `rooms[].probs`·`evidence`).
 
 ### Changed
 - 연결 프로그램 → memmap 장면 넘기기의 복사를 줄임(결과 값은 같음).
+- **호환 변경:** 방 나누기를 Hydra room finder 의 2D 판으로 바꿈. 방 번호는 1 부터이고 지도가 자라도 유지되며, 같은 종류의 방은 번호가 붙는다(kitchen 2).
 
 ### Removed
 - **호환 변경:** 표면 지도(`--surface`, TSDF 서브맵·사진 텍스처)와 도구 `surfcmp`·`meshshot`. 3D 지도는 점 지도 하나이고 옵션 없이 늘 만든다(`--points` 도 없어짐).

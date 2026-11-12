@@ -15,6 +15,7 @@ mod kfstore;
 mod maps;
 mod out;
 mod rec;
+mod rooms;
 mod scale;
 mod seg;
 mod segsim;
@@ -564,6 +565,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none())
     });
     let mut mem = Memory::new(0.012, 0.04);
+    let mut room_tr = rooms::Tracker::default(); // 방 번호를 실행 내내 잇는다
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
     let mut z0: Option<f64> = None;
@@ -1707,7 +1709,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
                 view_due = true;
             } else {
-                write_view(&a.out, &grid, &mut mem, &traj, t, last_pose, &cam_json, &scene_json, merge, VIEW_REFRESH);
+                write_view(&a.out, &grid, &mut mem, &mut room_tr, &traj, t, last_pose, &cam_json, &scene_json, merge, VIEW_REFRESH);
             }
             clock.add(if merge { P::Merge } else { P::View }, c_v);
             let c_p = Instant::now();
@@ -1799,7 +1801,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     for o in mem.objs.iter_mut().filter(|o| o.dirty) {
         o.cells_saved = 0; // 마지막 기록은 바뀐 물체를 모두 내보냄
     }
-    write_view(&a.out, &grid, &mut mem, &traj, t_end, last_pose, &cam_json, &scene_json, true, usize::MAX);
+    write_view(&a.out, &grid, &mut mem, &mut room_tr, &traj, t_end, last_pose, &cam_json, &scene_json, true, usize::MAX);
     if n_rebuild > 0 {
         prune_object_files(&a.out, &mem);
     }
@@ -2280,7 +2282,7 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
                 let q = to_w(&pc);
                 let hg = q[2] - floor_z;
                 if hg > 0.15 && hg < 1.8 {
-                    occ.push((q[0], q[1]));
+                    occ.push((q[0], q[1], hg > WALL_H));
                 } else if hg < 0.08 {
                     flo.push((q[0], q[1]));
                 }
@@ -2386,7 +2388,10 @@ fn prune_object_files(dir: &Path, mem: &Memory) {
     }
 }
 
-fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])], stamp: f64, pose: [f64; 3],
+/// 이 높이(m) 넘는 막힘은 가구가 아니라 벽으로 본다(책상 0.75, 의자 등받이·모니터 1.2 안팎) — 방 나누기에 씀
+const WALL_H: f64 = 1.3;
+
+fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tracker, traj: &[(f64, [f64; 3])], stamp: f64, pose: [f64; 3],
               cam: &serde_json::Value, scene: &serde_json::Value, merge: bool, refresh: usize) {
     let mut left = refresh;
     if merge {
@@ -2429,17 +2434,17 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, traj: &[(f64, [f64; 3])
         }
         objs.push(e);
     }
-    let (grid_j, rooms, edges) = match &gi {
+    let (grid_j, rooms, doors, edges) = match &gi {
         Some(g) => {
             out::pgm(&dir.join("map.pgm"), g.w, g.h, &g.px);
             let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", o.name.as_str())).collect();
-            let (rj, ej) = graph::build(g, grid.res, &ol);
-            (json!({"width": g.w, "height": g.h, "resolution": grid.res, "origin": [g.x0 as f64 * grid.res, g.y0 as f64 * grid.res]}), rj, ej)
+            let (rj, dj, ej) = graph::build(room_tr, g, grid.res, &ol);
+            (json!({"width": g.w, "height": g.h, "resolution": grid.res, "origin": [g.x0 as f64 * grid.res, g.y0 as f64 * grid.res]}), rj, dj, ej)
         }
-        None => (json!(null), json!([]), json!([])),
+        None => (json!(null), json!([]), json!([]), json!([])),
     };
     let nodes: Vec<_> = traj.iter().enumerate().map(|(i, (t, p))| json!({"id": format!("A{i}"), "kind": "agent", "pos": p, "t": t})).collect();
-    let mut view = json!({"stamp": stamp, "pose": pose, "grid": grid_j, "objects": objs, "rooms": rooms,
+    let mut view = json!({"stamp": stamp, "pose": pose, "grid": grid_j, "objects": objs, "rooms": rooms, "doors": doors,
         "graph": {"nodes": nodes, "edges": edges}, "robot": "handheld camera", "cam": cam});
     if !scene.is_null() {
         view["scene_points"] = scene.clone();

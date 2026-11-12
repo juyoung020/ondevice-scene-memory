@@ -4,7 +4,7 @@
 //! 점유 격자는 16 화소 간격(8 + 16k)만 읽어 4 화소 간격 깊이와 같은 값이고, 물체 점·사진은 상자 안만 읽는다.
 use crate::geom::*;
 use crate::seg::Det;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// 노드가 이만큼 넘게 움직이면 다시 쌓을 거리(m)·각도(°)
@@ -13,6 +13,7 @@ const MOVE_R: f64 = 1.0;
 
 pub struct Kf {
     pub seq: u64, // 보관한 순서(다시 쌓는 동안 들어온 장면을 가려냄)
+    pub held: bool, // 맡아 둔 장면으로 들어옴(기준 노드가 믿는 지도와 이어져야 지도에 들어감)
     pub t: f64,
     anchor: u32,
     rel: (M3, V3),
@@ -121,6 +122,7 @@ impl Kf {
 
 pub struct KfStore {
     nodes: HashMap<u32, (M3, V3)>,
+    held: HashSet<u32>, // 믿는 지도와 아직 안 이어진 노드
     kfs: Vec<Arc<Kf>>,
     budget: usize,
     bytes: usize,
@@ -152,7 +154,7 @@ fn angle(a: &M3, b: &M3) -> f64 {
 
 impl KfStore {
     pub fn new(budget_mb: usize) -> KfStore {
-        KfStore { nodes: HashMap::new(), kfs: vec![], budget: budget_mb << 20, bytes: 0, stride: 1, count: 0, dirty: false, moved: (0.0, 0.0) }
+        KfStore { nodes: HashMap::new(), held: HashSet::new(), kfs: vec![], budget: budget_mb << 20, bytes: 0, stride: 1, count: 0, dirty: false, moved: (0.0, 0.0) }
     }
 
     pub fn len(&self) -> usize {
@@ -164,10 +166,20 @@ impl KfStore {
         self.bytes
     }
 
-    /// 그래프 블록: 새 노드는 더하고, 있던 노드가 문턱 넘게 움직였으면 다시 쌓기 표시
-    pub fn apply_graph(&mut self, upd: &[(u32, M3, V3)]) {
-        for (id, r, p) in upd {
-            if let Some(old) = self.nodes.insert(*id, (*r, *p)) {
+    /// 그래프 블록: 새 노드는 더하고, 있던 노드가 문턱 넘게 움직였으면 다시 쌓기 표시.
+    /// 맡아 둔 노드는 지도에 없으니 움직여도 표시하지 않고, 믿는 노드로 바뀌면(이어짐) 그 노드의 장면을 넣도록 표시
+    pub fn apply_graph(&mut self, upd: &[(u32, M3, V3, bool)]) {
+        for (id, r, p, held) in upd {
+            let old = self.nodes.insert(*id, (*r, *p));
+            if *held {
+                self.held.insert(*id);
+                continue;
+            }
+            if self.held.remove(id) {
+                self.dirty |= self.kfs.iter().any(|k| k.anchor == *id);
+                continue;
+            }
+            if let Some(old) = old {
                 let (dt, dr) = (norm(&sub(p, &old.1)), angle(r, &old.0));
                 if dt > MOVE_T || dr > MOVE_R {
                     self.dirty |= !self.kfs.is_empty();
@@ -175,6 +187,23 @@ impl KfStore {
                 }
             }
         }
+    }
+
+    /// 이 노드를 기준으로 맡아 둘 수 있는지(맡아 둠 표시로 받은 노드)
+    pub fn holds(&self, node: u32) -> bool {
+        self.held.contains(&node)
+    }
+
+    /// 지금 지도에 넣을 장면인지(기준 노드가 아직 안 이어졌으면 아님)
+    pub fn usable(&self, k: &Kf) -> bool {
+        !self.held.contains(&k.anchor)
+    }
+
+    /// 맡아 둔 장면 수: (이어져 지도에 들어간 것, 아직 안 이어진 것)
+    pub fn held_counts(&self) -> (usize, usize) {
+        let n = self.kfs.iter().filter(|k| k.held).count();
+        let w = self.kfs.iter().filter(|k| k.held && !self.usable(k)).count();
+        (n - w, w)
     }
 
     /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음)
@@ -210,7 +239,7 @@ impl KfStore {
             (pack_rgb(rgb, w, h), pack_depth_m(depth, w, h), vec![])
         };
         let kf = Kf {
-            seq: self.count as u64, t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
+            seq: self.count as u64, held: self.held.contains(&anchor), t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
             dets: dets.as_ref().map(|v| v.iter().map(|d| Det { cls: d.cls, score: d.score, box_: d.box_, mask: d.mask.clone() }).collect()),
             pts: Default::default(),
         };
@@ -317,12 +346,12 @@ mod tests {
     #[test]
     fn follows_anchor() {
         let mut st = KfStore::new(100);
-        st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0])]);
+        st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0], false)]);
         // 노드 1 에서 x 로 1 m 앞의 장면
         st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None, false);
         assert!(!st.dirty);
         // 노드가 원점에서 90° 돌고 (0, 2, 0) 으로 옮겨짐 → 장면은 (0, 3, 0), 90°
-        st.apply_graph(&[(1, rz(std::f64::consts::FRAC_PI_2), [0.0, 2.0, 0.0])]);
+        st.apply_graph(&[(1, rz(std::f64::consts::FRAC_PI_2), [0.0, 2.0, 0.0], false)]);
         assert!(st.dirty);
         let (r, p) = st.pose(&st.kfs()[0]);
         assert!((p[0] - 0.0).abs() < 1e-9 && (p[1] - 3.0).abs() < 1e-9);
@@ -330,11 +359,31 @@ mod tests {
     }
 
     #[test]
+    fn held_joins_later() {
+        let mut st = KfStore::new(100);
+        st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0], false)]);
+        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None, false);
+        // 새 지도의 노드 2(맡아 둠)와 그 노드에서 x 로 1 m 앞의 장면: 지도에 안 넣음
+        st.apply_graph(&[(2, rz(0.0), [5.0, 0.0, 0.0], true)]);
+        assert!(st.holds(2) && !st.holds(1));
+        st.push(1.0, 2, rz(0.0), [6.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None, false);
+        st.apply_graph(&[(2, rz(0.0), [7.0, 0.0, 0.0], true)]);
+        assert!(!st.dirty && !st.usable(&st.kfs()[1]) && st.usable(&st.kfs()[0]));
+        assert_eq!(st.held_counts(), (0, 1));
+        // 이어짐: 노드 2 가 믿는 노드로 (0, 3, 0) 에 → 장면은 (1, 3, 0) 에서 지도에 들어감
+        st.apply_graph(&[(2, rz(0.0), [0.0, 3.0, 0.0], false)]);
+        assert!(st.dirty && st.usable(&st.kfs()[1]));
+        assert_eq!(st.held_counts(), (1, 0));
+        let (_, p) = st.pose(&st.kfs()[1]);
+        assert!((p[0] - 1.0).abs() < 1e-9 && (p[1] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn small_move_not_dirty() {
         let mut st = KfStore::new(100);
-        st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0])]);
+        st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0], false)]);
         st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &[1.0], &None, false);
-        st.apply_graph(&[(1, rz(0.001), [0.005, 0.0, 0.0])]);
+        st.apply_graph(&[(1, rz(0.001), [0.005, 0.0, 0.0], false)]);
         assert!(!st.dirty);
     }
 

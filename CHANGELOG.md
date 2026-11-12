@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-12
+
+### Added
+- 위치를 놓친 뒤 새로 찍은 구간을 버리지 않고 맡아 두었다가, 아는 곳과 다시 이어지면 지도·물체에 넣는다(스트림 상태 8, 그래프 노드의 맡아 둠 칸, 결과 `stream_held`).
+
 ## [0.6.0] - 2026-11-12
 
 ### Added
@@ -130,7 +135,8 @@
 ### Fixed
 - 모델 설정 필드 순서로 초기화가 깨지던 문제.
 
-[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.3.0...v0.4.0

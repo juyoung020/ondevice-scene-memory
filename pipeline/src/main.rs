@@ -381,6 +381,7 @@ struct Frame {
     feat: Option<vo::Feat>,
     track_only: bool, // 깊이·분할 없이 위치만 추적하는 장면(--fast-pose)
     lost: bool,       // 스트림 입력에서 위치를 놓친 장면(지도·물체에 넣지 않음)
+    held: bool,       // 스트림: 맡아 둘 장면(믿는 지도와 이어지면 다시 쌓기 때 지도에 들어감)
     anchor: u32,      // 스트림: 기준 지도 노드 id(0 = 없음)
     graph: Vec<stream::Node>, // 스트림: 이 장면 앞에 온 그래프 블록 노드
 }
@@ -463,7 +464,7 @@ impl InferStage {
 
 /// 분할 단계 3 — 후처리: 마스크 해독, 본 스레드에 넘길 장면으로 묶음. 버퍼는 돌려준다.
 fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>) -> (Frame, (seg::SegIn, seg::SegRaw)) {
-    let (w, h, lost) = (j.sf.w, j.sf.h, j.sf.lost());
+    let (w, h, lost, held) = (j.sf.w, j.sf.h, j.sf.lost(), j.sf.held());
     let dets = j.do_seg.then(|| {
         let c = Instant::now();
         let d = j.dets.take().unwrap_or_else(|| seg::seg_post(&j.bufs.1, j.bufs.0.geom, w, h, conf));
@@ -475,7 +476,7 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
     });
     let sf = j.sf;
     let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: sf.rgb, w, h, depth: j.pd.unwrap_or(j.depth), dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], scale: f64::NAN, feat: j.feat,
-                    track_only: false, lost, anchor: sf.anchor, graph: j.graph };
+                    track_only: false, lost, held, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
 
@@ -838,7 +839,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 graph.append(&mut rd.take_graph());
                 if !graph.is_empty() {
                     let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: vec![], dets: None, load: 0.0, seg: 0.0,
-                                    scale: f64::NAN, feat: None, track_only: false, lost: true, anchor: 0, graph };
+                                    scale: f64::NAN, feat: None, track_only: false, lost: true, held: false, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
                 eprintln!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
@@ -895,7 +896,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             nj += 1;
                             let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, (nj - 1) % seg_every == 0, npu_par, (nj - 1) % sp_every == 0);
                             let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
-                            let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: 0.0, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, anchor: 0, graph: vec![] };
+                            let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: 0.0, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
                             if tx2.send(f).is_err() {
                                 break;
                             }
@@ -935,7 +936,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let c1 = Instant::now();
                     if let Some((jtx, _)) = &model {
                         // 위치만 추적하는 장면으로 먼저 보내고(같은 장면의 깊이 결과보다 앞서 도착), 모델이 쉬고 있으면 이 장면을 맡긴다
-                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, anchor: 0, graph: vec![] };
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
                         if tx.send(f).is_err() {
                             break;
                         }
@@ -944,7 +945,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     }
                     if fast_pose {
                         // 녹화 최대 속도: 위치만 추적 장면을 먼저, depth_every 장마다 아래에서 모델까지
-                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, anchor: 0, graph: vec![] };
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
                         if tx.send(f).is_err() {
                             break;
                         }
@@ -960,7 +961,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let (pd, dets, feat) = run_models(&mut dnet, seg_slot.as_mut().unwrap(), &mut spnet, &rgb, w, h, conf, do_seg, npu_par, (nf - 1) % sp_every == 0);
                     let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
                     let c2 = Instant::now();
-                    let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, anchor: 0, graph: vec![] };
+                    let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
                     if tx.send(f).is_err() {
                         break;
                     }
@@ -1002,7 +1003,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let rgb = img.into_raw();
                 if fast_pose {
                     // 실시간과 같게: 모든 장면은 먼저 위치만 추적, 깊이·분할은 depth_every 장마다
-                    let f = Frame { t, p, r, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: 0.0, seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, anchor: 0, graph: vec![] };
+                    let f = Frame { t, p, r, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: 0.0, seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
                     if tx.send(f).is_err() {
                         break;
                     }
@@ -1033,7 +1034,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     None => (kin, f64::NAN),
                 };
                 let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false, lost: false, anchor: 0, graph: vec![] };
+                let f = Frame { t, p, r, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
                 if fast_pose && depth_lag > 0 {
                     lagged.push_back((n_to + depth_lag, f));
                     continue;
@@ -1143,6 +1144,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
     let mut leveled = if a.stream.is_some() { a.no_level } else { a.cam.is_none() || !a.vo };
     let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
+    let mut stream_held = 0u32; // 맡아 둘 장면으로 받은 수
     let (mut stream_lost, mut map_traj) = (0u32, Vec::<(f64, V3, M3)>::new()); // map_traj: 지도에 넣은 장면의 카메라 위치(지도 좌표) → poses_map.txt
     // 루프 클로저 뒤 다시 쌓기: 지도에 넣은 장면을 기준 노드와 함께 보관, 노드가 움직이면 작업 스레드가 고친 위치로 지도·물체를 처음부터 다시 쌓고
     // 끝나면 본 스레드가 갈아 끼운다(그동안 실시간 장면은 계속 들어옴)
@@ -1156,7 +1158,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
-    while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, held, anchor, graph }) = rx.recv() {
         *taken.n.lock().unwrap() += 1;
         taken.cv.notify_all();
         let c_top = Instant::now();
@@ -1222,6 +1224,23 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             }
             if a.live > 0.0 {
                 // 뷰어: 마지막 위치 그대로, 놓침 표시(손카메라 빨간색)
+                out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false}).to_string().as_bytes());
+            }
+            continue;
+        }
+        if held {
+            // 맡아 둘 장면: 믿는 지도와 이어지지 않은 새 지도의 위치라 지금 지도에는 넣지 않고 보관만 한다.
+            // 기준 노드가 믿는 노드로 바뀌면(루프 클로저로 이어짐) 다시 쌓기가 고친 위치로 넣는다
+            stream_held += 1;
+            if leveled && a.rebuild_every >= 0.0 && kfs.holds(anchor) {
+                let keep = kfs.push(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, &rgb, &depth, &dets, true);
+                match (pw.as_mut(), keep) {
+                    (Some(pw), Some(kf)) => pw.hold(&depth, &rgb, w, h, kf),
+                    (None, Some(kf)) => { let _ = kf.pts.set(None); }
+                    _ => {}
+                }
+            }
+            if a.live > 0.0 {
                 out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false}).to_string().as_bytes());
             }
             continue;
@@ -1633,11 +1652,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 hist_h.push(ch);
             }
         }
-        let h_now = if hist_h.is_empty() { 1.4 } else {
-            let mut s: Vec<f64> = hist_h.iter().rev().take(15).copied().collect();
-            s.sort_by(|x, y| x.partial_cmp(y).unwrap());
-            s[s.len() / 2]
-        };
+        let h_now = cam_height(&hist_h);
         let z0v = if leveled { *z0.get_or_insert(p[2] - h_now) } else { p[2] - h_now };
         last_z0v = z0v;
         let pwc = [p[0], p[1], p[2] - z0v];
@@ -1829,6 +1844,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     if a.stream.is_some() {
         summary["stream_lost"] = json!(stream_lost);
+        let (joined, waiting) = kfs.held_counts();
+        summary["stream_held"] = json!({"frames": stream_held, "joined": joined, "waiting": waiting});
     }
     summary["frame_parts"] = clock.parts_json();
     summary["degraded_frames"] = json!(n_behind);
@@ -1880,9 +1897,20 @@ struct Rebuilt {
 type Snap = Vec<(std::sync::Arc<kfstore::Kf>, M3, V3)>;
 
 /// 보관한 장면과 지금 노드 위치로 만든 위치(수평 맞춤·바닥 높이 원점 적용, 지도 좌표)
+/// 카메라 높이(바닥 위): 최근 15 번 잰 값의 가운데 값
+fn cam_height(hist: &[f64]) -> f64 {
+    if hist.is_empty() {
+        return 1.4;
+    }
+    let mut s: Vec<f64> = hist.iter().rev().take(15).copied().collect();
+    s.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    s[s.len() / 2]
+}
+
 fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
     kfs.kfs()
         .iter()
+        .filter(|kf| kfs.usable(kf))
         .map(|kf| {
             let (r0, p0) = kfs.pose(kf);
             let p = mv(fix, &p0);
@@ -2066,6 +2094,8 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3) -> Vec<(V3, [u8; 3], 
 enum PtsMsg {
     /// 실시간 장면: 점을 고르고(보관 장면이면 점 격자를 압축해 붙임) 지도에 넣음
     Frame { kf: u32, r: M3, pwc: V3, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, part: Option<usize> },
+    /// 맡아 둘 장면: 점 격자만 만들어 붙임(지도에는 이어진 뒤 다시 쌓기가 넣음)
+    Hold { depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf> },
     /// 보관 장면(다시 쌓은 뒤 이어 넣기): 붙여 둔 점 격자로
     Stored { kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf> },
     /// 노드 파일 쓰기(점 수 상한, 0 = 모두), 다 쓰면 알림(기다리는 모드)
@@ -2114,6 +2144,12 @@ impl PtsWorker {
                         let c1 = Instant::now();
                         scene.add(kf, &grid_points(k, &g, &r, &pwc));
                         (t_grid, t_add, nf) = (t_grid + (c1 - c0).as_secs_f64(), t_add + c1.elapsed().as_secs_f64(), nf + 1);
+                        out::slow(c0);
+                        q2.fetch_sub(1, Relaxed);
+                    }
+                    PtsMsg::Hold { depth, rgb, w, h, keep } => {
+                        let c0 = Instant::now();
+                        let _ = keep.pts.set(Some(pts_grid(&a, k, &depth, &rgb, w, h, None).pack()));
                         out::slow(c0);
                         q2.fetch_sub(1, Relaxed);
                     }
@@ -2172,6 +2208,17 @@ impl PtsWorker {
             None
         };
         self.send(PtsMsg::Frame { kf, r, pwc, depth: depth.to_vec(), rgb: rgb.to_vec(), w, h, keep, part });
+    }
+    /// 맡아 둘 장면: 점 격자만 만들어 붙이게 넘김(밀렸으면 빈 점 격자로 표시)
+    fn hold(&mut self, depth: &[f32], rgb: &[u8], w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
+            self.dropped += 1;
+            let _ = keep.pts.set(None);
+            return;
+        }
+        self.queued.fetch_add(1, Relaxed);
+        self.send(PtsMsg::Hold { depth: depth.to_vec(), rgb: rgb.to_vec(), w, h, keep });
     }
     fn stored(&self, kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf>) {
         self.send(PtsMsg::Stored { kf, r, pwc, store });

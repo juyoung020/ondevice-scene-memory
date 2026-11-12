@@ -45,6 +45,7 @@ std::vector<uint8_t> encode_graph(const std::vector<GraphNode>& nodes, bool rese
     size_t o = kGraphHeaderBytes;
     for (const GraphNode& n : nodes) {
         put<uint32_t>(b.data(), o, n.id);
+        put<uint32_t>(b.data(), o + 4, n.held);
         for (int i = 0; i < 12; ++i) put<double>(b.data(), o + 8 + 8 * i, n.T[i]);
         o += 8 + 96;
     }

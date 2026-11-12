@@ -8,14 +8,17 @@ pub const HEADER: usize = 176;
 pub const LOST: u32 = 1;
 pub const NEW_MAP: u32 = 2;
 pub const MAP_CORRECTED: u32 = 4;
-/// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 리셋 표시 4), 노드마다 id u32 + 예약 u32 + 3×4 f64
+/// 맡아 둘 장면(LOST 와 함께 옴): 믿는 지도와 아직 안 이어진 새 지도의 위치·기준 노드가 들어 있다
+pub const HELD: u32 = 8;
+/// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 리셋 표시 4), 노드마다 id u32 + 맡아 둠 u32 + 3×4 f64
 const GRAPH_HEADER: usize = 16;
 const GRAPH_NODE: usize = 8 + 96;
 /// 읽기 버퍼: 머리·그래프 블록용. 사진은 이보다 커서 버퍼를 거치지 않고 받을 자리에 바로 읽힌다
 const READ_BUF: usize = 1 << 16;
 
-/// 그래프 노드: (RTAB-Map 노드 id, 자세, 위치) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표
-pub type Node = (u32, M3, V3);
+/// 그래프 노드: (RTAB-Map 노드 id, 자세, 위치, 맡아 둠) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표.
+/// 맡아 둠 = 믿는 지도와 아직 안 이어진 새 지도의 노드(이어지면 같은 id 가 맡아 둠 없이 다시 온다)
+pub type Node = (u32, M3, V3, bool);
 
 pub struct StreamFrame {
     pub flags: u32,
@@ -39,8 +42,12 @@ pub struct StreamFrame {
 }
 
 impl StreamFrame {
+    /// 위치가 없는 장면(맡아 둘 장면은 위치가 있으니 아님)
     pub fn lost(&self) -> bool {
-        self.flags & LOST != 0
+        self.flags & LOST != 0 && !self.held()
+    }
+    pub fn held(&self) -> bool {
+        self.flags & HELD != 0
     }
     /// 깊이(미터, 0 = 없음). TUM Kinect 입력(tum.rs)과 같은 계산(값 / 배율)
     pub fn depth_m(&self) -> Vec<f32> {
@@ -116,7 +123,8 @@ impl StreamReader {
             let id = u32::from_le_bytes(c[0..4].try_into().unwrap());
             let t: Vec<f64> = (0..12).map(|i| f64::from_le_bytes(c[8 + 8 * i..16 + 8 * i].try_into().unwrap())).collect();
             let (r, p) = pose_of(&t);
-            self.graph.push((id, r, p));
+            let held = u32::from_le_bytes(c[4..8].try_into().unwrap()) == 1;
+            self.graph.push((id, r, p, held));
         }
         Some(())
     }

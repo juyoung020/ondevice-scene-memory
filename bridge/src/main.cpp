@@ -210,7 +210,7 @@ static int run(int argc, char** argv) {
     }
     if (!stats_path.empty()) {
         stats_f.open(stats_path);
-        stats_f << "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers\n";
+        stats_f << "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held\n";
     }
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -220,6 +220,11 @@ static int run(int argc, char** argv) {
     Summary s_read, s_odom, s_slam, s_send, s_total;
     long n = 0, n_lost = 0, n_newmap = 0, n_loop = 0, n_corr = 0, n_graph = 0, n_graph_nodes = 0;
     std::map<int, Transform> sent_nodes;  // memmap 에 보낸 노드 위치(지도 몸체 축)
+    // 믿는 지도와 아직 안 이어진 새 지도: 노드를 "맡아 둠" 표시로 보내고 장면도 위치·기준 노드와 함께 맡겨 둔다.
+    // 나중에 루프 클로저로 이어지면 그 노드를 믿는 노드로 다시 보내 memmap 이 맡아 둔 장면을 고친 위치로 지도에 넣는다
+    std::map<int, long> held_nodes;  // 맡아 둔 노드 id → 그 노드를 기준으로 맡긴 장면 수
+    int held_last = -1;              // 지금 새 지도의 마지막 노드(없으면 -1)
+    long n_held = 0, n_joined = 0;
     uint32_t map_id = 0;
     bool fresh = true;  // 처음이거나 리셋 직후의 장면: 위치 추적이 새로 시작하는 것이 정상
     // 다시 시작한 뒤의 위치는 "마지막 위치에서 이어 붙인" 값이라 그동안 카메라가 움직였으면 틀리다.
@@ -244,6 +249,8 @@ static int run(int argc, char** argv) {
             odom->reset();
             rtabmap.resetMemory();
             sent_nodes.clear();
+            held_nodes.clear();
+            held_last = -1;
             map_id = 0;
             prev_stamp = 0;
             prev_corr = Transform::getIdentity();
@@ -315,6 +322,7 @@ static int run(int argc, char** argv) {
             int id = rtabmap.triggerNewMap();
             map_id = id >= 0 ? (uint32_t)id : map_id + 1;
             new_map = true;
+            held_last = -1;
             if (good_id > 0) anchored = false;
             ++n_newmap;
         }
@@ -343,6 +351,7 @@ static int run(int argc, char** argv) {
                 std::fprintf(stderr, "장면 %ld: 이전 지도와 다시 이어짐\n", n);
             }
             if (anchored && lp.count(rtabmap.getLastLocationId())) good_id = rtabmap.getLastLocationId();
+            if (!anchored && data.id() > 0 && lp.count(rtabmap.getLastLocationId())) held_last = rtabmap.getLastLocationId();
         }
         // 기준 장면: 믿는 위치의 장면을 0.4 초마다 하나씩, 최근 6 개
         if (anchored && !pose.isNull() && !new_map) {
@@ -368,19 +377,29 @@ static int run(int argc, char** argv) {
 
         // 그래프 블록: 지도 갱신 뒤 새로 생기거나 움직인(행렬 원소 1e-3 = 1 mm·약 0.06° 넘게) 노드를 이 장면보다 먼저 보낸다.
         // memmap 은 장면을 기준 노드와 함께 보관했다가 노드가 움직이면 고친 위치로 지도·물체를 다시 쌓는다
-        if (process && anchored) {
+        // 이어지지 않은 동안의 노드는 맡아 둠 표시로, 이어진 뒤에는 믿는 노드로(표시가 바뀐 노드는 안 움직였어도 다시 보냄)
+        if (process) {
             std::vector<stream::GraphNode> upd;
             for (const auto& [id, P] : rtabmap.getLocalOptimizedPoses()) {
                 if (id <= 0 || P.isNull()) continue;
                 auto it = sent_nodes.find(id);
-                if (it != sent_nodes.end()) {
+                auto hit = held_nodes.find(id);
+                const bool was_held = hit != held_nodes.end();
+                if (!anchored && it != sent_nodes.end() && !was_held) continue;  // 믿는 노드는 이어지지 않은 지도의 값으로 덮지 않음
+                if (it != sent_nodes.end() && was_held == !anchored) {
                     float dmax = 0;
                     for (int i = 0; i < 12; ++i) dmax = std::max(dmax, std::abs(it->second.data()[i] - P.data()[i]));
                     if (dmax < 1e-3f) continue;
                 }
                 sent_nodes[id] = P;
+                if (!anchored && !was_held) held_nodes[id] = 0;
+                if (anchored && was_held) {
+                    n_joined += hit->second;
+                    held_nodes.erase(hit);
+                }
                 stream::GraphNode gn;
                 gn.id = (uint32_t)id;
+                gn.held = anchored ? 0 : 1;
                 const Transform Tn = P * optical;
                 for (int i = 0; i < 12; ++i) gn.T[i] = Tn.data()[i];
                 upd.push_back(gn);
@@ -398,7 +417,9 @@ static int run(int argc, char** argv) {
         }
 
         stream::OutFrame of;
-        of.flags = (lost ? stream::kLost : 0) | (new_map ? stream::kNewMap : 0) | (corrected ? stream::kMapCorrected : 0);
+        // 맡길 장면: 새 지도에서 위치를 구했고 그 지도의 노드를 이미 보냈을 때
+        const bool held = !anchored && !pose.isNull() && !info.lost && !new_map && held_nodes.count(held_last);
+        of.flags = (lost ? stream::kLost : 0) | (new_map ? stream::kNewMap : 0) | (corrected ? stream::kMapCorrected : 0) | (held ? stream::kHeld : 0);
         of.map_id = map_id;
         of.seq = (uint64_t)n;
         of.t = fr.t;
@@ -411,6 +432,13 @@ static int run(int argc, char** argv) {
             // 기준 노드: 마지막 지도 노드(이 장면 위치 = 그 노드 위치 × 오도메트리 상대 위치)
             int last_id = rtabmap.getLastLocationId();
             of.anchor = sent_nodes.count(last_id) ? (uint32_t)last_id : 0;
+        } else if (held) {
+            Twc = (corr.isNull() ? Transform::getIdentity() : corr) * pose * optical;
+            const float* d = Twc.data();
+            for (int i = 0; i < 12; ++i) of.T[i] = d[i];
+            of.anchor = (uint32_t)held_last;
+            if (n % send_every == 0) ++held_nodes[held_last];
+            ++n_held;
         }
         of.fx = fr.fx;
         of.fy = fr.fy;
@@ -437,8 +465,8 @@ static int run(int argc, char** argv) {
         s_total.add(total_ms);
         if (stats_f) {
             char b[256];
-            std::snprintf(b, sizeof b, "%ld,%.6f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d\n", n, fr.t, read_ms, odom_ms, slam_ms, send_ms, lost, new_map, corrected, loop,
-                          info.features, info.reg.inliers);
+            std::snprintf(b, sizeof b, "%ld,%.6f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d\n", n, fr.t, read_ms, odom_ms, slam_ms, send_ms, lost, new_map, corrected, loop,
+                          info.features, info.reg.inliers, held);
             stats_f << b;
         }
         ++n;
@@ -466,6 +494,7 @@ static int run(int argc, char** argv) {
 
     std::fprintf(stderr, "장면 %ld 개, %.1f 초(%.1f 장/초), 놓침 %ld, 새 지도 %ld, 루프 클로저 %ld, 지도 보정 바뀜 %ld\n", n, wall, n / std::max(wall, 1e-9), n_lost, n_newmap,
                  n_loop, n_corr);
+    std::fprintf(stderr, "놓침 가운데 새 지도에서 맡긴 장면 %ld(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 %ld)\n", n_held, n_joined);
     std::fprintf(stderr, "같은 지도에서 다시 잡음 %ld 번, ms/회 %s\n", n_reloc, s_reloc.str().c_str());
     if (auto* ts = dynamic_cast<TumSource*>(src.get())) std::fprintf(stderr, "재생에서 밀려 건너뛴 장면 %zu\n", ts->skipped());
     std::fprintf(stderr, "보냄 %zu, 밀려 버림 %zu, 그래프 블록 %ld 개(노드 %ld 개)\n", writer.written(), writer.dropped(), n_graph, n_graph_nodes);

@@ -1017,3 +1017,12 @@ TUM fr1 desk2 실시간 재생(`rtab_bridge --rate 1 --out - | memmap --stream -
 - 맞는 이름의 몫은 오른다: 책상 desk 0.28 → 0.64, 곰 인형 0.44 → 0.79, 의자 0.48 → 0.52 – 0.63.
 - 틀린 이름의 몫도 같이 오른다: 컵 → bedpan 0.27 → 0.60, 넓은 면 → teddy bear 0.33 → 0.62. 0.3 기준으로 거를 수 없게 된다.
 - 가장 닮은 이름 자체는 대부분 같다(monitor · chair · bucket · eraser · aerosol can). 이름만 넣는 방식을 그대로 둔다.
+
+### 이름 목록을 4,234 개로 늘려 보기
+
+LVIS 동의어 전부 · Open Images 600 · BEHAVIOR-1K 범주 · object-memory-robot 의 ovdet 어휘를 더한 4,234 개(그 프로젝트 주 표 4,091 개와 같은 출처)로 글 벡터를 만들어 같은 물체들에 대 봤다.
+
+- 맞던 이름은 그대로 맞지만 몫이 절반쯤으로 준다(같은 뜻의 이름이 나눠 가짐): monitor 0.82 → computer monitor 0.42, chair 0.48 → 0.24, bucket 0.70 → pail 0.50, eraser 0.49 → 0.22. 0.3 기준을 넘는 물체가 COCO 쪽 13 → 6 개.
+- 더 맞게 바뀐 것: swivel chair, wastebin, 넓은 면이 floor · baseboard 로 불림.
+- 새로 틀리는 것: 컵 → mortar 0.78, 칸막이 → candy dispenser shelf 0.43, 봉지 → bag of starch 0.46, 병 → bottle of lime juice. BEHAVIOR 의 "bottle of …" · "bag of …" 같은 이름이 끌어간다.
+- 1,221 개 목록을 그대로 둔다. 목록을 늘리려면 같은 뜻의 이름끼리 몫을 합치는 묶음(동의어 표)이 먼저 있어야 한다.

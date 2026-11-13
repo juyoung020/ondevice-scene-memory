@@ -2517,7 +2517,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
             o.crop_saved = o.crop_ver;
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
-        let look = embed::name(o.id);
+        let look = embed::name(o.id, o.name != "object");
         let mut e = json!({"id": o.id, "name": look.as_ref().map_or(&o.name, |l| &l.0), "seg_name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
             "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": false,
             "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox, "n": o.n_pts}});
@@ -2536,7 +2536,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
         Some(g) => {
             out::pgm(&dir.join("map.pgm"), g.w, g.h, &g.px);
             // 방 이름의 근거가 되는 물체 이름: 사진으로 붙인 이름이 있으면 그것
-            let shown: Vec<String> = mem.objs.iter().map(|o| embed::name(o.id).map_or_else(|| o.name.clone(), |l| l.0)).collect();
+            let shown: Vec<String> = mem.objs.iter().map(|o| embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0)).collect();
             let ol: Vec<_> = mem.objs.iter().zip(&shown).map(|(o, n)| (o.id, o.pos, o.extent, o.state == "gone", n.as_str())).collect();
             let (rj, dj, ej) = graph::build(room_tr, g, grid.res, &ol);
             (json!({"width": g.w, "height": g.h, "resolution": grid.res, "origin": [g.x0 as f64 * grid.res, g.y0 as f64 * grid.res]}), rj, dj, ej)

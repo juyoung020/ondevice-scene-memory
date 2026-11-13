@@ -78,11 +78,11 @@ fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)>
     Some((names[i].clone(), 1.0 / z))
 }
 
-/// 그 물체의 사진으로 붙인 이름(몫 NAME_MIN 이상일 때만). `--vocab` 이 없거나 벡터 계산 전이면 None
-pub fn name(id: u32) -> Option<(String, f32)> {
-    NAMES.lock().unwrap().as_ref()?.get(&id).filter(|(_, p)| *p >= NAME_MIN).cloned()
+/// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,
+/// 이름 없는 물체(object)는 몫이 낮아도 가장 닮은 이름을 쓴다. `--vocab` 이 없거나 벡터 계산 전이면 None
+pub fn name(id: u32, sure: bool) -> Option<(String, f32)> {
+    NAMES.lock().unwrap().as_ref()?.get(&id).filter(|(_, p)| !sure || *p >= NAME_MIN).cloned()
 }
-
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {
     if let Some((names, vecs)) = VOCAB.get() {

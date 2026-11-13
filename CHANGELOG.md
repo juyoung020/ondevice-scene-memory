@@ -10,7 +10,7 @@
 - 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
 - 물체 이름을 사진으로 붙이기 `memmap --vocab vocab/names.voc`: 이름 1,221 개(LVIS · COCO 등) 중 사진이 가장 닮은 이름을 쓴다(tv → monitor · laptop computer).
 - 이름 글 벡터를 미리 만들어 두는 `sgview --encode-vocab <이름 목록> <파일>` 과 그 파일을 읽는 `sgview --vocab`.
-- 분할 모델의 클래스 이름 `memmap --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 `--vocab` 이 붙인다.
+- 분할 모델의 클래스 이름 `memmap --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 모두 `--vocab` 이 붙인다.
 
 ### Changed
 - 카메라를 가만히 두는 동안(1 cm · 1° 안)은 다시 쌓기용 장면을 2 초에 한 장만 보관한다.

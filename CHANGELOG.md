@@ -10,6 +10,7 @@
 - 보드에서 아무 말로 물체 찾기: `memmap --embed` 가 NPU 모델(.dxnn)을 받는다(SigLIP2 영상 인코더, 사진 한 장 18 ms).
 - 사진 벡터 확인 `memmap --embed-check <모델> <사진 폴더> <벡터 파일>`: PC 의 ONNX 벡터와 보드 NPU 벡터의 코사인·추론 시간.
 - 컬러 노출 고정 `rtab_bridge --exposure <ms> [--gain 0..128]`.
+- 뷰어 수평 버튼(리셋 왼쪽): 카메라를 수평으로 든 채 누르면 그 자세를 수평으로 삼아 지도를 처음부터(`GET /api/level`, `level.req`).
 
 ## [0.7.0] - 2026-11-12
 

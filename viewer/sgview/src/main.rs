@@ -9,6 +9,7 @@
 //! GET /                      the page
 //! GET /api/view?v=<ver>      {"v": ver, "map_v": ver, "view": <view.json>} or {"unchanged": true} (poll; ver = mtime+size)
 //! GET /api/map[?since=<ver>] PGM pixels (row 0 = max y); with since only the changed rows (X-Y0/X-Y1/X-Full)
+//! GET /api/level             the camera is level now: restart the map with the current pose as horizontal (writes level.req + reset.req)
 //! GET /api/reset             ask the running pipeline to start over (writes reset.req in the memory dir)
 //! GET /api/walls?x=&y=&yaw=  {"segments": [[ax,ay,bx,by]..], "state": [56 floats], "pose": [x,y,yaw]}
 //! GET /api/depth?path=<rel>  16-bit grey PNG → u16 little-endian pixels (X-W / X-H)
@@ -637,6 +638,11 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         "/favicon.ico" => respond(&mut s, 204, "image/x-icon", "", b""),
         // Reset button: leave a request file in the memory dir; rtab_bridge (--reset-file) picks it up, restarts tracking and tells memmap to start an empty map
         "/api/reset" => match std::fs::write(st.dir.join("reset.req"), b"") {
+            Ok(()) => respond(&mut s, 200, "application/json", "", b"{\"ok\":true}"),
+            Err(e) => respond(&mut s, 500, "text/plain", "", e.to_string().as_bytes()),
+        },
+        // Level button: the camera is held level now. Leave level.req for memmap (the next map takes the pose at its start as horizontal, skipping the floor vote), then ask for a reset
+        "/api/level" => match std::fs::write(st.dir.join("level.req"), b"").and_then(|_| std::fs::write(st.dir.join("reset.req"), b"")) {
             Ok(()) => respond(&mut s, 200, "application/json", "", b"{\"ok\":true}"),
             Err(e) => respond(&mut s, 500, "text/plain", "", e.to_string().as_bytes()),
         },

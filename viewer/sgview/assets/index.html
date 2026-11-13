@@ -57,6 +57,11 @@
   #b_reset:hover { background:rgba(255,120,120,.16); color:#fff; border-color:rgba(255,120,120,.45); }
   #b_reset:disabled { opacity:.45; cursor:default; }
   #b_reset:disabled svg { animation:rspin 1s linear infinite; }
+  #b_level { position:absolute; right:64px; bottom:14px; z-index:7; width:42px; height:42px; display:flex; align-items:center; justify-content:center; padding:0;
+    background:var(--panel); border:1px solid var(--line); border-radius:50%; color:#cfd5e2; cursor:pointer; }
+  body.panel-open #b_level { right:398px; }
+  #b_level:hover { background:rgba(120,200,255,.16); color:#fff; border-color:rgba(120,200,255,.45); }
+  #b_level:disabled { opacity:.45; cursor:default; }
   @keyframes rspin { to { transform:rotate(360deg); } }
   #find { position:absolute; left:18px; top:64px; width:330px; z-index:8; }   /* left column: the middle of the map stays free for the match the camera flies to */
   #f_q { width:100%; box-sizing:border-box; padding:8px 30px 8px 14px; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:12px; font:inherit; font-size:13px;
@@ -74,10 +79,10 @@
   .hit .pc { font-variant-numeric:tabular-nums; font-weight:600; width:38px; text-align:right; }
   .hit .by { font-size:10.5px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:#c9cfdc; }
   .lbl.find { border-color:rgba(74,222,128,.6); }
-  body.ui-off #b_reset, body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys, body.ui-off #find { display:none; }
+  body.ui-off #b_reset, body.ui-off #b_level, body.ui-off #tools, body.ui-off #panel, body.ui-off #title, body.ui-off #keys, body.ui-off #find { display:none; }
   canvas.crop { max-width:100%; image-rendering:pixelated; border:1px solid var(--line); display:block; }
   .stats { color:var(--mute); font-size:11px; }
-  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } body.panel-open #b_reset { right:14px; bottom:calc(45% + 24px); } #keys { display:none; } #find { left:8px; right:8px; top:56px; width:auto; } #f_out { max-height:30vh; } }
+  @media (max-width:700px) { #panel { left:8px; right:8px; width:auto; top:auto; height:45%; } body.panel-open #b_reset { right:14px; bottom:calc(45% + 24px); } body.panel-open #b_level { right:64px; bottom:calc(45% + 24px); } #keys { display:none; } #find { left:8px; right:8px; top:56px; width:auto; } #f_out { max-height:30vh; } }
 </style>
 </head>
 <body>
@@ -89,6 +94,7 @@
 <div id="find"><input id="f_q" type="text" autocomplete="off" spellcheck="false" placeholder="Search objects in any words · 의자, something to drink …  ( / )"><button id="f_x" title="Clear (Esc)">✕</button>
   <div id="f_out"><div id="f_note"></div><div id="f_list"></div></div></div>
 <div id="keys"><b>drag</b>orbit · <b>/</b>search · <b>F</b>fit · <b>T</b>top · <b>R</b>demo · <b>G</b>settings · <b>H</b>hide UI</div>
+<button id="b_level" title="Level: the camera is held level right now — restart the map with this pose as horizontal" aria-label="Set level"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="8" width="20" height="8" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M7 10v4"/><path d="M17 10v4"/></svg></button>
 <button id="b_reset" title="Reset: re-acquire the camera pose and rebuild the map from empty" aria-label="Reset map"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></button>
 <div id="tools"><button id="b_fit" title="Fit (F)">Fit</button><button id="b_top" title="Top view (T)">Top</button><button id="b_demo" title="Slow auto-rotate (R)">Demo</button><button id="b_q" title="Rendering quality">High</button><button id="b_panel" title="Settings (G)">Settings</button></div>
 <div id="panel">
@@ -1346,6 +1352,7 @@ let userMoved = false;
 function setDemo(on) { controls.autoRotate = on; $("b_demo").classList.toggle("on", on); invalidate(); }
 function togglePanel(on) { document.body.classList.toggle("panel-open", on); $("b_panel").classList.toggle("on", document.body.classList.contains("panel-open")); }
 $("b_demo").onclick = () => setDemo(!controls.autoRotate);
+$("b_level").onclick = () => { const b = $("b_level"); b.disabled = true; fetch("/api/level").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_reset").onclick = () => { const b = $("b_reset"); b.disabled = true; fetch("/api/reset").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_panel").onclick = () => togglePanel();
 $("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; localStorage.setItem("sg_quality", quality); applyQuality(); };

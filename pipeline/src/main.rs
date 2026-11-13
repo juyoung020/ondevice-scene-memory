@@ -1142,7 +1142,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let dvo_minlv = if a.depth == "kinect" { 0 } else { 1 }; // 딥러닝 깊이는 640×480 단계 생략(정확도 같고 40 % 빠름)
     let mut vo_dvo = 0u32; // 직접 방식으로 메운 장면 수
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
-    let mut leveled = if a.stream.is_some() { a.no_level } else { a.cam.is_none() || !a.vo };
+    // 뷰어의 수평 버튼: level.req 가 있으면 이번 지도는 시작 순간의 카메라 자세를 수평으로 삼는다(바닥 합의를 건너뜀)
+    let level_req = a.stream.is_some() && std::fs::remove_file(a.out.join("level.req")).is_ok();
+    if level_req {
+        eprintln!("수평 버튼: 지금 카메라 자세를 수평으로 삼음");
+    }
+    let mut leveled = if a.stream.is_some() { a.no_level || level_req } else { a.cam.is_none() || !a.vo };
     let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
     let mut stream_held = 0u32; // 맡아 둘 장면으로 받은 수
     let (mut stream_lost, mut map_traj) = (0u32, Vec::<(f64, V3, M3)>::new()); // map_traj: 지도에 넣은 장면의 카메라 위치(지도 좌표) → poses_map.txt

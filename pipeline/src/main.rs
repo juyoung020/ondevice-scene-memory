@@ -1142,12 +1142,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let dvo_minlv = if a.depth == "kinect" { 0 } else { 1 }; // 딥러닝 깊이는 640×480 단계 생략(정확도 같고 40 % 빠름)
     let mut vo_dvo = 0u32; // 직접 방식으로 메운 장면 수
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
-    // 뷰어의 수평 버튼: level.req 가 있으면 이번 지도는 시작 순간의 카메라 자세를 수평으로 삼는다(바닥 합의를 건너뜀)
-    let level_req = a.stream.is_some() && std::fs::remove_file(a.out.join("level.req")).is_ok();
-    if level_req {
-        eprintln!("수평 버튼: 지금 카메라 자세를 수평으로 삼음");
-    }
-    let mut leveled = if a.stream.is_some() { a.no_level || level_req } else { a.cam.is_none() || !a.vo };
+    let mut leveled = if a.stream.is_some() { a.no_level } else { a.cam.is_none() || !a.vo };
+    let mut force_rb = false; // 수평 버튼: 기다리지 않고 바로 다시 쌓기
     let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
     let mut stream_held = 0u32; // 맡아 둘 장면으로 받은 수
     let (mut stream_lost, mut map_traj) = (0u32, Vec::<(f64, V3, M3)>::new()); // map_traj: 지도에 넣은 장면의 카메라 위치(지도 좌표) → poses_map.txt
@@ -1213,7 +1209,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         clock.add(P::Install, c_in);
         let c_rs = Instant::now();
-        if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every {
+        if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && (force_rb || last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every) {
+            force_rb = false;
             let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
             kfs.clear_dirty();
@@ -1249,6 +1246,24 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 out::write_atomic(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false}).to_string().as_bytes());
             }
             continue;
+        }
+        // 뷰어의 수평 버튼(level.req): 지금 카메라 자세를 수평으로 삼는다. 받은 위치에 곱하는 회전을 '카메라의 위 = 세계의 위'가 되게 바꾸고,
+        // 보관한 장면을 그 회전으로 다시 쌓아 이미 만든 지도·물체도 함께 바로 세운다(쌓는 중이면 끝난 뒤에)
+        if a.stream.is_some() && a.live > 0.0 && rb_job.is_none() && std::fs::remove_file(a.out.join("level.req")).is_ok() {
+            let up_raw = [-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]]; // 카메라 좌표의 위(−y)를 받은 좌표로
+            let fix = rot_between(&up_raw, &[0.0, 0.0, 1.0]);
+            let old_t: M3 = [[stream_fix[0][0], stream_fix[1][0], stream_fix[2][0]], [stream_fix[0][1], stream_fix[1][1], stream_fix[2][1]], [stream_fix[0][2], stream_fix[1][2], stream_fix[2][2]]];
+            let delta = mm(&fix, &old_t); // 지금까지의 좌표 → 새 좌표
+            for e in est_traj.iter_mut() {
+                (e.1, e.2) = (mv(&delta, &e.1), mm(&delta, &e.2));
+            }
+            let tilt = delta[2][2].clamp(-1.0, 1.0).acos().to_degrees();
+            stream_fix = fix;
+            leveled = true;
+            z0 = Some(mv(&stream_fix, &raw.1)[2] - cam_height(&hist_h)); // 바닥 높이 원점도 새 좌표로
+            kfs.dirty = true;
+            force_rb = true;
+            eprintln!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
         }
         if a.stream.is_some() {
             r = mm(&stream_fix, &r);

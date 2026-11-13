@@ -65,13 +65,15 @@ cargo build --release --manifest-path viewer/sgview/Cargo.toml
 # TUM 영상 → RTAB-Map → memmap(점 지도 + 물체)
 rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
   | pipeline/target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx \
-      --embed models/siglip2-base-patch32-256/vision_model.onnx --max-depth 3.5 --out data/memory/office
+      --embed models/siglip2-base-patch32-256/vision_model.onnx --vocab vocab/names.voc --max-depth 3.5 --out data/memory/office
 
 # 다른 창에서 뷰어 → 브라우저로 http://127.0.0.1:8091
-viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.0.1   --search-model models/siglip2-base-patch32-256
+viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.0.1   --search-model models/siglip2-base-patch32-256 --vocab vocab/names.voc
 ```
 
 검색 모델은 Hugging Face 의 SigLIP2 base patch32-256 을 ONNX 로 내보낸 것으로, `models/siglip2-base-patch32-256/` 에 `vision_model.onnx`(memmap 이 물체 사진에), `text_model_fp16.onnx`·`tokenizer.json`(뷰어가 검색어에) 을 둡니다. `--embed`·`--search-model` 을 빼면 검색창은 저장된 이름의 글자만 비교합니다.
+
+`vocab/names.voc` 는 이름 1,221 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. memmap 은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 물체 이름으로 쓰고(tv → monitor, 몫 0.3 이상일 때), 뷰어는 같은 파일로 이름들의 글 벡터 계산을 건너뜁니다. 목록을 바꾸면 `sgview --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 
@@ -105,6 +107,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | `--npu-jobs K` | 스트림 분할 장면을 NPU 에 K 장까지 함께 올림(NPU 코어 여럿이 나눠 돎, 기본 4, `1` 은 한 장씩) |
 | `--seg <모델>` / `--conf 0.35` | 물체 분할 모델 / 물체로 인정할 확신도 |
 | `--embed <vision_model.onnx>` | 물체 사진마다 검색용 벡터를 남김(뷰어 검색, 물체 병합에 씀) |
+| `--vocab <글 벡터 파일>` | 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(`--embed` 와 함께, `vocab/names.voc`) |
 | `--max-depth` | 지도에 넣을 최대 거리(m) |
 | `--every N` | 받은 장면 N장마다 처리 |
 | `--live 1` / `--loop` | 실제 속도로 재생하며 뷰어에 계속 갱신 / 끝나면 반복 |

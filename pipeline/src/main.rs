@@ -79,6 +79,7 @@ struct Args {
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
+    vocab: Option<String>,  // --vocab <글 벡터 파일>: 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(--embed 와 함께, 파일은 sgview --encode-vocab 이 만듦)
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -90,6 +91,7 @@ fn args() -> Args {
         out: get("--out").or_else(|| get("--seg-check").map(|_| String::new())).expect("--out <dir>").into(), // --seg-check 는 쓰는 파일이 없음
         seg: get("--seg").unwrap_or("models/yolo26s-seg.onnx".into()),
         embed: get("--embed"),
+        vocab: get("--vocab"),
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
@@ -585,8 +587,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let _ = std::fs::remove_dir_all(a.out.join("scene"));
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
-    // 분할 모델이 낼 수 있는 이름 전체: 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
-    let _ = std::fs::write(a.out.join("vocab.json"), serde_json::to_string(&seg::COCO[..]).unwrap());
+    // 물체가 가질 수 있는 이름 전체(분할 모델의 이름 + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
+    let mut names: Vec<String> = seg::COCO.iter().map(|s| s.to_string()).collect();
+    if let Some(f) = &a.vocab {
+        names.extend(embed::load_vocab(f));
+        names.sort();
+        names.dedup();
+    }
+    let _ = std::fs::write(a.out.join("vocab.json"), serde_json::to_string(&names).unwrap());
     let mut last_pose = [0.0; 3];
     let t0 = Instant::now();
     // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
@@ -1843,6 +1851,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     embed::drain(); // 마지막 병합이 모든 물체의 사진 벡터를 보게
     write_view(&a.out, &grid, &mut mem, &mut room_tr, &traj, t_end, last_pose, &cam_json, &scene_json, true, usize::MAX);
+    if a.vocab.is_some() {
+        // 방금 기록이 맡긴 사진의 벡터가 끝난 뒤 그 이름을 view.json 에 넣음
+        embed::drain();
+        write_view(&a.out, &grid, &mut mem, &mut room_tr, &traj, t_end, last_pose, &cam_json, &scene_json, true, usize::MAX);
+    }
     if n_rebuild > 0 {
         prune_object_files(&a.out, &mem);
     }
@@ -2501,9 +2514,14 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
             }
             o.crop_saved = o.crop_ver;
         }
-        let mut e = json!({"id": o.id, "name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
+        // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
+        let look = embed::name(o.id);
+        let mut e = json!({"id": o.id, "name": look.as_ref().map_or(&o.name, |l| &l.0), "seg_name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
             "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": false,
             "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox, "n": o.n_pts}});
+        if let Some((_, p)) = &look {
+            e["name_p"] = json!((*p as f64 * 100.0).round() / 100.0);
+        }
         if o.crop.is_some() {
             e["rgbd"] = json!({"rgb": format!("{base}_rgb.png"), "mask": format!("{base}_mask.png"), "depth": format!("{base}_depth.png"), "v": o.crop_ver});
             if embed::on() {

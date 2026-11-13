@@ -38,8 +38,58 @@ pub fn get(id: u32) -> Option<Vec<f32>> {
     LATEST.lock().unwrap().as_ref()?.get(&id).cloned()
 }
 
+/// SigLIP2 base patch32-256: 로짓 = SCALE · 코사인 (체크포인트의 logit_scale = e^4.717)
+const SCALE: f32 = 111.83;
+/// 사진으로 붙인 이름을 쓰는 가장 낮은 몫. 사무실 녹화의 물체 33 개에서 0.3 이상은 사진과 맞았고(오리 0.46, 지우개 0.50, 스프레이 통 0.35)
+/// 그 아래는 틀린 이름이 섞였다(컵 → bedpan 0.27)
+pub const NAME_MIN: f32 = 0.3;
+
+/// 이름 목록과 그 글 벡터(`--vocab`): PC 에서 `sgview --encode-vocab` 로 한 번 만들어 둔 파일이라 글 인코더 없이 쓴다
+static VOCAB: std::sync::OnceLock<(Vec<String>, Vec<f32>)> = std::sync::OnceLock::new();
+/// 물체 번호 → 사진이 가장 닮은 이름과 그 몫
+static NAMES: std::sync::Mutex<Option<std::collections::HashMap<u32, (String, f32)>>> = std::sync::Mutex::new(None);
+
+/// 글 벡터 파일(첫 줄 `SGVOC 1 <n> <차원>`, 이름 n 줄, 이어서 f32 n·차원 개)을 읽어 둔다. 이름 목록을 돌려준다
+pub fn load_vocab(path: &str) -> Vec<String> {
+    let b = std::fs::read(path).unwrap_or_else(|e| panic!("--vocab {path}: {e}"));
+    let mut pos = 0;
+    let mut line = || {
+        let end = pos + b[pos..].iter().position(|c| *c == b'\n').unwrap_or_else(|| panic!("--vocab {path}: 글 벡터 파일이 아님"));
+        let s = std::str::from_utf8(&b[pos..end]).unwrap_or_else(|_| panic!("--vocab {path}: 글 벡터 파일이 아님")).to_string();
+        pos = end + 1;
+        s
+    };
+    let head = line();
+    let h: Vec<&str> = head.split(' ').collect();
+    assert!(h.len() == 4 && h[0] == "SGVOC" && h[1] == "1" && h[3].parse() == Ok(DIM), "--vocab {path}: 글 벡터 파일이 아님");
+    let n: usize = h[2].parse().unwrap_or_else(|_| panic!("--vocab {path}: 글 벡터 파일이 아님"));
+    let names: Vec<String> = (0..n).map(|_| line()).collect();
+    assert_eq!(b.len(), pos + n * DIM * 4, "--vocab {path}: 벡터 수가 이름 수와 다름");
+    let v: Vec<f32> = b[pos..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let _ = VOCAB.set((names.clone(), v));
+    names
+}
+
+/// 사진 벡터(길이 1)가 가장 닮은 이름과 그 몫: 이름 전체에 대한 softmax(SCALE · 코사인)
+fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)> {
+    let l: Vec<f32> = vecs.chunks(DIM).map(|t| SCALE * t.iter().zip(e).map(|(a, b)| a * b).sum::<f32>()).collect();
+    let (i, m) = l.iter().cloned().enumerate().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let z: f32 = l.iter().map(|x| (x - m).exp()).sum();
+    Some((names[i].clone(), 1.0 / z))
+}
+
+/// 그 물체의 사진으로 붙인 이름(몫 NAME_MIN 이상일 때만). `--vocab` 이 없거나 벡터 계산 전이면 None
+pub fn name(id: u32) -> Option<(String, f32)> {
+    NAMES.lock().unwrap().as_ref()?.get(&id).filter(|(_, p)| *p >= NAME_MIN).cloned()
+}
+
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {
+    if let Some((names, vecs)) = VOCAB.get() {
+        if let Some(n) = look_name(names, vecs, &v) {
+            NAMES.lock().unwrap().get_or_insert_with(Default::default).insert(id, n);
+        }
+    }
     LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
 }
 
@@ -255,6 +305,24 @@ mod tests {
         assert!((at(0, 10, 100) - 1.0).abs() < 1e-4 && (at(2, 10, 100) + 1.0).abs() < 1e-4);
         assert!((at(0, 245, 100) + 1.0).abs() < 1e-4 && (at(2, 245, 100) - 1.0).abs() < 1e-4);
         assert!(out.iter().all(|v| (-1.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn look_name_picks_the_closest_word() {
+        // 이름 셋이 축 0·1·2 를 가리키고, 사진은 축 1 쪽으로 조금 기움(글·사진 코사인은 실제 모델에서도 작다)
+        let names: Vec<String> = ["chair", "monitor", "cup"].iter().map(|s| s.to_string()).collect();
+        let mut vecs = vec![0.0; 3 * DIM];
+        for i in 0..3 {
+            vecs[i * DIM + i] = 1.0;
+        }
+        let mut e = vec![0.0; DIM];
+        (e[1], e[9]) = (0.1, 0.995);
+        let (n, p) = look_name(&names, &vecs, &e).unwrap();
+        assert_eq!(n, "monitor");
+        assert!(p > 0.99, "{p}");
+        // 어느 이름도 닮지 않은 사진: 몫이 셋으로 갈려 NAME_MIN 근처
+        e[1] = 0.0;
+        assert!((look_name(&names, &vecs, &e).unwrap().1 - 1.0 / 3.0).abs() < 1e-4);
     }
 
     #[test]

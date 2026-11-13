@@ -39,6 +39,8 @@ pub struct TextEnc {
     sess: Mutex<ort::session::Session>,
     tok: tokenizers::Tokenizer,
     cache: Mutex<HashMap<String, Arc<Vec<f32>>>>,
+    /// word vectors read from a file (`--vocab`): never dropped, never computed
+    known: std::sync::OnceLock<HashMap<String, Arc<Vec<f32>>>>,
 }
 
 #[cfg(feature = "search")]
@@ -54,12 +56,20 @@ impl TextEnc {
         let sess = ort::session::Session::builder(env).map_err(|e| e.to_string())?
             .with_intra_threads(4).map_err(|e| e.to_string())?
             .commit_from_file(&model).map_err(|e| format!("{}: {e}", model.display()))?;
-        Ok(TextEnc { sess: Mutex::new(sess), tok, cache: Mutex::new(HashMap::new()) })
+        Ok(TextEnc { sess: Mutex::new(sess), tok, cache: Mutex::new(HashMap::new()), known: std::sync::OnceLock::new() })
+    }
+
+    /// Hand over word vectors made ahead of time (`read_vocab`): those words are answered without running the model
+    pub fn know(&self, vocab: Vec<(String, Arc<Vec<f32>>)>) {
+        let _ = self.known.set(vocab.into_iter().map(|(n, v)| (n.trim().to_lowercase(), v)).collect());
     }
 
     /// Text → unit vector. SigLIP2 was trained on lower-cased text; results are kept (class names repeat on every query).
     pub fn encode(&self, text: &str) -> Result<Arc<Vec<f32>>, String> {
         let key = text.trim().to_lowercase();
+        if let Some(v) = self.known.get().and_then(|k| k.get(&key)) {
+            return Ok(v.clone());
+        }
         if let Some(v) = self.cache.lock().unwrap().get(&key) {
             return Ok(v.clone());
         }
@@ -84,6 +94,49 @@ impl TextEnc {
         c.insert(key, v.clone());
         Ok(v)
     }
+}
+
+/// Word vectors made ahead of time (`sgview --encode-vocab`, read by `--vocab` and by memmap `--vocab`):
+/// one text line `SGVOC 1 <n> <dim>`, n lines of names, then n · dim f32 (little endian, unit length)
+pub fn read_vocab(p: &Path) -> Result<Vec<(String, Arc<Vec<f32>>)>, String> {
+    let b = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let bad = || format!("{}: not a word vector file", p.display());
+    let mut pos = 0;
+    let mut line = || -> Option<&str> {
+        let end = pos + b[pos..].iter().position(|c| *c == b'\n')?;
+        let s = std::str::from_utf8(&b[pos..end]).ok()?;
+        pos = end + 1;
+        Some(s)
+    };
+    let head: Vec<&str> = line().ok_or_else(bad)?.split(' ').collect();
+    let (n, dim) = match head[..] {
+        ["SGVOC", "1", n, d] => (n.parse::<usize>().map_err(|_| bad())?, d.parse::<usize>().map_err(|_| bad())?),
+        _ => return Err(bad()),
+    };
+    let names: Vec<String> = (0..n).map(|_| line().map(str::to_string)).collect::<Option<_>>().ok_or_else(bad)?;
+    if dim != DIM || b.len() != pos + n * dim * 4 {
+        return Err(bad());
+    }
+    let f: Vec<f32> = b[pos..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    Ok(names.into_iter().zip(f.chunks(dim)).map(|(n, v)| (n, Arc::new(v.to_vec()))).collect())
+}
+
+/// `--encode-vocab <names.txt> <out>`: one name a line → word vector file (done once on a PC; the file is then used as it is)
+#[cfg(feature = "search")]
+pub fn encode_vocab(model: &Path, list: &Path, out: &Path) -> Result<usize, String> {
+    let enc = TextEnc::load(model)?;
+    let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
+    let names: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let mut b = format!("SGVOC 1 {} {DIM}\n", names.len()).into_bytes();
+    for n in &names {
+        b.extend(n.as_bytes());
+        b.push(b'\n');
+    }
+    for n in &names {
+        b.extend(enc.encode(n)?.iter().flat_map(|x| x.to_le_bytes()));
+    }
+    std::fs::write(out, b).map_err(|e| format!("{}: {e}", out.display()))?;
+    Ok(names.len())
 }
 
 /// Text → unit vector, or None when no encoder is loaded (then only the letters of the name are compared)
@@ -119,7 +172,7 @@ fn vocabulary(root: &Path, present: &[String]) -> Vec<String> {
 ///                      every stored name near 0
 ///           1 when the letters match (query inside the name or the name inside the query)
 ///   p_look  the query describes this object's picture better than any class name does:
-///           softmax over {query} ∪ vocabulary of SCALE · cos(text, picture)
+///           softmax over {query} ∪ vocabulary of SCALE · cos(text, picture); names the query was read as (p ≥ 0.2) are left out
 ///   score   1 − (1 − p_name)(1 − p_look);  by = "name" or "look", whichever is larger
 pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: usize, min: f32) -> serde_json::Value {
     let ql = q.trim().to_lowercase();
@@ -142,6 +195,8 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         }
         None => HashMap::new(),
     };
+    // names the query was read as say the same thing as the query: they do not compete with it for a picture
+    let same = |n: &str| n == ql || p_names.get(n).is_some_and(|p| *p >= 0.2);
     let mut hits: Vec<(f32, serde_json::Value)> = vec![];
     for (o, nl) in objs.iter().zip(&names) {
         if ql.is_empty() {
@@ -152,7 +207,7 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         let p_look = match (&tq, o["emb"].as_str().and_then(|p| read_emb(&root.join(p)))) {
             (Some(t), Some(e)) => {
                 let lq = SCALE * cos(t, &e);
-                let z = lse(std::iter::once(lq).chain(vocab.iter().filter(|(n, _)| *n != ql).map(|(_, v)| SCALE * cos(v, &e))));
+                let z = lse(std::iter::once(lq).chain(vocab.iter().filter(|(n, _)| !same(n)).map(|(_, v)| SCALE * cos(v, &e))));
                 (lq - z).exp()
             }
             _ => 0.0,
@@ -218,6 +273,21 @@ mod tests {
 
     fn ids(r: &serde_json::Value) -> Vec<(u64, String)> {
         r["results"].as_array().unwrap().iter().map(|h| (h["id"].as_u64().unwrap(), h["by"].as_str().unwrap().to_string())).collect()
+    }
+
+    #[test]
+    fn word_vector_file_round_trip() {
+        let p = std::env::temp_dir().join(format!("sgview_voc_{}", std::process::id()));
+        let mut b = format!("SGVOC 1 2 {DIM}\nchair\ncomputer monitor\n").into_bytes();
+        b.extend(axis(0, 1, 0.0).iter().chain(axis(2, 3, 0.5).iter()).flat_map(|x| x.to_le_bytes()));
+        std::fs::write(&p, &b).unwrap();
+        let v = read_vocab(&p).unwrap();
+        assert_eq!(v.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["chair", "computer monitor"]);
+        assert_eq!(*v[1].1, axis(2, 3, 0.5));
+        // a vector short
+        std::fs::write(&p, &b[..b.len() - 4]).unwrap();
+        assert!(read_vocab(&p).is_err());
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

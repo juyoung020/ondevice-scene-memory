@@ -980,3 +980,16 @@ TUM fr1 desk2 실시간 재생(`rtab_bridge --rate 1 --out - | memmap --stream -
 | 이후 | 1,224 | 699 MB | 7.85 초 | 39 |
 
 - 계속 움직이는 녹화에서는 거의 그대로다. 기준을 3 cm · 2° 로 넓히면 보관 645 개 · 다시 쌓기 3.9 초까지 줄지만 물체 구성이 달라져(36 → 33) 좁은 기준을 쓴다.
+
+## 물체 이름을 사진으로 붙이기 (2026-11-13)
+
+분할 모델(COCO 80 개 이름)은 모니터를 tv, 노트북을 tv, 오리 인형을 apple 로 부른다. 이름 1,221 개(LVIS 1,198 + COCO + ObjectSAM 라벨에 쓴 문 · 창 · 계단 · 선반 등)의 SigLIP2 글 벡터를 PC 에서 한 번 계산해 `vocab/names.voc`(3.7 MB)에 두고(43 초, 이름 하나 32 ms), memmap 이 물체 사진 벡터와 내적해 가장 닮은 이름을 붙인다(`--vocab`, softmax 몫 0.3 이상일 때만, 아니면 분할 모델의 이름).
+
+사무실 녹화(`office.mmf`, `--seg yolo26s-seg.onnx --embed vision_model.onnx --no-drop`, PC), 물체 33 개:
+
+- 이름이 바뀐 물체 9 개: tv → monitor · laptop computer, apple → duck, cell phone → eraser, cat → teddy bear, bottle → aerosol can, keyboard → computer keyboard(2), book → hardback book, knife → steak knife. 사진을 직접 본 오리 · 지우개 · 스프레이 통은 새 이름이 맞다.
+- 몫 0.3 아래는 틀린 이름이 섞여(컵 → bedpan 0.27) 분할 모델의 이름을 그대로 둔다.
+- 이름 목록 비교(물체마다 가장 닮은 이름): Objects365(378 개)는 monitor 86 % · keyboard 98 %, LVIS(1,198 개)는 monitor 93 % · computer keyboard 99 % 로 비슷하고, LVIS 가 더 잘게 부른다(steak knife, hardback book).
+- 검색(뷰어 `--vocab`): "모니터" → monitor 1.0(이전 tv 셋 모두 1.0), "노트북" → laptop computer 1.0(이전 tv 0.87), "오리" → duck 1.0(이전 apple 0.95), "지우개" → eraser 1.0(이전 cell phone 0.86), "스프레이" → aerosol can 1.0. "고양이" 는 결과 없음(이전에는 cat 으로 잘못 불린 곰 인형이 1.0).
+- 이름이 많아져 이름이 아닌 말도 가까운 이름을 찾는다: "화면" → cup 0.29, "마실 것" 은 alcohol 로 읽히고 결과는 cup 0.55 · bottle 0.45. 이름 일치 상수는 이름 80 개에 맞춘 값 그대로다.
+- 보드에서는 재지 않았다(NPU 사진 벡터는 기준과 코사인 0.93).

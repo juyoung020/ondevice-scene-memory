@@ -1011,6 +1011,7 @@ fn main() {
     let (mut port, mut bind) = (8080u16, "0.0.0.0".to_string());
     let mut ingest: Option<String> = None;
     let mut search_model: Option<String> = None;
+    let (mut vocab, mut encode_vocab): (Option<String>, Option<(String, String)>) = (None, None);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1018,13 +1019,31 @@ fn main() {
             "--bind" => bind = it.next().unwrap_or(bind),
             "--ingest" => ingest = it.next(),
             "--search-model" => search_model = it.next(),
+            "--vocab" => vocab = it.next(),
+            "--encode-vocab" => encode_vocab = it.next().zip(it.next()),
             _ => dir = Some(a),
+        }
+    }
+    // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
+    if let Some((list, out)) = &encode_vocab {
+        #[cfg(feature = "search")]
+        match search_model.as_deref().ok_or("--encode-vocab needs --search-model <dir>".to_string()).and_then(|m| search::encode_vocab(Path::new(m), Path::new(list), Path::new(out))) {
+            Ok(n) => return eprintln!("{n} names → {out}"),
+            Err(e) => {
+                eprintln!("encode-vocab: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "search"))]
+        {
+            eprintln!("encode-vocab {list} {out}: built without the search feature");
+            std::process::exit(1);
         }
     }
     let dir = match dir {
         Some(d) => PathBuf::from(d),
         None => {
-            eprintln!("usage: sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>]");
+            eprintln!("usage: sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <word vectors>]");
             std::process::exit(2);
         }
     };
@@ -1042,7 +1061,12 @@ fn main() {
         let st2 = st.clone();
         std::thread::spawn(move || match search::TextEnc::load(Path::new(&m)) {
             Ok(e) => {
-                // class names are asked on every query: encode them once now
+                // class names are asked on every query: take their vectors from the file, or encode them once now
+                match vocab.as_deref().map(|f| search::read_vocab(Path::new(f))) {
+                    Some(Ok(v)) => e.know(v),
+                    Some(Err(err)) => eprintln!("search: {err}"),
+                    None => {}
+                }
                 let names: Vec<String> = fs::read_to_string(st2.dir.join("vocab.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
                 for n in &names {
                     let _ = e.encode(n);

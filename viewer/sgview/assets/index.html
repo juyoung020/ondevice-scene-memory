@@ -1115,6 +1115,7 @@ function infoRows(o) {
   const room = (view.rooms || []).find(r => (r.objects || []).includes(o.id));
   const rows = [["state", `<b>${o.state}</b>${o.structural ? " (structural)" : ""}`], ["pos", f(o.pos)], ["first_pos", f(o.first_pos)], ["n_obs", o.n_obs],
     ["score", o.score.toFixed(3)], ["last seen", `${o.last_seen.toFixed(2)} s (now ${view.stamp.toFixed(2)})`], ["extent", f(o.extent)], ["room", room ? room.name : "-"]];
+  if (o.seg_name && o.seg_name !== o.name) rows.push(["seg name", `${o.seg_name} (look ${Math.round((o.name_p || 0) * 100)}%)`]);
   if (o.points) rows.push(["points", (o.points.n != null ? `${o.points.n} pts, ` : "") + `voxel ${o.points.voxel} m`]);
   return rows;
 }

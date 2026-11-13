@@ -1009,3 +1009,11 @@ TUM fr1 desk2 실시간 재생(`rtab_bridge --rate 1 --out - | memmap --stream -
 - 이름 없는 물체(object)는 몫이 낮아도 가장 닮은 이름을 쓴다. 몫 0.2 대는 대체로 맞고(chair 0.27 – 0.29, bottle 0.23, file cabinet 0.20), 0.1 아래는 틀린 이름이 많다(breechcloth 0.06, urinal 0.08).
 - 넓고 납작한 덩어리(112 × 163 × 5 cm 등 책상 위·바닥 면)가 물체로 남고, 여러 물건이 한 마스크에 든 사진은 몫이 낮다.
 - 최신 ObjectSAM(v21L, YOLOv8s-seg)과 보드 NPU 로는 재지 않았다.
+
+### 이름을 문장으로 바꿔 보기
+
+이름만 넣는 대신 "this is a photo of a {이름}." · "a photo of a {이름}" 으로 글 벡터를 만들어 같은 물체들(COCO 33 개, ObjectSAM 38 개)에 대 봤다.
+
+- 맞는 이름의 몫은 오른다: 책상 desk 0.28 → 0.64, 곰 인형 0.44 → 0.79, 의자 0.48 → 0.52 – 0.63.
+- 틀린 이름의 몫도 같이 오른다: 컵 → bedpan 0.27 → 0.60, 넓은 면 → teddy bear 0.33 → 0.62. 0.3 기준으로 거를 수 없게 된다.
+- 가장 닮은 이름 자체는 대부분 같다(monitor · chair · bucket · eraser · aerosol can). 이름만 넣는 방식을 그대로 둔다.

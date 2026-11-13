@@ -132,6 +132,16 @@ pub struct KfStore {
     pub moved: (f64, f64), // 다시 쌓기 전까지 가장 크게 움직인 노드(m, °)
 }
 
+/// 가만히 있는 동안 보관 간격(초)
+const STILL_GAP_S: f64 = 2.0;
+
+/// 두 위치가 1 cm · 1° 안인가
+fn still(a: &(M3, V3), b: &(M3, V3)) -> bool {
+    let d = [a.1[0] - b.1[0], a.1[1] - b.1[1], a.1[2] - b.1[2]];
+    let tr: f64 = (0..3).map(|i| (0..3).map(|j| a.0[i][j] * b.0[i][j]).sum::<f64>()).sum(); // tr(Raᵀ·Rb)
+    d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 0.01 * 0.01 && (tr - 1.0) / 2.0 > 1f64.to_radians().cos()
+}
+
 fn inv_mul(a: &(M3, V3), b: &(M3, V3)) -> (M3, V3) {
     let rt = [[a.0[0][0], a.0[1][0], a.0[2][0]], [a.0[0][1], a.0[1][1], a.0[2][1]], [a.0[0][2], a.0[1][2], a.0[2][2]]];
     (mm(&rt, &b.0), mv(&rt, &sub(&b.1, &a.1)))
@@ -217,6 +227,13 @@ impl KfStore {
             Some(n) => (anchor, inv_mul(n, &(r, p))),
             None => (0, (r, p)),
         };
+        // 카메라를 가만히 두면 거의 같은 장면이 계속 쌓인다(8 분에 3,679 장 → 다시 쌓기 23 초).
+        // 마지막으로 보관한 장면과 같은 기준 노드에서 1 cm · 1° 안이면 2 초에 한 장만 보관한다(그 자리에서 바뀐 것은 2 초 간격으로 남음)
+        if let Some(last) = self.kfs.last() {
+            if last.anchor == anchor && last.sparse == sparse && (t - last.t).abs() < STILL_GAP_S && still(&last.rel, &rel) {
+                return None;
+            }
+        }
         let (rgb_z, depth_z, crops) = if sparse {
             let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
             let q: Vec<u16> = (0..qw * qh).map(|i| mm16(depth[(i / qw) * Q * w + (i % qw) * Q])).collect();
@@ -447,6 +464,23 @@ mod tests {
     }
 
     #[test]
+    fn still_camera_keeps_one_per_gap() {
+        // 가만히 30 장/초로 10 초: 2 초에 한 장만 남는다. 1 cm 넘게 움직이거나 1° 넘게 돌면 바로 보관
+        let (w, h) = (16, 12);
+        let (rgb, d) = (vec![0u8; w * h * 3], vec![1.0f32; w * h]);
+        let mut st = KfStore::new(100);
+        for i in 0..300 {
+            st.push(i as f64 / 30.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &rgb, &d, &None, true);
+        }
+        assert_eq!(st.kfs().len(), 5);
+        let n = st.kfs().len();
+        st.push(10.01, 0, rz(0.0), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &d, &None, true);
+        st.push(10.02, 0, rz(3f64.to_radians()), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &d, &None, true);
+        st.push(10.03, 0, rz(3f64.to_radians()), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &d, &None, true);
+        assert_eq!(st.kfs().len(), n + 2);
+    }
+
+    #[test]
     fn budget_thins() {
         let mut st = KfStore::new(1); // 1 MB
         // 압축이 안 되는 값(의사 난수)
@@ -455,7 +489,7 @@ mod tests {
         let rgb: Vec<u8> = (0..320 * 300 * 3).map(|_| rnd()).collect();
         let d: Vec<f32> = (0..320 * 300).map(|_| rnd() as f32 * 0.1).collect();
         for i in 0..10 {
-            st.push(i as f64, 0, rz(0.0), [0.0; 3], 1.0, 320, 300, &rgb, &d, &None, false);
+            st.push(i as f64, 0, rz(0.0), [i as f64 * 0.1, 0.0, 0.0], 1.0, 320, 300, &rgb, &d, &None, false);
         }
         assert!(st.bytes <= 1 << 20);
         assert!(st.stride > 1);

@@ -9,6 +9,9 @@
 ### Added
 - 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
 
+### Changed
+- 카메라를 가만히 두는 동안(1 cm · 1° 안)은 다시 쌓기용 장면을 2 초에 한 장만 보관한다.
+
 ## [0.8.0] - 2026-11-13
 
 ### Added

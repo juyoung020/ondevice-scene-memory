@@ -80,6 +80,7 @@ struct Args {
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
     vocab: Option<String>,  // --vocab <글 벡터 파일>: 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(--embed 와 함께, 파일은 sgview --encode-vocab 이 만듦)
+    seg_names: Option<String>, // --seg-names <이름,이름,…>: 분할 모델의 클래스 이름(기본 COCO 80 개). 물체만 자르는 1 클래스 모델은 object
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -92,6 +93,7 @@ fn args() -> Args {
         seg: get("--seg").unwrap_or("models/yolo26s-seg.onnx".into()),
         embed: get("--embed"),
         vocab: get("--vocab"),
+        seg_names: get("--seg-names"),
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
@@ -588,7 +590,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let _ = std::fs::remove_dir_all(a.out.join("scene"));
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
     // 물체가 가질 수 있는 이름 전체(분할 모델의 이름 + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
-    let mut names: Vec<String> = seg::COCO.iter().map(|s| s.to_string()).collect();
+    let mut names: Vec<String> = seg::names();
     if let Some(f) = &a.vocab {
         names.extend(embed::load_vocab(f));
         names.sort();
@@ -2390,7 +2392,7 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
         mem.n_seg += 1;
     }
     for d in dets.iter().flatten().filter(|_| map_ok) {
-        let name = seg::COCO.get(d.cls).copied().unwrap_or("object");
+        let name = seg::name(d.cls);
         if name == "person" {
             continue;
         }
@@ -2533,7 +2535,9 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
     let (grid_j, rooms, doors, edges) = match &gi {
         Some(g) => {
             out::pgm(&dir.join("map.pgm"), g.w, g.h, &g.px);
-            let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", o.name.as_str())).collect();
+            // 방 이름의 근거가 되는 물체 이름: 사진으로 붙인 이름이 있으면 그것
+            let shown: Vec<String> = mem.objs.iter().map(|o| embed::name(o.id).map_or_else(|| o.name.clone(), |l| l.0)).collect();
+            let ol: Vec<_> = mem.objs.iter().zip(&shown).map(|(o, n)| (o.id, o.pos, o.extent, o.state == "gone", n.as_str())).collect();
             let (rj, dj, ej) = graph::build(room_tr, g, grid.res, &ol);
             (json!({"width": g.w, "height": g.h, "resolution": grid.res, "origin": [g.x0 as f64 * grid.res, g.y0 as f64 * grid.res]}), rj, dj, ej)
         }
@@ -2664,6 +2668,9 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args();
+    if let Some(n) = &a.seg_names {
+        seg::set_names(n);
+    }
     if let Some(m) = &a.embed {
         embed::start(m);
     }

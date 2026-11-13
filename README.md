@@ -108,6 +108,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | `--seg <모델>` / `--conf 0.35` | 물체 분할 모델 / 물체로 인정할 확신도 |
 | `--embed <vision_model.onnx>` | 물체 사진마다 검색용 벡터를 남김(뷰어 검색, 물체 병합에 씀) |
 | `--vocab <글 벡터 파일>` | 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(`--embed` 와 함께, `vocab/names.voc`) |
+| `--seg-names <이름,…>` | 분할 모델의 클래스 이름(기본 COCO 80 개). 물체만 자르는 1 클래스 모델(ObjectSAM)은 `object` |
 | `--max-depth` | 지도에 넣을 최대 거리(m) |
 | `--every N` | 받은 장면 N장마다 처리 |
 | `--live 1` / `--loop` | 실제 속도로 재생하며 뷰어에 계속 갱신 / 끝나면 반복 |

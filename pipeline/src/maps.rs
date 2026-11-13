@@ -386,7 +386,12 @@ impl Memory {
             }
             let ov = keys.iter().filter(|k| o.support.contains_key(k)).count() as f64 / keys.len().max(1) as f64;
             let e = [0, 1, 2].map(|k| o.extent[k].max(ext[k]));
-            let gate = (0.6 * crate::geom::norm(&e)).max(0.5);
+            // 이름이 하나뿐인 분할 모델(object)은 이름으로 옆 물체를 가를 수 없다: 중심 문턱을 둘 중 작은 쪽 크기의 절반으로 좁힌다
+            let gate = if name == "object" {
+                0.5 * crate::geom::norm(&[0, 1, 2].map(|k| o.extent[k].min(ext[k])))
+            } else {
+                (0.6 * crate::geom::norm(&e)).max(0.5)
+            };
             // 딥러닝 깊이는 거리(시선 방향)가 주로 틀린다: 옆 방향은 같은 문턱, 시선 방향은 거리의 25 % 까지 더 허용
             let along_ok = cam.is_some_and(|cp| {
                 let ray = crate::geom::sub(c, cp);

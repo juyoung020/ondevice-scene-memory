@@ -22,6 +22,27 @@ pub struct Det {
 }
 
 /// 분할 모델 입력 한 변
+/// 분할 모델이 내는 이름(`--seg-names`). 정하지 않으면 COCO 80 개
+static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// 클래스 이름 목록을 바꾼다: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `object`
+pub fn set_names(list: &str) {
+    let _ = NAMES.set(list.split(',').map(|s| s.trim().to_string()).collect());
+}
+
+/// 분할 모델이 낼 수 있는 이름 전체
+pub fn names() -> Vec<String> {
+    NAMES.get().cloned().unwrap_or_else(|| COCO.iter().map(|s| s.to_string()).collect())
+}
+
+/// 클래스 번호의 이름(목록 밖이면 object)
+pub fn name(cls: usize) -> &'static str {
+    match NAMES.get() {
+        Some(n) => n.get(cls).map_or("object", |s| s.as_str()),
+        None => COCO.get(cls).copied().unwrap_or("object"),
+    }
+}
+
 pub const SEG_S: usize = 640;
 
 /// 레터박스 자리: 배율 r, 여백 (px, py)

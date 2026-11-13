@@ -993,3 +993,18 @@ TUM fr1 desk2 실시간 재생(`rtab_bridge --rate 1 --out - | memmap --stream -
 - 검색(뷰어 `--vocab`): "모니터" → monitor 1.0(이전 tv 셋 모두 1.0), "노트북" → laptop computer 1.0(이전 tv 0.87), "오리" → duck 1.0(이전 apple 0.95), "지우개" → eraser 1.0(이전 cell phone 0.86), "스프레이" → aerosol can 1.0. "고양이" 는 결과 없음(이전에는 cat 으로 잘못 불린 곰 인형이 1.0).
 - 이름이 많아져 이름이 아닌 말도 가까운 이름을 찾는다: "화면" → cup 0.29, "마실 것" 은 alcohol 로 읽히고 결과는 cup 0.55 · bottle 0.45. 이름 일치 상수는 이름 80 개에 맞춘 값 그대로다.
 - 보드에서는 재지 않았다(NPU 사진 벡터는 기준과 코사인 0.93).
+
+### 이름 없는 분할 모델(ObjectSAM v1.0)로 바꿔 보기
+
+같은 녹화를 ObjectSAM v1.0(YOLO26n-seg 1 클래스, 416 으로 학습한 가중치를 640 입력 ONNX 로 내보냄)으로 돌렸다: `--seg ObjectSAM-416_640.onnx --seg-names object --vocab vocab/names.voc`. 출력 모양이 YOLO26s-seg 와 같아 해독은 그대로다.
+
+| | COCO YOLO26s-seg | ObjectSAM v1.0 |
+|---|---|---|
+| 분할 추론(PC CPU, 장면마다) | 73 – 131 ms | 42 – 43 ms |
+| 물체 | 33 | 38 |
+| 사진으로 이름이 붙은 물체(몫 0.3 이상) | 9 (나머지는 분할 모델 이름) | 11 (나머지 27 개는 object) |
+
+- 이름이 object 하나라 "같은 이름이고 중심이 0.5 m 안이면 같은 물체" 규칙이 옆 물체를 모두 합쳤다(물체 11 개). object 일 때는 중심 문턱을 둘 중 작은 쪽 크기의 절반으로 좁혀 38 개가 됐다.
+- COCO 에 없는 물체가 잡힌다: bucket 0.70, plastic bag 0.44, pegboard 0.42. monitor 0.83 · 0.64, laptop computer 0.49 도 붙는다.
+- 넓고 납작한 덩어리(112 × 163 × 5 cm 등 책상 위·바닥 면)가 물체로 남고, 여러 물건이 한 마스크에 든 사진은 어느 이름도 0.3 을 넘지 못한다.
+- 최신 ObjectSAM(v21L, YOLOv8s-seg)과 보드 NPU 로는 재지 않았다.

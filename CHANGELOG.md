@@ -6,6 +6,9 @@
 
 ## [Unreleased]
 
+### Added
+- 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
+
 ## [0.8.0] - 2026-11-13
 
 ### Added

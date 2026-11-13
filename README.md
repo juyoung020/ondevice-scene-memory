@@ -123,3 +123,9 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 - **시연할 때:** `Follow the handheld camera (behind)`를 켜면 시점이 손카메라 뒤에서 따라갑니다(마우스로 돌리면 꺼짐).
 
 설명 문서: 연결·루프 클로저·다시 쌓기는 [docs/bridge.md](docs/bridge.md), 뷰어 세부는 [viewer/sgview/README.md](viewer/sgview/README.md).
+
+## 라이선스
+
+[PolyForm Noncommercial License 1.0.0](LICENSE.md) — 개인 공부·연구·교육·비영리 목적으로는 자유롭게 쓰고 고치고 나눌 수 있고, **상업적 이용은 허용하지 않습니다.** 나눌 때는 `LICENSE.md` 의 저작권 표시(Required Notice)를 함께 전합니다.
+
+저장소에 함께 든 외부 코드(three.js, OrbitControls, lodepng)와 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다.

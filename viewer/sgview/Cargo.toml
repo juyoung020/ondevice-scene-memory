@@ -1,6 +1,6 @@
 [package]
 name = "sgview"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Native scene-graph viewer server (Rust, no Python / Spark-DSG): serves view.json + map + object files and the three.js page; walls via scenemap C++."
 

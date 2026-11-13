@@ -78,7 +78,7 @@ struct Args {
     stream: Option<String>, // --stream <파일|->: 연결 프로그램(bridge/)이 보내는 장면 스트림(위치·컬러·깊이)
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
-    embed: Option<String>,  // --embed <vision_model.onnx>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
+    embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -2619,6 +2619,12 @@ fn limit_malloc_arenas() {
 
 fn main() {
     limit_malloc_arenas();
+    // 사진 벡터 확인: memmap --embed-check <모델> <사진 폴더> <벡터 파일>
+    let v: Vec<String> = std::env::args().collect();
+    if let Some(i) = v.iter().position(|x| x == "--embed-check") {
+        let g = |k: usize| v.get(i + k).unwrap_or_else(|| panic!("--embed-check <모델> <사진 폴더> <벡터 파일>")).as_str();
+        return embed::check(g(1), g(2), g(3));
+    }
     let a = args();
     if let Some(m) = &a.embed {
         embed::start(m);

@@ -88,6 +88,9 @@ rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file
 sgview data/memory/live --port 8091 --bind 0.0.0.0
 ```
 
+- **아무 말로 찾기(보드):** memmap 에 `--embed <SigLIP2 영상 인코더>.dxnn`(NPU), 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
+- **움직일 때 번지면:** `rtab_bridge --exposure 8 --gain 110` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
+
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.
 - **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'memmap --'`.
 

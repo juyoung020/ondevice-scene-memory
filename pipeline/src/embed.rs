@@ -1,4 +1,4 @@
-//! 물체 사진 → 검색용 벡터. SigLIP2 영상 인코더(vision_model.onnx)가 사진 한 장을 768 차원 벡터로 바꾸고,
+//! 물체 사진 → 검색용 벡터. SigLIP2 영상 인코더(PC: vision_model.onnx, 보드 NPU: .dxnn)가 사진 한 장을 768 차원 벡터로 바꾸고,
 //! 길이를 1 로 맞춰 `objects/O<id>_emb.bin`(f32 리틀 엔디언 768 개)에 남긴다. 뷰어의 검색이 글 벡터와 내적해 닮은 물체를 찾는다.
 //! 지도 쌓기와 따로 도는 스레드 하나가 맡는다: 사진이 바뀐 물체만 받아, 밀리면 물체마다 가장 새 사진만 계산한다.
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ pub fn get(id: u32) -> Option<Vec<f32>> {
     LATEST.lock().unwrap().as_ref()?.get(&id).cloned()
 }
 
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {
     LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
 }
@@ -48,7 +48,7 @@ pub fn rel_path(id: u32) -> String {
     format!("objects/O{id}_emb.bin")
 }
 
-#[cfg(feature = "onnx")]
+#[cfg(any(feature = "onnx", feature = "dxrt"))]
 mod worker {
     use super::*;
     use std::collections::HashMap;
@@ -66,10 +66,55 @@ mod worker {
     /// 맡겼지만 아직 끝나지 않은 사진 수
     static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    /// 인코더 실행기: 입력 NCHW f32(−1..1) 256×256 → 768 차원
+    enum Net {
+        #[cfg(feature = "onnx")]
+        Onnx(ort::session::Session),
+        /// DX-M1: 입력·출력 모두 f32 (패치 나누기와 끝 MLP 는 런타임이 CPU 로 돌림)
+        #[cfg(feature = "dxrt")]
+        Dx(crate::seg::dx::Engine),
+    }
+    impl Net {
+        fn open(model: &str) -> Net {
+            #[cfg(feature = "dxrt")]
+            if model.ends_with(".dxnn") {
+                let e = crate::seg::dx::Engine::with_cpu_tasks(model);
+                assert_eq!(e.out.len(), DIM * 4, "embed model output");
+                eprintln!("embed: NPU 모델 {model}, 출력 {}", e.tensors[0].0);
+                return Net::Dx(e);
+            }
+            #[cfg(feature = "onnx")]
+            {
+                // 지도 쌓기·분할과 코어를 다투지 않게 스레드 둘만
+                let sess = ort::session::Session::builder(crate::seg::ort_env()).unwrap().with_intra_threads(2).unwrap()
+                    .commit_from_file(model).unwrap_or_else(|e| panic!("embed model {model}: {e}"));
+                Net::Onnx(sess)
+            }
+            #[cfg(not(feature = "onnx"))]
+            panic!("--embed {model}: 이 빌드는 NPU 모델(.dxnn)을 받는다");
+        }
+        fn run(&mut self, buf: &[f32]) -> Vec<f32> {
+            match self {
+                #[cfg(feature = "onnx")]
+                Net::Onnx(sess) => {
+                    let inp = ort::value::TensorRef::from_array_view(([1usize, 3, SIZE, SIZE], buf)).unwrap();
+                    let out = sess.run(ort::inputs![inp]).expect("embed run");
+                    let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().unwrap();
+                    assert_eq!(v.len(), DIM, "embed model output");
+                    v.to_vec()
+                }
+                #[cfg(feature = "dxrt")]
+                Net::Dx(e) => {
+                    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
+                    e.run(bytes);
+                    e.f32_at(0).to_vec()
+                }
+            }
+        }
+    }
+
     pub fn start(model: &str) {
-        // 지도 쌓기·분할과 코어를 다투지 않게 스레드 둘만
-        let mut sess = ort::session::Session::builder(crate::seg::ort_env()).unwrap().with_intra_threads(2).unwrap()
-            .commit_from_file(model).unwrap_or_else(|e| panic!("embed model {model}: {e}"));
+        let mut net = Net::open(model);
         let (tx, rx) = mpsc::channel::<Job>();
         let th = std::thread::Builder::new().name("embed".into()).spawn(move || {
             let (mut buf, mut n, mut ms) = (Vec::new(), 0u32, 0.0f64);
@@ -85,11 +130,7 @@ mod worker {
                 for j in jobs.into_values() {
                     let t = std::time::Instant::now();
                     preprocess(&j.rgb, j.w, j.h, &mut buf);
-                    let inp = ort::value::TensorRef::from_array_view(([1usize, 3, SIZE, SIZE], &buf[..])).unwrap();
-                    let out = sess.run(ort::inputs![inp]).expect("embed run");
-                    let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().unwrap();
-                    assert_eq!(v.len(), DIM, "embed model output");
-                    let mut v = v.to_vec();
+                    let mut v = net.run(&buf);
                     normalize(&mut v);
                     let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
                     // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
@@ -110,6 +151,42 @@ mod worker {
 
     pub fn on() -> bool {
         W.lock().unwrap().is_some()
+    }
+
+    /// 폴더의 사진(png·jpg, 이름 순)을 벡터로 바꿔 `vec_file` 에 쓴다. 파일이 이미 있으면 그 벡터와 코사인을 견준다
+    /// (PC 의 ONNX 벡터를 기준으로 보드 NPU 벡터를 확인): `memmap --embed-check <모델> <사진 폴더> <벡터 파일>`
+    pub fn check(model: &str, dir: &str, vec_file: &str) {
+        let mut net = Net::open(model);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir}: {e}")).filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("png" | "jpg" | "jpeg"))).collect();
+        files.sort();
+        let (mut buf, mut all, mut ms) = (Vec::new(), Vec::<f32>::new(), 0.0f64);
+        for (i, f) in files.iter().enumerate() {
+            let img = image::open(f).unwrap_or_else(|e| panic!("{}: {e}", f.display())).to_rgb8();
+            preprocess(img.as_raw(), img.width(), img.height(), &mut buf);
+            let t = std::time::Instant::now();
+            let mut v = net.run(&buf);
+            if i > 0 {
+                ms += t.elapsed().as_secs_f64() * 1e3; // 첫 장은 모델 올리는 시간이 섞여 뺌
+            }
+            normalize(&mut v);
+            all.extend(v);
+        }
+        println!("embed check: 사진 {} 장, 추론 {:.1} ms/장", files.len(), ms / (files.len().max(2) - 1) as f64);
+        match std::fs::read(vec_file) {
+            Ok(b) => {
+                let r: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                assert_eq!(r.len(), all.len(), "{vec_file}: 사진 수가 다름");
+                let cos: Vec<f32> = all.chunks(DIM).zip(r.chunks(DIM)).map(|(x, y)| x.iter().zip(y).map(|(p, q)| p * q).sum()).collect();
+                let mean = cos.iter().sum::<f32>() / cos.len().max(1) as f32;
+                println!("기준 벡터와의 코사인: 평균 {mean:.4}, 최소 {:.4}", cos.iter().cloned().fold(f32::INFINITY, f32::min));
+            }
+            Err(_) => {
+                let bytes: Vec<u8> = all.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(vec_file, bytes).unwrap_or_else(|e| panic!("{vec_file}: {e}"));
+                println!("기준 벡터를 {vec_file} 에 씀");
+            }
+        }
     }
 
     pub fn submit(dir: &Path, id: u32, w: u32, h: u32, rgb: &[u8]) {
@@ -134,23 +211,27 @@ mod worker {
     }
 }
 
-/// 인코더를 올리고 계산 스레드를 띄운다(`--embed <vision_model.onnx>`)
-#[cfg(feature = "onnx")]
-pub use worker::{drain, finish, on, start, submit};
+/// 인코더를 올리고 계산 스레드를 띄운다(`--embed <vision_model.onnx | .dxnn>`)
+#[cfg(any(feature = "onnx", feature = "dxrt"))]
+pub use worker::{check, drain, finish, on, start, submit};
 
-#[cfg(not(feature = "onnx"))]
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn start(_model: &str) {
-    panic!("--embed: 이 빌드에는 ONNX 실행기가 없다(onnx 기능으로 빌드)");
+    panic!("--embed: 이 빌드에는 모델 실행기가 없다(onnx 또는 dxrt 기능으로 빌드)");
 }
-#[cfg(not(feature = "onnx"))]
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
+pub fn check(model: &str, _dir: &str, _vec_file: &str) {
+    start(model);
+}
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn on() -> bool {
     false
 }
-#[cfg(not(feature = "onnx"))]
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn submit(_dir: &Path, _id: u32, _w: u32, _h: u32, _rgb: &[u8]) {}
-#[cfg(not(feature = "onnx"))]
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn finish() {}
-#[cfg(not(feature = "onnx"))]
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn drain() {}
 
 #[cfg(test)]

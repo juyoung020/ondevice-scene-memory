@@ -71,7 +71,7 @@ static void write_tum(std::ostream& o, double t, const Transform& T) {
 
 static void usage() {
     std::fprintf(stderr,
-                 "rtab_bridge (--tum <폴더> [--rate R] | --realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30])\n"
+                 "rtab_bridge (--tum <폴더> [--rate R] | --realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n"
                  "            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n"
                  "            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--db <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--Group/Name 값 ...]\n");
 }
@@ -81,7 +81,8 @@ static int run(int argc, char** argv) {
     bool realsense = false;
     double reloc_wait = 1.0;  // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도
     int block = -1;  // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
-    double rate = 0;
+    double rate = 0, exposure_ms = 0;
+    int gain = -1;
     int send_every = 1, queue = 4, w = 640, h = 480, fps = 30;
     long max_frames = -1;
     ParametersMap overrides;
@@ -99,6 +100,8 @@ static int run(int argc, char** argv) {
         else if (a == "--rate") rate = std::stod(val());
         else if (a == "--align") align = val();
         else if (a == "--serial") serial = val();
+        else if (a == "--exposure") exposure_ms = std::stod(val());
+        else if (a == "--gain") gain = std::stoi(val());
         else if (a == "--size") {
             std::string s = val();
             std::sscanf(s.c_str(), "%dx%d", &w, &h);
@@ -152,7 +155,7 @@ static int run(int argc, char** argv) {
         src = std::make_unique<TumSource>(tum, rate);
     } else {
 #ifdef BRIDGE_HAVE_REALSENSE
-        src = std::make_unique<RealSenseSource>(w, h, fps, align, serial);
+        src = std::make_unique<RealSenseSource>(w, h, fps, align, serial, exposure_ms, gain);
 #else
         std::fprintf(stderr, "이 빌드에는 RealSense 입력이 없다(librealsense2 를 찾지 못함)\n");
         return 2;

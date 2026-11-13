@@ -9,7 +9,7 @@
 class RealSenseSource : public FrameSource {
 public:
     // serial: 빈 문자열이면 처음 찾은 카메라
-    RealSenseSource(int w, int h, int fps, const std::string& aligner, const std::string& serial);
+    RealSenseSource(int w, int h, int fps, const std::string& aligner, const std::string& serial, double exposure_ms = 0, int gain = -1);
     ~RealSenseSource() override;
     bool next(RgbdFrame& f) override;
     double last_read_ms() const override { return read_ms_; }

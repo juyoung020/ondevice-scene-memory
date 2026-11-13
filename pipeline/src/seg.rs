@@ -575,7 +575,14 @@ pub mod dx {
     }
     impl Engine {
         pub fn new(path: &str) -> Engine {
-            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option: 0, use_ort: -1, reserved: [0; 6] };
+            Engine::open(path, -1)
+        }
+        /// 모델 안의 CPU 부분까지 런타임이 돌리게 연다(ONNX Runtime). 입력·출력이 모델 원래의 것(f32)이 된다
+        pub fn with_cpu_tasks(path: &str) -> Engine {
+            Engine::open(path, 1)
+        }
+        fn open(path: &str, use_ort: c_int) -> Engine {
+            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option: 0, use_ort, reserved: [0; 6] };
             let mut e = std::ptr::null_mut();
             let p = CString::new(path).unwrap();
             unsafe {

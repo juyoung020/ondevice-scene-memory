@@ -56,6 +56,7 @@ baseball base
 baseball bat
 baseball cap
 baseball glove
+baseboard
 basket
 basketball
 basketball backboard
@@ -211,6 +212,7 @@ cat
 cauliflower
 cayenne
 cd player
+ceiling
 celery
 cell phone
 cellular telephone
@@ -444,6 +446,7 @@ flashlight
 fleece
 flip-flop
 flipper
+floor
 flower arrangement
 flowerpot
 flute glass
@@ -1167,6 +1170,7 @@ wagon
 wagon wheel
 walking cane
 walking stick
+wall
 wall clock
 wall socket
 wallet

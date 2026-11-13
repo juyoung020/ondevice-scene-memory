@@ -43,6 +43,12 @@ const SCALE: f32 = 111.83;
 /// 사진으로 붙인 이름을 쓰는 가장 낮은 몫. 사무실 녹화의 물체 33 개에서 0.3 이상은 사진과 맞았고(오리 0.46, 지우개 0.50, 스프레이 통 0.35)
 /// 그 아래는 틀린 이름이 섞였다(컵 → bedpan 0.27)
 pub const NAME_MIN: f32 = 0.3;
+/// 이름 없는 물체(object)에 사진 이름을 쓰는 가장 낮은 몫. ObjectSAM v1.0 으로 돌린 사무실 녹화에서 0.15 아래는 대부분 틀렸다
+/// (breechcloth 0.06, ping-pong ball 0.08, vending machine 0.10), 0.2 대는 맞았다(chair 0.27, bottle 0.23, file cabinet 0.20)
+pub const NAME_MIN_UNNAMED: f32 = 0.15;
+
+/// 물체가 아닌 면의 이름(이름 목록에 함께 넣어 둠)
+pub const STRUCTURAL: [&str; 4] = ["floor", "wall", "ceiling", "baseboard"];
 
 /// 이름 목록과 그 글 벡터(`--vocab`): PC 에서 `sgview --encode-vocab` 로 한 번 만들어 둔 파일이라 글 인코더 없이 쓴다
 static VOCAB: std::sync::OnceLock<(Vec<String>, Vec<f32>)> = std::sync::OnceLock::new();
@@ -79,9 +85,9 @@ fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)>
 }
 
 /// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,
-/// 이름 없는 물체(object)는 몫이 낮아도 가장 닮은 이름을 쓴다. `--vocab` 이 없거나 벡터 계산 전이면 None
+/// 이름 없는 물체(object)는 몫 NAME_MIN_UNNAMED 이상이면 가장 닮은 이름을 쓴다. `--vocab` 이 없거나 벡터 계산 전이면 None
 pub fn name(id: u32, sure: bool) -> Option<(String, f32)> {
-    NAMES.lock().unwrap().as_ref()?.get(&id).filter(|(_, p)| !sure || *p >= NAME_MIN).cloned()
+    NAMES.lock().unwrap().as_ref()?.get(&id).filter(|(_, p)| *p >= if sure { NAME_MIN } else { NAME_MIN_UNNAMED }).cloned()
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {

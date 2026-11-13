@@ -1006,7 +1006,7 @@ TUM fr1 desk2 실시간 재생(`rtab_bridge --rate 1 --out - | memmap --stream -
 
 - 이름이 object 하나라 "같은 이름이고 중심이 0.5 m 안이면 같은 물체" 규칙이 옆 물체를 모두 합쳤다(물체 11 개). object 일 때는 중심 문턱을 둘 중 작은 쪽 크기의 절반으로 좁혀 38 개가 됐다.
 - COCO 에 없는 물체가 잡힌다: bucket 0.70, plastic bag 0.44, pegboard 0.42. monitor 0.83 · 0.64, laptop computer 0.49 도 붙는다.
-- 이름 없는 물체(object)는 몫이 낮아도 가장 닮은 이름을 쓴다. 몫 0.2 대는 대체로 맞고(chair 0.27 – 0.29, bottle 0.23, file cabinet 0.20), 0.1 아래는 틀린 이름이 많다(breechcloth 0.06, urinal 0.08).
+- 이름 없는 물체(object)는 몫 0.15 이상이면 가장 닮은 이름을 쓴다(38 개 중 23 개, 구조물 4 개 포함). 몫 0.2 대는 대체로 맞고(chair 0.27 – 0.29, bottle 0.23, file cabinet 0.20), 0.1 아래는 틀린 이름이 많다(breechcloth 0.06, urinal 0.08).
 - 넓고 납작한 덩어리(112 × 163 × 5 cm 등 책상 위·바닥 면)가 물체로 남고, 여러 물건이 한 마스크에 든 사진은 몫이 낮다.
 - 최신 ObjectSAM(v21L, YOLOv8s-seg)과 보드 NPU 로는 재지 않았다.
 
@@ -1026,3 +1026,7 @@ LVIS 동의어 전부 · Open Images 600 · BEHAVIOR-1K 범주 · object-memory-
 - 더 맞게 바뀐 것: swivel chair, wastebin, 넓은 면이 floor · baseboard 로 불림.
 - 새로 틀리는 것: 컵 → mortar 0.78, 칸막이 → candy dispenser shelf 0.43, 봉지 → bag of starch 0.46, 병 → bottle of lime juice. BEHAVIOR 의 "bottle of …" · "bag of …" 같은 이름이 끌어간다.
 - 1,221 개 목록을 그대로 둔다. 목록을 늘리려면 같은 뜻의 이름끼리 몫을 합치는 묶음(동의어 표)이 먼저 있어야 한다.
+
+### 구조물 면 빼기 (ObjectSAM v1.0)
+
+이름 목록에 floor · wall · ceiling · baseboard 를 넣고(1,225 개), 이름 없는 물체의 사진 이름이 이 넷이면 구조물로 표시한다(뷰어의 물체 수·이름표에서 빠짐). 같은 녹화에서 4 개가 구조물이 됐다(floor 0.35 · 0.15, baseboard 0.32 · 0.29; 112 × 163 × 5 cm 바닥 면 포함). 113 × 178 × 6 cm 면 하나는 teddy bear 0.33 으로 남는다.

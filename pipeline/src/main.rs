@@ -2518,8 +2518,10 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");
+        // 이름 없는 분할 모델이 자른 벽·바닥·천장 면: 사진 이름이 구조물이면 구조물로 표시(뷰어가 따로 끄고 켬)
+        let structural = o.name == "object" && look.as_ref().is_some_and(|l| embed::STRUCTURAL.contains(&l.0.as_str()));
         let mut e = json!({"id": o.id, "name": look.as_ref().map_or(&o.name, |l| &l.0), "seg_name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
-            "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": false,
+            "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": structural,
             "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox, "n": o.n_pts}});
         if let Some((_, p)) = &look {
             e["name_p"] = json!((*p as f64 * 100.0).round() / 100.0);

@@ -73,7 +73,7 @@ viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.
 
 검색 모델은 Hugging Face 의 SigLIP2 base patch32-256 을 ONNX 로 내보낸 것으로, `models/siglip2-base-patch32-256/` 에 `vision_model.onnx`(memmap 이 물체 사진에), `text_model_fp16.onnx`·`tokenizer.json`(뷰어가 검색어에) 을 둡니다. `--embed`·`--search-model` 을 빼면 검색창은 저장된 이름의 글자만 비교합니다.
 
-`vocab/names.voc` 는 이름 1,221 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. memmap 은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 물체 이름으로 쓰고(tv → monitor, 몫 0.3 이상일 때), 뷰어는 같은 파일로 이름들의 글 벡터 계산을 건너뜁니다. 목록을 바꾸면 `sgview --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
+`vocab/names.voc` 는 이름 1,225 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 · 바닥 · 벽 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. memmap 은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 물체 이름으로 쓰고(tv → monitor, 몫 0.3 이상일 때), 뷰어는 같은 파일로 이름들의 글 벡터 계산을 건너뜁니다. 목록을 바꾸면 `sgview --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 

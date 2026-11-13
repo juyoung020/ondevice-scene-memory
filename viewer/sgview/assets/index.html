@@ -1091,7 +1091,7 @@ function updateLabels() {
       if (opt("g_on")) for (const [kind, text] of [["object", "물체"], ["room", "방"]]) putLayer("L" + kind, text, graphNodes.filter(n => n.kind === kind).map(n => [n.x, n.y, n.z]));
     }
     const nMax = opt("n_olmax");
-    let olist = view.objects.filter(o => objVisible(o) && o.id !== selected && o.id !== hoverId && !find.ids.has(o.id) && (nMax <= 0 || o.state !== "gone"));
+    let olist = view.objects.filter(o => objVisible(o) && !o.structural && o.id !== selected && o.id !== hoverId && !find.ids.has(o.id) && (nMax <= 0 || o.state !== "gone"));
     if (nMax > 0) olist = olist.sort((a, b) => b.extent[0] * b.extent[1] * b.extent[2] - a.extent[0] * a.extent[1] * a.extent[2]).filter((o, i, l) => l.findIndex(q => q.name === o.name) === i).slice(0, nMax);   // one label per name, the largest
     if (opt("c_olabels")) for (const o of olist) {
       put("o" + o.id, nMax > 0 ? o.name : `${o.name}#${o.id}`, [o.pos[0], o.pos[1], o.pos[2] + o.extent[2] / 2 + 0.1], "obj", true);

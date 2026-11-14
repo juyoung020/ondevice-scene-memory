@@ -10,6 +10,7 @@
 - `--serve` 는 기억 폴더를 메모리에 두고 끝에(또는 `--save-every S` 초마다 · 뷰어 저장 버튼으로) 디스크에 쓴다.
 - 한 프로그램에서 뷰어의 리셋 · 수평 버튼이 추가 인자 없이 동작한다.
 - PC 실행 스크립트 `scripts/run.sh` 와 보드 화면(HDMI)에 뷰어를 띄우는 `scripts/board_view.sh`.
+- 뷰어가 물체 상자를 기본으로 그린다(모든 물체, 한 번에 그리는 선 묶음 하나).
 - 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.
 - 보드(aarch64) YUYV→RGB · 회색조, 설명자 해밍 거리, BRIEF 9×9 상자 합, 깊이 → 컬러 정렬 사각형 채우기, 보관 장면 풀기를 NEON 으로 계산한다(결과 비트 동일).
 - PC 에서 보드 실행 파일을 교차 빌드해 보내는 `scripts/cross_board.sh` 와 빠른 확인용 빌드 설정 `--profile dev-fast`.

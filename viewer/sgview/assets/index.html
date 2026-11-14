@@ -119,7 +119,7 @@
     <div class="num">3D map opacity <input type="number" id="n_sop" value="1" min="0.05" max="1" step="0.05"></div>
     <div class="num" title="splat size / voxel: above 1.4 neighbouring points overlap into a surface">3D map splat × voxel <input type="number" id="n_ssize" value="1.35" min="0.3" max="4" step="0.1"></div>
     <div class="num">Point size × voxel <input type="number" id="n_psize" value="1.1" min="0.2" max="5" step="0.1"></div>
-    <label class="row"><input type="checkbox" id="c_boxes"> Boxes (objects w/o points)</label>
+    <label class="row"><input type="checkbox" id="c_boxes" checked> Object boxes</label>
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
     <label class="row"><input type="checkbox" id="c_gone" checked> Gone objects</label>
     <label class="row"><input type="checkbox" id="c_ceil"> Show ceiling</label>
@@ -844,9 +844,11 @@ function drawObjects() {  invalidate();
       if (se && se.geom) { const p = new THREE.Points(se.geom, mat()); p.userData.shared = true; gObjs.add(p); }
     }
   }
+  const bx = opt("c_boxes") ? [] : null;   // every visible object's box: one merged line set (one draw call), rebuilt only when objects change
   for (const o of objs.values()) {
     if (!objVisible(o)) continue;
     const st = STATE_COL[o.state] ?? 0xc83cc8;
+    if (bx) bx.push(o);
     if (o.points) ensurePoints(o);
     const ent = plyCache.get("p" + o.id);
     const sel = selected === o.id;
@@ -858,15 +860,26 @@ function drawObjects() {  invalidate();
         gObjs.add(pts);
       }
       if (sel) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
-    } else if (!o.points || !ent || !ent.geom) {
-      // no points (yet): draw nothing at the object's place — the object is still its node in the graph layer.
-      // A stand-in sphere here looked like a graph node that had dropped to the floor. Optional box only.
-      if (opt("c_boxes")) {
-        const b = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(...o.extent.map(v => Math.min(v, 3)))), new THREE.LineBasicMaterial({ color:st }));
-        b.position.set(...o.pos); gObjs.add(b);
-      }
     }
   }
+  if (bx && bx.length) gObjs.add(boxLines(bx));
+}
+// all object boxes as one LineSegments: 12 edges per box, colour = object state
+const BOX_E = [0,1, 1,3, 3,2, 2,0, 4,5, 5,7, 7,6, 6,4, 0,4, 1,5, 2,6, 3,7];
+function boxLines(list) {
+  const pos = new Float32Array(list.length * 72), col = new Float32Array(list.length * 72), c = new THREE.Color();
+  let k = 0;
+  for (const o of list) {
+    c.setHex(STATE_COL[o.state] ?? 0xc83cc8);
+    const h = o.extent.map(v => Math.min(v, 3) / 2);
+    for (const i of BOX_E) {
+      pos[k] = o.pos[0] + (i & 1 ? h[0] : -h[0]); pos[k + 1] = o.pos[1] + (i & 2 ? h[1] : -h[1]); pos[k + 2] = o.pos[2] + (i & 4 ? h[2] : -h[2]);
+      col[k] = c.r; col[k + 1] = c.g; col[k + 2] = c.b; k += 3;
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  return new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors:true }));
 }
 // ---------------- graph layers ----------------
 const labelEls = new Map();

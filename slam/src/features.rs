@@ -197,12 +197,12 @@ pub fn min_eigen(gray: &[u8], w: usize, h: usize, mask: Option<&[u8]>) -> (Vec<f
 
 /// min_eigen 을 이미 있는 버퍼에(장면마다 1.2 MB 를 새로 받으면 쪽 나눔 비용이 계산만큼 큼)
 pub fn min_eigen_into(gray: &[u8], w: usize, h: usize, mask: Option<&[u8]>, eig: &mut Vec<f32>) -> f32 {
-    eig_pass(gray, w, h, mask, eig, false, false).0
+    eig_pass(gray, w, h, mask, eig, false, false, 0.0).0
 }
 
 /// 띠마다 고유값 계산 + (원하면) 띠 안쪽 열의 3×3 극대점(0 보다 크고 가리개 안) 화소 번호.
 /// 반환: (가리개 안 최댓값, 띠 안쪽 극대점, 띠 경계 열 목록)
-fn eig_pass(gray: &[u8], w: usize, h: usize, mask: Option<&[u8]>, eig: &mut Vec<f32>, peaks: bool, box_f32: bool) -> (f32, Vec<u32>, Vec<usize>) {
+fn eig_pass(gray: &[u8], w: usize, h: usize, mask: Option<&[u8]>, eig: &mut Vec<f32>, peaks: bool, box_f32: bool, quality: f64) -> (f32, Vec<u32>, Vec<usize>) {
     assert!(w >= 3 && h >= 3 && gray.len() == w * h);
     // 모든 칸을 띠들이 덮어쓰므로 0 으로 채울 필요 없음(크기만 맞춤)
     eig.resize(w * h, 0.0);
@@ -215,7 +215,7 @@ fn eig_pass(gray: &[u8], w: usize, h: usize, mask: Option<&[u8]>, eig: &mut Vec<
             let (xa, xb) = (w * s / strips, w * (s + 1) / strips);
             // SAFETY: 띠마다 열 [xa, xb) 만 쓰고, 읽는 것도 자기 열뿐이라 서로 겹치지 않음
             let out = unsafe { std::slice::from_raw_parts_mut(out.get(), w * h) };
-            eig_strip(gray, w, h, xa, xb, out, mask, peaks, box_f32)
+            eig_strip(gray, w, h, xa, xb, out, mask, peaks, box_f32, quality)
         })
         .collect();
     // 띠 경계 열(왼쪽 띠의 마지막 열, 오른쪽 띠의 첫 열)은 이웃 띠 값이 필요해 나중에 따로 봄
@@ -240,24 +240,24 @@ impl SendPtr {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eig_strip(gray: &[u8], w: usize, h: usize, xa: usize, xb: usize, out: &mut [f32], mask: Option<&[u8]>, peaks: bool, box_f32: bool) -> (Option<f32>, Vec<u32>) {
+fn eig_strip(gray: &[u8], w: usize, h: usize, xa: usize, xb: usize, out: &mut [f32], mask: Option<&[u8]>, peaks: bool, box_f32: bool, quality: f64) -> (Option<f32>, Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("avx2") {
             // SAFETY: 위에서 CPU 가 fma·avx2 를 지원함을 확인
             return unsafe {
-                if box_f32 { eig_strip_fma::<f32>(gray, w, h, xa, xb, out, mask, peaks) } else { eig_strip_fma::<f64>(gray, w, h, xa, xb, out, mask, peaks) }
+                if box_f32 { eig_strip_fma::<f32>(gray, w, h, xa, xb, out, mask, peaks, quality) } else { eig_strip_fma::<f64>(gray, w, h, xa, xb, out, mask, peaks, quality) }
             };
         }
     }
-    if box_f32 { eig_strip_impl::<f32>(gray, w, h, xa, xb, out, mask, peaks) } else { eig_strip_impl::<f64>(gray, w, h, xa, xb, out, mask, peaks) }
+    if box_f32 { eig_strip_impl::<f32>(gray, w, h, xa, xb, out, mask, peaks, quality) } else { eig_strip_impl::<f64>(gray, w, h, xa, xb, out, mask, peaks, quality) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma,avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn eig_strip_fma<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usize, out: &mut [f32], mask: Option<&[u8]>, peaks: bool) -> (Option<f32>, Vec<u32>) {
-    eig_strip_impl::<A>(gray, w, h, xa, xb, out, mask, peaks)
+unsafe fn eig_strip_fma<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usize, out: &mut [f32], mask: Option<&[u8]>, peaks: bool, quality: f64) -> (Option<f32>, Vec<u32>) {
+    eig_strip_impl::<A>(gray, w, h, xa, xb, out, mask, peaks, quality)
 }
 
 /// 상자 합 누적 자료형. 원본(boxFilter 32F)은 f64. f32 는 비트가 달라지는 빠른 선택(Extractor::box_f32)
@@ -351,7 +351,7 @@ fn cov_row_sum<A: BoxAcc>(du: &[f32], dm: &[f32], dd: &[f32], su: &[f32], sd: &[
 /// 4) calcMinEigenVal: λmin = (a+c) - √((a-c)² + b²), a = cov0·0.5, c = cov2·0.5
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn eig_strip_impl<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usize, out: &mut [f32], mask: Option<&[u8]>, peaks: bool) -> (Option<f32>, Vec<u32>) {
+fn eig_strip_impl<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usize, out: &mut [f32], mask: Option<&[u8]>, peaks: bool, quality: f64) -> (Option<f32>, Vec<u32>) {
     let cw = xb - xa;
     let n = cw + 2; // cov 열: xa-1 ..= xb
     let c: Vec<usize> = (0..n).map(|i| refl(xa as isize + i as isize - 1, w)).collect();
@@ -400,7 +400,11 @@ fn eig_strip_impl<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usi
     // 극대점 검사 열: 띠 안에서 양옆이 있는 열, 그림 안쪽 1..w-1
     let (pa, pb) = ((xa + 1).max(1), (xb - 1).min(w - 1));
     let mut pk = Vec::new();
-    let mut rmax = f32::NEG_INFINITY;
+    let pw = pb.saturating_sub(pa);
+    let mut hm = vec![0f32; 3 * pw];
+    let mut flag = vec![0u8; pw];
+    let mut lb = 0f32; // 극대점 아래 경계(0 보다 커야 함)
+    let mut cmax = vec![f32::NEG_INFINITY; cw];
     for y in 0..h {
         if y >= 1 && y + 1 < h {
             if y + 2 < h {
@@ -427,62 +431,65 @@ fn eig_strip_impl<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usi
             let t = a - c;
             *o = (a + c) - eig_q(t, b).sqrt();
         }
-        // minMaxLoc(가리개): 가리개 밖은 -∞ 로 보고 8 칸씩 나란히 최댓값(값은 유한이라 -∞ 가 남으면 가리개 안 화소 없음)
-        let mut lanes = [f32::NEG_INFINITY; 8];
-        let ninf = f32::NEG_INFINITY;
+        // minMaxLoc(가리개): 열마다 누적 최댓값(가리개 밖은 -∞), 띠 끝에서 한 번 줄임. 최댓값은 순서와 무관해 비트가 같음
         match mask {
             Some(mk) => {
-                let mk = &mk[y * w + xa..y * w + xb];
-                for (v8, m8) in o.chunks(8).zip(mk.chunks(8)) {
-                    for ((l, &v), &m) in lanes.iter_mut().zip(v8).zip(m8) {
-                        *l = fmax(*l, if m != 0 { v } else { ninf });
-                    }
+                for ((c, &v), &m) in cmax.iter_mut().zip(o.iter()).zip(&mk[y * w + xa..y * w + xb]) {
+                    *c = fmax(*c, if m != 0 { v } else { f32::NEG_INFINITY });
                 }
             }
             None => {
-                for v8 in o.chunks(8) {
-                    for (l, &v) in lanes.iter_mut().zip(v8) {
-                        *l = fmax(*l, v);
-                    }
+                for (c, &v) in cmax.iter_mut().zip(o.iter()) {
+                    *c = fmax(*c, v);
                 }
             }
         }
-        rmax = lanes.iter().fold(rmax, |a, &b| fmax(a, b));
         // 줄 y 가 나왔으니 줄 y-1 의 극대점(위·아래 줄이 다 있음)
-        if peaks && y >= 2 && pa < pb {
-            find_peaks(out, w, y - 1, pa, pb, mask, &mut pk);
+        if peaks && pa < pb {
+            // 줄 y 의 가로 3 칸 최댓값(열 pa..pb), 줄 번호 % 3 칸
+            let k = y % 3 * pw;
+            let row = &out[y * w..(y + 1) * w];
+            for (((o, &a), &b), &c) in hm[k..k + pw].iter_mut().zip(&row[pa - 1..pb - 1]).zip(&row[pa..pb]).zip(&row[pa + 1..pb + 1]) {
+                *o = fmax(fmax(a, b), c);
+            }
+            if y >= 2 {
+                if y % 16 == 0 {
+                    // 지금까지 본 최댓값으로 문턱 아래 경계: 전체 최댓값 이상은 안 되므로 (그 값 × q) 이하는 어차피 문턱 이하
+                    lb = lb.max((cmax.iter().fold(f32::NEG_INFINITY, |a, &b| fmax(a, b)) as f64 * quality) as f32);
+                }
+                find_peaks(out, w, y - 1, pa, pb, mask, &hm, pw, lb, &mut flag, &mut pk);
+            }
         }
     }
+    let rmax = cmax.iter().fold(f32::NEG_INFINITY, |a, &b| fmax(a, b));
     ((rmax > f32::NEG_INFINITY).then_some(rmax), pk)
 }
 
-/// 줄 yy, 열 [xa, xb) 에서 0 보다 크고 3×3 이웃(원래 값) 모두 이상이며 가리개 안인 화소 번호
+/// 줄 yy, 열 [xa, xb) 에서 0 보다 크고 3×3 이웃(원래 값) 모두 이상이며 가리개 안인 화소 번호.
+/// hm = 줄 번호 % 3 칸의 가로 3 칸 최댓값(열 xa.. 기준, 폭 pw)
 #[inline(always)]
-fn find_peaks(eig: &[f32], w: usize, yy: usize, xa: usize, xb: usize, mask: Option<&[u8]>, pk: &mut Vec<u32>) {
-    let row = |r: usize| &eig[r * w..(r + 1) * w];
-    let (r0, r1, r2) = (row(yy - 1), row(yy), row(yy + 1));
-    let mrow = mask.map(|m| &m[yy * w..(yy + 1) * w]);
-    // 8 칸씩: 조건을 비교로만 세고, 하나라도 맞으면 그때 칸마다 봄
-    let mut x = xa;
-    while x < xb {
-        let e = (x + 8).min(xb);
-        let mut any = false;
-        let mut f = [false; 8];
-        for (k, f) in f.iter_mut().enumerate().take(e - x) {
-            let i = x + k;
-            let v = r1[i];
-            let m = fmax(fmax(fmax(r0[i - 1], r0[i]), fmax(r0[i + 1], r1[i - 1])), fmax(fmax(r1[i + 1], r2[i - 1]), fmax(r2[i], r2[i + 1])));
-            *f = (v > 0.0) & (v >= m);
-            any |= *f;
+#[allow(clippy::too_many_arguments)]
+fn find_peaks(eig: &[f32], w: usize, yy: usize, xa: usize, xb: usize, mask: Option<&[u8]>, hm: &[f32], pw: usize, lb: f32, flag: &mut [u8], pk: &mut Vec<u32>) {
+    let r1 = &eig[yy * w + xa..yy * w + xb];
+    let (h0, h1, h2) = (&hm[(yy - 1) % 3 * pw..][..pw], &hm[yy % 3 * pw..][..pw], &hm[(yy + 1) % 3 * pw..][..pw]);
+    for ((((f, &v), &a), &b), &c) in flag.iter_mut().zip(r1).zip(h0).zip(h1).zip(h2) {
+        *f = ((v > lb) & (v >= fmax(fmax(a, b), c))) as u8;
+    }
+    if let Some(m) = mask {
+        for (f, &m) in flag.iter_mut().zip(&m[yy * w + xa..yy * w + xb]) {
+            *f &= (m != 0) as u8;
         }
-        if any {
-            for (k, &fl) in f.iter().enumerate().take(e - x) {
-                if fl && mrow.is_none_or(|m| m[x + k] != 0) {
-                    pk.push((yy * w + x + k) as u32);
-                }
+    }
+    // 대부분 0 이라 8 칸씩 건너뜀
+    for (ci, ch) in flag.chunks(8).enumerate() {
+        if u64::from_ne_bytes(std::array::from_fn(|k| ch.get(k).copied().unwrap_or(0))) == 0 {
+            continue;
+        }
+        for (k, &f) in ch.iter().enumerate() {
+            if f != 0 {
+                pk.push((yy * w + xa + ci * 8 + k) as u32);
             }
         }
-        x = e;
     }
 }
 
@@ -525,7 +532,7 @@ thread_local! {
 #[allow(clippy::too_many_arguments)]
 fn gftt_with(gray: &[u8], w: usize, h: usize, mask: Option<&[u8]>, max_corners: i32, quality: f64, min_distance: f64, eig: &mut Vec<f32>, box_f32: bool) -> Vec<KeyPoint> {
     // 1 단계: 고유값 + 띠 안쪽 극대점(문턱은 전체 최댓값을 알아야 정해지므로 아직 안 거름)
-    let (max_val, peaks, edges) = eig_pass(gray, w, h, mask, eig, true, box_f32);
+    let (max_val, peaks, edges) = eig_pass(gray, w, h, mask, eig, true, box_f32, quality);
     let eig: &[f32] = eig;
     // threshold(TOZERO): 문턱 = (float)(최댓값 × qualityLevel), src > 문턱 이면 남김
     let th = (max_val as f64 * quality) as f32;
@@ -931,10 +938,10 @@ mod tests {
         let (w, h) = (300usize, 50usize);
         let g: Vec<u8> = (0..w * h).map(|i| ((i * 7919) % 251) as u8).collect();
         let mut one = vec![0f32; w * h];
-        eig_strip(&g, w, h, 0, w, &mut one, None, false, false);
+        eig_strip(&g, w, h, 0, w, &mut one, None, false, false, 0.0);
         let mut many = vec![0f32; w * h];
         for (a, b) in [(0, 64), (64, 130), (130, 299), (299, 300)] {
-            eig_strip(&g, w, h, a, b, &mut many, None, false, false);
+            eig_strip(&g, w, h, a, b, &mut many, None, false, false, 0.0);
         }
         assert!(one.iter().zip(&many).all(|(a, b)| a.to_bits() == b.to_bits()));
     }

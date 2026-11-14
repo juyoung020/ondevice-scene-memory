@@ -1015,7 +1015,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         for e in est_traj.iter_mut() {
                             (e.1, e.2) = (mv(&fix, &e.1), mm(&fix, &e.2));
                         }
-                        z0 = z0.map(|_| mv(&fix, &p)[2] - cam_height(&hist_h));
+                        // 바닥 높이는 기울어진 채 잰 값이라 버리고, 이 장면에서 새 좌표로 다시 잰다(바닥 = z 0)
+                        hist_h.clear();
+                        z0 = None;
                         (kfs.dirty, force_rb) = (true, true);
                     }
                     r = mm(&fix, &r);

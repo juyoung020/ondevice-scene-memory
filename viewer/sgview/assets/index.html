@@ -201,7 +201,7 @@ const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShade
 const renderer = new THREE.WebGLRenderer({ antialias:!WEAK_GPU, alpha:true });   // transparent clear: the page gradient is the background
 renderer.setClearColor(0x000000, 0);
 host.appendChild(renderer.domElement);
-let quality = QS.get("quality") || localStorage.getItem("sg_quality") || "high";
+let quality = QS.get("quality") || "high";   // normal quality by default on every screen; ?quality=low only when asked (a saved choice never forces Low)
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
@@ -1369,7 +1369,7 @@ $("b_demo").onclick = () => setDemo(!controls.autoRotate);
 $("b_level").onclick = () => { const b = $("b_level"); b.disabled = true; fetch("/api/level").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_reset").onclick = () => { const b = $("b_reset"); b.disabled = true; fetch("/api/reset").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_panel").onclick = () => togglePanel();
-$("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; localStorage.setItem("sg_quality", quality); applyQuality(); };
+$("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; applyQuality(); };
 if (QS.get("ui") === "0") document.body.classList.add("ui-off");
 if (QS.get("panel") === "1") togglePanel(true);
 if (QS.get("demo") === "1") setTimeout(() => setDemo(true), 0);
@@ -1440,6 +1440,10 @@ function applyView(v) {
   if (!LIVE) { const sPose = JSON.stringify(view.pose); if (sPose !== prev.pose) drawRobot(); prev.pose = sPose; }
   status(); if (objChanged) renderInfo();
   Object.assign(prev, { obj:sObj, graph:sGraph, rooms:sRooms, grid:sGrid });
+  // the pipeline re-stacked the map (leveling correction, loop closure): new run → refit once if the user has not moved the camera
+  const run = view.scene_points && view.scene_points.run;
+  if (viewSeen && run !== prev.run && !userMoved) setTimeout(() => fitView(QS.get("top") === "1", false), 1500);   // after the new map's first nodes arrive
+  prev.run = run;
   if (!viewSeen) { viewSeen = true; fitView(QS.get("top") === "1");   // ?top=1: start in the Top view
     const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
 }

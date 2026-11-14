@@ -722,6 +722,30 @@ impl Core {
                 *o = if cur != 0 && cur < zz { cur } else { zz };
             }
         }
+        /// 한 줄의 칸 [xa, xb] 에 put. aarch64 는 8 칸 안이면 NEON 한 번: (cur − 1 감싸기) 와 (zz − 1) 의 최솟값 + 1
+        /// (cur = 0 이면 65535 라 zz, 아니면 min(cur, zz)) = put 과 같은 값. 구간 밖 칸은 읽은 값 그대로 다시 씀
+        #[inline(always)]
+        unsafe fn put_span(row: *mut u16, xa: usize, xb: usize, cw: usize, zz: u16) {
+            unsafe {
+                #[cfg(target_arch = "aarch64")]
+                if xb - xa < 8 && xa + 8 <= cw {
+                    use core::arch::aarch64::*;
+                    const IDX: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                    let p = row.add(xa);
+                    let one = vdupq_n_u16(1);
+                    let cur = vld1q_u16(p);
+                    let new = vaddq_u16(vminq_u16(vsubq_u16(cur, one), vdupq_n_u16(zz - 1)), one);
+                    let m = vcleq_u16(vld1q_u16(IDX.as_ptr()), vdupq_n_u16((xb - xa) as u16));
+                    vst1q_u16(p, vbslq_u16(m, new, cur));
+                    return;
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                let _ = cw;
+                for ox in xa..=xb {
+                    put(row.add(ox), zz);
+                }
+            }
+        }
         let (mut vmin, mut vmax) = (ch, -1i32);
         for y in y0..y1 {
             let z = &depth[y * w..y * w + w];
@@ -781,10 +805,8 @@ impl Core {
                         continue;
                     }
                     for oy in ya..=yb {
-                        let row = unsafe { out.add(oy as usize * cw as usize) };
-                        for ox in xa..=xb {
-                            unsafe { put(row.add(ox as usize), zz) };
-                        }
+                        // SAFETY: 칸 [xa, xb] 는 컬러 줄 oy 안
+                        unsafe { put_span(out.add(oy as usize * cw as usize), xa as usize, xb as usize, cw as usize, zz) };
                     }
                 }
             } else {

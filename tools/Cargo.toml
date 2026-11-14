@@ -1,0 +1,54 @@
+[package]
+name = "tools"
+version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
+edition = "2024"
+description = "깊이 → 컬러 정렬 라이브러리 fast_align(librealsense rs2::align 과 비트 단위로 같은 결과)과 RealSense·IMU 도구."
+
+[lib]
+name = "tools"
+path = "src/lib.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = []
+# RealSense 도구(librealsense2 C API 를 직접 부름: rs_info · rs_rec · rs_align_check · align_sdk_check)
+realsense = []
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+
+[[bin]]
+name = "bench_align"
+path = "src/bin/bench_align.rs"
+
+[[bin]]
+name = "imu_probe"
+path = "src/bin/imu_probe.rs"
+
+[[bin]]
+name = "check_tum"
+path = "src/bin/check_tum.rs"
+
+[[bin]]
+name = "rs_info"
+path = "src/bin/rs_info.rs"
+required-features = ["realsense"]
+
+[[bin]]
+name = "rs_rec"
+path = "src/bin/rs_rec.rs"
+required-features = ["realsense"]
+
+[[bin]]
+name = "rs_align_check"
+path = "src/bin/rs_align_check.rs"
+required-features = ["realsense"]
+
+[[bin]]
+name = "align_sdk_check"
+path = "src/bin/align_sdk_check.rs"
+required-features = ["realsense"]

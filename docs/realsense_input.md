@@ -1,6 +1,6 @@
 # RealSense 카메라 입력과 깊이→컬러 정렬
 
-카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → `slam_bridge` 위치 → memmap. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 `bridge/align/`(정렬 라이브러리 `fast_align`, RealSense 도구 `rs_info`·`rs_rec`·`rs_align_check`), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
+카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → `slam_bridge` 위치 → memmap. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 Rust 크레이트 `tools/`(정렬 라이브러리 `tools::fast_align`, RealSense 도구 `rs_info`·`rs_rec`·`rs_align_check`·`align_sdk_check`, librealsense2 C API 를 직접 부름), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
 
 ## D435 보정값과 깊이 범위
 
@@ -41,22 +41,23 @@ Pi 5 에서 "정렬만 수십 ms" 라는 보고(Pi 4 에서 3 장/초, `align.pr
 
 ## fast_align
 
-`bridge/align/include/fast_align/fast_align.hpp` — `DepthAligner(깊이 보정, 컬러 보정, 깊이→컬러, 깊이 단위, Options)` 를 한 번 만들고 장면마다 `process(깊이 u16, 출력 u16)`. 보정값 구조체는 `rs2_intrinsics`·`rs2_extrinsics` 와 같은 배치라 그대로 복사해 넘긴다.
+`tools/src/fast_align.rs` — `DepthAligner::new(깊이 보정, 컬러 보정, 깊이→컬러, 깊이 단위, &Options)` 를 한 번 만들고 장면마다 `process(&깊이 u16, &mut 출력 u16)`. 보정값 구조체(`#[repr(C)]`)는 `rs2_intrinsics`·`rs2_extrinsics` 와 같은 배치라 C API 에 그대로 넘긴다.
 
-- **방식**: `Method::Sdk`(기본) = SIMD 규칙, `Method::Generic` = 일반 구현 규칙. 각 방식은 SDK 와 같은 순서의 float 연산을 쓴다(x86 은 SSE 의 곱·더하기 순서, aarch64 는 NEON 의 fma 순서, 나머지는 `-ffp-contract=off`·MSVC `/fp:precise`).
-- **빠르게 한 것**: 모서리 역투영 방향을 열마다 x, 줄마다 y 로만 둔다(깊이 왜곡이 없을 때, SDK 는 화소마다 float 4 개 표 = 4.9 MB). 줄 하나씩 좌표 계산 → 바로 흩뿌리기(SDK 는 영상 전체 int2 배열을 쓰고 다시 읽음). 계산 루프는 분기 없는 식이라 자동 벡터화되고(MSVC·GCC x86, aarch64 NEON 확인), 모서리 하나 경우는 컬러 화소 번호와 화면 밖 판정까지 벡터 루프에서 낸다. 줄 단위 여러 스레드(`threads`): 깊이 줄 덩어리를 짝수·홀수 두 번에 나눠 돌리고, 동시에 돈 덩어리가 쓴 컬러 줄 범위가 겹치면 한 스레드로 다시 해서 결과가 늘 같다.
+- **방식**: `Method::Sdk`(기본) = SIMD 규칙, `Method::Generic` = 일반 구현 규칙. 각 방식은 SDK 와 같은 순서의 float 연산을 쓴다(x86 은 SSE 의 곱·더하기 순서, aarch64 는 NEON 의 fma 순서, fma 는 `mul_add` 로 쓴 곳만이고 Rust 는 곱·더하기를 스스로 합치지 않는다).
+- **빠르게 한 것**: 모서리 역투영 방향을 열마다 x, 줄마다 y 로만 둔다(깊이 왜곡이 없을 때, SDK 는 화소마다 float 4 개 표 = 4.9 MB). 줄 하나씩 좌표 계산 → 바로 흩뿌리기(SDK 는 영상 전체 int2 배열을 쓰고 다시 읽음). 계산 루프는 분기 없는 식이라 자동 벡터화되고(x86 은 AVX2 가 있으면 실행 중에 골라 8 칸, aarch64 NEON 확인), 모서리 하나 경우는 컬러 화소 번호와 화면 밖 판정까지 벡터 루프에서 낸다. 사각형 채우기는 2×2 이하를 루프 없이 쓴다. 줄 단위 여러 스레드(`threads`, 부른 스레드 + 조건 변수로 깨우는 일꾼): 깊이 줄 덩어리를 짝수·홀수 두 번에 나눠 돌리고, 동시에 돈 덩어리가 쓴 컬러 줄 범위가 겹치면 한 스레드로 다시 해서 결과가 늘 같다.
 - **선택**: `exact = false` 는 나눗셈 하나(1/Z)로 계산해 반올림 경계의 화소 약 0.002 % 가 옆 화소로 옮겨진다. `color_distortion = true` 는 컬러 왜곡 계수가 있는 카메라(D455 등)에서 그 왜곡을 rsutil 식으로 적용해 깊이를 실제 컬러 화소 위치에 놓는다(SDK 와 결과가 달라짐). `force_rect` 는 늘 사각형을 채운다.
 
 ### 정확성
 
-`bridge/align/tests/test_align.cpp`(옮겨 온 librealsense 코드 `tests/rs_ref.hpp`, Apache-2.0 출처 주석)와 `tools/align_sdk_check.cpp`(이 PC 의 실제 SDK):
+`tools/tests/test_align.rs`(옮겨 온 librealsense 코드 `tools/src/rsref.rs`, Apache-2.0 출처 주석), `align_sdk_check`(이 기계의 실제 SDK), `rs_align_check`(녹화 폴더):
 
 | 비교 | 결과 |
 |---|---|
 | fast_align Sdk ↔ 옮겨 온 SSE 경로, 8 가지 보정(D455 가정 640/848 깊이, 1280×720 컬러, 왜곡 없음·MBC·깊이 왜곡·640×360·사각형 경우) × 방·무작위 깊이 × 스레드 1·3·4 | 다른 화소 **0** |
 | fast_align Generic ↔ 옮겨 온 일반 경로, 같은 조합 | 다른 화소 **0** |
-| aarch64(-mcpu=cortex-a76) 빌드를 qemu 로: fast_align ↔ 옮겨 온 NEON 경로 | 다른 화소 **0**(96 / 96 경우) |
-| fast_align Sdk ↔ **실제 rs2::align**(Windows SDK 2.59.1, software_device, 640·848 깊이 각 120 장) | 다른 화소 **0 / 7,372.8 만** |
+| aarch64(`-C target-cpu=cortex-a76`) 빌드를 qemu 로: fast_align ↔ 옮겨 온 NEON 경로 | 다른 화소 **0**(96 / 96 경우) |
+| fast_align Sdk ↔ **실제 rs2::align**(librealsense 2.59.1 SSE, software_device, 640·848 깊이) | 다른 화소 **0**(Windows SDK 각 120 장 7,372.8 만, WSL 각 20 장 1,228.8 만) |
+| 실제 D435 깊이 80 장(digiteo2 `depth_sync`, D435 비슷한 보정) ↔ 실제 rs2::align | 다른 화소 **0 / 2,457.6 만** |
 | 빠른 식(exact=false) ↔ rs2::align | 0.0021–0.0023 % 다름 |
 
 합성 장면 정답(컬러 화소 중심이 보는 면의 깊이)과 비교, 컬러 왜곡 없음:
@@ -83,34 +84,45 @@ PC(Ryzen 9 9950X, 다른 작업이 CPU 를 약 55 % 쓰는 중) 코어 하나에
 | fast_align Sdk, 스레드 4 | 0.27–0.28 | 0.38 |
 | 옮겨 온 일반 경로(NEON 없는 빌드의 규칙) | 6.7 | 9.5 |
 
-GCC(x86, WSL)로 빌드하면 한 스레드는 옮겨 온 SSE 경로보다 느리다(0.79 대 0.58 ms, SSE2 기본에서 32 비트 곱·고르기를 흉내 내는 비용). aarch64 의 계산 루프는 llvm-mca(Neoverse-N1 모형, A76 계열)로 SDK NEON 7.26 주기/화소, fast_align 7.52(빠른 식 6.64)로 거의 같다.
+Rust 판(WSL, 같은 PC, `bench_align --core 5`, 출력 비트 동일): 640×480 깊이 한 스레드 **0.46–0.50 ms**(C++ GCC 0.76), 스레드 4 개 **0.29 ms**(C++ 0.37), 848×480 깊이 0.66 / 0.37 ms(C++ 1.03 / 0.42). 같은 기계의 실제 rs2::align(SSE) 은 0.65 / 0.80 ms. 1280×720 컬러(사각형 채움)는 한 스레드 2.6 ms(C++ 2.8). x86 한 스레드가 빨라진 것은 AVX2 8 칸 루프 덕이고, aarch64 는 NEON 4 칸 그대로라 보드 시간은 보드에서 잰다. aarch64 의 계산 루프는 llvm-mca(Neoverse-N1 모형, A76 계열)로 SDK NEON 7.26 주기/화소, C++ fast_align 7.52(빠른 식 6.64)로 거의 같았다.
 
 **Pi 5 환산**(가정: A76 2.4 GHz 코어 = 이 PC 코어의 2–3 배 시간, `rtabmap_tuning.md` 와 같은 가정): rs2::align NEON 경로 640×480 약 1.8–2.8 ms/장면(30 장/초에 코어 하나의 5–8 %), fast_align 한 스레드 1.2–2.1 ms, 스레드 4 개 0.6–0.9 ms(다른 일과 코어를 나누면 늘어남), NEON 없는 일반 구현 13–20 ms(실제 SDK 는 API 호출 비용이 더해져 수십 ms). 즉 v2.59.1 소스 빌드에서는 정렬이 병목이 아니고, fast_align 은 같은 결과를 프레임 할당 없이, 원하는 스레드에서, 필요하면 여러 코어로 낸다. 보드 실측으로 바꾼다(아래 "Pi 5 에서").
 
-## 카메라 확인 순서(Windows PC)
+## 카메라 확인 순서
 
-빌드(한 번, 이미 해 둠):
+빌드(리눅스: 보드 또는 WSL, librealsense2 는 `~/opt/librealsense`):
 
 ```
-cmake -S bridge/align -B bridge/align/build -G "Visual Studio 17 2022" -A x64 -DREALSENSE_ROOT=C:/librealsense2/v2.59.1
-cmake --build bridge/align/build --config Release
+RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \
+  cargo build --release --features realsense --manifest-path tools/Cargo.toml
+cargo test --release --manifest-path tools/Cargo.toml -- --nocapture   # 정확성 표
 ```
 
-카메라를 **USB3 포트**(파란 포트, `rs_info` 의 `"usb": "3.2"`)에 꽂고 `bridge/align/build/Release` 에서:
+카메라를 **USB3 포트**(파란 포트, `rs_info` 의 `"usb": "3.2"`)에 꽂고 `target/release` 에서:
 
 1. `rs_info > rs_info.json` — 장치·펌웨어·USB, 스트림 목록, IMU, 640×480 깊이·컬러 보정값과 외부 변환, `sdk_align_fills_rect`(false 면 모서리 하나 규칙). `rs_info --depth 848x480 > rs_info_848.json` 로 시야각 비교. 펌웨어가 `recommended_firmware` 보다 낮으면 RealSense Viewer 로 올린다.
-2. `rs_rec C:/ondevice/data/d435/desk01 20` — 20 초 녹화(레이저 켬, 기본 프리셋). 1 초마다 rs2::align · fast_align 시간, 가운데 깊이, 유효 화소 비율을 찍고, 끝에 rs2::align 과 다른 화소 수와 memmap 용 변환 명령을 찍는다. 쓰기가 밀린 장면이 있으면 숫자로 보인다.
-3. `rs_align_check C:/ondevice/data/d435/desk01` — 녹화된 원래 깊이로 fast_align(정확한 식·빠른 식·컬러 왜곡)과 rs2::align(software_device 로 다시)을 돌려 녹화된 rs2::align 결과와 일치 비율, 둘 다 값 있는데 다른 화소, 한쪽만 값 있는 화소, 경계 화소 차이, 코어 하나 시간을 낸다. 정확한 식은 다른 화소 0 이어야 한다(끝 코드 0).
-4. 최소 거리: `rs_rec C:/ondevice/data/d435/minz 15` 를 켜고 벽을 정면으로 1 m 에서 천천히 다가가며 "가운데 깊이 … (유효 …%)" 가 0 으로 떨어지는 거리를 적는다. 레이저 끔(`--emitter off`)과 비교.
+2. `rs_rec data/d435/desk01 20` — 20 초 녹화(레이저 켬, 기본 프리셋). 1 초마다 rs2::align · fast_align 시간, 가운데 깊이, 유효 화소 비율을 찍고, 끝에 rs2::align 과 다른 화소 수와 memmap 용 변환 명령을 찍는다. 쓰기가 밀린 장면이 있으면 숫자로 보인다.
+3. `rs_align_check data/d435/desk01` — 녹화된 원래 깊이로 fast_align(정확한 식·빠른 식·컬러 왜곡)과 rs2::align(software_device 로 다시)을 돌려 녹화된 rs2::align 결과와 일치 비율, 둘 다 값 있는데 다른 화소, 한쪽만 값 있는 화소, 경계 화소 차이, 코어 하나 시간을 낸다. 정확한 식은 다른 화소 0 이어야 한다(끝 코드 0).
+4. 최소 거리: `rs_rec data/d435/minz 15` 를 켜고 벽을 정면으로 1 m 에서 천천히 다가가며 "가운데 깊이 … (유효 …%)" 가 0 으로 떨어지는 거리를 적는다. 레이저 끔(`--emitter off`)과 비교.
 5. memmap 입력: 2 번 끝에 찍힌 `rgbd2tum <녹화> <녹화>_freiburg3 fx fy cx cy 1000` 으로 TUM fr3 형식(5000/m)으로 바꿔 `memmap --tum` 과 `rtabmap-rgbd_dataset` 에 넣는다.
 
-녹화 폴더: `rgb/`(컬러), `depth/`(fast_align 정렬, 컬러 크기), `depth_raw/`(정렬 전), `depth_rs/`(rs2::align), 각 목록 `rgb.txt`·`depth.txt`·`depth_raw.txt`·`depth_rs.txt`, 짝 `association.txt`, `calib.json`(보정값·설정·SDK 정렬 구현·변환 명령), `rec_stats.json`(장면 수·시간·rs2::align 과 다른 화소). 깊이 PNG 는 카메라 단위 그대로(1 mm = 1): 단위 바꾸기와 fr3 보정값으로 다시 그리기는 `rgbd2tum` 한 곳에서 한다(memmap 의 `tum.rs` 는 폴더 이름으로 fr1/2/3 보정값을 고르고 5000/m 로 읽음).
+녹화 폴더: `rgb/`(컬러), `depth/`(fast_align 정렬, 컬러 크기), `depth_raw/`(정렬 전), `depth_rs/`(rs2::align), 각 목록 `rgb.txt`·`depth.txt`·`depth_raw.txt`·`depth_rs.txt`, 짝 `association.txt`, `calib.json`(보정값·설정·SDK 정렬 구현·변환 명령), `rec_stats.json`(장면 수·시간·rs2::align 과 다른 화소). PNG 는 `image` 크레이트로 쓴다(16 비트 회색·RGB8, 화소는 원래 lodepng 판과 같음). 깊이 PNG 는 카메라 단위 그대로(1 mm = 1): 단위 바꾸기와 fr3 보정값으로 다시 그리기는 `rgbd2tum` 한 곳에서 한다(memmap 의 `tum.rs` 는 폴더 이름으로 fr1/2/3 보정값을 고르고 5000/m 로 읽음).
 
 ## Pi 5 에서
 
-- librealsense v2.59.1 소스 빌드(`-DFORCE_RSUSB_BACKEND=ON -DBUILD_WITH_NEON=ON -DCMAKE_BUILD_TYPE=Release`, NEON 은 aarch64 기본값) 뒤 `cmake -S bridge/align -B build -G Ninja && ninja -C build` 로 같은 도구가 빌드된다(`find_package(realsense2)`).
+- librealsense v2.59.1 소스 빌드(`-DFORCE_RSUSB_BACKEND=ON -DBUILD_WITH_NEON=ON -DCMAKE_BUILD_TYPE=Release`, NEON 은 aarch64 기본값) 뒤 위 "빌드" 명령으로 같은 도구가 빌드된다.
 - 보드에서 `bench_align --core 3` 와 `rs_align_check <녹화> --core 3 --threads 3` 로 PC 환산 대신 실측을 남긴다. 도구가 찍는 SDK 정렬 구현 줄이 "NEON-optimized" 인지 확인한다.
-- PC 에서 aarch64 확인: `bash bridge/align/tools/cross_check.sh`(WSL, 크로스 빌드·qemu 시험·NEON 명령 수), `bash bridge/align/tools/neon_mca.sh`(llvm-mca 주기).
+- PC 에서 aarch64 확인(WSL, `rustup target add aarch64-unknown-linux-gnu`, `g++-aarch64-linux-gnu`·`qemu-user`):
+
+```
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu" RUSTFLAGS="-C target-cpu=cortex-a76" \
+  cargo test --release --target aarch64-unknown-linux-gnu --manifest-path tools/Cargo.toml -- --nocapture
+```
+
+## IMU(ICM-42688-P) 연결 확인
+
+`imu_probe [/dev/i2c-1] [초=5]`(`tools/`, Linux I2C): 0x68·0x69 에서 칩(WHO_AM_I 0x47)을 찾아 ±16 g · ±2000 °/s · 200 Hz 로 켜고, 가만히 둔 동안의 평균 가속도·중력 방향·자이로 치우침을 찍는다. 배선(Pi 5 핀): VCC 1(3.3 V), GND 6, SDA 3, SCL 5. I2C 켜기: `sudo dtparam i2c_arm=on`.
 
 ## 참고
 

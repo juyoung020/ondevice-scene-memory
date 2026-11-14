@@ -45,7 +45,8 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 | `pipeline/src/graph.rs` | 씬그래프 연결(방→물체, 방↔방, 물체↔물체) |
 | `pipeline/src/seg.rs` | 분할 모델 실행(ONNX·NPU) |
 | `slam/` | 연결 프로그램 `slam_bridge`(Rust, RealSense·TUM → 위치 추적·루프 클로저 → 장면 스트림), [slam/README.md](../slam/README.md) |
-| `bridge/` | C++ 원본 `rtab_bridge`(RTAB-Map 라이브러리 링크, `slam_bridge` 비교 기준·지금 보드 실시간 스크립트), RealSense 정렬 도구 `bridge/align/` |
+| `bridge/` | C++ 원본 `rtab_bridge`(RTAB-Map 라이브러리 링크, `slam_bridge` 비교 기준·지금 보드 실시간 스크립트) |
+| `tools/` | 깊이→컬러 정렬 `fast_align`(Rust, rs2::align 과 비트 동일)과 도구 `rs_info`·`rs_rec`·`rs_align_check`·`align_sdk_check`·`bench_align`·`imu_probe`·`check_tum`, [realsense_input.md](realsense_input.md) |
 | `viewer/sgview/` | 웹 뷰어(Rust 서버 + three.js) |
 | `train/ObjectSAM/` | 자체 분할 모델 학습기(C++/CUDA) |
 | `docs/` | 설계·측정 결과·평가 계획 |

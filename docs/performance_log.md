@@ -250,7 +250,7 @@ PC 에서 kf/s 는 작업 스레드(PNG 읽기 + 그래픽카드 분할 ≈ 10.5
 
 ## D455 깊이→컬러 정렬 (2026-11-05)
 
-`bridge/align` 의 fast_align(rs2::align 과 같은 규칙·같은 float 연산 순서)과 librealsense v2.59.1 정렬 비교. PC Ryzen 9 9950X(다른 작업이 CPU 약 55 % 사용 중), 프로세스를 코어 하나(스레드 시험은 코어 2·4 개)에 묶고 20 번 평균 × 21 회 중앙값(ms/장면). 입력 = D455 가정 보정값(컬러 Inverse Brown-Conrady)의 방 장면, 잡음 0.4 %·구멍 3 %. "이식" = librealsense 코드를 시험 쪽에 옮긴 것(프레임 할당 없는 계산부), "실제" = 이 PC 의 SDK 2.59.1 `rs2::align.process`(software_device, 120 장). 방법과 확인 순서: [`realsense_input.md`](realsense_input.md).
+fast_align(지금 코드는 Rust `tools/`, 아래 표는 C++ 판, rs2::align 과 같은 규칙·같은 float 연산 순서)과 librealsense v2.59.1 정렬 비교. PC Ryzen 9 9950X(다른 작업이 CPU 약 55 % 사용 중), 프로세스를 코어 하나(스레드 시험은 코어 2·4 개)에 묶고 20 번 평균 × 21 회 중앙값(ms/장면). 입력 = D455 가정 보정값(컬러 Inverse Brown-Conrady)의 방 장면, 잡음 0.4 %·구멍 3 %. "이식" = librealsense 코드를 시험 쪽에 옮긴 것(프레임 할당 없는 계산부), "실제" = 이 PC 의 SDK 2.59.1 `rs2::align.process`(software_device, 120 장). 방법과 확인 순서: [`realsense_input.md`](realsense_input.md).
 
 | ms/장면(MSVC, 코어 1 개) | 깊이 640×480 → 컬러 640×480 | 848×480 → 640×480 | 640×480 → 1280×720(사각형 채움) |
 |---|---|---|---|
@@ -1232,3 +1232,21 @@ C++ `rtab_bridge`(RTAB-Map 0.24.2 · OpenCV · GTSAM 비트 비교용 빌드, `s
 - Rust 후는 본 스레드 계산이 장면당 2.8 – 3.1 ms 라 벽시계는 PNG 읽기 스레드가 정한다(desk 268 장/초 ≈ 읽기 속도).
 - `/mnt/c` 에서 읽으면 9P 읽기가 느려 모두 읽기에 묶인다(Rust desk 5.0 초 · 복도 13 – 15 초 · 긴 사무실 20 – 22 초). 위 표는 읽기를 빼고 계산을 견주려고 WSL 디스크에서 쟀다.
 - 확인 도구(WSL `~/slamint`): `cmp.sh`(C++ · Rust 실행, 스트림 해시 비교, `RESET_AT` · `EXTRA` · `OUT` · `SKIPC`), `tm.sh`(속도), `rdshim.so`, 시험 입력 `in/freiburg1_*`.
+
+## 깊이 정렬 Rust 이식 (WSL, 2026-11-14)
+
+C++ `bridge/align`(fast_align 과 도구)을 Rust 크레이트 `tools/` 로 옮겼다. 같은 PC(Ryzen 9 9950X) WSL, 원래 C++ 를 GCC `-O3 -ffp-contract=off` 로 빌드해 같은 입력으로 견줌. `bench_align --core 5`(20 번 평균 × 15 회 중앙값, ms/장면, D455 가정 보정값의 방 장면).
+
+| ms/장면 | C++ 640 깊이 | Rust 640 깊이 | C++ 848 깊이 | Rust 848 깊이 | C++ 1280×720 컬러 | Rust 1280×720 컬러 |
+|---|---|---|---|---|---|---|
+| fast_align Sdk, 스레드 1 | 0.760 | **0.46–0.50** | 1.026 | **0.66** | 2.816 | **2.65** |
+| fast_align Sdk 빠른 식, 스레드 1 | 0.748 | 0.44–0.48 | 1.009 | 0.63–0.66 | 2.741 | 2.63 |
+| fast_align Sdk, 스레드 2 | 0.492 | 0.27–0.40 | 0.619 | 0.39–0.46 | 1.602 | 1.55 |
+| fast_align Sdk, 스레드 4 | 0.374 | **0.29** | 0.423 | **0.37** | 0.961 | **0.92** |
+| fast_align Generic | 2.968 | 2.70–2.79 | 3.809 | 3.38–3.43 | 3.454 | 3.32 |
+| 실제 rs2::align(이 기계 librealsense 2.59.1 SSE, align_sdk_check) | 0.648 | – | 0.802 | – | – | – |
+
+- 같은 결과: `cargo test`(시험 표 128 줄)가 C++ `test_align` 출력과 글자까지 같다(x86, 그리고 aarch64 `-C target-cpu=cortex-a76` 를 qemu 로 돌린 것도 C++ aarch64 출력과 같음). `align_sdk_check --frames 20` 출력(시간 줄 빼고)·`calib.json`·목록 파일이 같다. `rs_align_check` 를 C++ · Rust 로 같은 폴더 세 개에 돌려 출력이 같다: 실제 D435 깊이 80 장(digiteo2 `depth_sync`, D435 비슷한 보정, `depth_rs/` = 원래 C++ fast_align 결과)에서 Rust 정확한 식 다른 화소 **0 / 2,457.6 만**, 실제 rs2::align 다시 돌린 것도 0. 합성 녹화(C++ 가 쓴 것, Rust 가 쓴 것) 각 20 장도 0.
+- 빨라진 곳: x86 은 AVX2 가 있으면 계산 루프를 실행 중에 골라 8 칸으로(같은 연산, Rust 는 곱·더하기를 합치지 않음), 여러 스레드는 rayon 대신 C++ 와 같은 구조(부른 스레드 + 조건 변수 일꾼)로 깨우는 비용을 줄임(rayon 일 때 스레드 4 개 0.51 ms), 사각형 채우기에서 2×2 이하는 루프 없이. aarch64 는 NEON 4 칸 그대로(`fdiv v.4s` 50 개 · `fmla v.4s` 178 개 확인)라 보드 시간은 보드에서 잰다.
+- PNG: `image` 크레이트로 쓰면 화소·IHDR 은 lodepng 와 같고 압축(deflate·줄 필터)이 달라 파일 바이트는 다르다(12 장 견줌, 크기 0.97 배). 읽는 쪽은 화소만 쓴다.
+- 카메라·I2C 없이 확인: `rs_info`·`rs_rec` 의 장치 없음 출력과 끝 코드(2), `imu_probe` 의 열기 실패(1)·칩 없음(2)이 C++ 와 같다. `imu_probe` 는 가짜 칩 시험(레지스터 쓰기 순서, 값 바꾸기, 요약 줄), `check_tum` 은 가짜 프로그램으로 셸 원본과 출력·로그가 같다.

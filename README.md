@@ -136,4 +136,4 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 [PolyForm Noncommercial License 1.0.0](LICENSE.md) — 개인 공부·연구·교육·비영리 목적으로는 자유롭게 쓰고 고치고 나눌 수 있고, **상업적 이용은 허용하지 않습니다.** 나눌 때는 `LICENSE.md` 의 저작권 표시(Required Notice)를 함께 전합니다.
 
-저장소에 함께 든 외부 코드(three.js, OrbitControls, lodepng), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다.
+저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다.

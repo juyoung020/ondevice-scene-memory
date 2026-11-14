@@ -12,3 +12,4 @@ runs/
 pipeline/target/
 # 지난 실행 결과·측정 스크립트 모음(로컬 보관)
 archive/
+tools/target/

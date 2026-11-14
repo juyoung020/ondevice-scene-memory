@@ -146,7 +146,7 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 아래 두 절은 C++ `rtab_bridge` 로 잰 값이다. `slam_bridge` 는 지금 ini(`docs/rtabmap_pi.ini`, GFTT/BRIEF + GTSAM)로 같은 입력을 넣으면 출력이 바이트까지 같아 그 조합의 정확도가 같다. ORB · g2o 조합은 C++ 원본에만 있다.
 
-`bridge/tools/check_tum.sh` 로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
+`check_tum`(`tools/`, 환경 변수 `BRIDGE`·`MEMMAP`·`ATE`·`INI`·`SEG`) 으로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
 
 - **기준**: 같은 설정 + 모든 장면을 지도 노드로 끝까지 돌려 최적화한 위치 → `memmap --tum --gt`(오프라인 경로).
 - **같은 위치 오프라인**: 스트림 실행이 보낸 위치 파일 그대로 → `memmap --tum --gt`. 스트림과 위치가 같고 입력 경로만 다르다.

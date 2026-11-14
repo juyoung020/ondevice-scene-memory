@@ -14,6 +14,7 @@
 - 분할 모델의 클래스 이름 `memmap --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
 
 ### Changed
+- 깊이 정렬 `fast_align` 과 RealSense·IMU 도구(`rs_info`·`rs_rec`·`rs_align_check`·`align_sdk_check`·`bench_align`·`imu_probe`·`check_tum`)를 Rust 크레이트 `tools/` 로 옮겼다(결과 비트 동일, PC 정렬 1.65 배 빠름).
 - memmap: 점 지도·점유 격자·물체 넣기·장면 넘기기를 다시 짜 CPU 를 약 3 분의 1 줄였다(출력 바이트 동일). `--no-drop` 스트림은 점 작업 스레드를 기다려 실행마다 같은 결과를 낸다.
 - 뷰어 벽 계산을 C++ 에서 Rust(`viewer/sgview/src/walls.rs`)로 옮겼다(원본과 선분 4,680 건·상태 74,860 건 비트 동일).
 - 보드 위치 추적: 장면 읽기를 따로 도는 스레드로 옮겼다(실시간 재생 25 → 28.6 장/초).

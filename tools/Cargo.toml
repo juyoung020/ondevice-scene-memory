@@ -14,7 +14,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 default = []
-# RealSense 도구(librealsense2 C API 를 직접 부름: rs_info · rs_rec · rs_align_check · align_sdk_check)
+# librealsense2 와 견주는 도구(C API 를 직접 부름: rs_align_check · align_sdk_check)
 realsense = []
 
 
@@ -29,16 +29,6 @@ path = "src/bin/imu_probe.rs"
 [[bin]]
 name = "check_tum"
 path = "src/bin/check_tum.rs"
-
-[[bin]]
-name = "rs_info"
-path = "src/bin/rs_info.rs"
-required-features = ["realsense"]
-
-[[bin]]
-name = "rs_rec"
-path = "src/bin/rs_rec.rs"
-required-features = ["realsense"]
 
 [[bin]]
 name = "rs_align_check"

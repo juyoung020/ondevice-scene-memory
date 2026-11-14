@@ -69,10 +69,6 @@ pub fn start_writer() {
     }
 }
 
-pub fn write_atomic(dst: &Path, bytes: &[u8]) {
-    write_owned(dst, bytes.to_vec());
-}
-
 /// 이미 만든 바이트를 그대로 넘겨 쓴다(복사 없이)
 pub fn write_owned(dst: &Path, bytes: Vec<u8>) {
     write_lazy(dst, Box::new(move || bytes));

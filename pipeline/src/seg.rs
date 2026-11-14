@@ -359,79 +359,6 @@ pub trait Segmenter: Send {
     }
 }
 
-/// 깊이 모델: RGB → 화소마다 거리(미터). Pi 는 NPU(.dxnn), PC 는 ONNX Runtime(.onnx).
-pub trait DepthNet: Send {
-    fn run(&mut self, rgb: &[u8], w: usize, h: usize) -> Vec<f32>;
-}
-/// 특징점 모델(SuperPoint): RGB → 점·기술자(위치 추정용).
-pub trait FeatNet: Send {
-    fn run(&mut self, rgb: &[u8], w: usize, h: usize) -> crate::vo::Feat;
-}
-
-/// 정사각 입력(s²)으로 늘려 넣고 결과를 원래 크기로 되돌리기. 화소 위치·쌍선형 가중은 처음 한 번만 계산(위치표 캐시).
-pub struct Square {
-    s: usize,
-    lut_in: Vec<u32>,
-    lut_ax: Vec<(u32, u32, f32)>,
-    lut_ay: Vec<(u32, u32, f32)>,
-    wh: (usize, usize),
-}
-impl Square {
-    pub fn new(s: usize) -> Square {
-        Square { s, lut_in: vec![], lut_ax: vec![], lut_ay: vec![], wh: (0, 0) }
-    }
-    /// RGB(w×h) → s² RGB(가까운 화소)
-    pub fn to_square(&mut self, rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
-        let s = self.s;
-        if self.wh != (w, h) {
-            self.wh = (w, h);
-            let xs: Vec<usize> = (0..s).map(|x| (((x as f32 + 0.5) * w as f32 / s as f32) as usize).min(w - 1)).collect();
-            let ys: Vec<usize> = (0..s).map(|y| (((y as f32 + 0.5) * h as f32 / s as f32) as usize).min(h - 1)).collect();
-            self.lut_in = (0..s * s).map(|i| (ys[i / s] * w + xs[i % s]) as u32 * 3).collect();
-            let axis = |n: usize| -> Vec<(u32, u32, f32)> {
-                (0..n)
-                    .map(|u| {
-                        let f = ((u as f32 + 0.5) * s as f32 / n as f32 - 0.5).clamp(0.0, (s - 1) as f32);
-                        (f.floor() as u32, (f.floor() as u32 + 1).min(s as u32 - 1), f.fract())
-                    })
-                    .collect()
-            };
-            self.lut_ax = axis(w);
-            self.lut_ay = axis(h);
-        }
-        let mut buf = vec![0u8; s * s * 3];
-        // 줄마다 상주 스레드 풀에서(보드 모델 스레드의 CPU 일)
-        use rayon::prelude::*;
-        buf.par_chunks_mut(s * 3).zip(self.lut_in.par_chunks(s)).for_each(|(row, lut)| {
-            for (d, &o) in row.chunks_exact_mut(3).zip(lut) {
-                let o = o as usize;
-                d.copy_from_slice(&rgb[o..o + 3]);
-            }
-        });
-        buf
-    }
-    /// s² 결과 → w×h(쌍선형)
-    pub fn back(&self, d: &[f32]) -> Vec<f32> {
-        let (s, (w, h)) = (self.s, self.wh);
-        let mut out = vec![0f32; w * h];
-        use rayon::prelude::*;
-        out.par_chunks_mut(w).zip(self.lut_ay.par_iter()).for_each(|(row, &(y0, y1, ay))| {
-            let (r0, r1) = (&d[y0 as usize * s..y0 as usize * s + s], &d[y1 as usize * s..y1 as usize * s + s]);
-            for (o, &(x0, x1, ax)) in row.iter_mut().zip(&self.lut_ax) {
-                let top = r0[x0 as usize] + (r0[x1 as usize] - r0[x0 as usize]) * ax;
-                let bot = r1[x0 as usize] + (r1[x1 as usize] - r1[x0 as usize]) * ax;
-                *o = top + (bot - top) * ay;
-            }
-        });
-        out
-    }
-}
-
-/// 흑백(정수 근사 BT.601)
-pub fn gray(rgb: &[u8]) -> Vec<u8> {
-    rgb.chunks(3).map(|c| ((77 * c[0] as u32 + 150 * c[1] as u32 + 29 * c[2] as u32) >> 8) as u8).collect()
-}
-
 // ------------------------------------------------------------------ PC: ONNX Runtime
 /// 한 프로세스에 ONNX Runtime 환경 하나(모델 셋이 같이 씀)
 #[cfg(feature = "onnx")]
@@ -452,74 +379,6 @@ fn session(path: &str) -> ort::session::Session {
     b.commit_from_file(path).unwrap_or_else(|e| panic!("onnx model {path}: {e}"))
 }
 
-/// 깊이(PC, yolo26s-depth.onnx — 보드 NPU 모델과 같은 구조): 보드와 같이 768² 로 늘려 넣고(RGB/255 NCHW)
-/// 출력 [1,1,768,768] 미터를 원래 크기로 쌍선형. 레터박스보다 위치 오차가 작았다(TUM 7 경우 중 6, 책상 0.61 → 0.26 m).
-#[cfg(feature = "onnx")]
-pub struct OnnxDepth {
-    sess: ort::session::Session,
-    sq: Square,
-}
-#[cfg(feature = "onnx")]
-impl OnnxDepth {
-    pub fn new(path: &str) -> OnnxDepth {
-        OnnxDepth { sess: session(path), sq: Square::new(768) }
-    }
-}
-#[cfg(feature = "onnx")]
-impl DepthNet for OnnxDepth {
-    fn run(&mut self, rgb: &[u8], w: usize, h: usize) -> Vec<f32> {
-        let s = 768;
-        let buf = self.sq.to_square(rgb, w, h);
-        let inp = ndarray::Array4::<f32>::from_shape_fn((1, 3, s, s), |(_, c, y, x)| buf[(y * s + x) * 3 + c] as f32 / 255.0);
-        let out = self.sess.run(ort::inputs![ort::value::TensorRef::from_array_view(&inp).unwrap()]).expect("onnx depth");
-        let (_, d) = out[0].try_extract_tensor::<f32>().unwrap();
-        self.sq.back(d)
-    }
-}/// 특징점(PC, SuperPoint ONNX 1024×768 흑백 0–1 입력 → 상위 512 점 (x, y)·점수·256 차원 기술자)
-#[cfg(feature = "onnx")]
-pub struct OnnxSuperPoint {
-    sess: ort::session::Session,
-}
-#[cfg(feature = "onnx")]
-impl OnnxSuperPoint {
-    pub fn new(path: &str) -> OnnxSuperPoint {
-        OnnxSuperPoint { sess: session(path) }
-    }
-}
-#[cfg(feature = "onnx")]
-impl FeatNet for OnnxSuperPoint {
-    fn run(&mut self, rgb: &[u8], w: usize, h: usize) -> crate::vo::Feat {
-        let (sw, sh) = (1024usize, 768usize);
-        let g = gray(rgb);
-        // 쌍선형으로 1024×768 에 맞춤
-        let (fx, fy) = (w as f32 / sw as f32, h as f32 / sh as f32);
-        let inp = ndarray::Array4::<f32>::from_shape_fn((1, 1, sh, sw), |(_, _, y, x)| {
-            let u = ((x as f32 + 0.5) * fx - 0.5).clamp(0.0, (w - 1) as f32);
-            let v = ((y as f32 + 0.5) * fy - 0.5).clamp(0.0, (h - 1) as f32);
-            let (u0, v0) = (u as usize, v as usize);
-            let (u1, v1) = ((u0 + 1).min(w - 1), (v0 + 1).min(h - 1));
-            let (a, b) = (u - u0 as f32, v - v0 as f32);
-            let p = |uu: usize, vv: usize| g[vv * w + uu] as f32;
-            ((p(u0, v0) * (1.0 - a) + p(u1, v0) * a) * (1.0 - b) + (p(u0, v1) * (1.0 - a) + p(u1, v1) * a) * b) / 255.0
-        });
-        let out = self.sess.run(ort::inputs![ort::value::TensorRef::from_array_view(&inp).unwrap()]).expect("onnx superpoint");
-        let (_, kp) = out[0].try_extract_tensor::<f32>().unwrap();
-        let (_, sc) = out[1].try_extract_tensor::<f32>().unwrap();
-        let (_, de) = out[2].try_extract_tensor::<f32>().unwrap();
-        let mut f = crate::vo::Feat { kp: vec![], desc: vec![] };
-        for i in 0..sc.len() {
-            if sc[i] <= 0.005 {
-                continue;
-            }
-            let (u, v) = (((kp[2 * i] + 0.5) * fx - 0.5).clamp(0.0, (w - 1) as f32), ((kp[2 * i + 1] + 0.5) * fy - 0.5).clamp(0.0, (h - 1) as f32));
-            let d = &de[i * 256..i * 256 + 256];
-            let n = d.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-            f.kp.push((u.round(), v.round()));
-            f.desc.extend(d.iter().map(|x| x / n));
-        }
-        f
-    }
-}
 #[cfg(feature = "onnx")]
 pub struct OnnxSeg {
     sess: ort::session::Session,
@@ -695,48 +554,6 @@ pub mod dx {
         }
     }
     unsafe impl Send for Waiter {}
-}
-
-#[cfg(feature = "dxrt")]
-/// 깊이(DX-M1, 공식 yolo26-depth-s_768x768): 입력 u8 NHWC 768² RGB(늘려 넣기), 출력 [1,1,768,768] f32(미터).
-pub struct DxDepth {
-    eng: dx::Engine,
-    sq: Square,
-}
-#[cfg(feature = "dxrt")]
-impl DxDepth {
-    pub fn new(path: &str) -> DxDepth {
-        let eng = dx::Engine::new(path);
-        let s = *eng.tensors[0].1.last().unwrap() as usize;
-        DxDepth { eng, sq: Square::new(s) }
-    }
-}
-#[cfg(feature = "dxrt")]
-impl DepthNet for DxDepth {
-    fn run(&mut self, rgb: &[u8], w: usize, h: usize) -> Vec<f32> {
-        let buf = self.sq.to_square(rgb, w, h);
-        self.eng.run(&buf);
-        self.sq.back(self.eng.f32_at(0))
-    }
-}#[cfg(feature = "dxrt")]
-pub struct DxSuperPoint {
-    eng: dx::Engine,
-}
-#[cfg(feature = "dxrt")]
-impl DxSuperPoint {
-    pub fn new(path: &str) -> DxSuperPoint {
-        DxSuperPoint { eng: dx::Engine::new(path) }
-    }
-}
-#[cfg(feature = "dxrt")]
-impl FeatNet for DxSuperPoint {
-    fn run(&mut self, rgb: &[u8], w: usize, h: usize) -> crate::vo::Feat {
-        assert_eq!((w, h), (640, 480), "superpoint_480x640 expects 640x480");
-        self.eng.run(&gray(rgb));
-        let semi = self.eng.f32_at(0).to_vec();
-        let desc = self.eng.f32_at(1);
-        crate::vo::superpoint_decode(&semi, desc, 60, 80, 400, 0.005)
-    }
 }
 
 #[cfg(feature = "dxrt")]

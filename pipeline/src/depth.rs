@@ -23,18 +23,6 @@ impl Depth {
         }
     }
 
-    /// f32 버퍼(스트림 u16 이면 이때 한 번 바꿈): 깊이를 고치는 경로(딥러닝 깊이 배율 · 직접 방식 위치 추적)만 부른다
-    pub fn m(&mut self) -> &mut Vec<f32> {
-        if let Depth::Raw { d, per_m } = self {
-            let per_m = *per_m;
-            *self = Depth::M(d.iter().map(|&v| v as f32 / per_m).collect());
-        }
-        match self {
-            Depth::M(v) => v,
-            Depth::Raw { .. } => unreachable!(),
-        }
-    }
-
     /// 줄 y0 부터 n 줄(폭 w)을 미터로: f32 면 그 자리 조각(복사 없음), u16 이면 buf 에 바꿔 담음
     #[inline]
     pub fn rows<'a>(&'a self, y0: usize, n: usize, w: usize, buf: &'a mut Vec<f32>) -> &'a [f32] {
@@ -66,7 +54,7 @@ mod tests {
         let d: Vec<u16> = (0..=65535u16).step_by(7).collect();
         for per_m in [1000.0f32, 5000.0, 999.87] {
             let full: Vec<f32> = d.iter().map(|&v| v as f32 / per_m).collect();
-            let mut r = Depth::Raw { d: d.clone(), per_m };
+            let r = Depth::Raw { d: d.clone(), per_m };
             for (i, &x) in full.iter().enumerate() {
                 assert_eq!(r.at(i).to_bits(), x.to_bits());
             }
@@ -74,7 +62,6 @@ mod tests {
             let mut buf = vec![];
             let rows = r.rows(3, 5, w, &mut buf).to_vec();
             assert_eq!(rows, full[3 * w..8 * w]);
-            assert_eq!(*r.m(), full);
         }
     }
 }

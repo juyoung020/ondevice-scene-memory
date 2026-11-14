@@ -11,6 +11,8 @@
 - 한 프로그램에서 뷰어의 리셋 · 수평 버튼이 추가 인자 없이 동작한다.
 - PC 실행 스크립트 `scripts/run.sh` 와 보드 화면(HDMI)에 뷰어를 띄우는 `scripts/board_view.sh`.
 - 뷰어가 물체 상자를 기본으로 그린다(모든 물체, 한 번에 그리는 선 묶음 하나).
+- 실시간 지도가 첫 장면부터 수평으로 보이고(첫 장면 카메라를 똑바로 선 것으로 봄), 바닥 합의가 나오면 한 번 고친다.
+- 뷰어가 지나온 길을 덧붙인 몫만 받는다.
 - 빠른 움직임에도 끊기지 않는 광류 위치 추적 `Odom/Strategy=9`(기본): 등속 예측 · 광류 · PnP, 끊기면 깊이 ICP · 키프레임 기술자로 같은 장면에서 되찾음. 사용자 손카메라 녹화에서 위치 못 낸 장면 21.5 % → 1.7 %, 새 지도 192 → 0.
 - 위치 프로그램 `--stride N`(TUM 재생에서 N 장마다 한 장), rsd_rec 녹화 폴더(calib.json) 재생, 통계 CSV 의 `no_pose` 칸, D435 컬러 노출 상한 `--ae-cap ms`.
 - 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.

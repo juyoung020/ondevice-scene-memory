@@ -832,6 +832,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut grav_obs: Vec<V3> = vec![];
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
     let mut leveled = a.stream.is_none() || a.no_level;
+    // 실시간: 첫 장면 카메라가 똑바로 서 있다고 보고(위 = 첫 장면 카메라의 −y) 처음부터 수평으로 보여 주고, 바닥 합의가 나오면 한 번 고쳐 다시 쌓는다
+    let (mut upright, mut refine) = (a.stream.is_some() && a.live > 0.0 && !a.no_level, false);
     let mut force_rb = false; // 수평 버튼: 기다리지 않고 바로 다시 쌓기
     let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
     let mut stream_held = 0u32; // 맡아 둘 장면으로 받은 수
@@ -970,13 +972,18 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             force_rb = true;
             common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
         }
+        if std::mem::take(&mut upright) && !leveled {
+            stream_fix = rot_between(&[-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]], &[0.0, 0.0, 1.0]);
+            (leveled, refine) = (true, true);
+            common::info!("수평: 첫 장면 카메라를 똑바로 선 것으로 보고 시작(바닥 합의가 나오면 고침)");
+        }
         if a.stream.is_some() {
             r = mm(&stream_fix, &r);
             p = mv(&stream_fix, &p);
         }
         let c_vo = Instant::now();
         // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
-        if !leveled && a.stream.is_some() {
+        if (!leveled || refine) && a.stream.is_some() {
             if let Some(n) = up_normal(&depth, w, h, seq.k, &r) {
                 grav_obs.push(n);
             }
@@ -991,6 +998,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 if inl.len() * 10 >= grav_obs.len() * 6 {
                     let up = mean(&inl);
                     let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
+                    if std::mem::take(&mut refine) {
+                        // 처음 가정(첫 장면이 똑바름)을 바닥 합의로 고침: 지난 위치 · 바닥 높이 원점도 새 좌표로, 지도는 다시 쌓음
+                        for e in est_traj.iter_mut() {
+                            (e.1, e.2) = (mv(&fix, &e.1), mm(&fix, &e.2));
+                        }
+                        z0 = z0.map(|_| mv(&fix, &p)[2] - cam_height(&hist_h));
+                        (kfs.dirty, force_rb) = (true, true);
+                    }
                     r = mm(&fix, &r);
                     p = mv(&fix, &p);
                     stream_fix = mm(&fix, &stream_fix);

@@ -1443,13 +1443,19 @@ function applyView(v) {
 // version (fetched once), `fpose` = the fast camera pose. An idle viewer sends no requests. If the event stream is down, a slow
 // poll (every 2 s) keeps the page current until it reconnects.
 let viewBusy = false, viewAgain = false;
+let trajLog = null;   // {id, nodes}: trajectory points held here, the server sends only the appended ones
 async function fetchView() {
   if (viewBusy) { viewAgain = true; return; }
   viewBusy = true;
   try {
-    const r = await fetch("/api/view?v=" + encodeURIComponent(viewVer));
+    // trajectory: send what we have (log id + count) so the server sends only the appended points
+    const r = await fetch("/api/view?v=" + encodeURIComponent(viewVer) + (trajLog ? `&tr=${trajLog.id}&tf=${trajLog.nodes.length}` : ""));
     const j = await r.json();
     if (j.view) {
+      const g = j.view.graph || (j.view.graph = {});
+      if (j.traj && j.traj.from > 0 && trajLog && trajLog.id === j.traj.id) { trajLog.nodes.push(...(g.nodes || [])); g.nodes = trajLog.nodes; }
+      trajLog = j.traj ? { id: j.traj.id, nodes: (g.nodes || []).slice() } : null;
+      if (trajLog) g.nodes = trajLog.nodes.slice();
       const first = !view;
       viewVer = j.v;
       if (first || j.map_v !== mapVer) { mapVer = j.map_v; view = j.view; await loadMap(); }

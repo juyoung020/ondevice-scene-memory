@@ -6,19 +6,23 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// 지나온 길(시각, 위치): 덧붙이기만 하는 로그. 판은 길이만 들고 있어 판마다 길 전체를 복사하지 않는다
 /// (다시 쌓기로 길이 새로 만들어지면 로그도 새로)
-#[derive(Default)]
-pub struct TrajLog(RwLock<Vec<(f64, [f64; 3])>>);
+pub struct TrajLog(RwLock<Vec<(f64, [f64; 3])>>, u64);
+
+static LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl TrajLog {
     pub fn new() -> Arc<TrajLog> {
-        Arc::new(TrajLog::default())
+        Arc::new(TrajLog(RwLock::new(Vec::new()), LOG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
     }
     pub fn extend(&self, s: &[(f64, [f64; 3])]) {
         self.0.write().unwrap().extend_from_slice(s);
     }
     /// view.json 바이트(길은 앞 n 개)
     pub fn view_bytes(&self, head: &Value, n: usize) -> Vec<u8> {
-        live_bytes(head, &self.0.read().unwrap()[..n])
+        live_bytes(head, &self.0.read().unwrap()[..n], 0)
+    }
+    pub fn id(&self) -> u64 {
+        self.1
     }
     pub fn len(&self) -> usize {
         self.0.read().unwrap().len()
@@ -64,11 +68,33 @@ impl View {
         self.bytes
             .get_or_init(|| match &self.src {
                 Src::File(b) => b.clone(),
-                Src::Live { traj, n } => Arc::new(live_bytes(self.doc().unwrap_or(&Value::Null), &traj.0.read().unwrap()[..*n])),
+                Src::Live { traj, n } => Arc::new(live_bytes(self.doc().unwrap_or(&Value::Null), &traj.0.read().unwrap()[..*n], 0)),
             })
             .clone()
     }
-    /// /api/view 몸: {"v":판,"map_v":지도 판,"view":…} — 지도 판이 같으면 짠 것을 그대로
+    /// /api/view 몸, 지나온 길은 덧붙인 몫만: 브라우저가 같은 길(로그 id `tr`)의 앞 `tf` 점을 이미 가졌으면 그 뒤만 보냄
+    /// ("traj":{"id","from"}, graph.nodes = from 뒤). 같은 프로세스 판이 아니거나 길이 새로 만들어졌으면 None(통째로)
+    pub fn api_delta(&self, map_v: &str, tr: u64, tf: usize) -> Option<Vec<u8>> {
+        let Src::Live { traj, n } = &self.src else { return None };
+        if traj.id() != tr || tf > *n {
+            return None;
+        }
+        let head = self.doc()?;
+        let v = live_bytes(head, &traj.0.read().unwrap()[tf..*n], tf);
+        let mut b = Vec::with_capacity(v.len() + 96);
+        b.extend_from_slice(format!("{{\"v\":\"{}\",\"map_v\":\"{}\",\"traj\":{{\"id\":{},\"from\":{}}},\"view\":", self.ver, map_v, tr, tf).as_bytes());
+        b.extend_from_slice(&v);
+        b.push(b'}');
+        Some(b)
+    }
+    /// 이 판의 길 로그 id(같은 프로세스 판만)
+    pub fn traj_id(&self) -> Option<u64> {
+        match &self.src {
+            Src::Live { traj, .. } => Some(traj.id()),
+            Src::File(_) => None,
+        }
+    }
+    /// /api/view 몸:{"v":판,"map_v":지도 판,"view":…} — 지도 판이 같으면 짠 것을 그대로
     pub fn api_body(&self, map_v: &str) -> Arc<Vec<u8>> {
         let mut c = self.body.lock().unwrap();
         if let Some((m, b)) = c.as_ref() {
@@ -78,7 +104,8 @@ impl View {
         }
         let v = self.bytes();
         let mut b = Vec::with_capacity(v.len() + 64);
-        b.extend_from_slice(format!("{{\"v\":\"{}\",\"map_v\":\"{}\",\"view\":", self.ver, map_v).as_bytes());
+        let tj = self.traj_id().map_or(String::new(), |id| format!("\"traj\":{{\"id\":{id},\"from\":0}},"));
+        b.extend_from_slice(format!("{{\"v\":\"{}\",\"map_v\":\"{}\",{tj}\"view\":", self.ver, map_v).as_bytes());
         b.extend_from_slice(&v);
         b.push(b'}');
         let b = Arc::new(b);
@@ -88,7 +115,7 @@ impl View {
 }
 
 /// head(키 차례 = serde_json 맵 차례) + 지나온 길 노드 → `serde_json::to_vec(view)` 와 같은 바이트
-pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])]) -> Vec<u8> {
+pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])], from: usize) -> Vec<u8> {
     let mut b = Vec::with_capacity(4096 + traj.len() * 80);
     let Some(m) = head.as_object() else {
         serde_json::to_writer(&mut b, head).unwrap();
@@ -110,7 +137,7 @@ pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])]) -> Vec<u8> {
                 if i > 0 {
                     b.push(b',');
                 }
-                b.extend_from_slice(format!("{{\"id\":\"A{i}\",\"kind\":\"agent\",\"pos\":").as_bytes());
+                b.extend_from_slice(format!("{{\"id\":\"A{}\",\"kind\":\"agent\",\"pos\":", from + i).as_bytes());
                 serde_json::to_writer(&mut b, &serde_json::json!(p)).unwrap();
                 b.extend_from_slice(b",\"t\":");
                 serde_json::to_writer(&mut b, &serde_json::json!(t)).unwrap();
@@ -148,6 +175,6 @@ mod tests {
         let full = json!({"stamp": 3.0, "pose": [1, 2], "grid": null, "objects": [{"a": 1}], "rooms": [], "doors": [], "graph": {"nodes": nodes, "edges": edges}, "robot": "x", "cam": {"pos": [1.0]}, "scene_points": {"run": 1}});
         let mut head = full.clone();
         head["graph"] = json!({"edges": edges});
-        assert_eq!(super::live_bytes(&head, &traj), serde_json::to_vec(&full).unwrap());
+        assert_eq!(super::live_bytes(&head, &traj, 0), serde_json::to_vec(&full).unwrap());
     }
 }

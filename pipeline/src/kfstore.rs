@@ -25,7 +25,7 @@ pub struct Kf {
     depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4(줄인 보관이면 4 화소 간격)
     crops: Vec<Crop>, // 줄인 보관: 검출 상자 안 컬러·깊이
     sparse: bool,
-    pub dets: Option<Vec<Det>>,
+    dets: Option<Vec<DetZ>>,
     /// 점 지도에 넣은 점(거른 뒤 --scene-step 간격 격자의 깊이 mm·색, LZ4): 점 작업 스레드가 채움 → 다시 쌓기는 온 장면 없이 이것만 읽는다
     pub pts: std::sync::OnceLock<Option<PtsZ>>,
 }
@@ -51,6 +51,25 @@ impl PtsZ {
     }
     fn bytes(&self) -> usize {
         self.depth_z.len() + self.rgb_z.len()
+    }
+}
+
+/// 보관한 검출: 마스크는 화소 8 개를 한 바이트에(받은 bool 마스크의 1/8)
+struct DetZ {
+    cls: usize,
+    score: f32,
+    box_: [i32; 4],
+    n: usize,
+    bits: Vec<u8>,
+}
+
+impl DetZ {
+    fn pack(d: &Det) -> DetZ {
+        let bits = d.mask.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |b, (i, &m)| b | (m as u8) << i)).collect();
+        DetZ { cls: d.cls, score: d.score, box_: d.box_, n: d.mask.len(), bits }
+    }
+    fn unpack(&self) -> Det {
+        Det { cls: self.cls, score: self.score, box_: self.box_, mask: (0..self.n).map(|i| self.bits[i / 8] >> (i % 8) & 1 == 1).collect() }
     }
 }
 
@@ -99,6 +118,10 @@ impl Kf {
         }
         d
     }
+    /// 보관한 검출(받은 것과 같은 값)
+    pub fn dets(&self) -> Option<Vec<Det>> {
+        self.dets.as_ref().map(|v| v.iter().map(DetZ::unpack).collect())
+    }
     pub fn rgb(&self) -> Vec<u8> {
         if !self.sparse {
             return unpack_rgb(&self.rgb_z, self.w, self.h);
@@ -115,7 +138,7 @@ impl Kf {
     }
     fn bytes(&self) -> usize {
         self.rgb_z.len() + self.depth_z.len() + self.crops.iter().map(|c| c.rgb_z.len() + c.depth_z.len()).sum::<usize>()
-            + self.dets.iter().flatten().map(|d| d.mask.len()).sum::<usize>()
+            + self.dets.iter().flatten().map(|d| d.bits.len()).sum::<usize>()
             + self.pts.get().and_then(|p| p.as_ref()).map_or(0, |p| p.bytes())
     }
 }
@@ -257,7 +280,7 @@ impl KfStore {
         };
         let kf = Kf {
             seq: self.count as u64, held: self.held.contains(&anchor), t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
-            dets: dets.as_ref().map(|v| v.iter().map(|d| Det { cls: d.cls, score: d.score, box_: d.box_, mask: d.mask.clone() }).collect()),
+            dets: dets.as_ref().map(|v| v.iter().map(DetZ::pack).collect()),
             pts: Default::default(),
         };
         let kf = Arc::new(kf);
@@ -354,6 +377,15 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn det_bits_roundtrip() {
+        for n in [0usize, 1, 7, 8, 9, 20 * 16 + 3] {
+            let d = Det { cls: 3, score: 0.7, box_: [1, 2, 3, 4], mask: (0..n).map(|i| (i * 7 + i / 3) % 5 < 2).collect() };
+            let u = DetZ::pack(&d).unpack();
+            assert_eq!((u.cls, u.score.to_bits(), u.box_, u.mask), (d.cls, d.score.to_bits(), d.box_, d.mask));
+        }
+    }
 
     fn rz(a: f64) -> M3 {
         let (s, c) = a.sin_cos();

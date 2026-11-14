@@ -1984,16 +1984,23 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 32 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음)
+    const DEC_CHUNK: usize = 32;
+    let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>, Option<PtsGrid>)> = Default::default();
     for (i, (kf, r, pwc)) in snap.iter().enumerate() {
         let cd = Instant::now();
-        let (kd, kr) = (Depth::M(kf.depth()), kf.rgb());
+        if dec.is_empty() {
+            use rayon::prelude::*;
+            let end = (i + DEC_CHUNK).min(snap.len());
+            dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets(), kf.pts.wait().as_ref().map(PtsGrid::from_z))).collect::<Vec<_>>().into();
+        }
+        let (kd, kr, kdets, kpts) = dec.pop_front().unwrap();
         t_dec += cd.elapsed().as_secs_f64();
-        let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kf.dets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
+        let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kdets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
         {
             // 점 지도: 점 작업 스레드가 보관해 둔 점 격자(온 장면을 풀지 않음)
             let cp = Instant::now();
-            let zz = kf.pts.wait();
-            if let Some(g) = zz.as_ref().map(PtsGrid::from_z) {
+            if let Some(g) = kpts {
                 grid_points(k, &g, r, pwc, &mut scene, i as u32);
             }
             t_pts += cp.elapsed().as_secs_f64();
@@ -2032,7 +2039,7 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
         }
     }
     for (kf, r, pwc) in newer.iter() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets, true, grid, mem, traj, map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets(), true, grid, mem, traj, map_traj);
     }
     eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
@@ -2841,7 +2848,7 @@ const CATCH_UP_MAX: usize = 3;
 fn catch_up(a: &Args, k: [f64; 4], rb: &mut Rebuilt, newer: Snap) {
     let c0 = Instant::now();
     for (kf, r, pwc) in newer.iter() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets, true, &mut rb.grid, &mut rb.mem, &mut rb.traj, &mut rb.map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets(), true, &mut rb.grid, &mut rb.mem, &mut rb.traj, &mut rb.map_traj);
         rb.last_seq = kf.seq;
     }
     rb.secs += c0.elapsed().as_secs_f64();

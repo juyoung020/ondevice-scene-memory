@@ -157,6 +157,8 @@ pub struct Config {
     /// > 0 이면(그리고 exposure_ms 가 0 이면) 자동 노출을 우리가 함: 노출은 이 값(ms)까지만, 더 어두우면 감도를 올림.
     /// 손에 든 카메라가 빨리 움직일 때 번짐을 막는다(D435 컬러 자체 자동 노출은 어두우면 33 ms 까지 길어짐)
     pub ae_cap_ms: f64,
+    /// 컬러 제어 묶음(아래 [`Profile`])
+    pub profile: Profile,
     pub emitter: bool,
     /// 처음 버리는 묶음 수
     pub warmup: u32,
@@ -167,7 +169,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { width: 640, height: 480, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
+        Config { width: 640, height: 480, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, profile: Profile::Librealsense, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
     }
 }
 
@@ -296,6 +298,43 @@ pub struct Camera {
     ae: Option<SoftAe>,
 }
 
+/// 컬러 제어 묶음
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// librealsense 와 같음: 연 직후 컬러 제어가 모두 장치 기본값(librealsense 2.59.1 rs-enumerate-devices 의 default 열,
+    /// 켠 직후 값과 같음). librealsense 는 흐름을 열 때 컬러 제어를 쓰지 않으므로, 앞 실행이 바꿔 둔 값을 기본값으로 되돌려 같게 맞춘다
+    Librealsense,
+    /// 손카메라 위치 추적용: 위 + 전원 주파수 60 Hz(한국 조명) + 노출 상한(ae_cap_ms, 0 이면 16.6 ms = 60 Hz 두 주기)과 감도 보충
+    Tracking,
+}
+
+impl Profile {
+    pub fn parse(s: &str) -> Result<Profile, String> {
+        match s {
+            "librealsense" | "default" => Ok(Profile::Librealsense),
+            "tracking" => Ok(Profile::Tracking),
+            o => Err(format!("--camera-profile {o}: librealsense | tracking")),
+        }
+    }
+}
+
+/// D435 컬러(RGB Camera) 제어의 장치 기본값(librealsense 2.59.1 rs-enumerate-devices -o, 펌웨어 5.16.0.1)
+const COLOR_DEFAULTS: [(u32, i32); 11] = [
+    (v4l2::CID_BRIGHTNESS, 0),
+    (v4l2::CID_CONTRAST, 50),
+    (v4l2::CID_SATURATION, 64),
+    (v4l2::CID_HUE, 0),
+    (v4l2::CID_GAMMA, 300),
+    (v4l2::CID_SHARPNESS, 50),
+    (v4l2::CID_AUTO_WHITE_BALANCE, 1),
+    (v4l2::CID_BACKLIGHT_COMPENSATION, 0),
+    (v4l2::CID_POWER_LINE_FREQUENCY, 3),
+    (v4l2::CID_EXPOSURE_AUTO, v4l2::EXPOSURE_APERTURE_PRIORITY),
+    (v4l2::CID_EXPOSURE_AUTO_PRIORITY, 0),
+];
+/// 자동 노출을 끈 뒤에만 쓸 수 있는 값(감도 64, 노출 16.6 ms)
+const COLOR_MANUAL_DEFAULTS: [(u32, i32); 2] = [(v4l2::CID_GAIN, 64), (v4l2::CID_EXPOSURE_ABSOLUTE, 166)];
+
 /// 노출 상한이 있는 자동 노출(밝기 = YUYV 의 Y 를 성기게 본 평균)
 struct SoftAe {
     cap: i32,  // 100 µs 단위
@@ -375,14 +414,23 @@ impl Camera {
         color.start()?;
         // 제어: 컬러 PU 는 컬러 노드, 이미터는 깊이 XU
         let cc = &color.s.node;
-        let _ = cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO_PRIORITY, 0);
-        // 화질: 60 Hz 전원 깜빡임 맞춤, 자동 화이트 밸런스, 역광 보정 끔(밝은 창 쪽으로 노출이 늘지 않게)
-        let _ = cc.set_ctrl(v4l2::CID_POWER_LINE_FREQUENCY, v4l2::POWER_LINE_60HZ);
-        let _ = cc.set_ctrl(v4l2::CID_AUTO_WHITE_BALANCE, 1);
-        let _ = cc.set_ctrl(v4l2::CID_BACKLIGHT_COMPENSATION, 0);
+        // 1) librealsense 와 같은 상태: 수동 노출에서만 쓰이는 감도·노출 기본값을 먼저, 그다음 나머지 기본값(자동 노출 켬)
+        let _ = cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO, v4l2::EXPOSURE_MANUAL);
+        for (id, v) in COLOR_MANUAL_DEFAULTS {
+            let _ = cc.set_ctrl(id, v);
+        }
+        for (id, v) in COLOR_DEFAULTS {
+            let _ = cc.set_ctrl(id, v);
+        }
+        // 2) 위치 추적 묶음: 60 Hz 깜빡임 맞춤 + 노출 상한
+        let tracking = cfg.profile == Profile::Tracking;
+        if tracking {
+            let _ = cc.set_ctrl(v4l2::CID_POWER_LINE_FREQUENCY, v4l2::POWER_LINE_60HZ);
+        }
+        let cap_ms = if cfg.ae_cap_ms > 0.0 { cfg.ae_cap_ms } else if tracking { 16.6 } else { 0.0 };
         let mut ae = None;
-        if cfg.exposure_ms <= 0.0 && cfg.ae_cap_ms > 0.0 {
-            let cap = ((cfg.ae_cap_ms * 10.0) as i32).max(1);
+        if cfg.exposure_ms <= 0.0 && cap_ms > 0.0 {
+            let cap = ((cap_ms * 10.0) as i32).max(1);
             let g = if cfg.gain >= 0 { cfg.gain } else { 64 };
             cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO, v4l2::EXPOSURE_MANUAL).map_err(|e| format!("자동 노출 끔: {e}"))?;
             cc.set_ctrl(v4l2::CID_EXPOSURE_ABSOLUTE, cap).map_err(|e| format!("노출: {e}"))?;
@@ -394,8 +442,6 @@ impl Camera {
             if cfg.gain >= 0 {
                 cc.set_ctrl(v4l2::CID_GAIN, cfg.gain).map_err(|e| format!("감도: {e}"))?;
             }
-        } else {
-            cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO, v4l2::EXPOSURE_APERTURE_PRIORITY).map_err(|e| format!("자동 노출 켬: {e}"))?;
         }
         let mut em = [cfg.emitter as u8];
         let _ = ctl.xu(DEPTH_XU_UNIT, XU_EMITTER_ENABLED, v4l2::UVC_SET_CUR, &mut em);

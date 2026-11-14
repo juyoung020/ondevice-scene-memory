@@ -17,8 +17,11 @@ OUT=${OUT:-data/memory/live}
 SRC="--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file $OUT/reset.req"
 if [ "${1:-}" = "--tum" ]; then SRC="--tum $2 --config docs/rtabmap_pi.ini --send-every 2"; shift 2; fi
 RT=${RT:-auto}
+# NPU 코어 묶기(DX-M1 코어 0·1·2, all = 셋 다): 분할과 사진 벡터를 다른 코어에 두어 줄 서지 않고 함께 돌게
+SEG_NPU=${SEG_NPU:-all}
+EMB_NPU=${EMB_NPU:-all}
 rm -rf "$OUT"; mkdir -p "$OUT"
 exec target/release/ondevice --slam "$SRC" \
     --every 1 --live 1 --seg "$SEG" --embed "$EMB" --vocab vocab/names.voc \
-    --max-depth 3.5 --out "$OUT" --rt "$RT" --mlock \
+    --max-depth 3.5 --out "$OUT" --rt "$RT" --mlock --seg-npu "$SEG_NPU" --embed-npu "$EMB_NPU" \
     --serve "8091 --bind 0.0.0.0 --search-model $M/siglip2 --vocab vocab/names.voc" "$@"

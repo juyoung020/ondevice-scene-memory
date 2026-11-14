@@ -190,6 +190,8 @@ pub struct Slam {
     constraints: LinkMap,
     map_correction: Tf,
     loop_hyp: (i32, f32),
+    /// 밖에서 찾은 루프 후보(옛 지도 노드 id): 이번 단계에 베이즈 가설이 없으면 이것으로 정합해 본다(검증은 원래 루프와 같음)
+    pub forced_hyp: i32,
     highest: (i32, f32),
     odom_cache_poses: BTreeMap<i32, Tf>,
     odom_cache_links: LinkMap,
@@ -228,6 +230,7 @@ impl Slam {
             constraints: LinkMap::default(),
             map_correction: Tf::IDENTITY,
             loop_hyp: (0, 0.0),
+            forced_hyp: 0,
             highest: (0, 0.0),
             odom_cache_poses: BTreeMap::new(),
             odom_cache_links: LinkMap::default(),
@@ -404,6 +407,10 @@ impl Slam {
         } else if !s.is_bad() && s.weight >= 0 && small {
             self.highest = last_highest;
         }
+        if self.loop_hyp.0 == 0 && self.forced_hyp > 0 && self.forced_hyp != sid && self.mem.sig(self.forced_hyp).is_some() {
+            self.loop_hyp = (self.forced_hyp, 1.0);
+        }
+        self.forced_hyp = 0;
         self.info.highest = self.highest;
         let mut added: Vec<(i32, i32)> = Vec::new();
         let mut last_prox = 0;

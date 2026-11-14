@@ -932,7 +932,6 @@ dependencies = [
 name = "sgview"
 version = "0.8.0"
 dependencies = [
- "cc",
  "flate2",
  "ort",
  "serde_json",

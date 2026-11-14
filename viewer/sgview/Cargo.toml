@@ -3,7 +3,7 @@ name = "sgview"
 version = "0.8.0"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
-description = "Native scene-graph viewer server (Rust, no Python / Spark-DSG): serves view.json + map + object files and the three.js page; walls via scenemap C++."
+description = "Native scene-graph viewer server (Rust, no Python / Spark-DSG): serves view.json + map + object files and the three.js page; walls (2D lines + state vector) in Rust."
 
 [dependencies]
 serde_json = "1"
@@ -15,9 +15,6 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"], 
 default = ["search"]
 # 글 검색: SigLIP2 글 인코더(ONNX Runtime) + 토크나이저. 끄면 이름 글자 검색만 남는다.
 search = ["dep:ort", "dep:tokenizers"]
-
-[build-dependencies]
-cc = "1"
 
 [profile.release]
 opt-level = 3

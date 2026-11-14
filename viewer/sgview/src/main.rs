@@ -2,7 +2,7 @@
 //!
 //! Reads the folder scenemap writes (`view.json`, `map.pgm` + `map.yaml`, `objects/O<id>_*`) and serves it to a three.js page.
 //! Everything the page needs comes from `view.json`, which already carries
-//! objects, rooms, the compact graph, robot pose and grid info. Walls as 2D lines / numbers come from scenemap's C++ (`walls.cpp`).
+//! objects, rooms, the compact graph, robot pose and grid info. Walls as 2D lines / numbers come from `walls.rs`.
 //!
 //!   sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir with text_model*.onnx + tokenizer.json>]
 //!
@@ -18,6 +18,7 @@
 //! GET /api/files?p=a,b,..   many files below the memory dir in one reply (see pack_files)
 //! GET /stream               SSE: live stream (--ingest), else folder events vv (view.json version) / fpose (pose.json)
 mod search;
+mod walls;
 
 use std::collections::HashMap;
 use std::fs;
@@ -105,11 +106,6 @@ fn decode_png(b: &[u8]) -> Option<(usize, usize, usize, usize, Vec<u8>)> {
         }
     }
     Some((w, h, ch, bps, out))
-}
-
-extern "C" {
-    fn sgv_wall_segments(cells: *const i8, w: i32, h: i32, res: f64, ox: f64, oy: f64, ignore: *const f64, n_ignore: i32, out: *mut f64, cap: i32, angle_out: *mut f64) -> i32;
-    fn sgv_wall_state(cells: *const i8, w: i32, h: i32, res: f64, ox: f64, oy: f64, segs: *const f64, n: i32, pose: *const f64, out: *mut f32);
 }
 
 /// Occupancy grid in scenemap layout (row 0 = min y; −1 unknown, 0..100 occupied %), plus its wall segments.
@@ -327,14 +323,7 @@ fn wall_map(st: &State) -> Option<Arc<WallMap>> {
             dst[x] = if src[x] <= 90 { 100 } else if src[x] == 205 { -1 } else { 0 };
         }
     }
-    let mut buf = vec![0f64; 4 * 512];
-    let mut theta = 0f64;
-    let mut n = unsafe { sgv_wall_segments(cells.as_ptr(), w as i32, h as i32, res, ox, oy, ig.as_ptr(), (ig.len() / 4) as i32, buf.as_mut_ptr(), 512, &mut theta) } as usize;
-    if n > 512 {
-        buf = vec![0f64; 4 * n];
-        n = unsafe { sgv_wall_segments(cells.as_ptr(), w as i32, h as i32, res, ox, oy, ig.as_ptr(), (ig.len() / 4) as i32, buf.as_mut_ptr(), n as i32, &mut theta) } as usize;
-    }
-    buf.truncate(4 * n);
+    let (buf, theta) = walls::wall_segments(&walls::Grid { cells: &cells, w: w as i32, h: h as i32, res, ox, oy }, &ig);
     let wm = Arc::new(WallMap { ver, ig_key, w: w as i32, h: h as i32, res, ox, oy, cells, segs: buf, theta });
     *g = Some(wm.clone());
     Some(wm)
@@ -392,10 +381,7 @@ fn walls_json(st: &State, q: &HashMap<String, String>) -> Option<String> {
     let wm = wall_map(st)?;
     let get = |k: &str| q.get(k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let pose = [get("x"), get("y"), get("yaw")];
-    let mut out = [0f32; WALL_STATE_LEN];
-    unsafe {
-        sgv_wall_state(wm.cells.as_ptr(), wm.w, wm.h, wm.res, wm.ox, wm.oy, wm.segs.as_ptr(), (wm.segs.len() / 4) as i32, pose.as_ptr(), out.as_mut_ptr());
-    }
+    let out: [f32; WALL_STATE_LEN] = walls::wall_state(&walls::Grid { cells: &wm.cells, w: wm.w, h: wm.h, res: wm.res, ox: wm.ox, oy: wm.oy }, &wm.segs, &pose);
     let segs: Vec<String> = wm.segs.chunks(4).map(|c| json_f64s(c)).collect();
     let state: Vec<String> = out.iter().map(|x| format!("{:.5}", x)).collect();
     Some(format!(
@@ -799,14 +785,7 @@ fn recompute_segments(l: &mut Live) {
     if l.w <= 0 || l.h <= 0 {
         return;
     }
-    let mut buf = vec![0f64; 4 * 512];
-    let mut theta = 0f64;
-    let mut n = unsafe { sgv_wall_segments(l.cells.as_ptr(), l.w, l.h, l.res, l.ox, l.oy, l.ig.as_ptr(), (l.ig.len() / 4) as i32, buf.as_mut_ptr(), 512, &mut theta) } as usize;
-    if n > 512 {
-        buf = vec![0f64; 4 * n];
-        n = unsafe { sgv_wall_segments(l.cells.as_ptr(), l.w, l.h, l.res, l.ox, l.oy, l.ig.as_ptr(), (l.ig.len() / 4) as i32, buf.as_mut_ptr(), n as i32, &mut theta) } as usize;
-    }
-    buf.truncate(4 * n);
+    let (buf, theta) = walls::wall_segments(&walls::Grid { cells: &l.cells, w: l.w, h: l.h, res: l.res, ox: l.ox, oy: l.oy }, &l.ig);
     if buf != l.segs || theta != l.theta {
         l.segs = buf;
         l.theta = theta;
@@ -820,10 +799,7 @@ fn walls_event(l: &Live, with_segments: bool) -> Option<String> {
         return None;
     }
     let pose = [p[1], p[2], p[3]];
-    let mut out = [0f32; WALL_STATE_LEN];
-    unsafe {
-        sgv_wall_state(l.cells.as_ptr(), l.w, l.h, l.res, l.ox, l.oy, l.segs.as_ptr(), (l.segs.len() / 4) as i32, pose.as_ptr(), out.as_mut_ptr());
-    }
+    let out: [f32; WALL_STATE_LEN] = walls::wall_state(&walls::Grid { cells: &l.cells, w: l.w, h: l.h, res: l.res, ox: l.ox, oy: l.oy }, &l.segs, &pose);
     let segs = if with_segments {
         let v: Vec<String> = l.segs.chunks(4).map(|c| json_f64s(c)).collect();
         format!("[{}],\"theta\":{:.6}", v.join(","), l.theta)

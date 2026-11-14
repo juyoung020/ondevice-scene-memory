@@ -60,6 +60,8 @@ pub struct RegInfo {
     /// 맞추기 뒤 `to` 장면에 남은 특징점 번호. 추측 없이 시작해 한 번 더 맞춘 경우만 일부(Some).
     /// RTAB-Map 은 두 번째 맞추기에서 이 남은 특징점을 그 장면의 특징으로 바꿔 저장한다(키프레임이 되면 이것을 씀)
     pub to_kept: Option<Vec<usize>>,
+    /// 두 번째 판(추측 있음)을 거친 경우 원본이 `from` Signature 에 남기는 단어 순서(원래 특징 번호): 추측 창에 이웃이 있던 투영 점(번호 순) 뒤에 나머지 유한 점(번호 순). 3D 없는 점은 빠짐
+    pub from_order: Option<Vec<usize>>,
     pub rejected: &'static str,
 }
 
@@ -75,6 +77,7 @@ impl RegInfo {
             match_pairs: Vec::new(),
             to_words: 0,
             to_kept: None,
+            from_order: None,
             rejected: "",
         }
     }
@@ -181,6 +184,8 @@ struct Corr {
     to_words: usize,
     /// 추측 없는 길에서 to 단어로 남는 보기 번호(중복 단어 제외)
     to_kept: Option<Vec<usize>>,
+    /// 추측 창 길: 원본 from 단어 순서(보기 번호)
+    from_order: Option<Vec<usize>>,
 }
 
 impl RegistrationVis {
@@ -219,17 +224,23 @@ impl RegistrationVis {
 
     /// float 위치 그대로 받는 판(위치 추적이 씀). guess 가 NULL 이면 추측 없음
     pub fn compute_tf(&self, from: &Features, to: &Features, cam: &Camera, guess: Tf) -> RegInfo {
+        self.compute_tf_ids(from, None, to, cam, guess)
+    }
+
+    /// from 특징에 원본 단어 id 가 붙어 있는 경우(같은 Signature 를 다시 맞출 때). from_ids[i] = i 번째 특징의 단어 id(겹침 없음).
+    /// 짝은 단어 id 순으로 PnP 에 들어가고(원본 estimateMotion3DTo2D 가 id 순), kNN 결과가 id 0 인 단어에 닿으면 그 뒤는 버린다(VWDictionary::addNewWords)
+    pub fn compute_tf_ids(&self, from: &Features, from_ids: Option<&[i32]>, to: &Features, cam: &Camera, guess: Tf) -> RegInfo {
         let local = cam_local(cam);
         let k = K { fx: cam.fx, fy: cam.fy, cx: cam.cx, cy: cam.cy };
         let fv = View::new(from, (0..from.kps.len()).collect());
         let tv = View::new(to, (0..to.kps.len()).collect());
-        let (mut info, kept) = self.compute_impl(&fv, &tv, cam, &k, &local, guess);
+        let (mut info, kept) = self.compute_impl(&fv, from_ids, &tv, cam, &k, &local, guess);
         if self.repeat_once && guess.is_null() && info.transform.is_some() {
             // 결과를 추측으로 한 번 더. to 는 첫 번째에서 단어가 된 특징점만(원본은 그 단어를 특징으로 다시 씀)
             let kept: Vec<usize> = kept.unwrap_or_else(|| (0..to.kps.len()).collect());
             let tv2 = View::new(to, kept.clone());
             let t = info.tf;
-            let (mut info2, _) = self.compute_impl(&fv, &tv2, cam, &k, &local, t);
+            let (mut info2, _) = self.compute_impl(&fv, from_ids, &tv2, cam, &k, &local, t);
             info2.to_kept = Some(kept);
             info = info2;
         }
@@ -238,7 +249,7 @@ impl RegistrationVis {
     }
 
     /// computeTransformationImpl 한 번. 두 번째 값: 추측 없는 길에서 to 단어로 남은 원래 번호
-    fn compute_impl(&self, fv: &View, tv: &View, cam: &Camera, k: &K, local: &Tf, guess: Tf) -> (RegInfo, Option<Vec<usize>>) {
+    fn compute_impl(&self, fv: &View, from_ids: Option<&[i32]>, tv: &View, cam: &Camera, k: &K, local: &Tf, guess: Tf) -> (RegInfo, Option<Vec<usize>>) {
         let mut info = RegInfo::empty();
         let guess_set = !guess.is_identity() && !guess.is_null();
         let _p0 = std::time::Instant::now();
@@ -246,11 +257,16 @@ impl RegistrationVis {
             if guess_set && self.guess_win_size > 0 {
                 self.match_guess(fv, tv, cam, k, local, &guess)
             } else {
-                self.match_knn(fv, tv)
+                self.match_knn(fv, from_ids, tv)
             }
         } else {
-            Corr { pairs: Vec::new(), from_words: fv.len(), to_words: 0, to_kept: None }
+            Corr { pairs: Vec::new(), from_words: fv.len(), to_words: 0, to_kept: None, from_order: None }
         };
+        let mut corr = corr;
+        if let Some(ids) = from_ids {
+            corr.pairs.sort_by_key(|&(a, _)| ids[fv.idx[a]]);
+        }
+        info.from_order = corr.from_order.as_ref().map(|v| v.iter().map(|&i| fv.idx[i]).collect());
         let kept = corr.to_kept.as_ref().map(|v| v.iter().map(|&i| tv.idx[i]).collect());
         PROF.with(|p| p.borrow_mut()[if guess_set {0} else {1}] += _p0.elapsed().as_secs_f64());
         info.to_words = corr.to_words;
@@ -451,6 +467,7 @@ impl RegistrationVis {
         let mut pairs = Vec::new();
         let mut from_words = 0usize;
         let mut any_projected = false;
+        let mut nbr = vec![false; fv.len()];
         for i in 0..fv.len() {
             let p3 = fv.p3(i);
             if !is_finite3(&p3) {
@@ -464,6 +481,7 @@ impl RegistrationVis {
                 continue;
             }
             any_projected = true;
+            // 이웃이 하나라도 있으면 원본은 이 점을 from 단어로 넣는다(짝 여부와 상관없이)
             // nanoflann 반경 찾기: (q - p)² 합 < r²(float)
             let (mut b0, mut d0, mut d1, mut nc) = (usize::MAX, u32::MAX, u32::MAX, 0usize);
             let mut only = usize::MAX;
@@ -483,6 +501,7 @@ impl RegistrationVis {
                     }
                 }
             }
+            nbr[i] = nc > 0;
             let matched = if nc >= 2 {
                 if (d0 as f32) < self.nndr * (d1 as f32) { Some(b0) } else { None }
             } else if nc == 1 {
@@ -499,13 +518,15 @@ impl RegistrationVis {
         }
         if !any_projected {
             // 모든 투영이 화면 밖: 원본은 단어를 하나도 만들지 않음
-            return Corr { pairs: Vec::new(), from_words: 0, to_words: 0, to_kept: None };
+            return Corr { pairs: Vec::new(), from_words: 0, to_words: 0, to_kept: None, from_order: None };
         }
-        Corr { pairs, from_words, to_words: tv.len(), to_kept: None }
+        let mut order: Vec<usize> = (0..fv.len()).filter(|&i| nbr[i]).collect();
+        order.extend((0..fv.len()).filter(|&i| !nbr[i] && is_finite3(&fv.p3(i))));
+        Corr { pairs, from_words, to_words: tv.len(), to_kept: None, from_order: Some(order) }
     }
 
     /// 추측 없이: VWDictionary kNN(정확한 해밍 2-NN) + NNDR + 중복 단어 제거
-    fn match_knn(&self, fv: &View, tv: &View) -> Corr {
+    fn match_knn(&self, fv: &View, from_ids: Option<&[i32]>, tv: &View) -> Corr {
         let nf = fv.len();
         let mut best = vec![usize::MAX; tv.len()];
         if self.kd_tree {
@@ -535,6 +556,9 @@ impl RegistrationVis {
                     if i < 0 {
                         continue;
                     }
+                    if from_ids.is_some_and(|v| v[fv.idx[i as usize]] == 0) {
+                        break; // 원본: id 0 단어는 결과에서 빼고 거기서 멈춤
+                    }
                     if d >= 0.0 {
                         res[n] = (d, i as usize);
                         n += 1;
@@ -551,17 +575,23 @@ impl RegistrationVis {
             }
         } else if nf >= 2 {
             for j in 0..tv.len() {
-                let (mut b0, mut d0, mut d1) = (usize::MAX, u32::MAX, u32::MAX);
+                let (mut b0, mut b1, mut d0, mut d1) = (usize::MAX, usize::MAX, u32::MAX, u32::MAX);
                 let tw = &tv.w[j];
                 for i in 0..nf {
                     let d = hamming(&fv.w[i], tw);
                     if d < d0 {
                         d1 = d0;
+                        b1 = b0;
                         d0 = d;
                         b0 = i;
                     } else if d < d1 {
                         d1 = d;
+                        b1 = i;
                     }
+                }
+                // 원본: id 0 단어는 결과에서 빼고 거기서 멈춤 → 결과가 둘 못 되면 짝 없음
+                if from_ids.is_some_and(|v| v[fv.idx[b0]] == 0 || v[fv.idx[b1]] == 0) {
+                    continue;
                 }
                 // 거절 조건: d0 > nndr*d1(제곱 L2 = 해밍, float)
                 if !((d0 as f32) > self.nndr * (d1 as f32)) {
@@ -587,7 +617,7 @@ impl RegistrationVis {
             }
         }
         pairs.sort_unstable();
-        Corr { pairs, from_words: nf, to_words: kept.len(), to_kept: Some(kept) }
+        Corr { pairs, from_words: nf, to_words: kept.len(), to_kept: Some(kept), from_order: None }
     }
 }
 

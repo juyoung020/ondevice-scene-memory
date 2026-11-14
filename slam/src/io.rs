@@ -1,7 +1,7 @@
 //! 장면 입력: TUM 폴더 재생, RealSense 카메라(`realsense` 기능), 읽기 스레드(PrefetchSource).
 //! 원본: bridge/src/frame_source.h · tum_source.cpp · prefetch_source.h · realsense_source.cpp · depth_align.cpp.
 //! 회색조·깊이 mm 바꾸기는 OpenCV 4.10 cvtColor(COLOR_BGR2GRAY) · Mat::convertTo 와 비트까지 같게 한다.
-use crate::{Camera, Frame, Pose};
+use crate::{Camera, Features, Frame, Pose};
 use nalgebra::{Matrix3, Rotation3, Translation3, UnitQuaternion};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -202,8 +202,11 @@ impl FrameSource for TumSource {
     }
 }
 
+/// 읽기 스레드가 장면마다 미리 해 둘 일(특징 추출 등). 결과는 장면과 함께 넘겨짐
+pub type Prep = Box<dyn FnMut(&Frame) -> Features + Send>;
+
 struct Slot {
-    frame: Option<(Frame, f64)>,
+    frame: Option<(Frame, f64, Option<Features>)>,
     done: bool,
     stop: bool,
     err: Option<String>,
@@ -218,10 +221,17 @@ pub struct PrefetchSource {
     desc: String,
     read_ms: f64,
     dropped: Arc<AtomicUsize>,
+    prepped: Option<Features>,
 }
 
 impl PrefetchSource {
-    pub fn new(mut inner: Box<dyn FrameSource>, drop: bool) -> PrefetchSource {
+    pub fn new(inner: Box<dyn FrameSource>, drop: bool) -> PrefetchSource {
+        Self::with_prep(inner, drop, None)
+    }
+
+    /// prep 이 있으면 읽기 스레드가 장면마다 그것을 돌려 결과를 장면과 함께 넘긴다(take_prepped 로 꺼냄).
+    /// 읽기 시간(last_read_ms)에는 prep 시간이 들어가지 않는다
+    pub fn with_prep(mut inner: Box<dyn FrameSource>, drop: bool, mut prep: Option<Prep>) -> PrefetchSource {
         let desc = inner.describe() + if drop { ", 읽기 스레드(밀리면 지난 장면 버림)" } else { ", 읽기 스레드" };
         let sh = Arc::new((Mutex::new(Slot { frame: None, done: false, stop: false, err: None }), Condvar::new()));
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -232,6 +242,7 @@ impl PrefetchSource {
                 match inner.next() {
                     Ok(Some(f)) => {
                         let ms = inner.last_read_ms();
+                        let pf = prep.as_mut().map(|p| p(&f));
                         let mut s = m.lock().unwrap();
                         if !drop {
                             s = cv.wait_while(s, |s| s.frame.is_some() && !s.stop).unwrap();
@@ -242,7 +253,7 @@ impl PrefetchSource {
                         if s.frame.is_some() {
                             dr2.fetch_add(1, Ordering::Relaxed);
                         }
-                        s.frame = Some((f, ms));
+                        s.frame = Some((f, ms, pf));
                         cv.notify_all();
                     }
                     Ok(None) => break,
@@ -255,11 +266,15 @@ impl PrefetchSource {
             m.lock().unwrap().done = true;
             cv.notify_all();
         });
-        PrefetchSource { sh, th: Some(th), desc, read_ms: 0.0, dropped }
+        PrefetchSource { sh, th: Some(th), desc, read_ms: 0.0, dropped, prepped: None }
     }
     /// 위치 추적이 밀려 가져가기 전에 새 장면으로 바뀐 장면 수
     pub fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Relaxed)
+    }
+    /// 마지막 next 장면에 읽기 스레드가 해 둔 prep 결과(한 번만 꺼낼 수 있음)
+    pub fn take_prepped(&mut self) -> Option<Features> {
+        self.prepped.take()
     }
 }
 
@@ -268,8 +283,9 @@ impl FrameSource for PrefetchSource {
         let (m, cv) = &*self.sh;
         let mut s = cv.wait_while(m.lock().unwrap(), |s| s.frame.is_none() && !s.done).unwrap();
         match s.frame.take() {
-            Some((f, ms)) => {
+            Some((f, ms, pf)) => {
                 self.read_ms = ms;
+                self.prepped = pf;
                 cv.notify_all();
                 Ok(Some(f))
             }

@@ -151,9 +151,10 @@ impl OdometryF2F {
                 out.lost = false;
                 return out;
             }
+            // 원본 Odometry.cpp: 속도·이전 시각 지우기는 이 else-if 블록 안에만 있다(ResetCountdown=0 이면 놓쳐도 그대로 둠)
+            self.velocity = Tf::NULL;
+            self.previous_stamp = 0.0;
         }
-        self.velocity = Tf::NULL;
-        self.previous_stamp = 0.0;
         res.pose = None;
         res.tf = Tf::NULL;
         res.lost = true;

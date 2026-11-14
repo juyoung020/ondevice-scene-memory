@@ -175,6 +175,32 @@ fn pack(d: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+#[inline]
+fn pack_bytes(p: &[u64; 4]) -> [u8; 32] {
+    let mut o = [0u8; 32];
+    for (i, w) in p.iter().enumerate() {
+        o[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    o
+}
+
+/// 바이트 값마다 8 비트를 칸별 가림(0 또는 모두 1)으로 편 표
+static BYTE_MASK: [[u32; 8]; 256] = {
+    let mut t = [[0u32; 8]; 256];
+    let mut v = 0;
+    while v < 256 {
+        let mut b = 0;
+        while b < 8 {
+            if (v >> b) & 1 != 0 {
+                t[v][b] = u32::MAX;
+            }
+            b += 1;
+        }
+        v += 1;
+    }
+    t
+};
+
 /// L1<float> 거리: 0/1 값이라 popcount(xor) 와 비트까지 같다
 #[inline]
 fn l1(a: &[u64; 4], b: &[u64; 4]) -> f32 {
@@ -522,33 +548,44 @@ impl KdTreeIndex {
     /// 앞쪽 최대 101 점의 평균·분산(원본 float 순서 그대로) → 분산 큰 축 5 개 중 rand 로 하나 → 평균에서 자른다
     fn mean_split(&mut self, ind: &mut [i32], mean: &mut [f32], var: &mut [f32]) -> (usize, i32, f32) {
         let count = ind.len();
-        mean.fill(0.0);
-        var.fill(0.0);
         let cnt = (SAMPLE_MEAN + 1).min(count);
-        let mut row = [0f32; DIM];
+        // 원본은 0/1 float 를 차례로 더한다: 합은 1 의 개수와 정확히 같으므로 개수를 세어 float 로 바꾼다
+        // 바이트 값 → 8 칸 비트 가림(0 / 0xFFFFFFFF). 칸 k = 바이트 k/8 의 비트 k%8
+        let mut ones = [0u32; DIM];
         for &j in &ind[..cnt] {
-            let p = &self.pts[j as usize];
-            for k in 0..DIM {
-                row[k] = bit(p, k);
-            }
-            for k in 0..DIM {
-                mean[k] += row[k];
+            let bytes = pack_bytes(&self.pts[j as usize]);
+            for (c, &by) in bytes.iter().enumerate() {
+                let m = &BYTE_MASK[by as usize];
+                let o = &mut ones[c * 8..c * 8 + 8];
+                for l in 0..8 {
+                    o[l] += m[l] & 1;
+                }
             }
         }
         let div = 1.0f32 / cnt as f32;
-        for m in mean.iter_mut() {
-            *m *= div;
+        // 분산: 칸마다 더하는 값은 (0-평균)² 또는 (1-평균)² 둘뿐. 원본과 같은 점 순서로 그 값을 더한다
+        let mut sq0 = [0u32; DIM];
+        let mut sqx = [0u32; DIM];
+        for k in 0..DIM {
+            let m = ones[k] as f32 * div;
+            mean[k] = m;
+            let (d0, d1) = (0.0f32 - m, 1.0f32 - m);
+            sq0[k] = (d0 * d0).to_bits();
+            sqx[k] = sq0[k] ^ (d1 * d1).to_bits();
         }
+        let mut acc = [0f32; DIM];
         for &j in &ind[..cnt] {
-            let p = &self.pts[j as usize];
-            for k in 0..DIM {
-                row[k] = bit(p, k);
-            }
-            for k in 0..DIM {
-                let d = row[k] - mean[k];
-                var[k] += d * d;
+            let bytes = pack_bytes(&self.pts[j as usize]);
+            for (c, &by) in bytes.iter().enumerate() {
+                let m = &BYTE_MASK[by as usize];
+                let r = c * 8..c * 8 + 8;
+                let (v, a, x) = (&mut acc[r.clone()], &sq0[r.clone()], &sqx[r]);
+                for l in 0..8 {
+                    v[l] += f32::from_bits(a[l] ^ (x[l] & m[l]));
+                }
             }
         }
+        var[..DIM].copy_from_slice(&acc);
         // selectDivision
         let mut num = 0usize;
         let mut top = [0usize; RAND_DIM];
@@ -757,6 +794,52 @@ mod tests {
             v = g.next();
         }
         assert_eq!(v, 4123659995);
+    }
+
+    /// 짓기 결과(마디·검색 결과)의 지문과 시간. 지문은 원본 그대로 옮긴 판(점마다 float 칸 더하기)에서 잰 값
+    #[test]
+    fn build_fingerprint() {
+        let mut s = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let rows: Vec<[u8; 32]> = (0..1000).map(|_| {
+            let mut d = [0u8; 32];
+            for c in d.chunks_exact_mut(8) {
+                c.copy_from_slice(&next().to_le_bytes());
+            }
+            d
+        }).collect();
+        let mut h = 0xcbf29ce484222325u64;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        let t0 = std::time::Instant::now();
+        let reps = 20;
+        let mut idx = KdTreeIndex::new(1.0);
+        for _ in 0..reps {
+            idx.build(&rows);
+        }
+        let tb = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        for n in &idx.nodes {
+            mix(n.divfeat as u64);
+            mix(n.divval.to_bits() as u64);
+            mix(n.child1 as u64);
+            mix(n.child2 as u64);
+        }
+        let t1 = std::time::Instant::now();
+        let (i, d) = idx.knn_search(&rows[..500], 2, 32);
+        let ts = t1.elapsed().as_secs_f64() * 1e3;
+        for (a, b) in i.iter().zip(&d) {
+            mix(*a as u64);
+            mix(b.to_bits() as u64);
+        }
+        eprintln!("짓기 {tb:.2} ms, 찾기(500) {ts:.2} ms, 지문 {h:016x}");
+        assert_eq!(h, 0xe2629005165aef3d, "지문 {h:016x}");
     }
 
     #[test]

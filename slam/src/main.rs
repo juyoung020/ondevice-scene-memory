@@ -51,13 +51,13 @@ mod engine {
     //!  - 무작위 상태(glibc rand() · std::random_device 호출 수)는 프로세스에 하나: 모든 모듈이 같은 SharedRng 를 원본과 같은 순서로 씀
     use slam::features::Extractor;
     use slam::loopclose::flann::KdTreeIndex;
-    use slam::loopclose::mem::{Kp, LinkMap, LinkType, NodeFeatures, Signature};
+    use slam::loopclose::mem::{Kp, NodeFeatures, Signature};
     use slam::loopclose::{GtsamOptimizer, LoopRegistration, NodeInput, RegOut, Slam, WordIndex};
     use slam::odom::OdometryF2F;
     use slam::params::Params;
     use slam::register::{new_shared_rng, RegistrationVis, SharedRng, Tf};
     use slam::{Camera, Features, Frame};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -97,10 +97,10 @@ mod engine {
     /// 기준 장면(원본 Signature(SensorData(영상, 깊이))): 특징은 처음 다시 잡기에 쓸 때 뽑음
     pub struct RefSig {
         frame: Frame,
+        /// 지금 Signature 의 단어 특징(원본 단어 순서). None = 아직 안 뽑음
         feats: Option<Features>,
-        /// 원본은 맞추기가 첫 판을 통과하면(두 번째 판까지 감) 이 Signature 의 단어를 두 번째 판 순서로 바꿔 둔다.
-        /// 그 뒤 다시 쓰면 순서가 원본과 다를 수 있어 세어 둔다(세 녹화에서 0 이어야 비트 비교가 성립)
-        reordered: bool,
+        /// 특징마다의 단어 id. None = 처음(뽑은 순서대로 1, 2, … 와 같은 뜻)
+        ids: Option<Vec<i32>>,
     }
 
     fn cov36(c: &[[f64; 6]; 6]) -> [f64; 36] {
@@ -109,12 +109,6 @@ mod engine {
             o[r * 6..r * 6 + 6].copy_from_slice(&c[r]);
         }
         o
-    }
-
-    /// 유한한 3D 점만 남김(원본 두 번째 판의 from 단어 = 3D 가 있는 점)
-    fn finite_subset(f: &Features) -> Features {
-        let keep: Vec<usize> = (0..f.kps.len()).filter(|&i| f.pts3d[i].x.is_finite() && f.pts3d[i].y.is_finite() && f.pts3d[i].z.is_finite()).collect();
-        Features { kps: keep.iter().map(|&i| f.kps[i]).collect(), pts3d: keep.iter().map(|&i| f.pts3d[i]).collect(), desc: keep.iter().map(|&i| f.desc[i]).collect() }
     }
 
     /// 지도 사전 색인(rtflann KD-tree): 짓기·더하기·지우기 때 공유 난수 상태를 빌려 쓰고 돌려줌
@@ -204,7 +198,8 @@ mod engine {
         prev_stamp: f64,
         frames: i32,
         pub loop_unique_ids: Arc<AtomicU32>,
-        pub reordered_reuse: u32,
+        pub ref_reuse: u32,
+        pub ref_unknown: u32,
     }
 
     impl Engine {
@@ -234,7 +229,8 @@ mod engine {
                 prev_stamp: 0.0,
                 frames: 0,
                 loop_unique_ids: unique,
-                reordered_reuse: 0,
+                ref_reuse: 0,
+                ref_unknown: 0,
             }
         }
 
@@ -253,9 +249,8 @@ mod engine {
             if r.pose.is_some() {
                 self.prev_stamp = stamp;
                 self.frames += 1;
-            } else {
-                self.prev_stamp = 0.0;
             }
+            // 놓쳐도 이전 시각은 그대로(Odom/ResetCountdown=0 의 원본 동작)
             let out = OdomOut {
                 pose: r.pose.map(|_| r.tf),
                 lost: r.lost,
@@ -287,22 +282,38 @@ mod engine {
 
         pub fn make_ref(&self, f: &Frame) -> RefSig {
             let frame = Frame { id: f.id, t: f.t, gray: f.gray.clone(), color: Vec::new(), color_is_rgb: f.color_is_rgb, depth_mm: f.depth_mm.clone(), depth_raw: Vec::new(), depth_per_m: f.depth_per_m, cam: f.cam.clone() };
-            RefSig { frame, feats: None, reordered: false }
+            RefSig { frame, feats: None, ids: None }
         }
 
-        /// reloc.computeTransformationMod(기준 Signature, Signature(data), 추측 없음)
+        /// reloc.computeTransformationMod(기준 Signature, Signature(data), 추측 없음).
+        /// 원본은 기준 Signature 를 고쳐 둔다: 지금 장면에 특징이 없으면 단어 id 를 0, 1, … 로 다시 매기고(id 0 은 뒤의 kNN 에서 빠짐),
+        /// 두 번째 판(추측 있음)까지 가면 단어 순서를 그 판의 순서로 바꾼다. 다음 시도는 그 상태에서 시작
         pub fn reloc(&mut self, r: &mut RefSig) -> Option<RelocOut> {
-            if r.reordered {
-                self.reordered_reuse += 1;
-            }
             if r.feats.is_none() {
                 r.feats = Some(self.ext.extract(&r.frame));
             }
-            let info = self.reloc.compute_tf(r.feats.as_ref().unwrap(), &self.cur, &r.frame.cam, Tf::NULL);
+            let n = r.feats.as_ref().unwrap().kps.len();
+            if self.cur.kps.is_empty() {
+                // RegistrationVis "just create fake words": id = 순번
+                if n > 0 {
+                    r.ids = Some((0..n as i32).collect());
+                }
+                return None;
+            }
+            if r.ids.is_some() {
+                self.ref_reuse += 1;
+            }
+            let info = self.reloc.compute_tf_ids(r.feats.as_ref().unwrap(), r.ids.as_deref(), &self.cur, &r.frame.cam, Tf::NULL);
             if info.to_kept.is_some() {
-                // 두 번째 판까지 감: 원본 기준 Signature 는 3D 있는 단어만 남음
-                r.feats = Some(finite_subset(r.feats.as_ref().unwrap()));
-                r.reordered = true;
+                match &info.from_order {
+                    Some(ord) => {
+                        let f = r.feats.as_ref().unwrap();
+                        let ids: Vec<i32> = r.ids.clone().unwrap_or_else(|| (1..=n as i32).collect());
+                        r.feats = Some(Features { kps: ord.iter().map(|&i| f.kps[i]).collect(), pts3d: ord.iter().map(|&i| f.pts3d[i]).collect(), desc: ord.iter().map(|&i| f.desc[i]).collect() });
+                        r.ids = Some(ord.iter().map(|&i| ids[i]).collect());
+                    }
+                    None => self.ref_unknown += 1,
+                }
             }
             if info.tf.is_null() {
                 return None;
@@ -346,95 +357,11 @@ mod engine {
             self.slam.reset();
         }
 
-        /// Rtabmap::getGraph(optimized=true, global=true): 마지막 노드에 이어진 전체 그래프를 지금 지도 위치를 추측으로 다시 최적화.
-        /// (Slam 의 optimizeCurrentMap 이 비공개라 같은 절차를 여기서 공개 부분으로 따라 함. 뿌리 = 이어진 노드 중 가장 작은 id)
-        /// 반환: (id, 시각, 위치). 노드가 없으면 빔
+        /// Rtabmap::getGraph(optimized=true, global=true): (id, 시각, 위치). 노드가 없으면 빔
         pub fn final_graph(&mut self) -> Vec<(i32, f64, Tf)> {
-            let Some(last) = self.slam.mem.last_working_signature().map(|s| s.id) else { return Vec::new() };
-            let ids = self.slam.mem.neighbors_id(last, 0, true, false, false, false, None);
-            let root = if ids.len() > 1 { *ids.keys().next().unwrap() } else { last };
-            let set: BTreeSet<i32> = ids.keys().copied().collect();
-            let (mut mp, links) = self.slam.mem.metric_constraints(&set);
-            let guess = self.slam.local_optimized_tf().clone();
-            if self.slam.opt.iterations() > 0 {
-                for (k, v) in mp.iter_mut() {
-                    if *k != root {
-                        if let Some(g) = guess.get(k) {
-                            *v = *g;
-                        }
-                    }
-                }
-            }
-            let out = if mp.len() != guess.len() {
-                let (po, lo) = connected_graph(root, &mp, &links);
-                self.slam.opt.optimize(root, &po, &lo)
-            } else {
-                self.slam.opt.optimize(root, &mp, &links)
-            };
-            out.poses.iter().filter_map(|(id, t)| self.slam.mem.sig(*id).map(|s| (*id, s.stamp, *t))).collect()
+            let (poses, _) = self.slam.get_graph(true, true);
+            poses.iter().filter_map(|(id, t)| self.slam.mem.sig(*id).map(|s| (*id, s.stamp, *t))).collect()
         }
-    }
-
-    /// Optimizer::getConnectedGraph (loopclose.rs 의 비공개 함수와 같은 절차)
-    fn connected_graph(root: i32, poses_in: &BTreeMap<i32, Tf>, links_in: &LinkMap) -> (BTreeMap<i32, Tf>, LinkMap) {
-        let key = |id: i32, ty: LinkType| -> (i32, i32) {
-            if id < 0 {
-                return (3, -id);
-            }
-            let cls = match ty {
-                LinkType::Neighbor => 0,
-                LinkType::NeighborMerged => 1,
-                _ => 2,
-            };
-            (cls, id)
-        };
-        let mut next: BTreeMap<(i32, i32), (i32, Tf)> = BTreeMap::new();
-        next.insert(key(root, LinkType::Undef), (root, poses_in[&root]));
-        let mut bi: BTreeMap<i32, Vec<(i32, LinkType)>> = BTreeMap::new();
-        for (_, l) in links_in.iter() {
-            if l.from != l.to {
-                let has = |bi: &BTreeMap<i32, Vec<(i32, LinkType)>>, a: i32, b: i32| bi.get(&a).map(|v| v.iter().any(|(t, ty)| *t == b && *ty == l.ty)).unwrap_or(false);
-                if !has(&bi, l.from, l.to) && !has(&bi, l.to, l.from) {
-                    bi.entry(l.from).or_default().push((l.to, l.ty));
-                    bi.entry(l.to).or_default().push((l.from, l.ty));
-                }
-            }
-        }
-        let mut out: BTreeMap<i32, Tf> = BTreeMap::new();
-        let mut lout = LinkMap::default();
-        while let Some((&k, &(cur, pose))) = next.iter().next() {
-            next.remove(&k);
-            if out.contains_key(&cur) {
-                continue;
-            }
-            out.insert(cur, pose);
-            if let Some(v) = links_in.0.get(&cur) {
-                for l in v {
-                    if l.from == l.to && l.ty != LinkType::PosePrior {
-                        lout.insert(cur, l.clone());
-                    }
-                }
-            }
-            for (to, ty) in bi.get(&cur).cloned().unwrap_or_default() {
-                if !poses_in.contains_key(&to) {
-                    continue;
-                }
-                let kl = links_in.get(links_in.find(cur, to, true, ty).unwrap()).clone();
-                if !out.contains_key(&to) {
-                    let t = if kl.from == cur { kl.t } else { kl.t.inverse() };
-                    let p = out[&cur].mul(&t);
-                    next.entry(key(to, ty)).or_insert((to, p));
-                }
-                if lout.find(cur, to, true, kl.ty).is_none() {
-                    if kl.to < 0 {
-                        lout.insert(kl.to, kl.inverse());
-                    } else {
-                        lout.insert(kl.from, kl);
-                    }
-                }
-            }
-        }
-        (out, lout)
     }
 }
 
@@ -470,7 +397,7 @@ mod sys {
 
 fn usage() {
     eprintln!(
-        "slam_bridge (--tum <폴더> [--rate R] | --realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--Group/Name 값 ...]"
+        "slam_bridge (--tum <폴더> [--rate R] | --realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -486,6 +413,7 @@ struct Args {
     reset_file: String,
     realsense: bool,
     reloc_wait: f64,
+    reset_at: i64,
     block: i32,
     rate: f64,
     exposure_ms: f64,
@@ -512,6 +440,7 @@ fn parse_args() -> Result<Args, i32> {
         serial: String::new(),
         reset_file: String::new(),
         realsense: false,
+        reset_at: -1,
         reloc_wait: 1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
@@ -574,6 +503,7 @@ fn parse_args() -> Result<Args, i32> {
             "--max-frames" => a.max_frames = num(&val()?)? as i64,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
+            "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
             "-h" | "--help" => {
                 usage();
                 return Err(0);
@@ -636,13 +566,14 @@ fn run() -> Result<i32, String> {
     let replay_max = !a.tum.is_empty() && a.rate == 0.0;
     let block = if a.block < 0 { replay_max } else { a.block == 1 };
     // 장면 읽기는 따로 도는 스레드에서(최대 속도 재생만 장면을 버리지 않음)
-    let mut src = PrefetchSource::new(src, !replay_max);
-
     // 파라미터: 기본값 ← ini([Core]) ← 명령줄
     let mut params = if a.config.is_empty() { Params::default() } else { Params::read_ini(&a.config)? };
     for (k, v) in &a.overrides {
         params.set(k, v);
     }
+    // 위치 추적 특징 추출(GFTT/BRIEF·3D 점)도 읽기 스레드에서: 난수를 안 쓰고 장면만 보므로 어디서 뽑아도 결과가 같다
+    let ext = slam::features::Extractor::new(&params);
+    let mut src = PrefetchSource::with_prep(src, !replay_max, Some(Box::new(move |f: &slam::Frame| ext.extract(f))));
     params.0.remove("Rtabmap/PublishRAMUsage");
     let intermediate = params.get_bool("Rtabmap/CreateIntermediateNodes", false);
     let detection_rate: f32 = params.get("Rtabmap/DetectionRate", 1.0);
@@ -705,7 +636,7 @@ fn run() -> Result<i32, String> {
         fr.id = n + 1;
         // 리셋 요청(뷰어의 Reset 버튼이 이 파일을 만듦): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
         // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다
-        let reset_req = !a.reset_file.is_empty() && std::path::Path::new(&a.reset_file).exists();
+        let reset_req = n == a.reset_at || (!a.reset_file.is_empty() && std::path::Path::new(&a.reset_file).exists());
         if reset_req {
             let _ = std::fs::remove_file(&a.reset_file);
         }
@@ -734,7 +665,7 @@ fn run() -> Result<i32, String> {
         let read_ms = src.last_read_ms();
 
         let c1 = Instant::now();
-        let mut info = eng.odom_process(&fr, None);
+        let mut info = eng.odom_process(&fr, src.take_prepped());
         let mut pose = info.pose;
         let mut relocalized = false;
         if pose.is_none() || info.lost {
@@ -999,7 +930,7 @@ fn run() -> Result<i32, String> {
     eprintln!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
     eprintln!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");
     eprintln!("같은 지도에서 다시 잡음 {n_reloc} 번, ms/회 {}", s_reloc.str());
-    eprintln!("루프 정합에서 단어 id 가 겹치지 않는 노드(원본은 id 순서를 씀) {} 번, 순서가 바뀐 기준 장면을 다시 씀 {} 번", eng.loop_unique_ids.load(Ordering::Relaxed), eng.reordered_reuse);
+    eprintln!("루프 정합에서 단어 id 가 겹치지 않는 노드(원본은 id 순서를 씀) {} 번, 다시 잡기에서 원본이 고쳐 둔 기준 장면을 다시 씀 {} 번(두 번째 판 순서를 모름 {} 번)", eng.loop_unique_ids.load(Ordering::Relaxed), eng.ref_reuse, eng.ref_unknown);
     if let Some(s) = skipped {
         eprintln!("재생에서 밀려 건너뛴 장면 {}", s.load(Ordering::Relaxed));
     }

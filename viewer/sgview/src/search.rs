@@ -12,12 +12,14 @@ use std::sync::{Arc, Mutex};
 pub const DIM: usize = 768;
 /// SigLIP2 base patch32-256: logits = SCALE · cos (logit_scale = e^4.717 in the checkpoint)
 const SCALE: f32 = 111.83;
-/// Reading a query as a class name (constants read off 37 Korean / English queries against the 80 COCO names, docs/performance_log.md):
+/// Reading a query as a class name (constants read off 36 Korean / English queries against the 1,225 names of vocab/names.voc, docs/performance_log.md):
 /// closest-name cosine minus the median cosine below which the query is no class name, and from which it surely is
-const NAME_GAP_LO: f32 = 0.05;
-const NAME_GAP_HI: f32 = 0.09;
+const NAME_GAP_LO: f32 = 0.06;
+const NAME_GAP_HI: f32 = 0.10;
 /// cosine distance from the closest name over which a name's share drops by e
 const NAME_FALLOFF: f32 = 0.035;
+/// Texts that describe no object: a picture these fit as well as the query is no hit for the query
+const NULLS: [&str; 5] = ["a photo", "an image", "a blurry photo", "nothing", "background"];
 /// Token count the text encoder was trained with
 const TOKENS: usize = 64;
 
@@ -166,13 +168,14 @@ fn vocabulary(root: &Path, present: &[String]) -> Vec<String> {
 ///   p_name  the query means this object's class name. Text vectors of this model all sit close together (cos ≈ 0.8 between
 ///           unrelated words), so the cosines to the vocabulary are read relative to each other:
 ///             conf   = how far the closest name stands out from the median name, 0 at NAME_GAP_LO .. 1 at NAME_GAP_HI
-///                      ("의자" → chair stands out by 0.13, "화면" → nothing stands out, 0.045)
+///                      ("의자" → chair stands out by 0.15, "화면" → nothing stands out, 0.07)
 ///             p_name = conf · e^((cos − closest cos) / NAME_FALLOFF): the closest name gets conf, near-synonyms
 ///                      ("가방": handbag, suitcase, backpack) stay in, a class that is not in the memory ("고양이" → cat) leaves
 ///                      every stored name near 0
 ///           1 when the letters match (query inside the name or the name inside the query)
 ///   p_look  the query describes this object's picture better than any class name does:
-///           softmax over {query} ∪ vocabulary of SCALE · cos(text, picture); names the query was read as (p ≥ 0.2) are left out
+///           softmax over {query} ∪ vocabulary ∪ NULLS of SCALE · cos(text, picture); names that mean what the query means
+///           (NAME_GAP_LO above the median name and within e^−1.6 of the closest name) are left out
 ///   score   1 − (1 − p_name)(1 − p_look);  by = "name" or "look", whichever is larger
 pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: usize, min: f32) -> serde_json::Value {
     let ql = q.trim().to_lowercase();
@@ -184,19 +187,22 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         Some(_) => vocabulary(root, &names).into_iter().filter(|n| !n.is_empty()).filter_map(|n| enc(&n).map(|v| (n, v))).collect(),
         None => vec![],
     };
-    let p_names: HashMap<&str, f32> = match &tq {
+    let nulls: Vec<Arc<Vec<f32>>> = if tq.is_some() { NULLS.iter().filter_map(|n| enc(n)).collect() } else { vec![] };
+    let (p_names, alike): (HashMap<&str, f32>, std::collections::HashSet<&str>) = match &tq {
         Some(t) => {
             let c: Vec<f32> = vocab.iter().map(|(_, v)| cos(t, v)).collect();
             let mut sorted = c.clone();
             sorted.sort_by(|a, b| b.total_cmp(a));
             let (best, median) = (sorted.first().copied().unwrap_or(0.0), sorted.get(sorted.len() / 2).copied().unwrap_or(0.0));
             let conf = ((best - median - NAME_GAP_LO) / (NAME_GAP_HI - NAME_GAP_LO)).clamp(0.0, 1.0);
-            vocab.iter().zip(&c).map(|((n, _), x)| (n.as_str(), conf * ((x - best) / NAME_FALLOFF).exp())).collect()
+            let near: HashMap<&str, f32> = vocab.iter().zip(&c).map(|((n, _), x)| (n.as_str(), ((x - best) / NAME_FALLOFF).exp())).collect();
+            let alike: std::collections::HashSet<&str> = vocab.iter().zip(&c).filter(|(_, x)| *x - median >= NAME_GAP_LO && ((*x - best) / NAME_FALLOFF).exp() >= 0.2).map(|((n, _), _)| n.as_str()).collect();
+            (near.into_iter().map(|(n, r)| (n, conf * r)).collect(), alike)
         }
-        None => HashMap::new(),
+        None => (HashMap::new(), Default::default()),
     };
-    // names the query was read as say the same thing as the query: they do not compete with it for a picture
-    let same = |n: &str| n == ql || p_names.get(n).is_some_and(|p| *p >= 0.2);
+    // names that stand out for the query and sit close to its closest name say the same thing as the query: they do not compete with it for a picture
+    let same = |n: &str| n == ql || alike.contains(n);
     let mut hits: Vec<(f32, serde_json::Value)> = vec![];
     for (o, nl) in objs.iter().zip(&names) {
         if ql.is_empty() {
@@ -207,7 +213,7 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         let p_look = match (&tq, o["emb"].as_str().and_then(|p| read_emb(&root.join(p)))) {
             (Some(t), Some(e)) => {
                 let lq = SCALE * cos(t, &e);
-                let z = lse(std::iter::once(lq).chain(vocab.iter().filter(|(n, _)| !same(n)).map(|(_, v)| SCALE * cos(v, &e))));
+                let z = lse(std::iter::once(lq).chain(vocab.iter().filter(|(n, _)| !same(n)).map(|(_, v)| SCALE * cos(v, &e))).chain(nulls.iter().map(|v| SCALE * cos(v, &e))));
                 (lq - z).exp()
             }
             _ => 0.0,

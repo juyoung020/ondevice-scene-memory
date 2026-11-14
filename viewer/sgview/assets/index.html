@@ -119,7 +119,7 @@
     <div class="num">3D map opacity <input type="number" id="n_sop" value="1" min="0.05" max="1" step="0.05"></div>
     <div class="num" title="splat size / voxel: above 1.4 neighbouring points overlap into a surface">3D map splat × voxel <input type="number" id="n_ssize" value="1.35" min="0.3" max="4" step="0.1"></div>
     <div class="num">Point size × voxel <input type="number" id="n_psize" value="1.1" min="0.2" max="5" step="0.1"></div>
-    <label class="row"><input type="checkbox" id="c_boxes"> Boxes (objects w/o points)</label>
+    <label class="row"><input type="checkbox" id="c_boxes" checked> Object boxes</label>
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
     <label class="row"><input type="checkbox" id="c_gone" checked> Gone objects</label>
     <label class="row"><input type="checkbox" id="c_ceil"> Show ceiling</label>
@@ -193,7 +193,7 @@ const EDGE_COL = { place:0x5a5a5a, door:0xe67814, agent:0x286ee6, inter:0x969696
 const host = $("view");
 const QS = new URLSearchParams(location.search);
 // Quality: "high" = device pixel ratio up to 2 and a 3 M point budget for the octree point map; "low" = pixel ratio 1 and 0.8 M points.
-// Weak GPUs (Raspberry Pi V3D, mobile, software rasterisers) start at low. EDL depth shading stays on in both (one light full-screen pass).
+// Every GPU starts at high (?quality=low or the button picks low; the choice is remembered). EDL depth shading stays on in both (one light full-screen pass).
 // The GPU is read from a throwaway context first: weak GPUs get a canvas without multisampling (the scene is drawn into the EDL target,
 // which has none, so canvas MSAA only cost a resolve per frame there, and with EDL off it doubled the point fill cost).
 const GPU_NAME = (() => { try { const gl = document.createElement("canvas").getContext("webgl"), x = gl.getExtension("WEBGL_debug_renderer_info"), n = String(gl.getParameter(x ? x.UNMASKED_RENDERER_WEBGL : gl.RENDERER)); const l = gl.getExtension("WEBGL_lose_context"); if (l) l.loseContext(); return n; } catch (e) { return ""; } })();
@@ -201,7 +201,7 @@ const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShade
 const renderer = new THREE.WebGLRenderer({ antialias:!WEAK_GPU, alpha:true });   // transparent clear: the page gradient is the background
 renderer.setClearColor(0x000000, 0);
 host.appendChild(renderer.domElement);
-let quality = QS.get("quality") || localStorage.getItem("sg_quality") || (WEAK_GPU ? "low" : "high");
+let quality = QS.get("quality") || localStorage.getItem("sg_quality") || "high";
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
@@ -844,9 +844,11 @@ function drawObjects() {  invalidate();
       if (se && se.geom) { const p = new THREE.Points(se.geom, mat()); p.userData.shared = true; gObjs.add(p); }
     }
   }
+  const bx = opt("c_boxes") ? [] : null;   // every visible object's box: one merged line set (one draw call), rebuilt only when objects change
   for (const o of objs.values()) {
     if (!objVisible(o)) continue;
     const st = STATE_COL[o.state] ?? 0xc83cc8;
+    if (bx) bx.push(o);
     if (o.points) ensurePoints(o);
     const ent = plyCache.get("p" + o.id);
     const sel = selected === o.id;
@@ -858,15 +860,26 @@ function drawObjects() {  invalidate();
         gObjs.add(pts);
       }
       if (sel) { const y = new THREE.Points(ent.geom, pointMat({ size:(o.points.voxel || 0.02) * opt("n_psize") * 1.5, color:0xffe14a, opacity:0.5, square:true })); y.userData.shared = true; gObjs.add(y); }
-    } else if (!o.points || !ent || !ent.geom) {
-      // no points (yet): draw nothing at the object's place — the object is still its node in the graph layer.
-      // A stand-in sphere here looked like a graph node that had dropped to the floor. Optional box only.
-      if (opt("c_boxes")) {
-        const b = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(...o.extent.map(v => Math.min(v, 3)))), new THREE.LineBasicMaterial({ color:st }));
-        b.position.set(...o.pos); gObjs.add(b);
-      }
     }
   }
+  if (bx && bx.length) gObjs.add(boxLines(bx));
+}
+// all object boxes as one LineSegments: 12 edges per box, colour = object state
+const BOX_E = [0,1, 1,3, 3,2, 2,0, 4,5, 5,7, 7,6, 6,4, 0,4, 1,5, 2,6, 3,7];
+function boxLines(list) {
+  const pos = new Float32Array(list.length * 72), col = new Float32Array(list.length * 72), c = new THREE.Color();
+  let k = 0;
+  for (const o of list) {
+    c.setHex(STATE_COL[o.state] ?? 0xc83cc8);
+    const h = o.extent.map(v => Math.min(v, 3) / 2);
+    for (const i of BOX_E) {
+      pos[k] = o.pos[0] + (i & 1 ? h[0] : -h[0]); pos[k + 1] = o.pos[1] + (i & 2 ? h[1] : -h[1]); pos[k + 2] = o.pos[2] + (i & 4 ? h[2] : -h[2]);
+      col[k] = c.r; col[k + 1] = c.g; col[k + 2] = c.b; k += 3;
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  return new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors:true }));
 }
 // ---------------- graph layers ----------------
 const labelEls = new Map();
@@ -1451,8 +1464,17 @@ async function fetchView() {
 
 // fast camera pose (pose.json, a few hundred bytes, written every keyframe): the handheld camera moves without waiting for view.json
 let latestPose = null;
+// ?metrics=1: 2 초마다 그린 프레임 수 · 위치(pose.json wall) → 화면 지연을 서버 로그로(/api/metric)
+let poseWall = 0;
+const met = { frames: 0, lat: [], t0: performance.now() };
+if (QS.get("metrics") === "1") setInterval(() => {
+  const dt = (performance.now() - met.t0) / 1000, l = met.lat.sort((a, b) => a - b), q = p => l.length ? l[Math.min(l.length - 1, Math.floor(l.length * p))].toFixed(0) : "-";
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${q(0.5)}&lat95=${q(0.95)}&n=${l.length}`).catch(() => {});
+  met.frames = 0; met.lat = []; met.t0 = performance.now();
+}, 2000);
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
+  if (j.wall) poseWall = j.wall;   // ?metrics=1: 손카메라 위치 → 화면 시간(같은 보드 시계)
   if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
 }
 function startFileEvents() {
@@ -1902,6 +1924,8 @@ function frame() {
   { const d = camera.position.distanceTo(controls.target); scene.fog.near = d * 0.6; scene.fog.far = d * 2.2; }   // fog follows the viewing distance: the focus stays clear at any zoom
   updatePointScale(); octUpdate(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
+  met.frames++;
+  if (poseWall) { met.lat.push(Date.now() - poseWall); poseWall = 0; }
 }
 (function loop() { requestAnimationFrame(loop); frame(); })();
 loadRobotModel();

@@ -28,6 +28,10 @@ name = "imu_probe"
 path = "src/bin/imu_probe.rs"
 
 [[bin]]
+name = "npu_prep"
+path = "src/bin/npu_prep.rs"
+
+[[bin]]
 name = "check_tum"
 path = "src/bin/check_tum.rs"
 

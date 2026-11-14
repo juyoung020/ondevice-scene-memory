@@ -27,16 +27,16 @@ RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rg
 cargo build --release
 
 # 카메라 → 위치 추적 → 물체 기억 → 뷰어, 한 프로세스(실시간). D435 입력은 리눅스 기본 rsdriver(V4L2 직접), --driver librealsense 는 --features slam-realsense 빌드
-ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
+ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
   --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 
 # TUM 재생(카메라 없이): --rate 1 이면 찍은 시각대로(밀리면 건너뜀), 생략하면 최대 속도로 빠짐없이
 ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
-  --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+  --every 2 --max-depth 3.5 --out data/memory/office_stream
 
 # 같은 것을 장면 스트림 파일로(위치만 한 번, 물체 기억은 몇 번이고)
 ondevice slam --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini --out data/office.mmf
-ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+ondevice --stream data/office.mmf --every 2 --max-depth 3.5 --out data/memory/office_stream
 ```
 
 `--slam` · `--serve` 의 인자는 공백으로 나눈다(경로에 공백이 없어야 함). 명령줄은 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 잘못된 위치 인자는 스레드를 띄우기 전에 멈춘다. `ondevice view <기억 폴더> …` 는 뷰어만 띄운다.
@@ -51,7 +51,7 @@ ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-
 | `--queue N`, `--block`·`--drop` | 쓰기 큐 길이(기본 4), 큐가 차면 기다림·가장 오래된 장면 버림. 기본은 최대 속도 재생 = 기다림, 카메라·`--rate` = 버림 |
 | `--poses <파일>` | 보낸 위치(TUM 형식, OpenCV 카메라 → RTAB-Map 지도) |
 | `--final-poses <파일>` | 끝에 최적화된 지도 노드 위치(TUM 형식, 같은 좌표) |
-| `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(뷰어 리셋 아이콘이 기억 폴더의 `reset.req` 를 만듦) |
+| `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(따로 띄운 뷰어의 리셋 아이콘이 기억 폴더의 `reset.req` 를 만듦. 한 프로그램 `--serve` 는 인자 없이 리셋 버튼이 됨) |
 | `--reloc-wait 초` | 놓친 뒤 같은 지도에서 다시 잡기만 시도하는 시간(기본 1) |
 | `--stats <파일>` | 장면별 시간·놓침·새 지도·지도 보정·특징 수(CSV) |
 | `--max-frames N` | 앞 N 장만 |
@@ -156,7 +156,7 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 아래 두 절은 C++ `rtab_bridge` 로 잰 값이다. 위치 프로그램은 지금 ini(`docs/rtabmap_pi.ini`, GFTT/BRIEF + GTSAM)로 같은 입력을 넣으면 출력이 바이트까지 같아 그 조합의 정확도가 같다. ORB · g2o 조합은 C++ 원본에만 있다.
 
-`check_tum`(`tools/`, 환경 변수 `BRIDGE`·`MEMMAP`·`ATE`·`INI`·`SEG`) 으로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
+`check_tum`(`tools/`, 환경 변수 `BRIDGE`·`MEMMAP`·`ATE`·`INI`·`SEG`) 으로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할(당시 기본, 지금은 ObjectSAM), `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
 
 - **기준**: 같은 설정 + 모든 장면을 지도 노드로 끝까지 돌려 최적화한 위치 → `ondevice --tum --gt`(오프라인 경로).
 - **같은 위치 오프라인**: 스트림 실행이 보낸 위치 파일 그대로 → `ondevice --tum --gt`. 스트림과 위치가 같고 입력 경로만 다르다.

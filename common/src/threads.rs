@@ -97,7 +97,10 @@ pub fn parse_cores(s: &str) -> u64 {
 
 /// `--rt` 해석(처음 한 번). 잘못된 조각은 건너뜀
 pub fn set_rt(spec: &str) {
-    let spec = if spec == "auto" { "camera=50,infer=40,reader=30,main=20" } else { spec };
+    // auto: 장면 받는 스레드만 SCHED_FIFO, 코어 3(지도 쌓기 등 nice 쪽 코어)에 묶음. 추론·본 스레드는 보통 스케줄 그대로 둔다:
+    // DXRT 런타임 스레드는 추론 스레드 코어(0·1)를 물려받는데, 같은 코어의 FIFO 스레드가 그 스레드를 굶겨
+    // 보드에서 NPU 분할이 장면당 수 초로 늘었다(2026-11-15)
+    let spec = if spec == "auto" { "camera=50@3" } else { spec };
     let v = spec
         .split(',')
         .filter(|p| !p.is_empty() && *p != "none")

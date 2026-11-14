@@ -1,18 +1,9 @@
-//! YOLO26-seg, end-to-end 출력: [1,300,38] = x1 y1 x2 y2 점수 클래스 + 계수 32, 원형 [1,32,160,160].
+//! ObjectSAM 분할(클래스 없는 물체 1 클래스, YOLO 형 머리), end-to-end 출력: [1,300,38] = x1 y1 x2 y2 점수 클래스(늘 0) + 계수 32, 원형 [1,32,160,160].
+//! 이름은 분할이 아니라 SigLIP2 사진 벡터(embed.rs)가 붙인다.
 //! 실행기 두 개가 같은 전처리(레터박스 RGB, 회색 114)·후처리(상자 안 화소만 계수·원형 내적)를 쓴다.
-//!   - PC: ONNX Runtime (feature "onnx", models/yolo26s-seg.onnx, 입력 f32 NCHW /255)
-//!   - Pi5 + DX-M1: DXRT C API (feature "dxrt", yolo26-s-seg_640x640.dxnn, 입력 u8 NHWC)
+//!   - PC: ONNX Runtime (feature "onnx", 기본 models/ObjectSAM-416_640.onnx, 입력 f32 NCHW /255)
+//!   - Pi5 + DX-M1: DXRT C API (feature "dxrt", 기본 ~/models/objectsam-416_640.dxnn, NPU 만 도는 머리 출력, 입력 u8 NHWC)
 
-pub const COCO: [&str; 80] = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant",
-    "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
-    "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut",
-    "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
-    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
-    "teddy bear", "hair drier", "toothbrush",
-];
 
 pub struct Det {
     pub cls: usize,
@@ -22,27 +13,6 @@ pub struct Det {
 }
 
 /// 분할 모델 입력 한 변
-/// 분할 모델이 내는 이름(`--seg-names`). 정하지 않으면 COCO 80 개
-static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
-/// 클래스 이름 목록을 바꾼다: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `object`
-pub fn set_names(list: &str) {
-    let _ = NAMES.set(list.split(',').map(|s| s.trim().to_string()).collect());
-}
-
-/// 분할 모델이 낼 수 있는 이름 전체
-pub fn names() -> Vec<String> {
-    NAMES.get().cloned().unwrap_or_else(|| COCO.iter().map(|s| s.to_string()).collect())
-}
-
-/// 클래스 번호의 이름(목록 밖이면 object)
-pub fn name(cls: usize) -> &'static str {
-    match NAMES.get() {
-        Some(n) => n.get(cls).map_or("object", |s| s.as_str()),
-        None => COCO.get(cls).copied().unwrap_or("object"),
-    }
-}
-
 pub const SEG_S: usize = 640;
 
 /// 레터박스 자리: 배율 r, 여백 (px, py)
@@ -339,6 +309,38 @@ pub struct SegRaw {
     pub pc: usize,
     pub ph: usize,
     pub pw: usize,
+    /// 머리 출력 모델(NPU 만, 상위 300 고르기를 이 프로그램이 함): 단계 3 개마다 (상자 4, 점수 1, 계수 pc) 의 buf 안 시작. 없으면 det 가 [300, 6 + pc]
+    pub heads: Option<[[usize; 3]; 3]>,
+}
+
+/// 머리 출력(상자 거리 [4,n,n] · 점수 로짓 [1,n,n] · 계수 [pc,n,n], 보폭 8 · 16 · 32)에서 점수 conf 이상만 골라 [k, 6 + pc] 행으로(점수 큰 순, 최대 300).
+/// 모델 안 후처리(ONNX: 시그모이드 → 상위 300 → 상자 = (격자 + 0.5 ∓ 거리) × 보폭)와 같은 값. 로짓 문턱을 먼저 견줘 시그모이드는 남은 것만
+pub fn heads_to_det(buf: &[f32], heads: &[[usize; 3]; 3], pc: usize, s: usize, conf: f32, out: &mut Vec<f32>) {
+    let thr = (conf / (1.0 - conf)).ln();
+    let mut cand: Vec<(f32, u8, u32)> = Vec::new();
+    for (l, hd) in heads.iter().enumerate() {
+        let n = s >> (3 + l);
+        let cls = &buf[hd[1]..hd[1] + n * n];
+        for (i, &v) in cls.iter().enumerate() {
+            if v >= thr {
+                cand.push((1.0 / (1.0 + (-v).exp()), l as u8, i as u32));
+            }
+        }
+    }
+    if cand.len() > 300 {
+        cand.select_nth_unstable_by(299, |a, b| b.0.total_cmp(&a.0));
+        cand.truncate(300);
+    }
+    cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out.clear();
+    for &(sc, l, i) in &cand {
+        let (hd, n, st) = (&heads[l as usize], s >> (3 + l), (8u32 << l) as f32);
+        let (i, nn) = (i as usize, n * n);
+        let (ax, ay) = ((i % n) as f32 + 0.5, (i / n) as f32 + 0.5);
+        let b = |k: usize| buf[hd[0] + k * nn + i];
+        out.extend_from_slice(&[(ax - b(0)) * st, (ay - b(1)) * st, (ax + b(2)) * st, (ay + b(3)) * st, sc, 0.0]);
+        out.extend((0..pc).map(|k| buf[hd[2] + k * nn + i]));
+    }
 }
 
 /// 전처리 단계: 레터박스. 추론과 다른 스레드에서 돌려도 된다.
@@ -349,6 +351,22 @@ pub fn seg_pre(rgb: &[u8], w: usize, h: usize, inp: &mut SegIn) {
 
 /// 후처리 단계: 마스크 해독. 추론과 다른 스레드에서 돌려도 된다.
 pub fn seg_post(raw: &SegRaw, geom: LbGeom, w: usize, h: usize, conf: f32) -> Vec<Det> {
+    let dets = seg_post_any(raw, geom, w, h, conf);
+    // 클래스 없는 물체 모델(ObjectSAM)만 받는다: 클래스가 둘 이상인 모델(COCO 등)은 멈춤
+    if let Some(d) = dets.iter().find(|d| d.cls != 0) {
+        panic!("--seg: 클래스 {} 을 낸 모델 — 클래스 없는 ObjectSAM 분할 모델(1 클래스)만 쓴다", d.cls);
+    }
+    dets
+}
+
+fn seg_post_any(raw: &SegRaw, geom: LbGeom, w: usize, h: usize, conf: f32) -> Vec<Det> {
+    if let Some(hd) = &raw.heads {
+        thread_local!(static DET: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) });
+        return DET.with_borrow_mut(|det| {
+            heads_to_det(&raw.buf, hd, raw.pc, SEG_S, conf, det);
+            decode(det, &raw.buf[raw.proto.0..raw.proto.0 + raw.proto.1], raw.pc, raw.ph, raw.pw, SEG_S, geom, w, h, conf)
+        });
+    }
     decode(&raw.buf[raw.det.0..raw.det.0 + raw.det.1], &raw.buf[raw.proto.0..raw.proto.0 + raw.proto.1], raw.pc, raw.ph, raw.pw, SEG_S, geom, w, h, conf)
 }
 
@@ -432,6 +450,25 @@ impl Segmenter for OnnxSeg {
 #[cfg(feature = "dxrt")]
 pub mod dx {
     use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    /// NPU 코어 묶기(DXRT bound_option): 0 = 셋 다, 1 · 2 · 3 = 코어 0 · 1 · 2, 4 = 0+1, 5 = 1+2, 6 = 0+2.
+    /// 분할(`--seg-npu`)과 사진 벡터(`--embed-npu`)를 다른 코어에 두면 서로 줄 서지 않고 함께 돈다
+    pub static SEG_BOUND: AtomicU32 = AtomicU32::new(0);
+    pub static EMBED_BOUND: AtomicU32 = AtomicU32::new(0);
+    /// "all" · "0" · "1" · "2" · "01" · "12" · "02" → bound_option
+    pub fn parse_bound(s: &str) -> u32 {
+        match s {
+            "all" | "" => 0,
+            "0" => 1,
+            "1" => 2,
+            "2" => 3,
+            "01" | "10" => 4,
+            "12" | "21" => 5,
+            "02" | "20" => 6,
+            _ => panic!("NPU 코어 지정 {s}: all · 0 · 1 · 2 · 01 · 12 · 02"),
+        }
+    }
 
     #[repr(C)]
     pub struct Options {
@@ -460,6 +497,7 @@ pub mod dx {
         fn dxrt_engine_wait(e: *mut c_void, job_id: c_int, output: *mut c_void) -> c_int;
         fn dxrt_engine_get_output_size(e: *mut c_void, size: *mut u64) -> c_int;
         fn dxrt_engine_get_output_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
+        fn dxrt_engine_get_input_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
         fn dxrt_last_error_message() -> *const c_char;
     }
 
@@ -468,17 +506,18 @@ pub mod dx {
         e: *mut c_void,
         pub out: Vec<u8>,
         pub tensors: Vec<(String, Vec<i64>, usize)>, // 이름, 모양, 바이트 오프셋
+        pub input: String,                          // 첫 입력 텐서 이름
     }
     impl Engine {
         pub fn new(path: &str) -> Engine {
-            Engine::open(path, -1)
+            Engine::open(path, -1, SEG_BOUND.load(Relaxed))
         }
         /// 모델 안의 CPU 부분까지 런타임이 돌리게 연다(ONNX Runtime). 입력·출력이 모델 원래의 것(f32)이 된다
         pub fn with_cpu_tasks(path: &str) -> Engine {
-            Engine::open(path, 1)
+            Engine::open(path, 1, EMBED_BOUND.load(Relaxed))
         }
-        fn open(path: &str, use_ort: c_int) -> Engine {
-            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option: 0, use_ort, reserved: [0; 6] };
+        fn open(path: &str, use_ort: c_int, bound_option: u32) -> Engine {
+            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option, use_ort, reserved: [0; 6] };
             let mut e = std::ptr::null_mut();
             let p = CString::new(path).unwrap();
             unsafe {
@@ -501,7 +540,10 @@ pub mod dx {
                         r
                     })
                     .collect();
-                Engine { e, out: vec![0u8; sz as usize], tensors }
+                let mut n: c_int = 16;
+                dxrt_engine_get_input_tensor_info(e, infos.as_mut_ptr(), &mut n);
+                let input = if n > 0 { CStr::from_ptr(infos[0].name.as_ptr()).to_string_lossy().into_owned() } else { String::new() };
+                Engine { e, out: vec![0u8; sz as usize], tensors, input }
             }
         }
         pub fn run(&mut self, input: &[u8]) {
@@ -576,11 +618,44 @@ pub mod dx {
 pub struct DxSeg {
     eng: dx::Engine,
     scratch: (SegIn, SegRaw),
+    lay: Layout,
+}
+#[cfg(feature = "dxrt")]
+/// dxnn 출력 배치: 머리 9 개 + 원형(NPU 만, ObjectSAM)
+#[derive(Clone, Copy)]
+struct Layout {
+    det: (usize, usize),
+    proto: (usize, usize),
+    p: (usize, usize, usize),
+    heads: Option<[[usize; 3]; 3]>,
+}
+#[cfg(feature = "dxrt")]
+impl Layout {
+    fn apply(&self, raw: &mut SegRaw) {
+        (raw.det, raw.proto, raw.heads) = (self.det, self.proto, self.heads);
+        (raw.pc, raw.ph, raw.pw) = self.p;
+    }
 }
 #[cfg(feature = "dxrt")]
 impl DxSeg {
     pub fn new(path: &str) -> DxSeg {
-        DxSeg { eng: dx::Engine::new(path), scratch: Default::default() }
+        let eng = dx::Engine::new(path);
+        let find = |key: &str| eng.tensors.iter().position(|t| t.0.contains(key));
+        let lay = if let (Some(pi), true) = (find("output1"), eng.tensors.len() == 10) {
+            let ps = &eng.tensors[pi].1;
+            let mut heads = [[0usize; 3]; 3];
+            for (l, hd) in heads.iter_mut().enumerate() {
+                for (k, c) in [2, 3, 4].iter().enumerate() {
+                    let i = find(&format!("one2one_cv{c}.{l}/")).unwrap_or_else(|| panic!("{path}: 머리 출력 cv{c}.{l} 없음"));
+                    hd[k] = eng.f32_span(i).0;
+                }
+            }
+            common::info!("seg: NPU 만 도는 머리 출력 모델 {path}(상위 고르기는 이 프로그램이)");
+            Layout { det: (0, 0), proto: eng.f32_span(pi), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize), heads: Some(heads) }
+        } else {
+            panic!("--seg {path}: NPU 만 도는 머리 출력(출력 10 개) ObjectSAM 모델이 아님 — tools npu_prep 으로 만든 objectsam-*.dxnn 을 쓴다");
+        };
+        DxSeg { eng, scratch: Default::default(), lay }
     }
 }
 #[cfg(feature = "dxrt")]
@@ -588,25 +663,25 @@ impl Segmenter for DxSeg {
     fn scratch(&mut self) -> &mut (SegIn, SegRaw) {
         &mut self.scratch
     }
-    /// 동기 호출(NPU 는 한 번에 하나). 결과를 raw 버퍼에 바로 받아, 후처리 스레드가 그것을 읽는 동안 다음 장면을 돌린다.
+    /// 동기 호출. 결과를 raw 버퍼에 바로 받아, 후처리 스레드가 그것을 읽는 동안 다음 장면을 돌린다.
     fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw) {
         self.eng.run_into(&inp.u8, &mut raw.buf);
-        raw.det = self.eng.f32_span(0);
-        raw.proto = self.eng.f32_span(1);
-        let ps = &self.eng.tensors[1].1;
-        (raw.pc, raw.ph, raw.pw) = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+        self.lay.apply(raw);
     }
     fn submit(&mut self, inp: &SegIn) -> Option<i32> {
         Some(self.eng.submit(&inp.u8))
     }
     fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
-        let (w, det, proto) = (self.eng.waiter(), self.eng.f32_span(0), self.eng.f32_span(1));
-        let ps = &self.eng.tensors[1].1;
-        let p = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+        // 모델 안에 CPU 작업(DXRT 가 ONNX Runtime 으로 돌림)이 있는 파일은 한 장씩만: 여러 장을 함께 올리면
+        // 보드가 Illegal instruction 으로 죽거나 멈춘 적이 있다(2026-11-15). NPU 만 도는 머리 출력 모델만 겹쳐 올린다
+        if self.lay.heads.is_none() {
+            common::info!("seg: 모델 안에 CPU 작업이 있어 --npu-jobs 를 1 로 둠");
+            return None;
+        }
+        let (w, lay) = (self.eng.waiter(), self.lay);
         Some(Box::new(move |id, raw| {
             w.wait_into(id, &mut raw.buf);
-            (raw.det, raw.proto) = (det, proto);
-            (raw.pc, raw.ph, raw.pw) = p;
+            lay.apply(raw);
         }))
     }
 }

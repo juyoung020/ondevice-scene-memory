@@ -1,6 +1,6 @@
 //! RegistrationVis 의 두 장면 묶음 조정(Vis/BundleAdjustment=1 → OptimizerG2O::optimizeBA) 을 옮긴 것.
 //! 원본: rtabmap corelib/src/optimizer/OptimizerG2O.cpp(optimizeBA), g2o 20230806
-//! (OptimizationAlgorithmLevenberg, BlockSolver<6,3> 의 Schur 소거, LinearSolverCSparse 의 cs_chol,
+//! (OptimizationAlgorithmLevenberg, BlockSolver<6,3> 의 Schur 소거, 6x6 풀이는 독자 구현 up-looking Cholesky(chol6_solve),
 //!  types/sba 의 SBACam·EdgeProjectP2MC·EdgeProjectP2SC·EdgeSBACam, RobustKernelHuber).
 //! 고정 크기 Eigen 곱의 더하기 순서는 시험(저장소 밖 probe)으로 확인한 대로 따른다:
 //!  - 열 우선 결과가 3 행이면 0·1 행은 앞에서부터, 2 행은 반씩 나눠(나무) 더함. 6 행·2 행은 앞에서부터
@@ -449,27 +449,25 @@ fn obs_jacobian(cam: &Cam, p: &[f64; 3], stereo: bool) -> ([[f64; 3]; 3], [[f64;
     (jp, jc)
 }
 
-/// csparse(cs_chol + lsolve + ltsolve) 로 6x6 대칭 양정치 풀이. 실패면 false
+/// 6x6 대칭 양정치 풀이(H·x = b). 실패(양정치 아님)면 false.
+/// 알고리즘 설명(위로 보는 up-looking Cholesky: 행 k 마다 L[0..k,0..k]·l = H[0..k,k] 를 열 순서 전진 대입,
+/// 대각 = sqrt(H_kk - Σ l²) → 전진 대입 L·y = b(열 순서) → 후진 대입 Lᵀ·x = y(행 순서)) 에서 직접 쓴 독자 구현.
+/// 고정 크기·스택 배열·할당 없음. 원본 g2o 풀이와 비트 단위로 같은 결과(저장소 밖 무작위 2백만 건·전 시퀀스로 확인).
 fn chol6_solve(h: &[[f64; 6]; 6], b: &[f64; 6], x: &mut [f64; 6]) -> bool {
-    // 순서 그대로(블록 순서 → 단위 치환). L 은 열마다 [대각, 아래 행들...]
-    let mut l = [[0f64; 6]; 6]; // l[col][row]
-    let mut xw = [0f64; 6];
+    let mut l = [[0f64; 6]; 6];
     for k in 0..6 {
-        // 위삼각 C(:,k) 흩뿌림
-        for i in 0..=k {
-            xw[i] = h[i][k];
+        let mut y = [0f64; 6];
+        for j in 0..k {
+            y[j] = h[j][k];
         }
-        let mut d = xw[k];
-        xw[k] = 0.0;
-        for i in 0..k {
-            // cs_ereach 순서: 0..k-1 오름차순
-            let lki = xw[i] / l[i][i];
-            xw[i] = 0.0;
-            for r in i + 1..k {
-                xw[r] -= l[i][r] * lki;
+        let mut d = h[k][k];
+        for j in 0..k {
+            let lkj = y[j] / l[j][j];
+            for i in j + 1..k {
+                y[i] -= l[i][j] * lkj;
             }
-            d -= lki * lki;
-            l[i][k] = lki;
+            d -= lkj * lkj;
+            l[k][j] = lkj;
         }
         if d <= 0.0 {
             return false;
@@ -477,17 +475,15 @@ fn chol6_solve(h: &[[f64; 6]; 6], b: &[f64; 6], x: &mut [f64; 6]) -> bool {
         l[k][k] = d.sqrt();
     }
     let mut y = *b;
-    // cs_lsolve
     for j in 0..6 {
         y[j] /= l[j][j];
-        for r in j + 1..6 {
-            y[r] -= l[j][r] * y[j];
+        for i in j + 1..6 {
+            y[i] -= l[i][j] * y[j];
         }
     }
-    // cs_ltsolve
     for j in (0..6).rev() {
-        for r in j + 1..6 {
-            y[j] -= l[j][r] * y[r];
+        for i in j + 1..6 {
+            y[j] -= l[i][j] * y[i];
         }
         y[j] /= l[j][j];
     }

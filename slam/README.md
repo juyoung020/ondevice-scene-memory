@@ -82,6 +82,6 @@ slam_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file
 - GTSAM 4.2 (borglab/gtsam) — BSD
 - CCOLAMD (SuiteSparse, GTSAM `3rdparty` 판) — BSD-3-Clause
 - FLANN 1.9 · PCL `KdTreeFLANN` — BSD
-- g2o (`optimizeBA` 경로) — BSD
+- g2o (`optimizeBA` 경로) — BSD. 6×6 선형 풀이(`ba.rs` `chol6_solve`)는 알고리즘 설명(up-looking Cholesky)에서 직접 쓴 독자 구현이다
 - Eigen 3.4 (덧셈 순서를 따름) — MPL-2.0
 - librealsense2 (`realsense` 기능에서 링크) — Apache-2.0

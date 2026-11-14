@@ -1062,3 +1062,15 @@ LVIS 동의어 전부 · Open Images 600 · BEHAVIOR-1K 범주 · object-memory-
 - 사진 비교에서 빼는 이름(질의와 같은 뜻)은 이제 이름 일치 확신과 따로 고른다: 중앙값보다 0.06 이상 높고 가장 가까운 이름 근처인 이름. "what can I type on" 은 이름으로는 약하게 읽혀도(keyboard 0.38) 사진으로 키보드 둘을 찾는다(0.67 · 0.50).
 - 무엇에도 안 닮은 사진이 아무 말에나 걸렸다: 흐린 마우스 사진 하나가 "여기 뭐가 있어" 0.59, "안녕하세요" 0.30, "부드러운 것" 0.34 로 나왔다(가장 닮은 이름의 코사인이 0.084, 다른 물체는 0.11 – 0.15). 사진 비교 경쟁 상대에 물체를 가리키지 않는 글 다섯 개(a photo · an image · a blurry photo · nothing · background)를 넣어 0.21 · 없음 · 없음이 됐다. 설명 질의 결과는 그대로다(something to sit on → chair 넷 0.78 – 0.82, yellow toy → teddy bear 0.46 · duck 0.40).
 - 남은 것: "인형" 은 doll 로 읽혀 teddy bear 를 못 찾고("곰인형" 은 찾음), "화면" 은 monitor 로 읽히지 않는다(글 인코더가 cover · packet 을 가깝게 봄).
+
+### 여러 장면의 사진 벡터를 모아 이름 붙이기 (2026-11-14)
+
+물체마다 더 크게 본 장면이 나올 때마다 사진 벡터를 다시 만든다(사무실 녹화에서 물체 33 개에 267 번). 가장 새 벡터 하나로 이름을 붙이는 대신 그동안의 벡터를 모두 더해(그대로 평균 / 사진 넓이로 가중) 이름을 붙여 봤다.
+
+| | 가장 새 벡터(지금) | 평균 | 넓이 가중 평균 |
+|---|---|---|---|
+| COCO 모델: 바뀐 이름 | 9 | 8 (mouse 0.39 새로 맞음, hardback book · steak knife 빠짐, laptop computer 0.56 → monitor 0.36) | 평균과 같음 |
+| ObjectSAM: 맞는 이름 | bucket 0.70, monitor 0.83 · 0.64, chair 6, computer keyboard 0.37 | bucket · monitor 0.83 · computer keyboard 빠짐, chair 3 | bucket 빠짐, chair 5, bottle 0.15 새로 맞음 |
+| ObjectSAM: 틀린 이름 | can opener, tights, pen, keycard, pegboard | baseball bat | baseball bat |
+
+- 틀린 이름은 줄지만 잘 맞던 이름(bucket 0.70)도 같이 빠진다: 작고 흐리게 본 앞 장면들이 섞여 몫이 내려간다. 가장 새 벡터 하나로 붙이는 지금 방식을 유지한다.

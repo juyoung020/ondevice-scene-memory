@@ -71,6 +71,7 @@ unsafe extern "C" {
     // 파이프라인
     pub fn rs2_create_pipeline(ctx: P, e: *mut P) -> P;
     pub fn rs2_create_config(e: *mut P) -> P;
+    pub fn rs2_config_enable_device(cfg: P, serial: *const c_char, e: *mut P);
     pub fn rs2_config_enable_stream(cfg: P, stream: i32, index: i32, w: i32, h: i32, format: i32, fps: i32, e: *mut P);
     pub fn rs2_pipeline_start_with_config(pipe: P, cfg: P, e: *mut P) -> P;
     pub fn rs2_pipeline_stop(pipe: P, e: *mut P);
@@ -85,6 +86,7 @@ unsafe extern "C" {
     pub fn rs2_process_frame(b: P, f: P, e: *mut P);
     pub fn rs2_poll_for_frame(q: P, out: *mut P, e: *mut P) -> i32;
     pub fn rs2_try_wait_for_frame(q: P, timeout: u32, out: *mut P, e: *mut P) -> i32;
+    pub fn rs2_wait_for_frame(q: P, timeout: u32, e: *mut P) -> P;
     pub fn rs2_embedded_frames_count(f: P, e: *mut P) -> i32;
     pub fn rs2_extract_frame(f: P, i: i32, e: *mut P) -> P;
     pub fn rs2_get_frame_stream_profile(f: P, e: *mut P) -> P;
@@ -92,6 +94,9 @@ unsafe extern "C" {
     pub fn rs2_get_frame_data(f: P, e: *mut P) -> *const u8;
     pub fn rs2_get_frame_width(f: P, e: *mut P) -> i32;
     pub fn rs2_get_frame_height(f: P, e: *mut P) -> i32;
+    pub fn rs2_get_frame_stride_in_bytes(f: P, e: *mut P) -> i32;
+    pub fn rs2_supports_frame_metadata(f: P, m: i32, e: *mut P) -> i32;
+    pub fn rs2_get_frame_metadata(f: P, m: i32, e: *mut P) -> i64;
     pub fn rs2_get_frame_timestamp(f: P, e: *mut P) -> f64;
     pub fn rs2_get_frame_number(f: P, e: *mut P) -> u64;
     pub fn rs2_frame_add_ref(f: P, e: *mut P);
@@ -122,6 +127,7 @@ unsafe extern "C" {
 }
 
 // rs.h 2.59.1 의 값(헤더에서 확인)
+pub const API_VERSION: i32 = 25901;
 pub const STREAM_DEPTH: i32 = 1;
 pub const STREAM_COLOR: i32 = 2;
 pub const STREAM_GYRO: i32 = 5;
@@ -152,6 +158,8 @@ pub const EXT_COLOR_SENSOR: i32 = 42;
 pub const MATCHER_DLR_C: i32 = 2;
 pub const TIMESTAMP_DOMAIN_HARDWARE_CLOCK: i32 = 0;
 pub const LOG_SEVERITY_INFO: i32 = 1;
+pub const META_ACTUAL_EXPOSURE: i32 = 3;
+pub const META_GAIN_LEVEL: i32 = 4;
 pub const RS400_VISUAL_PRESET_COUNT: i32 = 8;
 
 /// librealsense 오류(rs2::error 의 what() 과 실패한 함수 이름) 또는 다른 오류

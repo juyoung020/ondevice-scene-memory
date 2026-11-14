@@ -278,24 +278,19 @@ pub fn read_file(p: &str) -> Result<String, String> {
 
 // ---------------- PNG ----------------
 
-fn save_png(path: &str, bytes: &[u8], w: i32, h: i32, ct: image::ExtendedColorType) -> bool {
-    use image::ImageEncoder;
-    let Ok(f) = std::fs::File::create(path) else { return false };
-    let enc = image::codecs::png::PngEncoder::new_with_quality(std::io::BufWriter::new(f), image::codecs::png::CompressionType::Default, image::codecs::png::FilterType::Adaptive);
-    enc.write_image(bytes, w as u32, h as u32, ct).is_ok()
+/// PNG 바이트는 기억 폴더와 같은 인코더(common::img)
+fn save_png(path: &str, png: Vec<u8>) -> bool {
+    std::fs::write(path, png).is_ok()
 }
 
 /// 16 비트 회색 PNG(값 그대로)
 pub fn write_png16(path: &str, d: &[u16], w: i32, h: i32) -> bool {
-    let n = (w * h) as usize;
-    // image 는 L16 을 이 기계의 바이트 순서로 받아 PNG 의 큰 끝 순서로 바꿔 쓴다
-    let bytes: Vec<u8> = d[..n].iter().flat_map(|v| v.to_ne_bytes()).collect();
-    save_png(path, &bytes, w, h, image::ExtendedColorType::L16)
+    save_png(path, common::img::png_u16(w as u32, h as u32, d))
 }
 
 /// RGB8 PNG
 pub fn write_png_rgb(path: &str, rgb: &[u8], w: i32, h: i32) -> bool {
-    save_png(path, &rgb[..(w * h * 3) as usize], w, h, image::ExtendedColorType::Rgb8)
+    save_png(path, common::img::png_rgb(w as u32, h as u32, rgb))
 }
 
 /// PNG 를 16 비트 회색으로 읽음(다른 형식이면 회색 16 비트로 바꿈)
@@ -309,17 +304,7 @@ pub fn read_png16(path: &str) -> Option<(Vec<u16>, i32, i32)> {
 /// TUM 목록(시각 경로)
 pub fn read_list(p: &str) -> Result<Vec<(String, String)>, String> {
     let text = read_file(p)?;
-    let mut v = vec![];
-    for line in text.split('\n') {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        if let (Some(t), Some(f)) = (it.next(), it.next()) {
-            v.push((t.to_string(), f.to_string()));
-        }
-    }
-    Ok(v)
+    Ok(common::tum::pairs(&text).map(|(t, f)| (t.to_string(), f.to_string())).collect())
 }
 
 /// a/b 경로 이음

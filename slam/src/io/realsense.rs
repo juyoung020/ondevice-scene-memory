@@ -1,91 +1,13 @@
 //! RealSense 카메라(D435·D455 등): 컬러 RGB8 + 깊이 Z16, 깊이를 컬러에 맞춤("rs2" = librealsense 의 align). IMU 는 켜지 않는다.
-//! 원본: bridge/src/realsense_source.cpp · depth_align.cpp. librealsense2 C API(rs.h)를 직접 부른다(librealsense2.so 링크).
+//! 원본: bridge/src/realsense_source.cpp · depth_align.cpp. librealsense2 C API(rs.h)를 직접 부른다(선언은 tools::rs2, librealsense2.so 링크).
 use super::{optical_rotation, to_gray, FrameSource};
 use crate::{Camera, Frame};
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString};
 use std::time::Instant;
 
-type P = *mut c_void;
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct Intrinsics {
-    width: i32,
-    height: i32,
-    ppx: f32,
-    ppy: f32,
-    fx: f32,
-    fy: f32,
-    model: i32,
-    coeffs: [f32; 5],
-}
-
-#[link(name = "realsense2")]
-unsafe extern "C" {
-    fn rs2_create_context(api: i32, e: *mut P) -> P;
-    fn rs2_create_pipeline(ctx: P, e: *mut P) -> P;
-    fn rs2_create_config(e: *mut P) -> P;
-    fn rs2_config_enable_device(cfg: P, serial: *const c_char, e: *mut P);
-    fn rs2_config_enable_stream(cfg: P, stream: i32, index: i32, w: i32, h: i32, format: i32, fps: i32, e: *mut P);
-    fn rs2_pipeline_start_with_config(pipe: P, cfg: P, e: *mut P) -> P;
-    fn rs2_pipeline_stop(pipe: P, e: *mut P);
-    fn rs2_pipeline_wait_for_frames(pipe: P, timeout: u32, e: *mut P) -> P;
-    fn rs2_pipeline_profile_get_device(prof: P, e: *mut P) -> P;
-    fn rs2_pipeline_profile_get_streams(prof: P, e: *mut P) -> P;
-    fn rs2_get_stream_profiles_count(list: P, e: *mut P) -> i32;
-    fn rs2_get_stream_profile(list: P, i: i32, e: *mut P) -> P;
-    fn rs2_get_stream_profile_data(p: P, stream: *mut i32, format: *mut i32, index: *mut i32, uid: *mut i32, fps: *mut i32, e: *mut P);
-    fn rs2_get_video_stream_intrinsics(p: P, k: *mut Intrinsics, e: *mut P);
-    fn rs2_query_sensors(dev: P, e: *mut P) -> P;
-    fn rs2_get_sensors_count(list: P, e: *mut P) -> i32;
-    fn rs2_create_sensor(list: P, i: i32, e: *mut P) -> P;
-    fn rs2_is_sensor_extendable_to(s: P, ext: i32, e: *mut P) -> i32;
-    fn rs2_supports_option(s: P, opt: i32, e: *mut P) -> i32;
-    fn rs2_set_option(s: P, opt: i32, v: f32, e: *mut P);
-    fn rs2_get_depth_scale(s: P, e: *mut P) -> f32;
-    fn rs2_get_device_info(dev: P, info: i32, e: *mut P) -> *const c_char;
-    fn rs2_distortion_to_string(d: i32) -> *const c_char;
-    fn rs2_create_align(to: i32, e: *mut P) -> P;
-    fn rs2_create_frame_queue(cap: i32, e: *mut P) -> P;
-    fn rs2_start_processing_queue(b: P, q: P, e: *mut P);
-    fn rs2_process_frame(b: P, f: P, e: *mut P);
-    fn rs2_wait_for_frame(q: P, timeout: u32, e: *mut P) -> P;
-    fn rs2_embedded_frames_count(f: P, e: *mut P) -> i32;
-    fn rs2_extract_frame(f: P, i: i32, e: *mut P) -> P;
-    fn rs2_get_frame_stream_profile(f: P, e: *mut P) -> P;
-    fn rs2_is_frame_extendable_to(f: P, ext: i32, e: *mut P) -> i32;
-    fn rs2_get_frame_data(f: P, e: *mut P) -> *const u8;
-    fn rs2_get_frame_width(f: P, e: *mut P) -> i32;
-    fn rs2_get_frame_height(f: P, e: *mut P) -> i32;
-    fn rs2_get_frame_stride_in_bytes(f: P, e: *mut P) -> i32;
-    fn rs2_get_frame_timestamp(f: P, e: *mut P) -> f64;
-    fn rs2_supports_frame_metadata(f: P, m: i32, e: *mut P) -> i32;
-    fn rs2_get_frame_metadata(f: P, m: i32, e: *mut P) -> i64;
-    fn rs2_frame_add_ref(f: P, e: *mut P);
-    fn rs2_release_frame(f: P);
-    fn rs2_get_error_message(e: P) -> *const c_char;
-    fn rs2_free_error(e: P);
-}
-
-// rs.h 2.59 의 값(헤더에서 확인)
-const API_VERSION: i32 = 25901;
-const STREAM_DEPTH: i32 = 1;
-const STREAM_COLOR: i32 = 2;
-const FORMAT_Z16: i32 = 1;
-const FORMAT_RGB8: i32 = 5;
-const OPT_EXPOSURE: i32 = 3;
-const OPT_GAIN: i32 = 4;
-const OPT_ENABLE_AUTO_EXPOSURE: i32 = 10;
-const OPT_EMITTER_ENABLED: i32 = 18;
-const OPT_AUTO_EXPOSURE_PRIORITY: i32 = 30;
-const EXT_DEPTH_SENSOR: i32 = 7;
-const EXT_DEPTH_FRAME: i32 = 12;
-const EXT_COLOR_SENSOR: i32 = 42;
-const INFO_NAME: i32 = 0;
-const INFO_SERIAL: i32 = 1;
-const INFO_FIRMWARE: i32 = 2;
-const META_ACTUAL_EXPOSURE: i32 = 3;
-const META_GAIN_LEVEL: i32 = 4;
+// librealsense2 C API 선언·상수는 tools::rs2 하나(녹화·정렬 확인 도구와 같은 것)
+use tools::fast_align::Intrinsics;
+use tools::rs2::*;
 
 /// rs2 함수를 부르고 오류가 있으면 문장으로 돌려줌
 fn ck<T>(f: impl FnOnce(*mut P) -> T) -> Result<T, String> {

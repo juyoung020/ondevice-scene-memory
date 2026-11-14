@@ -360,19 +360,14 @@ pub trait Segmenter: Send {
 }
 
 // ------------------------------------------------------------------ PC: ONNX Runtime
-/// 한 프로세스에 ONNX Runtime 환경 하나(모델 셋이 같이 씀)
-#[cfg(feature = "onnx")]
-pub fn ort_env() -> &'static ort::environment::Environment {
-    static ENV: std::sync::OnceLock<&'static ort::environment::Environment> = std::sync::OnceLock::new();
-    ENV.get_or_init(|| Box::leak(Box::new(ort::init().build().expect("onnxruntime"))))
-}
+/// ONNX Runtime 세션: 프로세스에 하나인 환경(`common::ort`, 뷰어 글 검색과 같은 것)에서 만든다
 #[cfg(feature = "onnx")]
 fn session(path: &str) -> ort::session::Session {
     #[allow(unused_mut)]
     // 스레드는 쓸 수 있는 코어 수까지만(8 고정이면 taskset 2 코어에서 7 개가 서로 깨우며 문맥 전환 260 만 번·코어를 나눠 먹음)
     let nth = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
     #[allow(unused_mut)]
-    let mut b = ort::session::Session::builder(ort_env()).unwrap().with_intra_threads(nth).unwrap();
+    let mut b = ort::session::Session::builder(common::ort::env()).unwrap().with_intra_threads(nth).unwrap();
     // directml 기능이면 그래픽카드로(안 되면 ORT 가 CPU 로 물러남). 입력 크기를 고정해 두면 DirectML 이 빠르다.
     #[cfg(feature = "directml")]
     let mut b = b.with_execution_providers([ort::ep::DirectML::default().build()]).unwrap().with_dimension_override("batch", 1).unwrap();

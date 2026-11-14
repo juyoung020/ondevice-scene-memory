@@ -1,11 +1,11 @@
-# slam — 위치 프로그램 `slam_bridge`
+# slam — 위치 프로그램
 
-RTAB-Map 0.24.2 에서 우리 설정(`docs/rtabmap_pi.ini`)이 지나가는 경로 — F2F 위치 추적, 루프 클로저, GTSAM 그래프 최적화 — 를 Rust 로 옮긴 크레이트다. 실행 파일 `slam_bridge` 는 RGB-D 입력(TUM 폴더 또는 RealSense D435)을 받아 장면마다 위치를 구하고, 위치 + 컬러 + 컬러에 맞춘 깊이를 memmap 으로 보낸다(`memmap --stream -`).
+RTAB-Map 0.24.2 에서 우리 설정(`docs/rtabmap_pi.ini`)이 지나가는 경로 — F2F 위치 추적, 루프 클로저, GTSAM 그래프 최적화 — 를 Rust 로 옮긴 크레이트다. 실행 파일 `ondevice` 안에서(`ondevice --slam "…"`) RGB-D 입력(TUM 폴더 또는 RealSense D435)을 받아 장면마다 위치를 구하고, 위치 + 컬러 + 컬러에 맞춘 깊이를 같은 프로세스의 물체 기억으로 메모리 큐로 넘긴다. 위치만 돌려 장면 스트림을 남길 때는 `ondevice slam …`.
 
 - 명령줄과 출력은 C++ 원본 `rtab_bridge`(`bridge/src`)와 같다. PC(x86)에서 같은 입력·설정이면 스트림, 보낸 위치(`--poses`), 최종 지도 위치(`--final-poses`), 장면별 판단(`--stats`)이 바이트까지 같다.
 - 속도는 원본의 약 2.2 – 2.3 배(PC WSL, fr1 책상 268 장/초, 복도 232 장/초). 본 스레드 계산이 장면당 2.8 – 3.1 ms 다.
 - 인자·스트림 형식·좌표 약속: [docs/bridge.md](../docs/bridge.md). 보드 설치: [docs/board_bridge.md](../docs/board_bridge.md).
-- 보드 실시간 스크립트는 지금 `rtab_bridge` 를 쓴다. 보드(ARM)에서 원본과 같은 바이트 비교를 마치면 `slam_bridge` 로 바꾼다.
+- 보드도 같은 `ondevice --slam` 으로 돈다. 보드(ARM)에서 원본과의 바이트 비교는 남은 일이다(방법: [docs/board_bridge.md](../docs/board_bridge.md)).
 
 ## 모듈
 
@@ -24,9 +24,9 @@ RTAB-Map 0.24.2 에서 우리 설정(`docs/rtabmap_pi.ini`)이 지나가는 경�
 | `graph/ccolamd` | 변수 순서 | CCOLAMD(GTSAM 4.2 `3rdparty/CCOLAMD`) |
 | `graph/exact` | 선형 풀이를 원본 덧셈 순서 그대로(소거 트리 → 접합 트리 → 클리크 Cholesky) | GTSAM 4.2 `GaussianFactorGraph::optimize`, Eigen 3.4 |
 | `io` (+ `io/realsense` · `io/rsdriver`) | TUM 재생(PNG 를 푼 RGB 그대로), D435 입력(`realsense` 기능 = librealsense2, `rsdriver` 기능 = V4L2 직접, `--driver` 로 고름), 읽기 스레드(위치 추적 특징점도 여기서 뽑음) | `bridge/src` 의 입력 코드, OpenCV `cvtColor` |
-| `stream` | 장면 스트림 쓰기 스레드, 같은 프로세스로 넘기는 메모리 큐(`Writer::channel` · `Receiver`) | `bridge/src/stream_writer.cpp` |
+| `stream` | 장면 스트림 형식 하나: 쓰기 스레드, 읽기(`Reader`, 물체 기억의 `--stream`), 같은 프로세스로 넘기는 메모리 큐(`Writer::channel` · `Receiver`) | `bridge/src/stream_writer.cpp` |
 | `params` | 설정: 기본값 ← ini `[Core]` ← 명령줄 `--Group/Name 값` | RTAB-Map `Parameters.h` |
-| `app` | 위치 루프(`run` = `slam_bridge`, `spawn` = memmap `--slam` 용 스레드 + 자기 스레드 풀): 명령줄, 장면마다의 판단(다시 잡기 · 새 지도 · 맡아 둠 · 그래프 블록), 끝 요약 | `bridge/src/main.cpp` |
+| `app` | 위치 루프(`parse` = 명령줄 → 설정, `run` = `ondevice slam`, `spawn` = `ondevice --slam` 용 스레드 + 부른 쪽이 만든 `slam` 역할 풀): 명령줄, 장면마다의 판단(다시 잡기 · 새 지도 · 맡아 둠 · 그래프 블록), 끝 요약 | `bridge/src/main.cpp` |
 
 난수(`rand()` · `std::random_device`)는 프로세스 하나에 하나인 `register::SharedRng` 를 모든 모듈이 원본과 같은 순서로 쓴다.
 
@@ -45,23 +45,18 @@ RTAB-Map 0.24.2 에서 우리 설정(`docs/rtabmap_pi.ini`)이 지나가는 경�
 ## 빌드 · 실행
 
 ```bash
-# 저장소 맨 위 작업 공간에서. TUM 재생만
-cargo build --release -p slam
-# D435 입력: rsdriver(V4L2 직접) 또는 librealsense2 C API(라이브러리 경로는 docs/board_bridge.md)
-cargo build --release -p slam --features rsdriver
-cargo build --release -p slam --features realsense
+# 저장소 맨 위 작업 공간에서: target/release/ondevice(리눅스는 D435 rsdriver 입력 포함)
+cargo build --release
+# librealsense2 C API 입력도(라이브러리 경로는 docs/board_bridge.md, 선언은 tools::rs2)
+cargo build --release --features slam-realsense
 
-# 한 프로세스: memmap 안에서 위치 루프를 돌림(라이브러리 `slam::app::spawn`, 장면은 메모리 큐 `stream::Writer::channel`)
+# 한 프로세스: 물체 기억과 같은 프로세스에서 위치 루프를 돌림(라이브러리 `slam::app::spawn`, 장면은 메모리 큐 `stream::Writer::channel`)
 target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
   --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
 
-# 두 프로세스: TUM 재생 → memmap
-target/release/slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
-  | target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
-
-# 카메라 → memmap(실시간)
-slam_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req \
-  | memmap --stream - --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live
+# 위치만: 장면 스트림을 파일로 남기고 물체 기억은 나중에 그 파일로
+target/release/ondevice slam --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini --out data/office.mmf
+target/release/ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
 ```
 
 시험용 `--reset-at N` 은 N 번째 장면에서 리셋 파일이 생긴 것처럼 처음부터 다시 시작한다. `--db` 는 받아서 넘어간다(데이터베이스 저장은 `rtab_bridge` 에만 있음).

@@ -50,7 +50,8 @@ struct Args {
     infer_min_ms: f64,  // --infer-min-ms N: 분할 추론 단계만 적어도 N ms 걸린 것처럼 기다림(보드 NPU 추론 시간 흉내; 전·후처리는 --slow 배)
     seg_pipe: bool,     // --seg-pipe off: 스트림 분할의 전처리 → 추론 → 후처리를 읽기 스레드 하나에서 차례로(기본: 단계마다 스레드를 두어 서로 겹침)
     seg_check: usize,   // --seg-check N: 지도는 만들지 않고, 스트림 분할 장면 N 장에 전·후처리를 기준 구현과 견줌(결과 같음 여부 + 시간)
-    serve: Option<String>, // --serve "<포트> [sgview 인자...]": 뷰어 서버를 같은 프로세스에서(자주 바뀌는 기억 파일은 메모리로)
+    serve: Option<sgview::Config>, // --serve "<포트> [뷰어 인자...]": 뷰어 서버를 같은 프로세스에서(기억 폴더에 쓴 파일은 메모리로)
+    serve_exit: bool,      // --serve-exit: 입력이 끝나면 뷰어도 끝냄(측정·검증용)
     no_drop: bool,      // --no-drop: 스트림이 밀려도 장면을 버리지 않음(재생 결과가 늘 같게)
     seg_skip: Option<(f64, f64, usize, f64)>, // --seg-skip M,DEG[,N[,L]] (기본 0.10,10,4,0.1, off 로 끔): 스트림이 L 초(기본 0.1) 넘게 밀렸을 때만, 직전 분할 키프레임보다 M 미터·DEG 도 안쪽이면 분할 생략(N 장째는 꼭 분할)
     scene_vox: f64,
@@ -58,8 +59,8 @@ struct Args {
     scene_step: usize, // 3D 지도에 쓸 화소 간격
     pts_depth: f64,    // --pts-depth M: 점 지도에 넣을 최대 깊이(멀수록 깊이 잡음이 커 표면이 두꺼워짐)
     pts_obs: u8,       // --pts-obs N: 고운 칸이 점이 되려면 키프레임 N 장 이상에서 보여야(한두 번 맞은 잡음 점을 거름)
-    stream: Option<String>, // --stream <파일|->: 연결 프로그램(bridge/)이 보내는 장면 스트림(위치·컬러·깊이)
-    slam: Option<String>,   // --slam "<slam_bridge 인자>": 같은 프로세스에서 위치 프로그램을 돌림(stream 은 "--slam")
+    stream: Option<String>, // --stream <파일|->: 녹화·파이프로 받는 장면 스트림(위치·컬러·깊이). --slam 이면 "--slam"
+    slam: Option<slam::app::Args>, // --slam "<위치 인자>": 같은 프로세스에서 위치 프로그램을 돌림(장면은 메모리 큐로)
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
@@ -68,9 +69,9 @@ struct Args {
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
-fn args() -> Args {
-    let v: Vec<String> = std::env::args().collect();
-    let get = |k: &str| v.iter().position(|a| a == k).and_then(|i| v.get(i + 1)).cloned();
+/// 명령줄을 처음에 한 번 읽는다: 물체 기억 설정 + 묶음 인자(--slam · --serve)는 각 프로그램의 설정으로 바로 읽어 둔다(잘못된 인자는 스레드를 띄우기 전에 멈춤)
+fn args(v: &common::cli::Argv) -> Args {
+    let get = |k: &str| v.get(k);
     Args {
         tum: get("--tum").unwrap_or_default().into(),
         out: get("--out").or_else(|| get("--seg-check").map(|_| String::new())).expect("--out <dir>").into(), // --seg-check 는 쓰는 파일이 없음
@@ -81,8 +82,8 @@ fn args() -> Args {
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
-        no_skip: v.iter().any(|a| a == "--no-skip"),
-        looping: v.iter().any(|a| a == "--loop"),
+        no_skip: v.flag("--no-skip"),
+        looping: v.flag("--loop"),
         scene_every: get("--scene-every").map_or(10, |s| s.parse().unwrap()),
         gt: get("--gt"),
         npu_jobs: get("--npu-jobs").and_then(|s| s.parse().ok()).unwrap_or(4).clamp(1, 8),
@@ -95,8 +96,14 @@ fn args() -> Args {
         infer_min_ms: get("--infer-min-ms").map_or(0.0, |s| s.parse().unwrap()),
         seg_pipe: get("--seg-pipe").is_none_or(|s| s != "off") && get("--seg-cache").is_none(), // --seg-cache 는 분할 한 번을 통째로 읽어 오므로 차례 실행
         seg_check: get("--seg-check").map_or(0, |s| s.parse().unwrap()),
-        serve: get("--serve"),
-        no_drop: v.iter().any(|x| x == "--no-drop"),
+        serve: v.group("--serve").map(|g| {
+            let mut it = g.into_iter();
+            let port = it.next().expect("--serve <포트>");
+            let out = get("--out").unwrap_or_default();
+            sgview::Config::parse([out, "--port".into(), port].into_iter().chain(it).collect())
+        }),
+        serve_exit: v.flag("--serve-exit"),
+        no_drop: v.flag("--no-drop"),
         // 기본 켬(0.10,10,4,0.1): 밀리지 않으면 늘 분할하므로 빠른 PC 에선 동작 그대로, "off" 로 끔
         seg_skip: match get("--seg-skip") { Some(s) if s == "off" => None, s => { let s = s.unwrap_or_else(|| "0.10,10,4,0.1".into());
             let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect();
@@ -108,9 +115,12 @@ fn args() -> Args {
         pts_obs: get("--pts-obs").map_or(3, |s| s.parse().unwrap()),
         // --slam "<slam_bridge 인자>": 위치 프로그램을 이 프로세스 안에서 돌려 장면을 메모리로 받음(스트림 입력과 같은 경로, 이름만 "--slam")
         stream: get("--stream").or_else(|| get("--slam").map(|_| "--slam".into())),
-        slam: get("--slam"),
-        no_level: v.iter().any(|x| x == "--no-level"),
-        rebuild_every: if v.iter().any(|x| x == "--no-rebuild") { -1.0 } else { get("--rebuild-every").map_or(5.0, |s| s.parse().unwrap()) },
+        slam: v.group("--slam").map(|g| {
+            let argv: Vec<String> = std::iter::once("slam".to_string()).chain(g).collect();
+            slam::app::parse(&argv).unwrap_or_else(|c| std::process::exit(c))
+        }),
+        no_level: v.flag("--no-level"),
+        rebuild_every: if v.flag("--no-rebuild") { -1.0 } else { get("--rebuild-every").map_or(5.0, |s| s.parse().unwrap()) },
         kf_store_mb: get("--kf-store-mb").map_or(3000, |s| s.parse().unwrap()),
     }
 }
@@ -278,7 +288,7 @@ fn make_seg(path: &str) -> Box<dyn seg::Segmenter + Send> {
     }
     #[cfg(feature = "onnx")]
     {
-        return Box::new(seg::OnnxSeg::new(seg::ort_env(), path));
+        return Box::new(seg::OnnxSeg::new(common::ort::env(), path));
     }
     #[allow(unreachable_code)]
     {
@@ -478,7 +488,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut scene_json = json!(null);
     // 3D 지도 조각: 이번 실행 번호(뷰어가 새 실행이면 받은 조각을 비움), 조각 수, 보낸 점 수
     let mut run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-    let _ = std::fs::remove_dir_all(a.out.join("scene"));
+    out::remove_dir_all(&a.out.join("scene"));
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
     // 물체가 가질 수 있는 이름 전체(분할 모델의 이름 + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
     let mut names: Vec<String> = seg::names();
@@ -487,7 +497,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         names.sort();
         names.dedup();
     }
-    let _ = std::fs::write(a.out.join("vocab.json"), serde_json::to_string(&names).unwrap());
+    out::write_direct(&a.out.join("vocab.json"), serde_json::to_string(&names).unwrap().into_bytes());
     let mut last_pose = [0.0; 3];
     let t0 = Instant::now();
     // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
@@ -1625,7 +1635,7 @@ impl PtsWorker {
         if let Ok(rd) = std::fs::read_dir(a_out.join("scene")) {
             for e in rd.flatten() {
                 if e.path().is_dir() && e.file_name().to_string_lossy() != scene.run.to_string() {
-                    let _ = std::fs::remove_dir_all(e.path());
+                    out::remove_dir_all(&e.path());
                 }
             }
         }
@@ -1652,7 +1662,7 @@ fn write_points(dir: &Path, scene: &mut SceneMap, budget: usize, pre: Option<Pts
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if e.path().is_dir() && name != scene.run.to_string() && name != published.to_string() {
-                let _ = std::fs::remove_dir_all(e.path());
+                out::remove_dir_all(&e.path());
             }
         }
     }
@@ -1809,7 +1819,7 @@ fn prune_object_files(dir: &Path, mem: &Memory) {
         let name = e.file_name();
         let Some(id) = name.to_str().and_then(|s| s.strip_prefix('O')).and_then(|s| s.split('_').next()).and_then(|s| s.parse::<u32>().ok()) else { continue };
         if !live.contains(&id) {
-            let _ = std::fs::remove_file(e.path());
+            out::remove_file(&e.path());
         }
     }
 }
@@ -1951,27 +1961,27 @@ fn limit_malloc_arenas() {
 }
 
 fn main() {
-    // 한 명령(ondevice): 첫 인자가 slam · view 면 그 프로그램(slam_bridge · sgview)을, run(또는 없음)이면 memmap 을
-    let argv: Vec<String> = std::env::args().collect();
-    match argv.get(1).map(String::as_str) {
+    // 한 프로그램(ondevice): 첫 인자가 slam · view 면 위치 프로그램만 · 뷰어 서버만, 그 밖(run 또는 없음)은 물체 기억(+ --slam · --serve)
+    let argv = common::cli::Argv::env();
+    match argv.0.get(1).map(String::as_str) {
         Some("slam") => {
-            let code = slam::app::run(&argv[1..], None).unwrap_or_else(|e| {
+            let code = slam::app::run(&argv.0[1..]).unwrap_or_else(|e| {
                 eprintln!("slam 오류: {e}");
                 1
             });
             std::process::exit(code);
         }
-        Some("view") => return sgview::run(argv[2..].to_vec()),
+        Some("view") => return sgview::run(argv.0[2..].to_vec()),
         _ => {}
     }
     limit_malloc_arenas();
-    // 사진 벡터 확인: memmap --embed-check <모델> <사진 폴더> <벡터 파일>
-    let v: Vec<String> = std::env::args().collect();
+    // 사진 벡터 확인: ondevice --embed-check <모델> <사진 폴더> <벡터 파일>
+    let v = &argv.0;
     if let Some(i) = v.iter().position(|x| x == "--embed-check") {
         let g = |k: usize| v.get(i + k).unwrap_or_else(|| panic!("--embed-check <모델> <사진 폴더> <벡터 파일>")).as_str();
         return embed::check(g(1), g(2), g(3));
     }
-    let a = args();
+    let a = args(&argv);
     if let Some(n) = &a.seg_names {
         seg::set_names(n);
     }
@@ -1992,23 +2002,20 @@ fn main() {
         None => make_seg(&a.seg),
     };
     out::thread_role(out::Role::Main);
-    // --serve: 뷰어 서버(sgview)를 같은 프로세스의 스레드로. view.json · pose.json · map.pgm · map.yaml 은 쓴 바이트를 메모리로 넘겨받는다
-    let serve_th = a.serve.as_deref().map(|s| {
-        let mut it = s.split_whitespace().map(String::from);
-        let port = it.next().expect("--serve <포트>");
-        let argv: Vec<String> = [a.out.to_string_lossy().into_owned(), "--port".into(), port].into_iter().chain(it).collect();
+    // --serve: 뷰어 서버(sgview)를 같은 프로세스의 스레드로. 기억 폴더에 쓰는 파일은 쓴 바이트를 메모리로 넘겨받는다(디스크에서 다시 읽지 않음)
+    let serve_th = a.serve.clone().map(|cfg| {
         sgview::memfs::enable();
         out::thread_free(); // 서버 스레드도 따로 된 프로세스처럼 코어 전부에서(띄운 뒤 본 스레드 역할로 돌아감)
-        let th = std::thread::Builder::new().name("sgview".into()).spawn(move || sgview::run(argv)).unwrap();
+        let th = std::thread::Builder::new().name("sgview".into()).spawn(move || sgview::serve(cfg)).unwrap();
         out::thread_role(out::Role::Main);
         th
     });
     // --slam: 위치 프로그램을 같은 프로세스의 스레드로(장면은 메모리 큐로 넘어와 --stream 과 같은 경로를 탄다)
-    let slam_th = a.slam.as_deref().map(|s| {
-        let argv: Vec<String> = std::iter::once("slam".to_string()).chain(s.split_whitespace().map(String::from)).collect();
-        // 위치 프로그램 스레드는 memmap 역할 묶음(앞 코어 둘 등)을 물려받지 않게 프로세스 코어 전부에서 띄운다(따로 된 프로세스와 같은 자리)
+    let slam_th = a.slam.clone().map(|sa| {
+        // 위치 프로그램 스레드는 물체 기억 역할 묶음(앞 코어 둘 등)을 물려받지 않게 프로세스 코어 전부에서 띄우고(따로 된 프로세스와 같은 자리),
+        // 나눠 돌리기는 `slam` 역할 풀(기본 코어 전부, --threads slam=nice:코어 로 묶음)에서
         out::thread_free();
-        let (rx, th) = slam::app::spawn(argv).unwrap_or_else(|e| panic!("--slam: {e}"));
+        let (rx, th) = slam::app::spawn(sa, out::slam_pool()).unwrap_or_else(|e| panic!("--slam: {e}"));
         out::thread_role(out::Role::Main);
         stream::hand_slam(rx);
         th
@@ -2034,7 +2041,7 @@ fn main() {
     // 입력이 끝나도 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄). --serve-exit 이면 바로 끝냄(측정·검증용)
     if let Some(th) = serve_th {
         out::flush_writer();
-        if !std::env::args().any(|x| x == "--serve-exit") {
+        if !a.serve_exit {
             eprintln!("입력 끝: 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄)");
             let _ = th.join();
         }

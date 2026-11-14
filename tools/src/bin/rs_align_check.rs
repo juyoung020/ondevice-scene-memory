@@ -1,4 +1,4 @@
-//! 녹화 폴더(rs_rec)의 원래 깊이에 fast_align 을 다시 돌려 rs2::align 결과(depth_rs/)와 화소 차이·시간을 비교한다.
+//! 녹화 폴더(rsd_rec)의 원래 깊이에 fast_align 을 다시 돌려 rs2::align 결과(depth_rs/)와 화소 차이·시간을 비교한다.
 //! 같은 원래 깊이로 rs2::align 도 카메라 없이(software_device) 다시 돌려 시간을 같은 조건에서 잰다.
 //!   rs_align_check <녹화 폴더> [--core 29] [--threads 4] [--max N]
 use tools::common::*;

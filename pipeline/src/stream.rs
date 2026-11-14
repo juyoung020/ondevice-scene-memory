@@ -1,22 +1,14 @@
-//! 장면 스트림 입력(--stream): 연결 프로그램(bridge/, RTAB-Map)이 보내는 장면 = 머리 176 바이트 + RGB8 + 깊이 u16,
-//! 그 사이에 그래프 블록(MMG1: 새로 생기거나 움직인 지도 노드 위치)이 끼어 온다.
-//! 형식과 좌표 약속은 docs/bridge.md "스트림 형식".
+//! 장면 입력(--slam · --stream): 위치 프로그램이 보내는 장면(위치·컬러·깊이)과 그 사이에 끼어 오는 그래프 블록(새로 생기거나 움직인 지도 노드 위치).
+//! 같은 프로세스의 위치 프로그램(--slam)은 메모리 큐로, 녹화·파이프(--stream)는 바이트 스트림으로 온다. 형식·읽기는 `slam::stream` 하나를 쓰고,
+//! 여기서는 둘 다 같은 함수로 `StreamFrame` 을 만든다. 형식과 좌표 약속은 docs/bridge.md "스트림 형식".
 use crate::geom::*;
-use std::io::Read;
+pub use slam::stream::{HELD, LOST, MAP_CORRECTED, NEW_MAP};
+use slam::stream::OutFrame;
 
-pub const HEADER: usize = 176;
-pub const LOST: u32 = 1;
-pub const NEW_MAP: u32 = 2;
-pub const MAP_CORRECTED: u32 = 4;
-/// 맡아 둘 장면(LOST 와 함께 옴): 믿는 지도와 아직 안 이어진 새 지도의 위치·기준 노드가 들어 있다
-pub const HELD: u32 = 8;
-/// 그래프 블록: 머리 16 바이트(표시 4 + 머리 크기 4 + 노드 수 4 + 리셋 표시 4), 노드마다 id u32 + 맡아 둠 u32 + 3×4 f64
-const GRAPH_HEADER: usize = 16;
-const GRAPH_NODE: usize = 8 + 96;
 /// 읽기 버퍼: 머리·그래프 블록용. 사진은 이보다 커서 버퍼를 거치지 않고 받을 자리에 바로 읽힌다
 const READ_BUF: usize = 1 << 16;
 
-/// 그래프 노드: (RTAB-Map 노드 id, 자세, 위치, 맡아 둠) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표.
+/// 그래프 노드: (지도 노드 id, 자세, 위치, 맡아 둠) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표.
 /// 맡아 둠 = 믿는 지도와 아직 안 이어진 새 지도의 노드(이어지면 같은 id 가 맡아 둠 없이 다시 온다)
 pub type Node = (u32, M3, V3, bool);
 
@@ -25,7 +17,7 @@ pub struct StreamFrame {
     pub map_id: u32,
     pub seq: u64,
     pub t: f64,
-    /// 카메라(OpenCV: x 오른쪽, y 아래, z 앞) → 세계(RTAB-Map 지도: x 앞, y 왼쪽, z 위)
+    /// 카메라(OpenCV: x 오른쪽, y 아래, z 앞) → 세계(지도: x 앞, y 왼쪽, z 위)
     pub r: M3,
     pub p: V3,
     pub k: [f64; 4],
@@ -51,14 +43,23 @@ impl StreamFrame {
     }
 }
 
-fn pose_of(t3x4: &[f64]) -> (M3, V3) {
+fn pose_of(t3x4: &[f64; 12]) -> (M3, V3) {
     ([[t3x4[0], t3x4[1], t3x4[2]], [t3x4[4], t3x4[5], t3x4[6]], [t3x4[8], t3x4[9], t3x4[10]]], [t3x4[3], t3x4[7], t3x4[11]])
 }
 
-/// 장면이 오는 곳: 바이트 스트림(파이프·파일) 또는 같은 프로세스의 위치 프로그램(--slam, 메모리 큐)
+/// 장면이 오는 곳: 같은 프로세스의 위치 프로그램(메모리 큐) 또는 바이트 스트림(파이프·파일)
 enum Src {
-    Bytes(Box<dyn Read + Send>),
     Mem(slam::stream::Receiver),
+    Bytes(slam::stream::Reader<Box<dyn std::io::Read + Send>>),
+}
+
+impl Src {
+    fn recv(&mut self) -> Option<OutFrame> {
+        match self {
+            Src::Mem(rx) => rx.recv(),
+            Src::Bytes(r) => r.recv(),
+        }
+    }
 }
 
 /// 리셋 블록을 만난 읽기 쪽이 여기 맡겨 두면 다음 open 이 이어서 읽는다(같은 파이프, 버퍼에 남은 바이트 포함)
@@ -86,12 +87,12 @@ impl StreamReader {
         if let Some(src) = HANDOVER.lock().unwrap().take() {
             return StreamReader { src: Some(src), graph: vec![] };
         }
-        let src: Box<dyn Read + Send> = if path == "-" {
+        let r: Box<dyn std::io::Read + Send> = if path == "-" {
             Box::new(std::io::BufReader::with_capacity(READ_BUF, std::io::stdin()))
         } else {
             Box::new(std::io::BufReader::with_capacity(READ_BUF, std::fs::File::open(path).unwrap_or_else(|e| panic!("--stream {path}: {e}"))))
         };
-        StreamReader { src: Some(Src::Bytes(src)), graph: vec![] }
+        StreamReader { src: Some(Src::Bytes(slam::stream::Reader::new(r))), graph: vec![] }
     }
 
     /// 스트림이 끝난 뒤 남은 그래프 노드(마지막 장면 뒤에 온 블록)
@@ -99,35 +100,13 @@ impl StreamReader {
         std::mem::take(&mut self.graph)
     }
 
-    fn bytes(&mut self) -> Option<&mut Box<dyn Read + Send>> {
-        match self.src.as_mut()? {
-            Src::Bytes(b) => Some(b),
-            Src::Mem(_) => unreachable!(),
-        }
-    }
-
-    /// 다음 장면(그 앞의 그래프 블록은 graph 에 담음). 스트림이 끝나면(보내는 쪽이 닫음) None.
+    /// 다음 장면(그 앞의 그래프 블록은 graph 에 담음). 스트림이 끝나면(보내는 쪽이 닫음) 또는 리셋 블록이면 None.
+    /// 메모리 큐와 바이트 스트림이 같은 값(위치·보정값은 같은 f64, 컬러·깊이 버퍼는 복사 없이 넘겨받음)
     pub fn next(&mut self) -> Option<StreamFrame> {
-        if let Src::Mem(_) = self.src.as_ref()? {
-            return self.next_mem();
-        }
         loop {
-            let mut m = [0u8; 4];
-            self.bytes()?.read_exact(&mut m).ok()?;
-            match &m {
-                b"MMF1" => return self.frame(),
-                b"MMG1" => self.graph_block()?,
-                _ => panic!("스트림 형식이 아님(머리 {m:?})"),
-            }
-        }
-    }
-
-    /// 메모리 큐에서: 바이트로 풀었을 때와 같은 값(위치·보정값은 같은 f64, 컬러·깊이 버퍼는 복사 없이 넘겨받음)
-    fn next_mem(&mut self) -> Option<StreamFrame> {
-        loop {
-            let Some(Src::Mem(rx)) = self.src.as_ref() else { return None };
-            let mut f = rx.recv()?;
+            let mut f = self.src.as_mut()?.recv()?;
             if f.reset {
+                // 리셋 블록: 여기서 스트림을 끝내고, 읽던 곳을 다음 실행에 넘긴다
                 self.graph.clear();
                 *HANDOVER.lock().unwrap() = self.src.take();
                 return None;
@@ -162,67 +141,5 @@ impl StreamReader {
                 graph: std::mem::take(&mut self.graph),
             });
         }
-    }
-
-    fn graph_block(&mut self) -> Option<()> {
-        let mut h = [0u8; GRAPH_HEADER - 4];
-        self.bytes()?.read_exact(&mut h).ok()?;
-        let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
-        assert_eq!(u32_at(0) as usize, GRAPH_HEADER, "모르는 그래프 블록 머리 크기");
-        let n = u32_at(4) as usize;
-        // 리셋 블록(예약 칸 1): 여기서 스트림을 끝내고, 읽던 곳을 다음 실행에 넘긴다
-        if u32_at(8) == 1 {
-            *HANDOVER.lock().unwrap() = self.src.take();
-            self.graph.clear();
-            return None;
-        }
-        let mut b = vec![0u8; n * GRAPH_NODE];
-        self.bytes()?.read_exact(&mut b).ok()?;
-        for c in b.chunks_exact(GRAPH_NODE) {
-            let id = u32::from_le_bytes(c[0..4].try_into().unwrap());
-            let t: Vec<f64> = (0..12).map(|i| f64::from_le_bytes(c[8 + 8 * i..16 + 8 * i].try_into().unwrap())).collect();
-            let (r, p) = pose_of(&t);
-            let held = u32::from_le_bytes(c[4..8].try_into().unwrap()) == 1;
-            self.graph.push((id, r, p, held));
-        }
-        Some(())
-    }
-
-    fn frame(&mut self) -> Option<StreamFrame> {
-        let mut h = [0u8; HEADER];
-        h[0..4].copy_from_slice(b"MMF1");
-        self.bytes()?.read_exact(&mut h[4..]).ok()?;
-        let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
-        let f32_at = |o: usize| f32::from_le_bytes(h[o..o + 4].try_into().unwrap());
-        let f64_at = |o: usize| f64::from_le_bytes(h[o..o + 8].try_into().unwrap());
-        assert_eq!(u32_at(4) as usize, HEADER, "모르는 머리 크기");
-        let t3x4: Vec<f64> = (0..12).map(|i| f64_at(32 + 8 * i)).collect();
-        let (r, p) = pose_of(&t3x4);
-        let (w, hh) = (u32_at(160) as usize, u32_at(164) as usize);
-        let mut rgb = vec![0u8; w * hh * 3];
-        // 깊이는 리틀 엔디언 u16 이라 받을 자리에 바로 읽는다
-        #[cfg(not(target_endian = "little"))]
-        compile_error!("스트림 깊이를 바로 읽는 것은 리틀 엔디언 기계 기준");
-        let mut depth = vec![0u16; w * hh];
-        let db = unsafe { std::slice::from_raw_parts_mut(depth.as_mut_ptr() as *mut u8, w * hh * 2) };
-        if self.bytes()?.read_exact(&mut rgb).is_err() || self.bytes()?.read_exact(db).is_err() {
-            return None; // 장면 중간에 끊김
-        }
-        Some(StreamFrame {
-            flags: u32_at(8),
-            map_id: u32_at(12),
-            seq: u64::from_le_bytes(h[16..24].try_into().unwrap()),
-            t: f64_at(24),
-            r,
-            p,
-            k: [f64_at(128), f64_at(136), f64_at(144), f64_at(152)],
-            w,
-            h: hh,
-            depth_per_m: f32_at(168),
-            rgb,
-            depth,
-            anchor: u32_at(172),
-            graph: std::mem::take(&mut self.graph),
-        })
     }
 }

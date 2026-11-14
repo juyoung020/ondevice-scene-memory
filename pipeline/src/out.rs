@@ -1,5 +1,4 @@
 //! 기억 폴더 쓰기: 임시 파일에 쓴 뒤 바꾸기(윈도우에서 뷰어가 읽는 중이면 잠깐 기다렸다 다시).
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -87,12 +86,36 @@ fn run_job(dst: &Path, job: Job) {
     let b = job();
     write_now(dst, &b);
     let n = b.len();
-    // --serve: 자주 바뀌는 파일은 같은 바이트를 서버에도 걸어 둠(복사 없이 넘김, 파일을 다 쓴 뒤라 디스크와 같은 차례)
-    if sgview::memfs::is_hot(dst) {
-        sgview::memfs::publish(dst, std::sync::Arc::new(b));
-    }
+    publish(dst, b);
     slow(c0);
     stats::add(stats::kind(dst), n, c0.elapsed().as_nanos() as u64);
+}
+
+/// --serve: 다 쓴 파일의 같은 바이트를 서버에도 걸어 둠(복사 없이 넘김, 파일을 다 쓴 뒤라 디스크와 같은 차례).
+/// 서버는 이 프로세스가 만든 파일을 디스크에서 다시 읽지 않는다
+pub fn publish(dst: &Path, bytes: Vec<u8>) {
+    if sgview::memfs::enabled() {
+        sgview::memfs::publish(dst, Arc::new(bytes));
+    }
+}
+
+/// 기록 스레드를 거치지 않고 바로 씀(그 자리에서 읽힐 작은 파일) + 서버에 걸어 둠
+pub fn write_direct(dst: &Path, bytes: Vec<u8>) {
+    if std::fs::write(dst, &bytes).is_ok() {
+        publish(dst, bytes);
+    }
+}
+
+/// 파일 지우기(서버에 걸어 둔 것도 함께)
+pub fn remove_file(p: &Path) {
+    let _ = std::fs::remove_file(p);
+    sgview::memfs::remove(p);
+}
+
+/// 폴더 지우기(서버에 걸어 둔 그 아래 파일도 함께)
+pub fn remove_dir_all(p: &Path) {
+    let _ = std::fs::remove_dir_all(p);
+    sgview::memfs::remove_dir(p);
 }
 
 fn write_now(dst: &Path, bytes: &[u8]) {
@@ -105,22 +128,9 @@ fn write_now(dst: &Path, bytes: &[u8]) {
     replace(&tmp, dst);
 }
 
-/// binary_little_endian PLY: float xyz + uchar rgb
-fn ply_bytes(pts: &[([f32; 3], [u8; 3])]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(pts.len() * 15 + 200);
-    write!(b, "ply\nformat binary_little_endian 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n", pts.len()).unwrap();
-    for (p, c) in pts {
-        for v in p {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        b.extend_from_slice(c);
-    }
-    b
-}
-
 /// 점 PLY: 바이트는 쓰는 쪽(실시간이면 기록 스레드)에서 짠다
 pub fn ply(dst: &Path, pts: Vec<([f32; 3], [u8; 3])>) {
-    write_lazy(dst, Box::new(move || ply_bytes(&pts)));
+    write_lazy(dst, Box::new(move || common::img::ply(&pts)));
 }
 
 pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
@@ -131,23 +141,13 @@ pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
 
 // PNG 압축은 기록 스레드에서(물체 사진이 바뀔 때 본 스레드가 장당 수십 ms 멈추던 것). 화소는 Arc 로 나눠 받아 복사 없이 압축
 pub fn png_rgb(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
-    write_lazy(dst, Box::new(move || png_of::<image::Rgb<u8>>(w, h, &px)));
+    write_lazy(dst, Box::new(move || common::img::png_rgb(w, h, &px)));
 }
 pub fn png_gray(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
-    write_lazy(dst, Box::new(move || png_of::<image::Luma<u8>>(w, h, &px)));
+    write_lazy(dst, Box::new(move || common::img::png_gray(w, h, &px)));
 }
 pub fn png_u16(dst: &Path, w: u32, h: u32, px: Arc<Vec<u16>>) {
-    write_lazy(dst, Box::new(move || png_of::<image::Luma<u16>>(w, h, &px)));
-}
-
-/// 빌린 화소로 PNG(ImageBuffer::write_to 와 같은 인코더·설정이라 같은 바이트)
-fn png_of<P: image::Pixel + image::PixelWithColorType>(w: u32, h: u32, px: &[P::Subpixel]) -> Vec<u8>
-where
-    [P::Subpixel]: image::EncodableLayout,
-{
-    let mut v = vec![];
-    image::ImageBuffer::<P, &[P::Subpixel]>::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-    v
+    write_lazy(dst, Box::new(move || common::img::png_u16(w, h, &px)));
 }
 
 /// 기록 통계(종류별 파일 수·바이트·짜기+쓰기 시간): 끝에 한 줄로 출력해 어느 파일이 디스크·기록 스레드를 먹는지 본다
@@ -193,53 +193,48 @@ pub fn flush_writer() {
     }
 }
 
-/// 스레드 역할: 우선순위(nice)·코어 묶기를 역할마다 정한다(`--threads`)
+/// 스레드 역할: 우선순위(nice)·코어 묶기를 역할마다 정한다(`--threads`).
+/// 한 프로세스의 풀 배치: 전역 rayon 풀(본 스레드 역할), 뒤쪽 풀(점 역할), 위치 프로그램 풀(`slam` 역할, `--slam`),
+/// ONNX Runtime 세션 스레드(추론 역할의 스레드에서 만들어 그 묶음을 물려받음)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Role { Main, Reader, Points, Rebuild, Writer, Infer }
-pub const ROLE_NAMES: [&str; 6] = ["main", "reader", "pts", "rebuild", "writer", "infer"];
-/// 역할별 기본 nice(묶지 않음: 본 스레드와 같은 코어를 나눠 쓰므로 작업 스레드를 크게 낮춤)
-const NICE: [(i32, u64); 6] = [(0, 0), (0, 0), (10, 0), (19, 0), (10, 0), (0, 0)];
+pub enum Role { Main, Reader, Points, Rebuild, Writer, Infer, Slam }
+pub const ROLES: usize = 7;
+pub const ROLE_NAMES: [&str; ROLES] = ["main", "reader", "pts", "rebuild", "writer", "infer", "slam"];
+/// 역할별 기본 nice(묶지 않음: 본 스레드와 같은 코어를 나눠 쓰므로 작업 스레드를 크게 낮춤). 위치 프로그램은 코어 전부
+const NICE: [(i32, u64); ROLES] = [(0, 0), (0, 0), (10, 0), (19, 0), (10, 0), (0, 0), (0, 0)];
 
 /// 역할별 (nice, 코어 묶음 비트). 묶음 0 = 프로세스가 받은 코어 전부
-static LAYOUT: std::sync::OnceLock<[(i32, u64); 6]> = std::sync::OnceLock::new();
-static FULL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static LAYOUT: std::sync::OnceLock<[(i32, u64); ROLES]> = std::sync::OnceLock::new();
 
-/// 프로세스가 쓸 수 있는 코어(taskset 으로 준 것)
-pub fn allowed_cpus() -> Vec<usize> {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        unsafe extern "C" {
-            fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
-        }
-        let mut m = [0u64; 16];
-        if sched_getaffinity(0, 128, m.as_mut_ptr()) == 0 {
-            return (0..1024).filter(|i| m[i / 64] >> (i % 64) & 1 == 1).collect();
-        }
-    }
-    (0..std::thread::available_parallelism().map_or(1, |n| n.get())).collect()
+pub use common::threads::allowed_cpus;
+
+/// 역할의 (nice, 코어 묶음)
+pub fn layout(r: Role) -> (i32, u64) {
+    LAYOUT.get().copied().unwrap_or(NICE)[r as usize]
 }
 
 /// `--threads` 해석. 기본(auto): 코어 4 개 이상이면 nice 는 본 스레드·읽기·추론 0, 점 +5, 기록 +5, 다시 쌓기 +10.
 /// 코어 4 개 이상이면 본 스레드·읽기(분할 전·후처리)를 앞 코어 둘에, 점·다시 쌓기·기록을 나머지 코어에 묶는다. 추론은 보드(NPU)면 앞 코어 둘, ONNX(CPU)면 나머지 코어(ONNX Runtime 스레드 포함).
-/// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔: 점·기록 +10, 다시 쌓기 +19). 직접 주기: `main=0:0,pts=5:2-3,rebuild=10:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
+/// 위치 프로그램(`slam`)은 프로세스 코어 전부(따로 된 프로세스와 같은 자리).
+/// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔: 점·기록 +10, 다시 쌓기 +19). 직접 주기: `main=0:0,pts=5:2-3,rebuild=10:2-3,slam=0:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
 pub fn set_layout(spec: &str) {
+    use common::threads::bits;
     let cpus = allowed_cpus();
-    let bits = |v: &[usize]| v.iter().fold(0u64, |m, &c| if c < 64 { m | 1 << c } else { m });
     let mut l = NICE;
     match spec {
-        "none" => l = [(0, 0); 6],
+        "none" => l = [(0, 0); ROLES],
         "auto" => {
             if cpus.len() >= 4 {
                 let (fg, bg) = (bits(&cpus[..2]), bits(&cpus[2..]));
                 // 추론: 보드는 NPU 가 하므로 부르는 스레드만 앞 코어에, ONNX(CPU) 는 모델 계산이 무거우니 나머지 코어 전부에
                 let inf = if cfg!(feature = "onnx") { bg } else { fg };
-                l = [(0, fg), (0, fg), (5, bg), (10, bg), (5, bg), (0, inf)];
+                l = [(0, fg), (0, fg), (5, bg), (10, bg), (5, bg), (0, inf), (0, 0)];
             }
         }
         s => {
             for part in s.split(',') {
                 let (name, rest) = part.split_once('=').expect("--threads: 역할=nice[:코어]");
-                let i = ROLE_NAMES.iter().position(|n| *n == name).expect("--threads: 역할 이름(main reader pts rebuild writer infer)");
+                let i = ROLE_NAMES.iter().position(|n| *n == name).expect("--threads: 역할 이름(main reader pts rebuild writer infer slam)");
                 let (nice, cores) = rest.split_once(':').map_or((rest, None), |(a, b)| (a, Some(b)));
                 let mut cs = vec![];
                 for r in cores.unwrap_or("").split('+').filter(|x| !x.is_empty()) {
@@ -252,54 +247,15 @@ pub fn set_layout(spec: &str) {
     }
     let _ = LAYOUT.set(l);
     eprintln!("스레드 배치(코어 {:?}): {}", cpus, ROLE_NAMES.iter().zip(&l).map(|(n, (ni, m))| format!("{n} nice {ni}{}", if *m == 0 { String::new() } else { format!(" 코어 {m:#x}") })).collect::<Vec<_>>().join(", "));
-    // 묶지 않는 역할도 프로세스 코어 전부로 다시 묶음(앞서 다른 역할로 묶인 스레드가 역할을 바꿀 때)
-    let all = bits(&cpus);
-    let _ = FULL.set(all);
 }
 
 /// 지금 스레드를 역할에 맞게(우선순위·코어). 리눅스만, 실패해도 그대로 진행
 pub fn thread_role(r: Role) {
-    let (nice, mask) = LAYOUT.get().copied().unwrap_or(NICE)[r as usize];
+    let (nice, mask) = layout(r);
     BG.with(|b| b.set(matches!(r, Role::Points | Role::Rebuild | Role::Writer)));
     #[cfg(target_os = "linux")]
-    unsafe {
-        unsafe extern "C" {
-            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
-            fn gettid() -> i32;
-            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
-        }
-        let tid = gettid();
-        cpu::enter(tid, r as usize);
-        setpriority(0, tid as u32, nice); // PRIO_PROCESS + 스레드 id = 그 스레드만
-        let mask = if mask == 0 { FULL.get().copied().unwrap_or(0) } else { mask };
-        if mask != 0 {
-            let mut m = [0u64; 16];
-            m[0] = mask;
-            sched_setaffinity(tid, 128, m.as_ptr());
-        }
-    }
-    let _ = (nice, mask);
-}
-
-/// 스레드 하나의 우선순위·코어 묶음(묶음 0 = 프로세스 코어 전부). 리눅스만
-fn apply(nice: i32, mask: u64) {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        unsafe extern "C" {
-            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
-            fn gettid() -> i32;
-            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
-        }
-        let tid = gettid();
-        setpriority(0, tid as u32, nice);
-        let mask = if mask == 0 { FULL.get().copied().unwrap_or(0) } else { mask };
-        if mask != 0 {
-            let mut m = [0u64; 16];
-            m[0] = mask;
-            sched_setaffinity(tid, 128, m.as_ptr());
-        }
-    }
-    let _ = (nice, mask);
+    cpu::enter(common::threads::tid(), r as usize);
+    common::threads::apply(nice, mask);
 }
 
 thread_local! {
@@ -312,14 +268,15 @@ static BG_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::ne
 /// 뒤쪽 풀은 점 역할의 우선순위·코어(점 고르기·다시 합치기). 뒤쪽 일은 뒤쪽 풀에서만 줄 선다.
 /// `set_layout` 뒤에 한 번 부른다
 pub fn start_pools() {
-    let l = LAYOUT.get().copied().unwrap_or(NICE);
-    let full = FULL.get().copied().unwrap_or(0);
-    let n = |m: u64| (if m == 0 { full } else { m }).count_ones().max(1) as usize;
-    let ((n0, m0), (n1, m1)) = (l[Role::Main as usize], l[Role::Points as usize]);
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(n(m0)).start_handler(move |_| apply(n0, m0)).build_global();
-    if let Ok(p) = rayon::ThreadPoolBuilder::new().num_threads(n(m1)).start_handler(move |_| apply(n1, m1)).build() {
-        let _ = BG_POOL.set(p);
-    }
+    let ((n0, m0), (n1, m1)) = (layout(Role::Main), layout(Role::Points));
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(common::threads::count(m0)).start_handler(move |_| common::threads::apply(n0, m0)).build_global();
+    let _ = BG_POOL.set(common::threads::pool("pts", n1, m1));
+}
+
+/// 위치 프로그램(`--slam`) 풀: `slam` 역할의 우선순위·코어(기본 프로세스 코어 전부, 그 코어 수만큼 스레드)
+pub fn slam_pool() -> rayon::ThreadPool {
+    let (nice, mask) = layout(Role::Slam);
+    common::threads::pool("slam", nice, mask)
 }
 
 /// 나눠 돌리는 일(rayon)을 부르는 스레드의 역할에 맞는 풀에서 돌린다
@@ -349,7 +306,7 @@ pub fn slow(c0: std::time::Instant) {
 /// 역할별 CPU 시간: 스레드가 역할을 맡은 동안 쓴 CPU 를 역할마다 더한다(끝 요약의 `cpu_s`, `--slow` 로 붙잡은 시간 포함). 리눅스만
 pub mod cpu {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static DONE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6]; // 역할을 내려놓았거나 끝난 스레드 몫(ns)
+    static DONE: [AtomicU64; super::ROLES] = [const { AtomicU64::new(0) }; super::ROLES]; // 역할을 내려놓았거나 끝난 스레드 몫(ns)
     static LIVE: std::sync::Mutex<Vec<(i32, usize, u64)>> = std::sync::Mutex::new(Vec::new()); // (스레드 id, 역할, 역할을 맡을 때의 CPU ns)
 
     /// 시계 id: 2 = 프로세스 전체, 3 = 지금 스레드, `of_thread(tid)` = 다른 스레드
@@ -400,8 +357,8 @@ pub mod cpu {
     }
 
     /// (역할별 CPU 초, 프로세스 전체 CPU 초). 전체 − 역할 합 = 역할 없는 스레드(rayon 풀·분할 추론 스레드)
-    pub fn report() -> ([f64; 6], f64) {
-        let mut ns: [u64; 6] = std::array::from_fn(|k| DONE[k].load(Relaxed));
+    pub fn report() -> ([f64; super::ROLES], f64) {
+        let mut ns: [u64; super::ROLES] = std::array::from_fn(|k| DONE[k].load(Relaxed));
         for &(tid, role, base) in LIVE.lock().unwrap().iter() {
             ns[role] += clock_ns(of_thread(tid)).saturating_sub(base);
         }
@@ -412,5 +369,5 @@ pub mod cpu {
 /// 지금 스레드를 어느 역할에도 묶지 않음(nice 0, 프로세스 코어 전부): 같은 프로세스에서 도는 다른 프로그램(--slam)을 띄울 때
 pub fn thread_free() {
     BG.with(|b| b.set(false));
-    apply(0, 0);
+    common::threads::apply(0, 0);
 }

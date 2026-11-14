@@ -6,15 +6,8 @@ pub type M3 = [[f64; 3]; 3];
 
 /// TUM 형식 "t x y z qx qy qz qw" → (시각, 위치, 사원수(x, y, z, w))
 pub fn read_tum(p: &str) -> Vec<(f64, V3, Option<[f64; 4]>)> {
-    std::fs::read_to_string(p)
-        .unwrap_or_else(|e| panic!("{p}: {e}"))
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .filter_map(|l| {
-            let v: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-            (v.len() >= 4).then(|| (v[0], [v[1], v[2], v[3]], (v.len() >= 8).then(|| [v[4], v[5], v[6], v[7]])))
-        })
-        .collect()
+    let text = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{p}: {e}"));
+    common::tum::rows(&text).filter(|v| v.len() >= 4).map(|v| (v[0], [v[1], v[2], v[3]], (v.len() >= 8).then(|| [v[4], v[5], v[6], v[7]]))).collect()
 }
 
 /// 정답 시각마다 tol 초 안에서 가장 가까운 추정: (추정 번호, 정답 번호)
@@ -84,14 +77,7 @@ pub fn apply(r: &M3, ce: &V3, cg: &V3, x: &V3) -> V3 {
 }
 
 /// 사원수(x, y, z, w) → 회전 행렬
-pub fn quat_m(q: [f64; 4]) -> M3 {
-    let (qx, qy, qz, qw) = (q[0], q[1], q[2], q[3]);
-    [
-        [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw), 2.0 * (qx * qz + qy * qw)],
-        [2.0 * (qx * qy + qz * qw), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
-        [2.0 * (qx * qz - qy * qw), 2.0 * (qy * qz + qx * qw), 1.0 - 2.0 * (qx * qx + qy * qy)],
-    ]
-}
+pub use common::quat::quat_m;
 
 pub fn mm(a: &M3, b: &M3) -> M3 {
     [0, 1, 2].map(|i| [0, 1, 2].map(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum::<f64>()))

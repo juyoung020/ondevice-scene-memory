@@ -11,10 +11,11 @@ path = "src/lib.rs"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+common = { path = "../common" }
 
 [features]
 default = []
-# librealsense2 와 견주는 도구(C API 를 직접 부름: rs_align_check · align_sdk_check)
+# librealsense2 와 견주는 도구(C API 를 직접 부름: rs_align_check · align_sdk_check, slam realsense 입력)
 realsense = []
 
 

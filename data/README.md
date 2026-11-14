@@ -26,7 +26,7 @@ TUM RGB-D 전체 목록: https://cvg.cit.tum.de/data/datasets/rgbd-dataset/downl
 
 | 이름 | 내용 | 있는 곳 |
 |---|---|---|
-| `rec/<날짜_시각>/` | 웹캠(ABKO APC930) 녹화, `--rec` 로 남김. `rgb.txt` + `rgb/*.jpg` | 보드 `~/om/data/rec/`, PC `data/rec/` |
+| `rec/<날짜_시각>/` | 웹캠(ABKO APC930) 녹화 보관본. `rgb.txt` + `rgb/*.jpg` | 보드 `~/om/data/rec/`, PC `data/rec/` |
 | `pc_test/run1.avi` | PC 웹캠 첫 시험 영상 | PC `data/pc_test/` |
 
 녹화에는 주변 사람이 찍혀 있을 수 있어 저장소에 올리지 않는다.
@@ -35,5 +35,5 @@ TUM RGB-D 전체 목록: https://cvg.cit.tum.de/data/datasets/rgbd-dataset/downl
 
 | 이름 | 내용 |
 |---|---|
-| `memory/<이름>/` | `memmap --out` 실행 결과(view.json·지도·물체 파일) |
+| `memory/<이름>/` | `ondevice --out` 실행 결과(view.json·지도·물체 파일) |
 | `euroc/advio15_*` | ADVIO 15 를 EuRoC 형식으로 바꾼 것(0.2.0 때 ORB-SLAM3 입력) |

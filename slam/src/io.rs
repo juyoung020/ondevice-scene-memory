@@ -74,18 +74,7 @@ fn read_png(path: &str) -> Result<image::DynamicImage, String> {
 }
 
 fn read_list(path: &str) -> Result<Vec<(f64, String)>, String> {
-    let text = std::fs::read_to_string(path).map_err(|_| format!("읽을 수 없음: {path}"))?;
-    let mut out = vec![];
-    for line in text.lines() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        if let (Some(t), Some(rel)) = (it.next().and_then(|s| s.parse::<f64>().ok()), it.next()) {
-            out.push((t, rel.to_string()));
-        }
-    }
-    Ok(out)
+    common::tum::read_list(path).map_err(|_| format!("읽을 수 없음: {path}"))
 }
 
 /// TUM RGB-D 폴더 재생(rgb.txt · depth.txt, 깊이 5000/m): 카메라 없이 시험할 때
@@ -110,14 +99,8 @@ impl TumSource {
         if rgb.is_empty() || depth.is_empty() {
             return Err(format!("빈 TUM 폴더: {dir}"));
         }
-        // 시퀀스별 보정값(TUM 문서). memmap tum.rs 와 같은 규칙: 폴더 이름으로 고름
-        let mut k = if dir.contains("freiburg1") {
-            [517.3, 516.5, 318.6, 255.3]
-        } else if dir.contains("freiburg2") {
-            [520.9, 521.0, 325.1, 249.7]
-        } else {
-            [535.4, 539.2, 320.1, 247.6]
-        };
+        // 시퀀스별 보정값(TUM 문서): 폴더 이름으로 고름(물체 기억의 TUM 입력과 같은 표)
+        let mut k = common::tum::camera_k(dir);
         // 폴더에 calibration.txt(fx fy cx cy, ETH3D 형식)가 있으면 그 값을 씀
         if let Ok(s) = std::fs::read_to_string(format!("{dir}/calibration.txt")) {
             let c: Vec<f64> = s.split_whitespace().take(4).map_while(|w| w.parse().ok()).collect();

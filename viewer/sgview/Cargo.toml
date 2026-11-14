@@ -10,9 +10,10 @@ serde_json = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 ort = { version = "=2.0.0-rc.15", optional = true }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+common = { path = "../../common", optional = true }
 
 [features]
 default = ["search"]
 # 글 검색: SigLIP2 글 인코더(ONNX Runtime) + 토크나이저. 끄면 이름 글자 검색만 남는다.
-search = ["dep:ort", "dep:tokenizers"]
+search = ["dep:ort", "dep:tokenizers", "dep:common", "common/onnx"]
 

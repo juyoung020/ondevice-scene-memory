@@ -1,7 +1,7 @@
 //! 카메라 없이 SDK 의 실제 rs2::align(이 기계의 realsense2 라이브러리)과 fast_align 을 같은 합성 장면에서 비교한다.
 //! software_device 에 깊이·컬러 프레임과 보정값을 넣어 rs2::align 을 돌리고, 결과 화소 차이와 시간을 잰다.
 //!   align_sdk_check [--calib <녹화 폴더/calib.json>] [--frames N] [--core C] [--threads T] [--write-rec <폴더>]
-//! --write-rec: 640x480 합성 장면을 rs_rec 과 같은 폴더 모양(원래 깊이·rs2::align 결과·calib.json)으로 써서
+//! --write-rec: 640x480 합성 장면을 rsd_rec 과 같은 폴더 모양(원래 깊이·rs2::align 결과·calib.json)으로 써서
 //!              카메라 없이 rs_align_check 를 시험할 수 있게 한다.
 //! --calib 이 없으면 D455 비슷한 가정 보정값(scenes)으로 640x480·848x480 깊이 두 가지.
 use std::fs::File;

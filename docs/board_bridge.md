@@ -1,22 +1,26 @@
-# 보드에 연결 프로그램 올리기 (Pi 5 · Debian 13 trixie arm64)
+# 보드에 올리기 (Pi 5 · Debian 13 trixie arm64)
 
-연결 프로그램은 `slam_bridge`(`slam/`, Rust, [bridge.md](bridge.md))이고, 한 명령 `ondevice` 는 같은 위치 루프를 memmap · 뷰어와 한 프로세스에서 돌린다. 저장소 맨 위 Cargo 작업 공간에서 빌드하며 결과는 `target/release/` 에 생긴다. D435 입력은 rsdriver(V4L2 직접, Rust 만)와 librealsense2 판 두 가지다.
+보드에서 도는 것은 실행 파일 `ondevice` 하나다: 위치 프로그램(`slam/`, Rust, [bridge.md](bridge.md)) · 물체 기억 · 뷰어 서버가 한 프로세스에서 돈다. 저장소 맨 위 Cargo 작업 공간에서 빌드하며 결과는 `target/release/` 에 생긴다. D435 입력은 rsdriver(V4L2 직접, Rust 만)가 기본이고, librealsense2 판(`slam-realsense`)은 견줄 때 넣는다.
 
 ```bash
-# 한 명령(memmap + 위치 루프 + 뷰어, D435 입력은 rsdriver)
-cargo build --release --no-default-features --features dxrt,cam      # target/release/ondevice · memmap
+# 보드 실행 파일(D435 입력은 rsdriver)
+cargo build --release --no-default-features --features dxrt      # target/release/ondevice
 # librealsense2 판 입력도 넣을 때(~/opt/librealsense, 아래 "librealsense2 v2.59.1" 순서로 설치)
 RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \
-  cargo build --release --no-default-features --features dxrt,cam,slam-realsense
-# 따로 도는 slam_bridge(비교용)
-RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \
-  cargo build --release -p slam --features realsense,rsdriver
-# 처음 할 확인: C++ 원본과 같은 입력·설정으로 돌려 스트림·위치 파일 바이트 비교(아래 "C++ 원본")
+  cargo build --release --no-default-features --features dxrt,slam-realsense
+
+# 실시간: D435 → 위치 추적 → 물체 기억(NPU 분할) → 뷰어(:8091), 한 프로세스
+M=~/dx-all-suite_my/workspace/res/models
+target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
+    --every 1 --live 1 --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 ```
 
-## C++ 원본 `rtab_bridge`(비교 기준, 지금 보드 실시간 스크립트)
+- NPU 는 한 번에 한 프로세스만: 새로 돌리기 전에 `pkill -f ondevice`(다른 NPU 프로그램도 멈춤).
+- 코어 묶기: `--threads` 로 역할마다(예 `--threads auto` 기본, 위치 프로그램 풀을 따로 묶을 때 `slam=0:2-3`).
 
-`slam_bridge` 의 바이트 동일 확인은 PC(x86) 원본 기준이다. 보드 원본(OpenCV·Eigen 이 ARM NEON 곱셈-덧셈 합침을 씀)과 같은 비교를 마칠 때까지 보드 실시간 스크립트는 `rtab_bridge` 를 쓰고, 비교에도 이 빌드를 쓴다. 필요한 것: RTAB-Map 0.24.2 라이브러리(GTSAM 4.2, OpenCV 4.10.0 + contrib), librealsense2, CMake. 아래는 이 빌드 순서다.
+## 위치 프로그램을 C++ 원본과 견주기(보드 ARM)
+
+위치 프로그램은 PC(x86)에서 C++ 원본 `rtab_bridge` 와 스트림 · 위치 파일 · 판단 바이트가 같다(시험 입력 18 개 × 설정 2 개). 보드 원본은 OpenCV · Eigen 이 ARM NEON 곱셈-덧셈 합침을 써서, 같은 비교를 보드에서 따로 한다(남은 일). 견주는 법: 같은 녹화를 `rtab_bridge --tum <폴더> --rate 0 --block --config docs/rtabmap_pi.ini --out a.mmf --poses a.txt` 와 `ondevice slam` (같은 인자, `--out b.mmf --poses b.txt`)로 돌려 두 파일의 md5 를 본다. `bridge/` 의 C++ 원본은 이 비교에만 쓰고, 아래는 그 빌드 순서다. 필요한 것: RTAB-Map 0.24.2 라이브러리(GTSAM 4.2, OpenCV 4.10.0 + contrib), librealsense2, CMake.
 
 ## 패키지로 받을 수 있는 것 (2026-11-05 packages.debian.org 확인)
 
@@ -118,6 +122,6 @@ ninja -C ~/build/bridge
 
 ## 보드에서 처음 할 확인
 
-1. `slam_bridge --realsense --out /dev/null --max-frames 300 --stats /tmp/rs.csv` — 첫 줄의 카메라 이름·펌웨어·보정값, 끝의 `읽기`(카메라 대기 + 정렬)·`위치추적` ms. (같은 인자로 `~/build/bridge/rtab_bridge` 도)
+1. `ondevice slam --realsense --out /dev/null --max-frames 300 --stats /tmp/rs.csv` — 첫 줄의 카메라 이름·펌웨어·보정값, 끝의 `읽기`(카메라 대기 + 정렬)·`위치추적` ms.
 2. 위 보정값 줄의 `왜곡 모델`: D435 컬러는 왜곡 계수가 0 이라 왜곡 없는 모델로 넘긴다.
-3. 코어 묶기 예(코어 4 개): 연결 프로그램 `taskset -c 0,1`, memmap `taskset -c 2,3`. 숫자는 [bridge.md](bridge.md) "시간".
+3. 코어 묶기 예(코어 4 개): `--threads` 기본(auto)은 본 스레드·읽기를 앞 코어 둘에, 점 · 다시 쌓기 · 기록을 나머지에 두고 위치 프로그램 풀은 코어 전부. 숫자는 [bridge.md](bridge.md) "시간".

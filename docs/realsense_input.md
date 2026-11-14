@@ -1,14 +1,14 @@
 # RealSense 카메라 입력과 깊이→컬러 정렬
 
-카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → `slam_bridge` 위치 → memmap. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 Rust 크레이트 `tools/`(정렬 라이브러리 `tools::fast_align`, RealSense 도구 `rs_info`·`rs_rec`·`rs_align_check`·`align_sdk_check`, librealsense2 C API 를 직접 부름), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
+카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → 위치 프로그램(`ondevice --slam "--realsense …"`) → 물체 기억. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 Rust 크레이트 `tools/`(정렬 라이브러리 `tools::fast_align`, librealsense 와 견주는 도구 `rs_align_check`·`align_sdk_check`, librealsense2 C API 를 직접 부름)와 `rsdriver/`(D435 드라이버, 도구 `rsd_info`·`rsd_rec`), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
 
 ## D435 보정값과 깊이 범위
 
 - **보드에서 읽은 값**(2026-11-06, `rtab_bridge --realsense` 첫 줄): 펌웨어 5.16.0.1, 컬러 640×480 fx 614.20 · fy 614.69 · cx 324.95 · cy 241.56, 컬러 왜곡 모델 Inverse Brown-Conrady, 깊이 단위 1 mm(1000/m). USB 3(5 Gbps)으로 붙었다.
 - **깊이 기준 카메라** = 왼쪽 IR. 두 IR 사이 기준선 50 mm. 깊이 내부 보정값은 Brown-Conrady 이고 계수가 모두 0(왜곡 없음).
-- **컬러 카메라**(OV2740, 롤링 셔터)는 깊이 기준 옆에 있다(`rs_info` 의 `depth_to_color`). D435 컬러 왜곡 계수는 0 이라 왜곡 모델 이름과 상관없이 왜곡 없는 투영과 같다(`rs_info` 의 `coeffs` 로 확인).
+- **컬러 카메라**(OV2740, 롤링 셔터)는 깊이 기준 옆에 있다(`rsd_info` 의 `depth_to_color`). D435 컬러 왜곡 계수는 0 이라 왜곡 모델 이름과 상관없이 왜곡 없는 투영과 같다(`rsd_info` 의 `coeffs` 로 확인).
 - **깊이와 컬러의 화소 밀도**: 640×480 에서 깊이 fx 는 약 383(시야 87°), 컬러 fx 는 614(시야 69°)라 **컬러가 각도당 화소가 더 많다** → 정렬은 깊이 화소마다 사각형을 채우는 경우(아래 "SIMD 규칙").
-- **최소 거리(Min-Z)**: Intel 사양은 최대 해상도(1280×720)에서 약 28 cm, 권장 범위 0.3–3 m. Min-Z 는 깊이 초점거리(화소)에 비례한다(Min-Z ≈ fx × 기준선 / 126 화소): 640×480(fx≈383) 약 0.15 m, 848×480(fx≈425) 약 0.17 m 가 이론값이다. 책상 물체를 가까이(0.3–1 m) 찍기에 맞고, 3 m 넘는 벽은 깊이 잡음이 커서 memmap `--max-depth 3` 안팎으로 자른다. 실제 값은 벽에 다가가며 `rs_rec` 의 "가운데 깊이"가 사라지는 거리로 잰다(아래 확인 순서 4).
+- **최소 거리(Min-Z)**: Intel 사양은 최대 해상도(1280×720)에서 약 28 cm, 권장 범위 0.3–3 m. Min-Z 는 깊이 초점거리(화소)에 비례한다(Min-Z ≈ fx × 기준선 / 126 화소): 640×480(fx≈383) 약 0.15 m, 848×480(fx≈425) 약 0.17 m 가 이론값이다. 책상 물체를 가까이(0.3–1 m) 찍기에 맞고, 3 m 넘는 벽은 깊이 잡음이 커서 memmap `--max-depth 3` 안팎으로 자른다. 실제 값은 벽에 다가가며 `rsd_rec` 녹화의 가운데 깊이가 사라지는 거리로 잰다(아래 확인 순서 4).
 - IMU 가 없다. 구성은 RGB-D 만 쓴다.
 
 ## 권장 스트림 설정
@@ -16,14 +16,14 @@
 | 항목 | 값 | 이유 |
 |---|---|---|
 | 컬러 | RGB8 640×480 @30 | memmap·RTAB-Map 입력 크기. RTAB-Map 보드 설정(`rtabmap_pi.ini`)이 30 장/초 기준 |
-| 깊이 | Z16 640×480 @30 (848×480 도 시험) | 컬러와 같은 크기면 정렬이 가장 가볍다(PC 0.6 ms). 848×480 은 Min-Z 가 비슷하고 가로 시야가 넓지만 정렬이 1.6 배. 두 해상도의 시야각은 `rs_info --depth 848x480` 의 `fov_deg` 로 비교해 정한다 |
+| 깊이 | Z16 640×480 @30 (848×480 도 시험) | 컬러와 같은 크기면 정렬이 가장 가볍다(PC 0.6 ms). 848×480 은 Min-Z 가 비슷하고 가로 시야가 넓지만 정렬이 1.6 배. 두 해상도의 시야각은 `rsd_info --size 848x480` 의 보정값으로 비교해 정한다 |
 | 레이저(이미터) | 켬 | 무늬 없는 벽·책상 면에도 깊이가 나온다. 점무늬가 컬러에 찍히는지는 녹화 `rgb/` 로 확인(찍히면 RTAB-Map 특징점이 점무늬에 붙음) |
 | 프리셋 | 기본(Default) | 채움과 정확도 균형. 경계 잡음이 크면 `--preset high_accuracy`(구멍이 늘고 틀린 깊이가 준다)와 비교 |
 | 자동 노출 | 깊이·컬러 켬, 컬러 노출 우선(auto exposure priority) 끔 | 어두운 곳에서도 30 장/초 유지(노출 우선이 켜져 있으면 프레임 수가 떨어짐) |
 | 시각 | 전역 시각(global time, 기본 켬) | 깊이·컬러·PC 시계를 같은 축으로 |
 | 처음 30 장 | 버림 | 자동 노출이 자리 잡을 때까지 |
 
-`rs_rec` 가 위 값을 그대로 건다(`--emitter`, `--preset`, `--depth`, `--color`, `--fps`, `--skip` 으로 바꿈).
+D435 입력(rsdriver)과 녹화 도구 `rsd_rec` 이 위 값을 건다(`rsd_rec` 은 `--size`, `--fps`, `--exposure`, `--gain`, `--emitter`, `--skip` 으로 바꿈).
 
 ## 정렬: rs2::align 이 실제로 하는 일
 
@@ -98,15 +98,15 @@ RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librea
 cargo test --release --manifest-path tools/Cargo.toml -- --nocapture   # 정확성 표
 ```
 
-카메라를 **USB3 포트**(파란 포트, `rs_info` 의 `"usb": "3.2"`)에 꽂고 `target/release` 에서:
+카메라를 **USB3 포트**(파란 포트)에 꽂고 `target/release` 에서:
 
-1. `rs_info > rs_info.json` — 장치·펌웨어·USB, 스트림 목록, IMU, 640×480 깊이·컬러 보정값과 외부 변환, `sdk_align_fills_rect`(false 면 모서리 하나 규칙). `rs_info --depth 848x480 > rs_info_848.json` 로 시야각 비교. 펌웨어가 `recommended_firmware` 보다 낮으면 RealSense Viewer 로 올린다.
-2. `rs_rec data/d435/desk01 20` — 20 초 녹화(레이저 켬, 기본 프리셋). 1 초마다 rs2::align · fast_align 시간, 가운데 깊이, 유효 화소 비율을 찍고, 끝에 rs2::align 과 다른 화소 수와 memmap 용 변환 명령을 찍는다. 쓰기가 밀린 장면이 있으면 숫자로 보인다.
-3. `rs_align_check data/d435/desk01` — 녹화된 원래 깊이로 fast_align(정확한 식·빠른 식·컬러 왜곡)과 rs2::align(software_device 로 다시)을 돌려 녹화된 rs2::align 결과와 일치 비율, 둘 다 값 있는데 다른 화소, 한쪽만 값 있는 화소, 경계 화소 차이, 코어 하나 시간을 낸다. 정확한 식은 다른 화소 0 이어야 한다(끝 코드 0).
-4. 최소 거리: `rs_rec data/d435/minz 15` 를 켜고 벽을 정면으로 1 m 에서 천천히 다가가며 "가운데 깊이 … (유효 …%)" 가 0 으로 떨어지는 거리를 적는다. 레이저 끔(`--emitter off`)과 비교.
-5. memmap 입력: 2 번 끝에 찍힌 `rgbd2tum <녹화> <녹화>_freiburg3 fx fy cx cy 1000` 으로 TUM fr3 형식(5000/m)으로 바꿔 `memmap --tum` 과 `rtabmap-rgbd_dataset` 에 넣는다.
+1. `rsd_info > rsd_info.json` — 장치·펌웨어·USB, 640×480 깊이·컬러 보정값과 외부 변환(rsdriver 가 장치에서 직접 읽은 값).
+2. `rsd_rec data/d435/desk01 600` — 녹화(`rgb/` · `depth/`(rsdriver 정렬) · `depth_raw/` · `calib.json` · `frames.tsv`).
+3. `rs_align_check data/d435/desk01`(`tools`, `realsense` 기능) — 녹화된 원래 깊이로 fast_align 과 librealsense rs2::align(software_device 로 다시)을 돌려 화소 차이·코어 하나 시간을 낸다. 정확한 식은 다른 화소 0 이어야 한다(끝 코드 0).
+4. 최소 거리: `rsd_rec data/d435/minz 450` 을 켜고 벽을 정면으로 1 m 에서 천천히 다가가며 가운데 깊이가 0 으로 떨어지는 거리를 적는다. 레이저 끔(`--emitter off`)과 비교.
+5. 물체 기억 입력: `rgbd2tum <녹화> <녹화>_freiburg3 fx fy cx cy 1000` 으로 TUM fr3 형식(5000/m)으로 바꿔 `ondevice --slam "--tum …"` 과 `rtabmap-rgbd_dataset` 에 넣는다.
 
-녹화 폴더: `rgb/`(컬러), `depth/`(fast_align 정렬, 컬러 크기), `depth_raw/`(정렬 전), `depth_rs/`(rs2::align), 각 목록 `rgb.txt`·`depth.txt`·`depth_raw.txt`·`depth_rs.txt`, 짝 `association.txt`, `calib.json`(보정값·설정·SDK 정렬 구현·변환 명령), `rec_stats.json`(장면 수·시간·rs2::align 과 다른 화소). PNG 는 `image` 크레이트로 쓴다(16 비트 회색·RGB8, 화소는 원래 lodepng 판과 같음). 깊이 PNG 는 카메라 단위 그대로(1 mm = 1): 단위 바꾸기와 fr3 보정값으로 다시 그리기는 `rgbd2tum` 한 곳에서 한다(memmap 의 `tum.rs` 는 폴더 이름으로 fr1/2/3 보정값을 고르고 5000/m 로 읽음).
+녹화 폴더: `rgb/`(컬러), `depth/`(fast_align 정렬, 컬러 크기), `depth_raw/`(정렬 전), `depth_rs/`(rs2::align), 각 목록 `rgb.txt`·`depth.txt`·`depth_raw.txt`·`depth_rs.txt`, 짝 `association.txt`, `calib.json`(보정값·설정·SDK 정렬 구현·변환 명령), `rec_stats.json`(장면 수·시간·rs2::align 과 다른 화소). PNG 는 `image` 크레이트로 쓴다(16 비트 회색·RGB8, 화소는 원래 lodepng 판과 같음). 깊이 PNG 는 카메라 단위 그대로(1 mm = 1): 단위 바꾸기와 fr3 보정값으로 다시 그리기는 `rgbd2tum` 한 곳에서 한다(TUM 입력은 폴더 이름으로 fr1/2/3 보정값을 고르고(`common::tum`) 5000/m 로 읽음).
 
 ## Pi 5 에서
 

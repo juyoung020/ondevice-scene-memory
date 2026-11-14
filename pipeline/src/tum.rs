@@ -15,18 +15,6 @@ pub struct Tum {
     pub k: [f64; 4],
 }
 
-fn read_list(p: &Path) -> Vec<(f64, String)> {
-    std::fs::read_to_string(p)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.to_string()))
-        })
-        .collect()
-}
-
 impl Tum {
     /// 카메라 입력용 빈 시퀀스(내부 보정값만)
     pub fn empty(k: [f64; 4]) -> Tum {
@@ -35,15 +23,11 @@ impl Tum {
 
     /// gt: 위치 파일(TUM 형식). 없으면 폴더의 groundtruth.txt(다른 SLAM 이 낸 위치를 넣을 때 씀)
     pub fn open(dir: &Path, gt: Option<&Path>) -> Tum {
-        let rgb = read_list(&dir.join("rgb.txt"));
-        let depth = read_list(&dir.join("depth.txt"));
+        let rgb = common::tum::read_list(dir.join("rgb.txt")).unwrap_or_default();
+        let depth = common::tum::read_list(dir.join("depth.txt")).unwrap_or_default();
         let (mut ts, mut ps, mut qs) = (vec![], vec![], vec![]);
         let gt_path = gt.map_or_else(|| dir.join("groundtruth.txt"), |p| p.to_path_buf());
-        for l in std::fs::read_to_string(&gt_path).expect("groundtruth.txt").lines() {
-            if l.starts_with('#') {
-                continue;
-            }
-            let v: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        for v in common::tum::rows(&std::fs::read_to_string(&gt_path).expect("groundtruth.txt")) {
             if v.len() == 8 {
                 ts.push(v[0]);
                 ps.push([v[1], v[2], v[3]]);
@@ -74,8 +58,7 @@ impl Tum {
         }
         let level = rot_between(&up, &[0.0, 0.0, 1.0]);
         // 시퀀스별 카메라 보정(TUM 문서): freiburg1 · freiburg2 · freiburg3
-        let name = dir.to_string_lossy();
-        let k = if name.contains("freiburg1") { [517.3, 516.5, 318.6, 255.3] } else if name.contains("freiburg2") { [520.9, 521.0, 325.1, 249.7] } else { [535.4, 539.2, 320.1, 247.6] };
+        let k = common::tum::camera_k(&dir.to_string_lossy());
         Tum { dir: dir.to_path_buf(), rgb, depth, ts, ps, qs, level, k }
     }
 

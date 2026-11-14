@@ -1,4 +1,4 @@
-//! 시험·벤치용 합성 장면과 D455 비슷한 보정값(가정 값: 실제 값은 rs_info 로 받는다).
+//! 시험·벤치용 합성 장면과 D455 비슷한 보정값(가정 값: 실제 값은 rsd_info 로 받는다).
 //! 장면은 깊이 카메라 좌표(OpenCV: x 오른쪽, y 아래, z 앞, m)의 평면·상자로 만들고 광선을 쏴서 깊이를 그린다.
 use crate::fast_align::{dist, Extrinsics, Intrinsics};
 use crate::rsref;

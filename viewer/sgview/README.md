@@ -15,10 +15,17 @@
 Rust 서버(std + `serde_json`·`flate2`)가 `view.json`,
 `map.pgm`/`map.yaml`, `objects/O<id>_*` 를 서빙하고, 그리기는 three.js(`assets/`에 같이 넣음, 인터넷 불필요).
 
+이 저장소에서 뷰어는 라이브러리 크레이트이고 실행 파일 `ondevice` 안에서 돈다.
+
 ```bash
-cd src/scene_graph/sgview && cargo build --release
-target/release/sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <폴더>]
+cargo build --release                                    # 저장소 맨 위: target/release/ondevice
+# 기억을 만들며 같은 프로세스에서 띄움: 이 프로세스가 기억 폴더에 쓴 파일(view.json · 물체 사진 · 점 파일 · 사진 벡터 …)은 쓴 바이트를 메모리에서 보냄(memfs)
+target/release/ondevice --slam "<위치 인자>" --out <memory_dir> --serve "8080 [--bind 0.0.0.0] [--search-model <폴더>]"
+# 다 만든 폴더만 볼 때(파일에서 읽음)
+target/release/ondevice view <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <폴더>]
 ```
+
+글 검색 모델(ONNX Runtime)은 물체 기억의 분할 · 사진 벡터 모델과 같은 ONNX Runtime 환경(`common::ort`)에서 세션을 만든다.
 브라우저에서 http://localhost:8080 . 서버가 폴더의 `view.json`·`pose.json` 을 50 ms 마다 살펴 바뀌면 `/stream`(SSE)으로 알리고(`vv` 판 번호 · `fpose` 빠른 카메라 자세), 페이지는 그때만 `/api/view` 를 한 번 받는다. 가만히 있는 뷰어는 요청을 보내지 않는다(10 s 마다 keepalive 한 줄). 이벤트 스트림이 끊기면 다시 붙을 때까지 2 s 마다 폴링한다.
 
 불러오기: 점 노드는 `/api/files?p=a,b,…`(파일 여러 개를 한 응답에, 파일마다 `u32 이름 길이·이름·u32 길이(없으면 0xffffffff)·내용`, ETag = 경로와 파일 판의 해시)로 12 노드씩 묶어 받는다. 물체 PLY 풀기는 페이지 안 Web Worker(인라인, 별도 파일 없음)가 하고 배열을 넘겨 주므로 본 스레드는 지오메트리만 만든다.
@@ -74,7 +81,7 @@ memmap 이 쓴 점 옥트리(`scene_points.octree`, 형식은 `docs/bridge.md` "
 시뮬/로봇 프로세스(`sgrt`)가 소켓으로 바로 보내고, 서버가 브라우저에 SSE 로 흘려 준다. 파일은 거치지 않는다(이미지·점구름 같은 큰 파일만 `/file/` 로).
 
 ```bash
-sgview <memory_dir> --port 8081 --ingest 127.0.0.1:9001          # 1) 뷰어: 9001 로 프레임을 받는다. memory_dir 은 sgrt 의 out 폴더(이미지·점구름 파일 위치)
+ondevice view <memory_dir> --port 8081 --ingest 127.0.0.1:9001          # 1) 뷰어: 9001 로 프레임을 받는다. memory_dir 은 sgrt 의 out 폴더(이미지·점구름 파일 위치)
 SGRT_STREAM=127.0.0.1:9001 SGRT_STREAM_HZ=60 SGRT_MAP_EVERY=1 <시뮬 실행>   # 2) sgrt 가 스트림을 연다(요약 주기 기본 60 Hz, 최대 240)
 ```
 
@@ -88,7 +95,7 @@ sgrt(C++) ──소켓(프레임)──▶ sgview(Rust) ──SSE──▶ 브�
 - **브라우저**: 자세는 표시 주기(60 fps+)로 지수 보간, 지도는 바뀐 행만 텍스처에 쓰고, 요약은 기하에 영향 주는 값(위치·상태·점 버전 …)이 바뀔 때만 다시 그린다. 새 시뮬 실행이 붙으면 `reset` 으로 이전 화면을 비운다. 설정 패널(G) 맨 위에 단계별 비용(HUD)이 보인다.
 - **합성 부하 시험**: `scenemap/tools/stream_sim <memory_dir> 127.0.0.1:9001 24 240 60 60` — 자세 240 Hz, 지도 60 Hz, 요약 60 Hz 를 보내 본다. 측정(GPU 브라우저): 받은 주기 pose 240/s·map 60/s·view 60/s, 이벤트 처리 0.00~0.27 ms, 렌더 60 fps(디스플레이 상한, 프레임 0.4 ms), 시작 첫 데이터 16 ms · 장면 완성 213 ms. 송신 쪽 pushPose 평균 227 ns, 버려진 프레임 0.
 - 시뮬 자체가 자세를 7 Hz 정도로만 내보내면(Isaac Sim 렌더 속도) 뷰어는 그 사이를 보간한다. 추론 주기(10~20 Hz)가 얼마든 뷰어가 병목이 되지 않게 한 것.
-- 파일 모드(`sgview <memory_dir>` 만)는 녹화된 폴더를 보는 용도로 그대로 있다.
+- 파일 모드(`ondevice view <memory_dir>` 만)는 녹화된 폴더를 보는 용도로 그대로 있다.
 - **지도 갱신 주기 분리 (`SGRT_MAP_EVERY=n`)**: 점유 지도를 검출 키프레임(`kf_every`, 기본 6 스텝)이 아니라 n 스텝마다 깊이만으로 갱신한다(스캔 ≈ 0.47 ms + 격자 ≈ 0.07 ms). 검출·물체 지도·임베딩은 키프레임 그대로. 0/미설정 = 예전 동작. 같은 시나리오 측정: 지도 갱신 초당 2~3번 → 14번(자세와 같은 주기), 스텝 평균 1.01 → 1.52 ms, 탐색 커버리지 0.906 → 0.927(나빠지지 않음).
 - **관절·상태 벡터 프레임(`joints`)**: `sm_push_proprio` 의 벡터를 그대로 스트림에 싣는다(로봇별 순서는 URDF 가 정함). 지금은 받아서 보관만 하고(`jointsCur`), URDF 모델을 올릴 때 이 값으로 로봇을 움직인다.
 - 카메라는 지도가 커지는 동안 자동으로 따라가고(직접 조작하면 멈춤, `Fit` 으로 다시 켬).

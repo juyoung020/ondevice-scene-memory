@@ -1,0 +1,16 @@
+[package]
+name = "common"
+version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
+edition = "2024"
+description = "ondevice 크레이트들이 함께 쓰는 것: 명령줄 읽기, 스레드 배치(우선순위·코어 묶기), TUM 목록, 사원수, PNG·PLY 바이트, ONNX Runtime 환경 하나."
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+ort = { version = "=2.0.0-rc.15", optional = true }
+rayon = "1"
+
+[features]
+default = []
+# ONNX Runtime 환경 하나(분할·깊이·사진 벡터·글 검색 모델이 함께 씀)
+onnx = ["dep:ort"]

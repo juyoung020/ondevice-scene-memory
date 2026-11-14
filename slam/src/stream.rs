@@ -436,3 +436,124 @@ mod tests {
         }
     }
 }
+
+/// 장면 표시(머리 첫 4 바이트)
+pub const FRAME_MAGIC: &[u8; 4] = b"MMF1";
+/// 그래프 블록 표시
+pub const GRAPH_MAGIC: &[u8; 4] = b"MMG1";
+/// 그래프 블록의 노드 하나: id u32 + 맡아 둠 u32 + 3×4 f64
+pub const GRAPH_NODE_BYTES: usize = 8 + 96;
+
+/// 머리 176 바이트 → 장면(컬러·깊이 버퍼는 비어 있음). `encode_header` 의 반대
+pub fn decode_header(h: &[u8; HEADER_BYTES]) -> OutFrame {
+    let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+    let f64_at = |o: usize| f64::from_le_bytes(h[o..o + 8].try_into().unwrap());
+    OutFrame {
+        flags: u32_at(8),
+        map_id: u32_at(12),
+        seq: u64::from_le_bytes(h[16..24].try_into().unwrap()),
+        t: f64_at(24),
+        pose: std::array::from_fn(|i| f64_at(32 + 8 * i)),
+        fx: f64_at(128),
+        fy: f64_at(136),
+        cx: f64_at(144),
+        cy: f64_at(152),
+        width: u32_at(160),
+        height: u32_at(164),
+        depth_per_m: f32::from_le_bytes(h[168..172].try_into().unwrap()),
+        anchor: u32_at(172),
+        // 스트림의 컬러는 늘 RGB(쓰기 쪽이 바꿔 씀)
+        color_is_rgb: true,
+        ..Default::default()
+    }
+}
+
+/// 노드 하나(GRAPH_NODE_BYTES 바이트) → 그래프 노드
+pub fn decode_graph_node(c: &[u8]) -> GraphNode {
+    GraphNode {
+        id: u32::from_le_bytes(c[0..4].try_into().unwrap()),
+        held: u32::from_le_bytes(c[4..8].try_into().unwrap()),
+        t: std::array::from_fn(|i| f64::from_le_bytes(c[8 + 8 * i..16 + 8 * i].try_into().unwrap())),
+    }
+}
+
+/// 바이트 스트림(파이프·파일) 읽기: `Receiver::recv` 와 같은 모양으로 장면·그래프 블록·리셋 블록을 차례로 꺼낸다.
+/// 노드 0 개인 보통 그래프 블록은 건너뛴다. 장면 중간에 끊기면 None
+pub struct Reader<R: std::io::Read> {
+    r: R,
+}
+
+impl<R: std::io::Read> Reader<R> {
+    pub fn new(r: R) -> Reader<R> {
+        Reader { r }
+    }
+
+    pub fn recv(&mut self) -> Option<OutFrame> {
+        loop {
+            let mut m = [0u8; 4];
+            self.r.read_exact(&mut m).ok()?;
+            match &m {
+                FRAME_MAGIC => return self.frame(),
+                GRAPH_MAGIC => {
+                    let mut h = [0u8; GRAPH_HEADER_BYTES - 4];
+                    self.r.read_exact(&mut h).ok()?;
+                    let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+                    assert_eq!(u32_at(0) as usize, GRAPH_HEADER_BYTES, "모르는 그래프 블록 머리 크기");
+                    if u32_at(8) == 1 {
+                        return Some(OutFrame { reset: true, ..Default::default() });
+                    }
+                    let mut b = vec![0u8; u32_at(4) as usize * GRAPH_NODE_BYTES];
+                    self.r.read_exact(&mut b).ok()?;
+                    let graph: Vec<GraphNode> = b.chunks_exact(GRAPH_NODE_BYTES).map(decode_graph_node).collect();
+                    if !graph.is_empty() {
+                        return Some(OutFrame { graph, ..Default::default() });
+                    }
+                }
+                _ => panic!("스트림 형식이 아님(머리 {m:?})"),
+            }
+        }
+    }
+
+    fn frame(&mut self) -> Option<OutFrame> {
+        let mut h = [0u8; HEADER_BYTES];
+        h[0..4].copy_from_slice(FRAME_MAGIC);
+        self.r.read_exact(&mut h[4..]).ok()?;
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize, HEADER_BYTES, "모르는 머리 크기");
+        let mut f = decode_header(&h);
+        let n = f.width as usize * f.height as usize;
+        f.color = vec![0u8; n * 3];
+        // 깊이는 리틀 엔디언 u16 이라 받을 자리에 바로 읽는다
+        #[cfg(not(target_endian = "little"))]
+        compile_error!("스트림 깊이를 바로 읽는 것은 리틀 엔디언 기계 기준");
+        f.depth = vec![0u16; n];
+        let db = unsafe { std::slice::from_raw_parts_mut(f.depth.as_mut_ptr() as *mut u8, n * 2) };
+        if self.r.read_exact(&mut f.color).is_err() || self.r.read_exact(db).is_err() {
+            return None;
+        }
+        Some(f)
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    #[test]
+    fn header_and_graph_round_trip() {
+        let f = OutFrame { flags: 9, map_id: 2, seq: 77, t: 1.25, pose: std::array::from_fn(|i| i as f64 * 0.5), fx: 1.0, fy: 2.0, cx: 3.0, cy: 4.0,
+                           depth_per_m: 5000.0, width: 2, height: 1, anchor: 6, ..Default::default() };
+        let g = decode_header(&encode_header(&f));
+        assert_eq!((g.flags, g.map_id, g.seq, g.t, g.pose, g.fx, g.cy, g.width, g.height, g.depth_per_m, g.anchor), (9, 2, 77, 1.25, f.pose, 1.0, 4.0, 2, 1, 5000.0, 6));
+        let nodes = vec![GraphNode { id: 3, held: 1, t: std::array::from_fn(|i| i as f64) }];
+        let mut bytes = encode_graph(&[], false);
+        bytes.extend(encode_graph(&nodes, false));
+        bytes.extend(encode_header(&f));
+        bytes.extend([1u8, 2, 3, 4, 5, 6, 7, 0, 8, 0]);
+        bytes.extend(encode_graph(&[], true));
+        let mut r = Reader::new(&bytes[..]);
+        assert_eq!(r.recv().unwrap().graph, nodes);
+        let fr = r.recv().unwrap();
+        assert_eq!((fr.color, fr.depth), (vec![1, 2, 3, 4, 5, 6], vec![7, 8]));
+        assert!(r.recv().unwrap().reset);
+        assert!(r.recv().is_none());
+    }
+}

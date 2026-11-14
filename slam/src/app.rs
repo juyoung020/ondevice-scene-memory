@@ -1,9 +1,9 @@
-//! slam_bridge: RGB-D 입력 → 위치 추적(매 장) + 지도 갱신(DetectionRate) → 장면 스트림(memmap --stream).
-//! 원본: bridge/src/main.cpp(rtab_bridge). 명령줄·장면마다의 판단(다시 잡기, 새 지도, 맡아 둠, 그래프 블록)·끝 요약을 그대로 옮겼다.
+//! 위치 프로그램: RGB-D 입력 → 위치 추적(매 장) + 지도 갱신(DetectionRate) → 장면(같은 프로세스의 메모리 큐 또는 장면 스트림).
+//! 원본: RTAB-Map 연결 프로그램 rtab_bridge(C++). 명령줄·장면마다의 판단(다시 잡기, 새 지도, 맡아 둠, 그래프 블록)·끝 요약을 그대로 옮겼다.
 //!
-//!   slam_bridge --tum <폴더> [--rate 1] | memmap --stream - ...
-//!   slam_bridge --realsense [--align rs2] | memmap --stream - ...
-//!   memmap --slam "--tum <폴더> --rate 0" ...   (한 프로세스: `spawn` 이 이 루프를 스레드로 돌리고 장면을 메모리 큐로 넘김)
+//!   ondevice --slam "--tum <폴더> --rate 0" ...   (한 프로세스: `spawn` 이 이 루프를 스레드로 돌리고 장면을 메모리 큐로 넘김)
+//!   ondevice slam --tum <폴더> [--rate 1] --out <스트림 파일>   (위치만: 장면 스트림을 파일·표준출력으로)
+//!
 //!
 //! 위치 추적·지도는 `engine::Engine` 하나로 부른다(특징점 → OdometryF2F, 다시 잡기 RegistrationVis, 지도 Slam, 난수 상태 하나를 함께 씀).
 use crate::io::{FrameSource, PrefetchSource, TumSource};
@@ -398,11 +398,13 @@ mod sys {
 
 fn usage() {
     eprintln!(
-        "slam_bridge (--tum <폴더> [--rate R] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
-struct Args {
+/// 위치 프로그램 설정(명령줄을 `parse` 로 한 번 읽은 것)
+#[derive(Clone)]
+pub struct Args {
     tum: String,
     config: String,
     out: String,
@@ -429,7 +431,8 @@ struct Args {
     overrides: Vec<(String, String)>,
 }
 
-fn parse_args(argv: &[String]) -> Result<Args, i32> {
+/// 명령줄(0 번은 프로그램 이름) → 설정. 도움말·잘못된 인자면 끝 코드
+pub fn parse(argv: &[String]) -> Result<Args, i32> {
     let mut a = Args {
         tum: String::new(),
         config: String::new(),
@@ -537,19 +540,17 @@ struct Ref {
     t: f64,
 }
 
-/// 같은 프로세스에서 돌리기: argv(0 번은 프로그램 이름)로 위치 루프를 스레드에서 시작하고, 스트림 대신 메모리 큐의 받는 쪽을 돌려준다.
+/// 같은 프로세스에서 돌리기: 읽어 둔 설정으로 위치 루프를 스레드에서 시작하고, 스트림 대신 메모리 큐의 받는 쪽을 돌려준다.
 /// 큐 길이·기다림/버림은 명령줄(--queue, --block|--drop) 그대로. 받는 쪽은 파이프 스트림과 같은 차례·같은 내용의 장면·그래프·리셋 블록을 받는다
-pub fn spawn(argv: Vec<String>) -> Result<(stream::Receiver, std::thread::JoinHandle<i32>), String> {
+/// pool: 위치 루프와 특징점 추출(읽기 스레드)의 나눠 돌리기가 모두 이 풀에서 돈다(부른 쪽이 코어·우선순위를 정해 만든 풀)
+pub fn spawn(a: Args, pool: rayon::ThreadPool) -> Result<(stream::Receiver, std::thread::JoinHandle<i32>), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let th = std::thread::Builder::new()
         .name("slam".into())
         .spawn(move || {
-            // 따로 된 프로세스처럼 쓸 수 있는 코어 수만큼의 자기 스레드 풀(부른 쪽의 풀·코어 묶음과 섞이지 않게).
-            // 위치 루프와 특징점 추출(읽기 스레드)의 나눠 돌리기가 모두 이 풀에서 돈다
-            let n = std::thread::available_parallelism().map_or(1, |n| n.get());
-            let pool = std::sync::Arc::new(rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("slam-{i}")).build().expect("slam 스레드 풀"));
+            let pool = std::sync::Arc::new(pool);
             let p2 = pool.clone();
-            match pool.install(|| run_in(&argv, Some(tx), Some(p2))) {
+            match pool.install(|| run_in(a, Some(tx), Some(p2))) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("slam 오류: {e}");
@@ -564,16 +565,15 @@ pub fn spawn(argv: Vec<String>) -> Result<(stream::Receiver, std::thread::JoinHa
     }
 }
 
-/// 명령줄 그대로 실행(slam_bridge). to_mem 이 있으면 스트림을 쓰지 않고 메모리 큐의 받는 쪽을 거기로 보낸다
-pub fn run(argv: &[String], to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>) -> Result<i32, String> {
-    run_in(argv, to_mem, None)
+/// 명령줄 그대로 실행(`ondevice slam …`): 스트림을 파일·표준출력으로 쓴다
+pub fn run(argv: &[String]) -> Result<i32, String> {
+    match parse(argv) {
+        Ok(a) => run_in(a, None, None),
+        Err(c) => Ok(c),
+    }
 }
 
-fn run_in(argv: &[String], to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, pool: Option<std::sync::Arc<rayon::ThreadPool>>) -> Result<i32, String> {
-    let a = match parse_args(argv) {
-        Ok(a) => a,
-        Err(c) => return Ok(c),
-    };
+fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, pool: Option<std::sync::Arc<rayon::ThreadPool>>) -> Result<i32, String> {
     let in_proc = to_mem.is_some();
     // 스트림이 표준출력이면 그 파일 기술자를 따로 떼어 두고 표준출력은 표준오류로 돌린다
     #[cfg(unix)]
@@ -614,7 +614,7 @@ fn run_in(argv: &[String], to_mem: Option<std::sync::mpsc::Sender<stream::Receiv
         line += &format!(" {k}={v}");
     }
     eprintln!("{line}");
-    eprintln!("출력: {} ({}, 큐 {}, {} 장마다)", if in_proc { "memmap 메모리 큐" } else { &a.out }, if block { "받는 쪽을 기다림" } else { "밀리면 오래된 장면 버림" }, a.queue, a.send_every);
+    eprintln!("출력: {} ({}, 큐 {}, {} 장마다)", if in_proc { "물체 기억 메모리 큐" } else { &a.out }, if block { "받는 쪽을 기다림" } else { "밀리면 오래된 장면 버림" }, a.queue, a.send_every);
 
     // 놓쳤을 때 다시 잡기는 아래에서 직접 한다: 위치 추적이 혼자 '마지막 위치'에서 다시 시작하지 않게 함
     let mut odom_params = params.clone();

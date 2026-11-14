@@ -1,7 +1,7 @@
 [workspace]
-# 한 작업 공간: 위치(slam) · 물체 기억(pipeline = memmap · ondevice) · 뷰어 서버(sgview) · 정렬·RealSense 도구(tools · rsdriver)
+# 한 작업 공간: 한 프로그램 ondevice(pipeline) = 위치(slam) · 물체 기억 · 뷰어 서버(sgview), 공통 조각(common), 정렬·D435 도구(tools · rsdriver)
 # 빌드 산출물은 한 곳(target/ 또는 CARGO_TARGET_DIR), Cargo.lock 하나
-members = ["slam", "pipeline", "viewer/sgview", "tools", "rsdriver"]
+members = ["common", "slam", "pipeline", "viewer/sgview", "tools", "rsdriver"]
 default-members = ["pipeline"]
 resolver = "3"
 

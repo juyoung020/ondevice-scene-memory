@@ -37,16 +37,8 @@ pub fn norm(a: &V3) -> f64 {
     dot(a, a).sqrt()
 }
 
-/// 쿼터니언(x, y, z, w) → 회전 행렬
-pub fn quat_to_m(q: [f64; 4]) -> M3 {
-    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    let (x, y, z, w) = (q[0] / n, q[1] / n, q[2] / n, q[3] / n);
-    [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-    ]
-}
+/// 쿼터니언(x, y, z, w) → 회전 행렬(길이 1 로 나눈 뒤)
+pub use common::quat::quat_to_m;
 
 /// 축 a 를 축 b 로 보내는 회전(로드리게스)
 pub fn rot_between(a: &V3, b: &V3) -> M3 {

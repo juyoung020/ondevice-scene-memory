@@ -44,7 +44,7 @@ println!("{}", cam.describe());
 ## 도구
 
 - `rsd_info [--size 640x480] [--serial S] [--dump 폴더]` — 보정값·깊이 단위를 JSON 으로(f32 는 16진 비트도). `--dump` 는 HWM 원래 바이트(`gvd`·`coeff`·`rgb`·`new`·`depth_table` .bin)를 저장. 카메라가 없으면 끝 코드 2.
-- `rsd_rec <폴더> [장면=60] [--size WxH] [--fps 30] [--exposure ms] [--gain g] [--emitter on|off] [--skip 30]` — `tools` 의 `rs_rec` 과 같은 폴더 꼴(`rgb/` `depth/` `depth_raw/` `depth_rs/` + 목록, `calib.json`)에 원본 `yuyv/*.bin` 과 `frames.tsv`(장치 시각·순번·장면 번호·노출·감도·YUYV/Z16/RGB/정렬 FNV 해시·대기·정렬 시간)를 더 쓴다. `depth_rs/` 에는 rsdriver 정렬 결과가 들어가 `rs_align_check` 를 그대로 돌릴 수 있다.
+- `rsd_rec <폴더> [장면=60] [--size WxH] [--fps 30] [--exposure ms] [--gain g] [--emitter on|off] [--skip 30]` — 정렬 확인 도구(`tools` 의 `rs_align_check`)가 읽는 폴더 꼴(`rgb/` `depth/` `depth_raw/` `depth_rs/` + 목록, `calib.json`)에 원본 `yuyv/*.bin` 과 `frames.tsv`(장치 시각·순번·장면 번호·노출·감도·YUYV/Z16/RGB/정렬 FNV 해시·대기·정렬 시간)를 더 쓴다. `depth_rs/` 에는 rsdriver 정렬 결과가 들어가 `rs_align_check` 를 그대로 돌릴 수 있다.
 
 ## 같은 결과 확인 (PC, 카메라 없이)
 
@@ -64,12 +64,12 @@ println!("{}", cam.describe());
 
 ## 보드 시험 순서 (Pi 5, D435 를 꽂고)
 
-카메라 흐름은 한 프로그램만 열 수 있어 librealsense 와 rsdriver 를 차례로 돌려 견준다. 저장소 `~/ondevice` 기준, librealsense 도구는 `tools` 를 `--features realsense` 로 빌드한 것.
+카메라 흐름은 한 프로그램만 열 수 있어 librealsense 와 rsdriver 를 차례로 돌려 견준다. 저장소 `~/om` 기준. librealsense 쪽은 `ondevice` 를 `--features slam-realsense` 로 빌드해 `--driver librealsense` 로 고르고, `rs_align_check` 는 `tools` 를 `--features realsense` 로 빌드한 것.
 
 1. 노드 확인: `v4l2-ctl --list-devices`, `ls /sys/class/video4linux/*/device -l` — D435 인터페이스 0·3 에 영상 노드와 메타 노드가 하나씩. 메타 노드가 없으면 커널 uvcvideo 메타데이터 지원부터 본다(그때 시각은 V4L2 버퍼 시각으로 대신함).
-2. 보정값: `rs_info > rs.json` 과 `rsd_info --dump calib_raw > rsd.json` — fx·fy·ppx·ppy·계수·depth_to_color·깊이 단위가 같아야 한다(`rsd.json` 의 `bits` 와 `rs_info` 값을 f32 로 바꿔 비교). 해상도마다 `--size 848x480`·`--depth 848x480` 도. `calib_raw/*.bin` 은 PC 로 가져와 `tests/data` 에 실제 D435 표로 추가한다(`depth_intrinsics`·`color_intrinsics` 기대값은 같은 파일로 PC 의 librealsense 를 불러 만듦).
+2. 보정값: `rsd_info --dump calib_raw > rsd.json` 과 `ondevice slam --realsense --driver librealsense --out /dev/null --max-frames 30` 첫 줄의 보정값 — fx·fy·cx·cy·깊이 단위가 같아야 한다(`rsd.json` 의 `bits` 를 f32 로 바꿔 비교). 해상도마다 `--size 848x480` 도. `calib_raw/*.bin` 은 PC 로 가져와 `tests/data` 에 실제 D435 표로 추가한다(`depth_intrinsics`·`color_intrinsics` 기대값은 같은 파일로 PC 의 librealsense 를 불러 만듦).
 3. 정렬·깊이: `rsd_rec /tmp/rsd 90` → `rs_align_check /tmp/rsd` — rsdriver 의 원래 깊이와 보정값으로 실제 rs2::align 을 다시 돌린 결과와 `depth_rs/`(rsdriver 정렬)의 다른 화소가 0 이어야 한다.
-4. 컬러 변환: 보드 librealsense 가 NEON 빌드인지 확인(`rs_rec` 이 보여 주는 "Using NEON-optimized align implementation" 줄). 보드에서 `cargo test --release`(NEON 규칙 해시 시험)가 통과하면 같은 YUYV 에서 같은 RGB.
-5. 시각·짝: `frames.tsv` 에서 `color_ts_us − depth_ts_us` 가 ±16.7 ms 안, 장면 번호가 1 씩 늘고 빠진 곳 수가 `rs_rec` 의 `rec_stats.json` 과 비슷한지. 30 장/초 유지(`wait_ms` 중앙 ≈ 33).
-6. 제어: `rsd_rec /tmp/e 60 --exposure 10 --gain 64` → `frames.tsv` 노출 100(0.1 ms 단위)·감도 64, 같은 설정으로 `slam_bridge --realsense --exposure 10 --gain 64` 첫 줄의 "컬러 노출 10 ms 감도 64(고정)" 과 같음. 돌리는 동안 다른 창에서 `v4l2-ctl -d <컬러 노드> -C auto_exposure,exposure_time_absolute,gain,exposure_dynamic_framerate` 로 1·100·64·0 확인. `--emitter off` 로 녹화하면 `depth_raw/` 의 IR 점무늬 채움이 줄어든다(`rs_rec --emitter off` 와 견줌).
-7. 시간: `frames.tsv` 의 `align_ms`·`wait_ms` 를 `slam_bridge --realsense` 의 `wait`·`align` 과 견준다.
+4. 컬러 변환: 보드 librealsense 가 NEON 빌드인지 확인(librealsense 판 실행 로그의 "Using NEON-optimized align implementation" 줄). 보드에서 `cargo test --release`(NEON 규칙 해시 시험)가 통과하면 같은 YUYV 에서 같은 RGB.
+5. 시각·짝: `frames.tsv` 에서 `color_ts_us − depth_ts_us` 가 ±16.7 ms 안, 장면 번호가 1 씩 늘고 빠진 곳 수가 librealsense 판(`--driver librealsense --stats`)과 비슷한지. 30 장/초 유지(`wait_ms` 중앙 ≈ 33).
+6. 제어: `rsd_rec /tmp/e 60 --exposure 10 --gain 64` → `frames.tsv` 노출 100(0.1 ms 단위)·감도 64, 같은 설정으로 `ondevice slam --realsense --driver librealsense --exposure 10 --gain 64` 첫 줄의 "컬러 노출 10 ms 감도 64(고정)" 과 같음. 돌리는 동안 다른 창에서 `v4l2-ctl -d <컬러 노드> -C auto_exposure,exposure_time_absolute,gain,exposure_dynamic_framerate` 로 1·100·64·0 확인. `--emitter off` 로 녹화하면 `depth_raw/` 의 IR 점무늬 채움이 줄어든다.
+7. 시간: `frames.tsv` 의 `align_ms`·`wait_ms` 를 `ondevice slam --realsense --driver librealsense --stats` 의 `wait`·`align` 과 견준다.

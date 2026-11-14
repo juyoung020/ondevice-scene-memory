@@ -715,7 +715,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         // 16-bit grey PNG (depth in mm) → little-endian u16 pixels; the page can't read 16-bit PNGs from a canvas
         "/api/depth" => {
             let rel = q.get("path").map(|s| s.as_str()).unwrap_or("");
-            match safe_join(&st.dir, rel).and_then(|p| fs::read(p).ok()).and_then(|b| decode_png(&b)) {
+            match safe_join(&st.dir, rel).and_then(|p| memfs::read(&p)).and_then(|b| decode_png(&b)) {
                 Some((w, h, 1, bps, px)) => {
                     let mut out = Vec::with_capacity(w * h * 2);
                     for i in 0..w * h {
@@ -998,25 +998,46 @@ fn serve_stream(mut s: TcpStream, st: Arc<State>) {
     }
 }
 
-/// 서버 실행(막힘): sgview 명령줄 인자(프로그램 이름 뺀 것). memmap --serve 도 이것을 스레드로 부른다
-pub fn run(args: Vec<String>) {
-    let mut dir: Option<String> = None;
-    let (mut port, mut bind) = (8080u16, "0.0.0.0".to_string());
-    let mut ingest: Option<String> = None;
-    let mut search_model: Option<String> = None;
-    let (mut vocab, mut encode_vocab): (Option<String>, Option<(String, String)>) = (None, None);
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port),
-            "--bind" => bind = it.next().unwrap_or(bind),
-            "--ingest" => ingest = it.next(),
-            "--search-model" => search_model = it.next(),
-            "--vocab" => vocab = it.next(),
-            "--encode-vocab" => encode_vocab = it.next().zip(it.next()),
-            _ => dir = Some(a),
+/// 뷰어 서버 설정(명령줄을 `Config::parse` 로 한 번 읽은 것)
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    pub dir: Option<String>,
+    pub port: u16,
+    pub bind: String,
+    pub ingest: Option<String>,
+    pub search_model: Option<String>,
+    pub vocab: Option<String>,
+    pub encode_vocab: Option<(String, String)>,
+}
+
+impl Config {
+    /// 뷰어 인자(프로그램 이름 뺀 것): `<기억 폴더> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <파일>] [--ingest <주소>]`
+    pub fn parse(args: Vec<String>) -> Config {
+        let mut c = Config { port: 8080, bind: "0.0.0.0".into(), ..Default::default() };
+        let mut it = args.into_iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--port" => c.port = it.next().and_then(|v| v.parse().ok()).unwrap_or(c.port),
+                "--bind" => c.bind = it.next().unwrap_or(c.bind),
+                "--ingest" => c.ingest = it.next(),
+                "--search-model" => c.search_model = it.next(),
+                "--vocab" => c.vocab = it.next(),
+                "--encode-vocab" => c.encode_vocab = it.next().zip(it.next()),
+                _ => c.dir = Some(a),
+            }
         }
+        c
     }
+}
+
+/// 서버 실행(막힘): 뷰어 명령줄 인자(프로그램 이름 뺀 것, `ondevice view …`)
+pub fn run(args: Vec<String>) {
+    serve(Config::parse(args))
+}
+
+/// 서버 실행(막힘): 읽어 둔 설정으로. `ondevice --serve` 는 이것을 스레드로 부른다
+pub fn serve(c: Config) {
+    let Config { dir, port, bind, ingest, search_model, vocab, encode_vocab } = c;
     // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
     if let Some((list, out)) = &encode_vocab {
         #[cfg(feature = "search")]
@@ -1060,7 +1081,7 @@ pub fn run(args: Vec<String>) {
                     Some(Err(err)) => eprintln!("search: {err}"),
                     None => {}
                 }
-                let names: Vec<String> = fs::read_to_string(st2.dir.join("vocab.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                let names: Vec<String> = memfs::read(&st2.dir.join("vocab.json")).and_then(|t| serde_json::from_slice(&t).ok()).unwrap_or_default();
                 for n in names.iter().map(String::as_str).chain(search::NULLS) {
                     let _ = e.encode(n);
                 }

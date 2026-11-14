@@ -3,21 +3,19 @@ name = "slam"
 version = "0.1.0"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2024"
-description = "RTAB-Map 0.24.2 의 우리가 쓰는 경로(F2F 위치 추적 · 루프 클로저 · 그래프 최적화)를 Rust 로 옮긴 것. rtab_bridge 와 같은 스트림을 memmap 에 보낸다."
+description = "RTAB-Map 0.24.2 의 우리가 쓰는 경로(F2F 위치 추적 · 루프 클로저 · 그래프 최적화)를 Rust 로 옮긴 것. 장면 스트림(또는 같은 프로세스의 메모리 큐)으로 물체 기억에 보낸다."
 
 [dependencies]
+common = { path = "../common" }
 nalgebra = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 rsdriver = { path = "../rsdriver", optional = true }
+tools = { path = "../tools", optional = true }
 
 [features]
 default = []
-# D435 입력(librealsense2 C API 를 직접 부름)
-realsense = []
+# D435 입력(librealsense2 C API 를 직접 부름, tools::rs2 선언)
+realsense = ["dep:tools", "tools/realsense"]
 # D435 입력(rsdriver: V4L2·UVC 직접, librealsense2 없이). 둘 다 켜면 --driver 로 고름(기본 rsdriver)
 rsdriver = ["dep:rsdriver"]
-
-[[bin]]
-name = "slam_bridge"
-path = "src/main.rs"

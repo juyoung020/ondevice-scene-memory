@@ -7,24 +7,31 @@
 ## [Unreleased]
 
 ### Added
-- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
-- 한 명령 `ondevice`: 위치 추적(`--slam`) → 지도·물체 → 뷰어 서버(`--serve`)를 한 프로세스에서 복사 없이 돌린다(기억 폴더는 파이프 방식과 바이트 동일).
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`ondevice --slam` · `ondevice slam`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
+- 한 프로그램 `ondevice`: 위치 추적(`--slam`) → 지도·물체 → 뷰어 서버(`--serve`)를 한 프로세스에서 복사 없이 돌린다(기억 폴더는 장면 스트림 방식과 바이트 동일). 뷰어는 이 프로세스가 쓴 기억 파일을 디스크에서 다시 읽지 않고 메모리에서 보낸다.
 - D435 입력을 librealsense2 없이 `rsdriver` 로 받는 `--driver rsdriver`(리눅스 기본, librealsense 판은 `--driver librealsense`).
 - 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
-- 물체 이름을 사진으로 붙이기 `memmap --vocab vocab/names.voc`: 이름 1,225 개(LVIS · COCO 등) 중 사진이 가장 닮은 이름을 쓴다(tv → monitor · laptop computer).
-- 이름 글 벡터를 미리 만들어 두는 `sgview --encode-vocab <이름 목록> <파일>` 과 그 파일을 읽는 `sgview --vocab`.
-- 분할 모델의 클래스 이름 `memmap --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
+- 물체 이름을 사진으로 붙이기 `ondevice --vocab vocab/names.voc`: 이름 1,225 개(LVIS · COCO 등) 중 사진이 가장 닮은 이름을 쓴다(tv → monitor · laptop computer).
+- 이름 글 벡터를 미리 만들어 두는 `ondevice view --encode-vocab <이름 목록> <파일>` 과 그 파일을 읽는 뷰어 `--vocab`.
+- 분할 모델의 클래스 이름 `ondevice --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
 
 ### Changed
+- **호환 변경:** 실행 파일을 `ondevice` 하나로 합쳤다(`memmap` → `ondevice`, `slam_bridge` → `ondevice slam`, `sgview` → `ondevice view`). 보드 실시간도 `ondevice --slam "--realsense …" --serve …` 한 명령이다.
+- 명령줄을 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 위치 프로그램 풀을 `--threads` 의 `slam` 역할로 코어에 묶을 수 있다.
+- 장면 스트림 형식 · TUM 목록 · 사원수 · PNG/PLY 쓰기 · ONNX Runtime 환경 · RealSense C API 선언을 한 곳씩으로 합쳤다(공통 크레이트 `common`, 출력 바이트 동일).
 - 한 프로세스에서 깊이를 u16 그대로 넘기고 D435 깊이 복사 · 카메라 버퍼 0 채우기를 없앴다. 재생 입력의 다시 쌓기는 장면 시각으로 정해 실행마다 같은 결과를 낸다.
 - 저장소 맨 위를 Cargo 작업 공간 하나로 묶었다(Cargo.lock · 빌드 폴더 하나, 릴리스 빌드는 LTO fat). 실행 파일은 `target/release/` 에 생긴다.
-- 깊이 정렬 `fast_align` 과 RealSense·IMU 도구(`rs_info`·`rs_rec`·`rs_align_check`·`align_sdk_check`·`bench_align`·`imu_probe`·`check_tum`)를 Rust 크레이트 `tools/` 로 옮겼다(결과 비트 동일, PC 정렬 1.65 배 빠름).
-- memmap: 점 지도·점유 격자·물체 넣기·장면 넘기기를 다시 짜 CPU 를 약 3 분의 1 줄였다(출력 바이트 동일). `--no-drop` 스트림은 점 작업 스레드를 기다려 실행마다 같은 결과를 낸다.
+- 깊이 정렬 `fast_align` 과 정렬 확인·IMU 도구(`rs_align_check`·`align_sdk_check`·`bench_align`·`imu_probe`·`check_tum`)를 Rust 크레이트 `tools/` 로 옮겼다(결과 비트 동일, PC 정렬 1.65 배 빠름).
+- 물체 기억(memmap): 점 지도·점유 격자·물체 넣기·장면 넘기기를 다시 짜 CPU 를 약 3 분의 1 줄였다(출력 바이트 동일). `--no-drop` 스트림은 점 작업 스레드를 기다려 실행마다 같은 결과를 낸다.
 - 뷰어 벽 계산을 C++ 에서 Rust(`viewer/sgview/src/walls.rs`)로 옮겼다(원본과 선분 4,680 건·상태 74,860 건 비트 동일).
 - 보드 위치 추적: 장면 읽기를 따로 도는 스레드로 옮겼다(실시간 재생 25 → 28.6 장/초).
 - 카메라를 가만히 두는 동안(1 cm · 1° 안)은 다시 쌓기용 장면을 2 초에 한 장만 보관한다.
 - 검색에서 질의와 같은 뜻으로 읽힌 이름은 사진 비교의 경쟁 상대에서 뺀다.
 - 검색의 이름 일치 기준을 이름 1,225 개에 맞췄다("화면" 같은 이름 아닌 말이 엉뚱한 물체를 찾지 않음).
+
+### Removed
+- 쓰지 않던 입력·위치 방식: 웹캠 입력(`--cam` · `--rec`), 카메라만으로 위치(`--pose vo|dvo`|dvo` · `--fast-pose` · SuperPoint), 딥러닝 깊이(`--depth <모델>` · `--scale-win`), `--snaps` · `--npu-par` 와 `cam` 빌드 기능.
+- librealsense 판 녹화 도구 `rs_info` · `rs_rec`(같은 일은 `rsd_info` · `rsd_rec`), 개발용 `objcrop` · `objdup` · `onnx_info`, 문서에 쓰이지 않는 결과 그림 51 개.
 
 ### Fixed
 - 검색: 무엇에도 안 닮은 흐린 사진이 아무 말에나 걸리던 것.
@@ -109,7 +116,7 @@
 - 방 종류 이름(물체 구성으로 사무실·주방·거실 …).
 - 따로 생긴 같은 물체를 합치는 병합 후처리.
 - 웹캠 입력·녹화·재생(`--cam`, `--rec`), 실제 속도 재생과 반복(`--live`, `--loop`).
-- 카메라만으로 위치 추정(`--pose vo`·`dvo`), 외부 위치로 돌리기(`--gt`).
+- 카메라만으로 위치 추정(`--pose vo|dvo``·`dvo`), 외부 위치로 돌리기(`--gt`).
 - 뷰어: 발표용 화면, High/Low 화질, 설정 패널·단축키, 손카메라 따라가기, 이름표.
 - 깊이→컬러 정렬 라이브러리 `bridge/align` 과 RealSense 도구 `rs_info`·`rs_rec`·`rs_align_check`.
 - 평가·확인 도구 `ate`·`surfcmp`·`bench`·`objdup`·`objcrop`·`meshshot`·`rgbd2tum`.

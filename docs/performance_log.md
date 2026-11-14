@@ -1346,3 +1346,21 @@ D435 를 V4L2·UVC XU 로 직접 읽는 크레이트 `rsdriver/` 를 만들었�
 - 재생 입력(TUM, `--no-drop` 스트림)의 다시 쌓기는 장면 시각으로 시작 · 갈아 끼우기를 정해, 기본값 `--rebuild-every 5` 도 같은 녹화를 두 번 돌리면 출력이 같다(책상 · 복도 · 긴 사무실). 실시간 입력은 벽시계 그대로다.
 - 확인: 출력 폴더 sha256 이 바꾸기 전과 같다(책상 318 · 복도 1,591 · 긴 사무실 748 파일, `--rebuild-every 0`). 시험 memmap 23 · slam 40 개 통과.
 - 시간 · CPU · 메모리는 PC 녹화 재생에서 측정 흔들림 안이다(복도 코어 4 개 CPU 13.9 → 13.8 – 14.0 초). 줄인 복사의 효과는 보드 · 실제 D435 에서 잰다.
+
+## 한 프로그램으로 합치기: 실행 파일 하나 · 공통 크레이트 · 뷰어는 메모리에서 (데스크톱 WSL, 2026-11-15)
+
+실행 파일을 `ondevice` 하나로(위치만 `ondevice slam`, 뷰어만 `ondevice view`), 장면 스트림 형식 · TUM 목록 · 사원수 · PNG/PLY · ONNX Runtime 환경 · RealSense C API 선언을 한 곳씩으로(`common` 크레이트, `slam::stream::Reader`), 명령줄을 처음에 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 위치 프로그램 풀을 `--threads` 의 `slam` 역할로 만들었다. 뷰어 서버는 이 프로세스가 기억 폴더에 쓰는(지우는) 모든 파일을 같은 바이트로 메모리에 걸어 두고 보낸다. 쓰지 않던 입력 · 위치 방식(웹캠, 카메라만으로 위치, 딥러닝 깊이)도 함께 뺐다.
+
+같음 확인(작업 전 main `198ac5d` 빌드 ↔ 이 빌드, 분할은 `--seg-cache`, `--surface --max-depth 3.5 --no-drop`, 위치는 `--rate 0 --block --config docs/rtabmap_pi.ini`, 기억 폴더 모든 파일 sha256, JSON 의 실행 번호만 맞춤):
+
+| 비교 | 결과 |
+|---|---|
+| fr1_desk `--slam`, `--rebuild-every 0` · 기본(5 초) | 318 파일 같음 · 318 파일 같음 |
+| fr3 긴 사무실 `--every 2 --rebuild-every 0` | 748 파일 같음 |
+| 위치만(`slam_bridge` ↔ `ondevice slam`): 스트림 · `--poses` md5 | 같음 · 같음 |
+| 그 스트림 파일을 `--stream` 으로(옛 읽기 ↔ `slam::stream::Reader`) | 318 파일 같음, `--slam` 결과와도 같음 |
+| 뷰어 응답(`--serve`, 옛 = 자주 바뀌는 4 개만 메모리 ↔ 새 = 전부 메모리): `/api/view` · `/api/map` · `/api/walls` · `/api/search` · `/file/*` · `/api/files`(점 파일 120 개) · 물체 파일 60 개 · `/api/depth` 5 개 | 93 종 머리 · 몸 같음(판 문자열 · 실행 번호만 맞춤) |
+
+- 최대 메모리(fr1_desk `--serve` 한 번): 176 → 173 MB. 기억 폴더(3.9 MB)를 메모리에 걸어 두는 몫은 흔들림 안이다.
+- `cargo test --workspace --release` 모두 통과(공통 크레이트 4 · 스트림 읽기 · memfs 시험 추가). 빌드: 기본(onnx) · `dxrt` · `directml` · `slam-realsense`(librealsense 2.59.1 링크) · `tools --features realsense`.
+- 보드(ARM)에서 위치 프로그램 ↔ C++ `rtab_bridge` 바이트 비교는 이번에 보드가 꺼져 있어(Tailscale · 공유기 주소 모두 응답 없음) 남았다.

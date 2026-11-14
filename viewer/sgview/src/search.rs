@@ -29,7 +29,7 @@ pub fn cos(a: &[f32], b: &[f32]) -> f32 {
 
 /// One object vector file → unit vector (None when missing or not DIM floats)
 pub fn read_emb(p: &Path) -> Option<Vec<f32>> {
-    let b = std::fs::read(p).ok()?;
+    let b = crate::memfs::read(p)?;
     if b.len() != DIM * 4 {
         return None;
     }
@@ -54,7 +54,7 @@ impl TextEnc {
         let mut tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         tok.with_truncation(Some(tokenizers::TruncationParams { max_length: TOKENS, ..Default::default() })).map_err(|e| e.to_string())?;
         tok.with_padding(Some(tokenizers::PaddingParams { strategy: tokenizers::PaddingStrategy::Fixed(TOKENS), pad_id: 0, pad_token: "<pad>".into(), ..Default::default() }));
-        let env: &'static ort::environment::Environment = Box::leak(Box::new(ort::init().build().map_err(|e| e.to_string())?));
+        let env = common::ort::env();
         let sess = ort::session::Session::builder(env).map_err(|e| e.to_string())?
             .with_intra_threads(4).map_err(|e| e.to_string())?
             .commit_from_file(&model).map_err(|e| format!("{}: {e}", model.display()))?;
@@ -153,8 +153,8 @@ fn lse(xs: impl Iterator<Item = f32>) -> f32 {
 
 /// Class names the query competes against: the detector's vocabulary memmap leaves in `vocab.json`, plus every name in the memory
 fn vocabulary(root: &Path, present: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_to_string(root.join("vocab.json")).ok()
-        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default()
+    let mut v: Vec<String> = crate::memfs::read(&root.join("vocab.json"))
+        .and_then(|t| serde_json::from_slice::<Vec<String>>(&t).ok()).unwrap_or_default()
         .into_iter().map(|s| s.to_lowercase()).collect();
     v.extend(present.iter().cloned());
     v.sort();

@@ -142,7 +142,7 @@ mod worker {
             #[cfg(feature = "onnx")]
             {
                 // 지도 쌓기·분할과 코어를 다투지 않게 스레드 둘만
-                let sess = ort::session::Session::builder(crate::seg::ort_env()).unwrap().with_intra_threads(2).unwrap()
+                let sess = ort::session::Session::builder(common::ort::env()).unwrap().with_intra_threads(2).unwrap()
                     .commit_from_file(model).unwrap_or_else(|e| panic!("embed model {model}: {e}"));
                 Net::Onnx(sess)
             }
@@ -191,8 +191,8 @@ mod worker {
                     let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
                     // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
                     let tmp = j.path.with_extension("bin.tmp");
-                    if std::fs::write(&tmp, bytes).is_ok() {
-                        let _ = std::fs::rename(&tmp, &j.path);
+                    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &j.path).is_ok() {
+                        crate::out::publish(&j.path, bytes); // --serve: 검색이 파일을 다시 읽지 않게
                     }
                     put(j.id, v);
                     n += 1;

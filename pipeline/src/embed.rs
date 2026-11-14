@@ -51,6 +51,9 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
+/// 물체 번호 → 지금까지 계산한 사진 벡터의 합(이름 고르기용)
+static SUMS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
+
 /// 물체 번호 → 가장 새 벡터. 계산 스레드가 채우고 물체 병합(maps::merge_pass)이 읽는다
 static LATEST: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
 
@@ -112,8 +115,17 @@ pub fn name(id: u32, sure: bool) -> Option<(String, f32)> {
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {
+    // 이름은 그 물체의 사진 벡터를 모두 더한 평균 방향으로(사진 한 장의 흔들림·어두움에 덜 휘둘림)
+    let mean = {
+        let mut sums = SUMS.lock().unwrap();
+        let s = sums.get_or_insert_with(Default::default).entry(id).or_insert_with(|| vec![0.0; v.len()]);
+        s.iter_mut().zip(&v).for_each(|(a, b)| *a += b);
+        let mut m = s.clone();
+        normalize(&mut m);
+        m
+    };
     if let Some((names, vecs)) = VOCAB.get() {
-        if let Some(n) = look_name(names, vecs, &v) {
+        if let Some(n) = look_name(names, vecs, &mean) {
             NAMES.lock().unwrap().get_or_insert_with(Default::default).insert(id, n);
         }
     }

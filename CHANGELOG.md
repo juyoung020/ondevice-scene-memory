@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
 - 물체 이름을 사진으로 붙이기 `memmap --vocab vocab/names.voc`: 이름 1,225 개(LVIS · COCO 등) 중 사진이 가장 닮은 이름을 쓴다(tv → monitor · laptop computer).
 - 이름 글 벡터를 미리 만들어 두는 `sgview --encode-vocab <이름 목록> <파일>` 과 그 파일을 읽는 `sgview --vocab`.
@@ -27,6 +28,7 @@
 ## [0.8.0] - 2026-11-13
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 보드에서 아무 말로 물체 찾기: `memmap --embed` 가 NPU 모델(.dxnn)을 받는다(SigLIP2 영상 인코더, 사진 한 장 18 ms).
 - 사진 벡터 확인 `memmap --embed-check <모델> <사진 폴더> <벡터 파일>`: PC 의 ONNX 벡터와 보드 NPU 벡터의 코사인·추론 시간.
 - 컬러 노출 고정 `rtab_bridge --exposure <ms> [--gain 0..128]`.
@@ -36,11 +38,13 @@
 ## [0.7.0] - 2026-11-12
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 위치를 놓친 뒤 새로 찍은 구간을 버리지 않고 맡아 두었다가, 아는 곳과 다시 이어지면 지도·물체에 넣는다(스트림 상태 8, 그래프 노드의 맡아 둠 칸, 결과 `stream_held`).
 
 ## [0.6.0] - 2026-11-12
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 글로 물체 찾기: 뷰어 검색창에 아무 말이나 치면(의자, something to drink) 닮은 물체를 점수 순으로 보여 주고 지도에 표시한다(`sgview --search-model`, `GET /api/search`).
 - 물체 사진 벡터(`memmap --embed`, SigLIP2): `objects/O<id>_emb.bin`, `view.json` 물체의 `emb`.
 - 분할 모델이 낼 수 있는 이름 목록 `vocab.json`.
@@ -53,6 +57,7 @@
 ## [0.5.0] - 2026-11-12
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 방 사이 문(위치·폭)과 방↔방 연결(`view.json` 의 `doors`).
 - 방 이름에 종류별 확률과 근거 물체(`view.json` 의 `rooms[].probs`·`evidence`).
 - 위치를 놓치면 같은 지도에서 바로 다시 잡는다(`rtab_bridge --reloc-wait`).
@@ -82,6 +87,7 @@
 ## [0.4.0] - 2026-11-11
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - Rust 파이프라인 `pipeline/`(memmap): 같은 코드가 PC(ONNX Runtime)와 보드(Pi5 + DX-M1 NPU)에서 돈다.
 - 연결 프로그램 `bridge/`(C++ `rtab_bridge`): RealSense D435 또는 TUM 폴더 → RTAB-Map 위치 추적·루프 클로저 → memmap 장면 스트림.
 - memmap 장면 스트림 입력(`--stream`)과 루프 클로저 뒤 지도·물체 다시 쌓기.
@@ -126,6 +132,7 @@
 ## [0.3.0] - 2026-11-03
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - TUM RGB-D 공개 영상 입력.
 - 깊이 모델 비교(Depth Anything V2, YOLO26s-depth).
 - 방 전체 3D 점 지도와 뷰어 표시.
@@ -149,6 +156,7 @@
 ## [0.2.0] - 2026-11-03
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 영상과 위치로 점유 지도를 만들고 물체를 3D 로 기억하는 파이프라인.
 - 씬그래프 웹 뷰어 `viewer/sgview`, 손에 든 카메라 표시.
 - ADVIO 영상 변환과 ORB-SLAM3 VIO 연결.
@@ -166,6 +174,7 @@
 ## [0.1.0] - 2026-10-29
 
 ### Added
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`slam_bridge`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 프로젝트 계획과 하드웨어 결정(USB 카메라, Pi5 + DX-M1).
 - YOLO26s-seg C++/CUDA 학습기 `train/ObjectSAM`.
 

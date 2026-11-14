@@ -1,0 +1,24 @@
+[package]
+name = "slam"
+version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
+edition = "2024"
+description = "RTAB-Map 0.24.2 의 우리가 쓰는 경로(F2F 위치 추적 · 루프 클로저 · 그래프 최적화)를 Rust 로 옮긴 것. rtab_bridge 와 같은 스트림을 memmap 에 보낸다."
+
+[dependencies]
+nalgebra = "0.33"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1"
+
+[features]
+default = []
+# D435 입력(librealsense2 C API 를 직접 부름)
+realsense = []
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+
+[[bin]]
+name = "slam_bridge"
+path = "src/main.rs"

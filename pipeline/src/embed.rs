@@ -26,18 +26,30 @@ pub fn preprocess_into(rgb: &[u8], w: u32, h: u32, patches: bool, out: &mut Vec<
         let a = (f as usize).min(src - 1);
         (a, (a + 1).min(src - 1), f - a as f32)
     };
-    let xs: Vec<(usize, usize, f32)> = (0..SIZE).map(|x| axis(x, w)).collect();
+    // 가로 위치·가중(열마다 한 번). 한 행의 가로 섞기를 먼저 채널별 배열로 만든 뒤 세로 섞기를 32 칸씩 이어서 쓴다
+    // (곱·더하기 순서는 화소마다 하던 식과 같아 값이 비트까지 같다. 세로 섞기 고리는 컴파일러가 NEON 으로 묶음)
+    let (mut ix0, mut ix1, mut wx0, mut wx1) = ([0usize; SIZE], [0usize; SIZE], [0f32; SIZE], [0f32; SIZE]);
+    for x in 0..SIZE {
+        let (a, b, f) = axis(x, w);
+        (ix0[x], ix1[x], wx0[x], wx1[x]) = (a * 3, b * 3, 1.0 - f, f);
+    }
     const K: f32 = 1.0 / 127.5;
+    let (mut top, mut bot) = ([0f32; SIZE], [0f32; SIZE]);
     for y in 0..SIZE {
         let (y0, y1, fy) = axis(y, h);
         let (r0, r1) = (&rgb[y0 * w * 3..(y0 + 1) * w * 3], &rgb[y1 * w * 3..(y1 + 1) * w * 3]);
-        for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
-            for c in 0..3 {
-                let top = r0[x0 * 3 + c] as f32 * (1.0 - fx) + r0[x1 * 3 + c] as f32 * fx;
-                let bot = r1[x0 * 3 + c] as f32 * (1.0 - fx) + r1[x1 * 3 + c] as f32 * fx;
-                let v = (top * (1.0 - fy) + bot * fy) * K - 1.0;
-                let i = if patches { ((y / 32) * 8 + x / 32) * 3072 + c * 1024 + (y % 32) * 32 + x % 32 } else { c * n + y * SIZE + x };
-                out[i] = v;
+        let (wy0, wy1) = (1.0 - fy, fy);
+        for c in 0..3 {
+            for x in 0..SIZE {
+                top[x] = r0[ix0[x] + c] as f32 * wx0[x] + r0[ix1[x] + c] as f32 * wx1[x];
+                bot[x] = r1[ix0[x] + c] as f32 * wx0[x] + r1[ix1[x] + c] as f32 * wx1[x];
+            }
+            for px in 0..SIZE / 32 {
+                let o = if patches { ((y / 32) * 8 + px) * 3072 + c * 1024 + (y % 32) * 32 } else { c * n + y * SIZE + px * 32 };
+                let (d, t, b) = (&mut out[o..o + 32], &top[px * 32..px * 32 + 32], &bot[px * 32..px * 32 + 32]);
+                for k in 0..32 {
+                    d[k] = (t[k] * wy0 + b[k] * wy1) * K - 1.0;
+                }
             }
         }
     }
@@ -399,6 +411,45 @@ pub fn drain() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 화소마다 하던 원래 식(기준)
+    fn preprocess_ref(rgb: &[u8], w: usize, h: usize, patches: bool) -> Vec<f32> {
+        let n = SIZE * SIZE;
+        let mut out = vec![0.0; 3 * n];
+        let axis = |dst: usize, src: usize| -> (usize, usize, f32) {
+            let f = ((dst as f32 + 0.5) * src as f32 / SIZE as f32 - 0.5).max(0.0);
+            let a = (f as usize).min(src - 1);
+            (a, (a + 1).min(src - 1), f - a as f32)
+        };
+        for y in 0..SIZE {
+            let (y0, y1, fy) = axis(y, h);
+            for x in 0..SIZE {
+                let (x0, x1, fx) = axis(x, w);
+                for c in 0..3 {
+                    let p = |yy: usize, xx: usize| rgb[(yy * w + xx) * 3 + c] as f32;
+                    let top = p(y0, x0) * (1.0 - fx) + p(y0, x1) * fx;
+                    let bot = p(y1, x0) * (1.0 - fx) + p(y1, x1) * fx;
+                    let i = if patches { ((y / 32) * 8 + x / 32) * 3072 + c * 1024 + (y % 32) * 32 + x % 32 } else { c * n + y * SIZE + x };
+                    out[i] = (top * (1.0 - fy) + bot * fy) * (1.0 / 127.5) - 1.0;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn preprocess_same_as_reference() {
+        let mut s = 7u64;
+        for &(w, h) in &[(37usize, 211usize), (640, 480), (256, 256), (3, 900)] {
+            let rgb: Vec<u8> = (0..w * h * 3).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 56) as u8 }).collect();
+            for patches in [false, true] {
+                let mut out = vec![];
+                preprocess_into(&rgb, w as u32, h as u32, patches, &mut out);
+                let want = preprocess_ref(&rgb, w, h, patches);
+                assert!(out.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{w}x{h} {patches}");
+            }
+        }
+    }
 
     #[test]
     fn preprocess_range_and_layout() {

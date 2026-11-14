@@ -41,7 +41,7 @@ dxcom -m osam_heads.onnx -c osam.json -o out
 ```bash
 # 1) 조각 나누기 합성곱(32×32, 보폭 32)을 행렬곱으로(입력 patches [1,64,3072]), 끝의 Reshape·Transpose·Gather 제거
 $P siglip-patches vs3.onnx vs3_patches.onnx
-# 2) 보정 자료: 물체 사진(png) 200 장 → [200,1,64,3072] (embed.rs 와 같은 전처리)
+# 2) 보정 자료: 물체 사진(png) 200 장 → [200,64,3072] (embed.rs 와 같은 전처리)
 $P patches-calib <물체 사진 폴더> patches_calib.npy 200
 # 3) 컴파일: dxcom 명령의 자료 읽기는 사진만 받아서, DX-COM 의 파이썬 API dx_com.compile 에 patches_calib.npy 를
 #    한 장씩 내주는 dataloader 를 넘긴다(calibration_method="ema", calibration_num=200, quant_diagnosis=True)

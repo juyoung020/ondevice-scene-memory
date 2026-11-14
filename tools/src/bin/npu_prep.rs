@@ -8,7 +8,7 @@
 //!     주어진 텐서까지만 남긴 모델(그 뒤 노드·쓰이지 않는 가중치를 뺌). 분할 모델을 머리 출력에서 끊어
 //!     모델 안 후처리(상위 300 고르기, CPU)를 없앨 때 쓴다(DX-COM 의 --compile_output_nodes 는 뒤를 CPU 작업으로 남김).
 //!   npu_prep patches-calib <사진 폴더> <나올.npy> [장 수=200]
-//!     보정 자료: png·jpg 를 256×256 쌍선형으로 줄여 (값/127.5 − 1) 조각 배치로 [N,1,64,3072] f32 .npy 로 쓴다
+//!     보정 자료: png·jpg 를 256×256 쌍선형으로 줄여 (값/127.5 − 1) 조각 배치로 [N,64,3072] f32 .npy (DX-COM dataloader 가 한 장씩 꺼내 묶음 차원 1 을 붙임) 로 쓴다
 //!     (pipeline/src/embed.rs 의 preprocess_into(patches = true) 와 같은 식).
 use std::path::Path;
 use tools::pb::{Msg, Val};
@@ -271,7 +271,7 @@ fn patches_calib(dir: &str, dst: &str, n: usize) -> Result<(), String> {
     }
     let k = files.len();
     // .npy v1: 머리글은 16 바이트 단위로 맞춤
-    let mut hdr = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({k}, 1, 64, 3072), }}");
+    let mut hdr = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({k}, 64, 3072), }}");
     while (10 + hdr.len() + 1) % 16 != 0 {
         hdr.push(' ');
     }
@@ -281,6 +281,6 @@ fn patches_calib(dir: &str, dst: &str, n: usize) -> Result<(), String> {
     o.extend_from_slice(hdr.as_bytes());
     o.extend(all.iter().flat_map(|x| x.to_le_bytes()));
     std::fs::write(dst, o).map_err(|e| format!("{dst}: {e}"))?;
-    println!("{dst}: 사진 {k} 장 → [{k}, 1, 64, 3072]");
+    println!("{dst}: 사진 {k} 장 → [{k}, 64, 3072]");
     Ok(())
 }

@@ -1,6 +1,6 @@
 # RealSense 카메라 입력과 깊이→컬러 정렬
 
-카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → RTAB-Map 위치 → memmap. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 `bridge/align/`(정렬 라이브러리 `fast_align`, RealSense 도구 `rs_info`·`rs_rec`·`rs_align_check`), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
+카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → `slam_bridge` 위치 → memmap. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 `bridge/align/`(정렬 라이브러리 `fast_align`, RealSense 도구 `rs_info`·`rs_rec`·`rs_align_check`), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
 
 ## D435 보정값과 깊이 범위
 

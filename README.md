@@ -8,7 +8,7 @@ RealSense D435 깊이 카메라를 손에 들고 방을 한 바퀴 훑으면, �
 - **물체 목록:** 무엇이 어디에 있는지(3D 위치, 사진, 마지막으로 본 시각)
 - **씬그래프:** 방 → 물체, 방 ↔ 방(문), 물체 ↔ 물체 관계(위·옆)
 
-계산은 모두 보드 안에서 합니다. 카메라 위치는 RTAB-Map(SLAM)이, 물체 분할은 NPU가, 지도·물체·씬그래프는 Rust 프로그램 `memmap`이 맡습니다.
+계산은 모두 보드 안에서 합니다. 카메라 위치는 `slam_bridge`(RTAB-Map 의 SLAM 경로를 Rust 로 옮긴 것)가, 물체 분할은 NPU가, 지도·물체·씬그래프는 Rust 프로그램 `memmap`이 맡습니다.
 
 ![손카메라로 책상 주위를 돌며 3D 지도·물체·방이 쌓이는 모습](docs/cover-slam.gif)
 
@@ -17,18 +17,18 @@ RealSense D435 깊이 카메라를 손에 들고 방을 한 바퀴 훑으면, �
 ## 구성
 
 ```
-D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로저) → memmap(Rust) → sgview(뷰어, 브라우저)
-                                                   NPU 물체 분할 ┘
+D435(컬러 + 깊이) → slam_bridge(Rust, 위치 추적·루프 클로저) → memmap(Rust) → sgview(뷰어, 브라우저)
+                                                  NPU 물체 분할 ┘
 ```
 
-- **위치:** RTAB-Map이 장면마다 카메라 위치를 구하고, 한 바퀴 돌아 아까 본 곳을 알아보면(루프 클로저) 지나온 위치를 다시 맞춥니다. 자세한 형식은 [docs/bridge.md](docs/bridge.md).
+- **위치:** `slam_bridge`(크레이트 [slam/](slam/README.md))는 RTAB-Map 0.24.2 에서 쓰는 경로(위치 추적·루프 클로저·GTSAM 그래프 최적화)를 Rust 로 옮긴 것으로, PC 에서 C++ 원본 `rtab_bridge` 와 출력이 바이트까지 같고 약 2.2 배 빠릅니다. 장면마다 카메라 위치를 구하고, 한 바퀴 돌아 아까 본 곳을 알아보면(루프 클로저) 지나온 위치를 다시 맞춥니다. 자세한 형식은 [docs/bridge.md](docs/bridge.md).
 - **점 지도:** Potree 방식(옥트리 단계별 상세도 + 둥근 점 + EDL 음영)으로 저장해, 뷰어는 화면에 필요한 만큼만 받아 그립니다. 루프 클로저로 위치가 고쳐지면 보관한 장면으로 지도와 물체를 다시 쌓습니다.
 - **실시간:** 처리가 밀리면 쌓인 장면을 건너뛰고 최신 장면부터 처리합니다(위치 정보는 버리지 않음). 지도 작업·다시 쌓기는 본 스레드 밖에서 돕니다.
 
 ## 되는 것
 
 - 물체 찾기(COCO 80종: 의자·컵·노트북·책 …) — 보드 NPU
-- 카메라 위치 추정과 루프 클로저 — RTAB-Map(BRIEF 특징 + GTSAM 최적화)
+- 카메라 위치 추정과 루프 클로저 — `slam_bridge`(RTAB-Map 방식: BRIEF 특징 + GTSAM 최적화)
 - 3D 점 지도, 물체 기억(옮겨짐·사라짐 표시)
 - 글로 물체 찾기: 지도에 chair 로 저장돼 있어도 "의자"·"앉을 것"으로 찾습니다(물체 사진 벡터 + 글 벡터, SigLIP2)
 - 방 나누기(Hydra 방식: 문처럼 좁은 목에서 끊음)와 문 찾기, 방 이름(물체 구성으로: 사무실·주방·거실 …, 확률·근거 포함), 방↔물체·방↔방·물체↔물체 연결
@@ -56,14 +56,15 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).
 
-**3. 빌드하고 실행** — `rtab_bridge` 빌드(RTAB-Map·librealsense)는 [docs/bridge.md](docs/bridge.md)와 [docs/board_bridge.md](docs/board_bridge.md).
+**3. 빌드하고 실행** — 위치 프로그램 `slam_bridge` 는 Rust 만으로 빌드됩니다(카메라 입력은 `--features realsense`, librealsense2 필요). 자세한 것은 [slam/README.md](slam/README.md)와 [docs/bridge.md](docs/bridge.md).
 
 ```bash
 cargo build --release --features directml --manifest-path pipeline/Cargo.toml
 cargo build --release --manifest-path viewer/sgview/Cargo.toml
+cargo build --release --manifest-path slam/Cargo.toml
 
-# TUM 영상 → RTAB-Map → memmap(점 지도 + 물체)
-rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
+# TUM 영상 → slam_bridge → memmap(점 지도 + 물체)
+slam/target/release/slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
   | pipeline/target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx \
       --embed models/siglip2-base-patch32-256/vision_model.onnx --vocab vocab/names.voc --max-depth 3.5 --out data/memory/office
 
@@ -77,11 +78,14 @@ viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 
+보드 실시간 스크립트는 지금 C++ `rtab_bridge` 를 씁니다(빌드: [docs/board_bridge.md](docs/board_bridge.md)). `slam_bridge` 의 바이트 동일 확인은 PC(x86) 원본 기준이라, 보드(ARM)에서 같은 비교를 마치면 스크립트를 `slam_bridge` 로 바꿉니다. 두 프로그램의 인자는 같아 아래 명령에서 이름만 바꿔 쓸 수 있습니다.
+
 ```bash
 cargo build --release --no-default-features --features dxrt,cam --manifest-path pipeline/Cargo.toml
+cargo build --release --features realsense --manifest-path slam/Cargo.toml   # slam_bridge(카메라 입력 포함)
 M=~/dx-all-suite_my/workspace/res/models
 
-# D435 → RTAB-Map → memmap(실시간)
+# D435 → 위치 프로그램 → memmap(실시간)
 rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req \
   | pipeline/target/release/memmap --stream - --every 1 --live 1 \
       --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live
@@ -91,7 +95,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 ```
 
 - **아무 말로 찾기(보드):** memmap 에 `--embed <SigLIP2 영상 인코더>.dxnn`(NPU), 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
-- **움직일 때 번지면:** `rtab_bridge --exposure 8 --gain 110` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
+- **움직일 때 번지면:** `--exposure 8 --gain 110`(`rtab_bridge`·`slam_bridge` 같음) 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
 
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.
 - **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'memmap --'`.
@@ -100,7 +104,7 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 | 옵션 | 뜻 |
 |---|---|
-| `--stream -\|<파일>` | `rtab_bridge` 장면 스트림 입력(표준입력 또는 남겨 둔 파일) |
+| `--stream -\|<파일>` | `slam_bridge`·`rtab_bridge` 장면 스트림 입력(표준입력 또는 남겨 둔 파일) |
 | `--rebuild-every S` / `--no-rebuild` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5) / 끄기 |
 | `--no-drop` | 밀려도 장면을 버리지 않음(재생 결과를 늘 같게) |
 | `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · rebuild · writer · infer) |
@@ -132,4 +136,4 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 
 [PolyForm Noncommercial License 1.0.0](LICENSE.md) — 개인 공부·연구·교육·비영리 목적으로는 자유롭게 쓰고 고치고 나눌 수 있고, **상업적 이용은 허용하지 않습니다.** 나눌 때는 `LICENSE.md` 의 저작권 표시(Required Notice)를 함께 전합니다.
 
-저장소에 함께 든 외부 코드(three.js, OrbitControls, lodepng)와 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다.
+저장소에 함께 든 외부 코드(three.js, OrbitControls, lodepng), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다.

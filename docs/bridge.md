@@ -1,10 +1,10 @@
-# 연결 프로그램: RTAB-Map → memmap 장면 스트림
+# 연결 프로그램: slam_bridge → memmap 장면 스트림
 
-`bridge/`(C++, CMake)의 `rtab_bridge` 가 RGB-D 입력을 RTAB-Map 에 넣어 장면마다 위치를 구하고, 위치 + 컬러 + 컬러에 맞춘 깊이를 memmap 으로 흘려보낸다. memmap 은 `--stream` 으로 받아 지금의 TUM·카메라 입력과 같은 지도·물체·씬그래프 단계를 돈다.
+`slam/`(Rust)의 `slam_bridge` 가 RGB-D 입력으로 장면마다 위치를 구하고, 위치 + 컬러 + 컬러에 맞춘 깊이를 memmap 으로 흘려보낸다. memmap 은 `--stream` 으로 받아 지금의 TUM·카메라 입력과 같은 지도·물체·씬그래프 단계를 돈다. `slam_bridge` 는 RTAB-Map 0.24.2 에서 우리 설정이 지나가는 경로(F2F 위치 추적 · 루프 클로저 · GTSAM 최적화)를 Rust 로 옮긴 것이고, PC 에서 C++ 원본 `rtab_bridge` 와 스트림·위치 파일·장면별 판단이 바이트까지 같다(모듈과 검증: [slam/README.md](../slam/README.md)). 아래에서 "RTAB-Map" 은 이 처리 방식을 가리킨다.
 
 ```
 RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rgb.txt·depth.txt, 시험용)
-        │ 깊이 → 컬러 정렬(depth_align.cpp, rs2::align)          │
+        │ 깊이 → 컬러 정렬(io/realsense.rs, librealsense align)          │
         └──────────────┬───────────────────────────────────┘
                        ▼
      RTAB-Map 위치 추적(매 장, Odometry) + 지도 갱신(Rtabmap::process, DetectionRate 1/초)
@@ -18,20 +18,20 @@ RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rg
 ## 쓰는 법
 
 ```bash
-# 빌드(WSL·보드): RTAB-Map·librealsense 설치 경로를 알려 줌. librealsense 가 없으면 TUM 재생만 들어감
-cmake -S bridge -B ~/build/bridge -G Ninja -DCMAKE_PREFIX_PATH="$HOME/opt/rtabmap;$HOME/opt/librealsense"
-ninja -C ~/build/bridge
+# 빌드: 기본은 TUM 재생만, --features realsense 면 카메라 입력(librealsense2 C API 링크)
+cargo build --release --manifest-path slam/Cargo.toml
+cargo build --release --features realsense --manifest-path slam/Cargo.toml
 
 # 카메라 → memmap(실시간)
-rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 \
+slam_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 \
   | memmap --stream - --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live
 
 # TUM 재생(카메라 없이): --rate 1 이면 찍은 시각대로(밀리면 건너뜀), 생략하면 최대 속도로 빠짐없이
-rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
+slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
   | memmap --stream - --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
 ```
 
-| `rtab_bridge` 인자 | 뜻 |
+| `slam_bridge` 인자(`rtab_bridge` 와 같음) | 뜻 |
 |---|---|
 | `--realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30]` | RealSense 입력(IMU 는 켜지 않음) |
 | `--tum <폴더> [--rate R]` | TUM 폴더 재생. 보정값은 memmap `tum.rs` 와 같이 폴더 이름으로(freiburg1·2·3), 폴더에 `calibration.txt`(fx fy cx cy, ETH3D 형식)가 있으면 그 값 |
@@ -44,9 +44,22 @@ rtab_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rta
 | `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(뷰어 리셋 아이콘이 기억 폴더의 `reset.req` 를 만듦) |
 | `--reloc-wait 초` | 놓친 뒤 같은 지도에서 다시 잡기만 시도하는 시간(기본 1) |
 | `--stats <파일>` | 장면별 시간·놓침·새 지도·지도 보정·특징 수(CSV) |
-| `--db <파일>` | RTAB-Map 데이터베이스로 남김(`rtabmap-databaseViewer` 로 볼 수 있음) |
+| `--max-frames N` | 앞 N 장만 |
+| `--reset-at N` | 시험용: N 번째 장면에서 리셋 파일이 생긴 것처럼 처음부터 |
+| `--db <파일>` | `rtab_bridge` 만: RTAB-Map 데이터베이스로 남김(`rtabmap-databaseViewer`). `slam_bridge` 는 넘어감 |
 
-RTAB-Map 로그는 표준오류로 나간다(표준출력은 시작할 때 떼어 스트림 전용으로 쓴다).
+로그는 표준오류로 나간다(표준출력은 스트림 전용).
+
+### C++ 원본(비교 기준)
+
+`bridge/src` 의 `rtab_bridge`(C++, RTAB-Map 0.24.2 라이브러리 링크)는 `slam_bridge` 의 비교 기준이고, 보드 실시간 스크립트가 지금 쓰는 프로그램이다(보드 ARM 에서 바이트 비교를 마치면 `slam_bridge` 로 바꿈). 인자·스트림은 같다. 빌드(WSL·보드, librealsense 가 없으면 TUM 재생만):
+
+```bash
+cmake -S bridge -B ~/build/bridge -G Ninja -DCMAKE_PREFIX_PATH="$HOME/opt/rtabmap;$HOME/opt/librealsense"
+ninja -C ~/build/bridge
+```
+
+보드의 RTAB-Map·OpenCV·GTSAM 소스 빌드는 [board_bridge.md](board_bridge.md).
 
 | `memmap` 인자 | 뜻 |
 |---|---|
@@ -131,6 +144,8 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 ## 검증 (WSL Ubuntu 24.04, TUM 재생, 2026-11-05)
 
+아래 두 절은 C++ `rtab_bridge` 로 잰 값이다. `slam_bridge` 는 지금 ini(`docs/rtabmap_pi.ini`, GFTT/BRIEF + GTSAM)로 같은 입력을 넣으면 출력이 바이트까지 같아 그 조합의 정확도가 같다. ORB · g2o 조합은 C++ 원본에만 있다.
+
 `bridge/tools/check_tum.sh` 로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
 
 - **기준**: 같은 설정 + 모든 장면을 지도 노드로 끝까지 돌려 최적화한 위치 → `memmap --tum --gt`(오프라인 경로).
@@ -176,10 +191,12 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 ## 시간
 
-[performance_log.md](performance_log.md) "연결 프로그램 시간". PC 코어 하나에서 연결 프로그램 18 ms/장(그중 위치 추적 9.8 ms, TUM PNG 읽기 8 ms), 지도 갱신 1 초에 한 번 14 ms(최대 44 ms). 30 장/초 재생에서 위치 추적은 장면을 놓치지 않고, memmap 이 느리면 쓰기 큐에서 장면이 버려진다.
+`slam_bridge`(PC WSL, 최대 속도 재생): fr1 책상 268 장/초, 복도 232 장/초로 C++ 원본의 약 2.2 – 2.3 배. 본 스레드 계산은 장면당 2.8 – 3.1 ms(위치 추적 평균 2.6 – 2.9 ms)라 벽시계는 PNG 읽기 스레드가 정한다. 기록: [performance_log.md](performance_log.md) "Rust 위치 프로그램(slam_bridge) 통합 재검증".
+
+C++ `rtab_bridge` 값([performance_log.md](performance_log.md) "연결 프로그램 시간"): PC 코어 하나에서 18 ms/장(그중 위치 추적 9.8 ms, TUM PNG 읽기 8 ms), 지도 갱신 1 초에 한 번 14 ms(최대 44 ms). 30 장/초 재생에서 위치 추적은 장면을 놓치지 않고, memmap 이 느리면 쓰기 큐에서 장면이 버려진다.
 
 장면 넘기기(쓰기 스레드 0.8 ms/장 + memmap 읽기 스레드 0.5 ms/장)는 본 스레드 밖에서 돈다. 파이프 버퍼는 1 MB, 카메라가 준 RGB 사진은 그대로 쓰고, 큐에 든 장면은 저마다 제 버퍼를 가진다. memmap 은 사진·깊이를 받을 자리에 바로 읽는다.
 
 ## 깊이 정렬 바꿔 끼우기
 
-깊이를 컬러 격자로 옮기는 곳은 `bridge/src/depth_align.cpp` 하나다. `DepthAligner::align(const rs2::frameset&) → cv::Mat(CV_16UC1, 컬러 크기)` 를 구현한 클래스를 `make_aligner` 에 이름으로 더하고 `--align <이름>` 으로 고른다. 지금은 `rs2`(librealsense `rs2::align`, CPU).
+깊이를 컬러 격자로 옮기는 곳은 `slam/src/io/realsense.rs` 하나다(`rtab_bridge` 는 `bridge/src/depth_align.cpp`). `--align <이름>` 으로 고르고, 지금은 `rs2`(librealsense align, CPU).

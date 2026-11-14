@@ -4,8 +4,8 @@
 
 ```
 RealSense D435 (컬러 + 깊이, 640×480@30)
-        ▼ rtab_bridge (C++)
-  RTAB-Map: 장면마다 위치 추적, 루프 클로저로 지도 노드 위치 다시 맞춤(BRIEF + GTSAM)
+        ▼ slam_bridge (Rust, RTAB-Map 0.24.2 경로를 옮김)
+  장면마다 위치 추적(F2F), 루프 클로저로 지도 노드 위치 다시 맞춤(BRIEF + GTSAM 방식)
   → 장면(컬러 + 컬러에 맞춘 깊이 + 위치 + 기준 노드) · 그래프 블록(움직인 노드)을 스트림으로
         ▼ memmap --stream (Rust)
   NPU 분할 (YOLO26s-seg)         → 물체 마스크·이름
@@ -30,7 +30,7 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 - 사진 벡터로 합치기: 두 물체의 사진 벡터 코사인 ≥ 0.88 이고 작은 쪽 굳은 칸의 25 % 이상이 큰 쪽 굳은 칸과 겹치면 이름이 달라도 합친다(같은 물체가 보는 방향에 따라 두 이름으로 남은 경우). 사진 벡터는 물체의 종류까지만 가린다 — 나란히 놓인 모니터 두 대도 코사인이 0.92 다. 그래서 자리가 겹칠 때만 쓰고, 같은 이름의 이웃 물체는 칸 겹침·맞닿음·전형 크기로 가른다. 벡터가 아직 없는 물체는 기하·이름 조건만 본다.
 - 물체 사진 벡터: 물체 사진이 바뀔 때마다 계산 스레드(코어 2 개)가 `objects/O<id>_emb.bin`(f32 768 개, 길이 1)을 다시 쓴다. 밀리면 물체마다 가장 새 사진만 계산한다.
 - 검색(`/api/search`, 뷰어 `search.rs`): 점수 = 1 − (1 − 이름 일치)(1 − 생김새 일치). 이름 일치는 검색어가 분할 모델의 이름 80 개 중 어느 것을 뜻하는지(글 벡터끼리, "의자" → chair), 생김새 일치는 검색어가 그 물체 사진을 이름들보다 잘 설명하는지(글 벡터와 사진 벡터, "마실 것" → 컵 사진)다. 글자가 이름과 겹치면 이름 일치 1.
-- 연결 프로그램·스트림 형식·루프 클로저·다시 쌓기: [bridge.md](bridge.md), 보드 설치 [board_bridge.md](board_bridge.md).
+- 연결 프로그램 `slam_bridge` 는 C++ 원본 `rtab_bridge` 와 PC 에서 출력이 바이트까지 같다. 스트림 형식·루프 클로저·다시 쌓기: [bridge.md](bridge.md), 보드 설치 [board_bridge.md](board_bridge.md).
 
 ## 폴더
 
@@ -44,7 +44,8 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 | `pipeline/src/rooms.rs` | 방 나누기·문·방 번호 잇기·물체 배정·방 이름 |
 | `pipeline/src/graph.rs` | 씬그래프 연결(방→물체, 방↔방, 물체↔물체) |
 | `pipeline/src/seg.rs` | 분할 모델 실행(ONNX·NPU) |
-| `bridge/` | 연결 프로그램 `rtab_bridge`(C++, RealSense·TUM → RTAB-Map → 장면 스트림) |
+| `slam/` | 연결 프로그램 `slam_bridge`(Rust, RealSense·TUM → 위치 추적·루프 클로저 → 장면 스트림), [slam/README.md](../slam/README.md) |
+| `bridge/` | C++ 원본 `rtab_bridge`(RTAB-Map 라이브러리 링크, `slam_bridge` 비교 기준·지금 보드 실시간 스크립트), RealSense 정렬 도구 `bridge/align/` |
 | `viewer/sgview/` | 웹 뷰어(Rust 서버 + three.js) |
 | `train/ObjectSAM/` | 자체 분할 모델 학습기(C++/CUDA) |
 | `docs/` | 설계·측정 결과·평가 계획 |
@@ -55,4 +56,4 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 - 저장소 경로는 공백·한글 없이(`C:\ondevice`). DEEPX 도구가 이런 경로에서 깨진다.
 - 빌드 기능: PC `--features directml`(윈도우 그래픽카드) 또는 기본(CPU), 보드 `--no-default-features --features dxrt,cam`.
 - 평가 표: `pipeline/target/release/bench [--quick]` — TUM 책상·사무실을 정해진 조건으로 돌려 위치 오차·실패·속도·물체 수를 한 표로.
-- 다른 카메라 RGB-D 를 TUM 형식으로: `rgbd2tum <원본> <출력(이름에 freiburg3)> fx fy cx cy <깊이 1 m 값>` — TUM fr3 보정값 640×480 으로 다시 그려 RTAB-Map `rtabmap-rgbd_dataset` 과 memmap 이 같이 읽음. 다른 SLAM 위치로 돌리기: `memmap --tum <폴더> --gt <위치 파일>`, 정렬 후 위치 오차: `ate <추정> <정답>`(memmap 은 `poses_est.txt`·`poses_map.txt` 를 남김).
+- 다른 카메라 RGB-D 를 TUM 형식으로: `rgbd2tum <원본> <출력(이름에 freiburg3)> fx fy cx cy <깊이 1 m 값>` — TUM fr3 보정값 640×480 으로 다시 그려 RTAB-Map `rtabmap-rgbd_dataset`·`slam_bridge --tum` 과 memmap 이 같이 읽음. 다른 SLAM 위치로 돌리기: `memmap --tum <폴더> --gt <위치 파일>`, 정렬 후 위치 오차: `ate <추정> <정답>`(memmap 은 `poses_est.txt`·`poses_map.txt` 를 남김).

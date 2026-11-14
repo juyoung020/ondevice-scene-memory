@@ -64,5 +64,4 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 
 - 저장소 경로는 공백·한글 없이(`C:\ondevice`). DEEPX 도구가 이런 경로에서 깨진다.
 - 빌드 기능: PC `--features directml`(윈도우 그래픽카드) 또는 기본(CPU), 보드 `--no-default-features --features dxrt`(librealsense2 로 견줄 때 `slam-realsense` 를 더함).
-- 평가 표: `target/release/bench [--quick]` — TUM 책상·사무실을 정해진 조건으로 돌려 위치 오차·실패·속도·물체 수를 한 표로.
 - 다른 카메라 RGB-D 를 TUM 형식으로: `rgbd2tum <원본> <출력(이름에 freiburg3)> fx fy cx cy <깊이 1 m 값>` — TUM fr3 보정값 640×480 으로 다시 그려 RTAB-Map `rtabmap-rgbd_dataset`·`ondevice --slam "--tum …"` · `ondevice --tum` 이 같이 읽음. 다른 SLAM 위치로 돌리기: `ondevice --tum <폴더> --gt <위치 파일>`, 정렬 후 위치 오차: `ate <추정> <정답>`(기억 폴더에 `poses_est.txt`·`poses_map.txt` 를 남김).

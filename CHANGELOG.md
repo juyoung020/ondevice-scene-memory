@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### Added
+- 다른 컴퓨터에서 재현: 모델을 GitHub 릴리스 `models-v1` 로 받는 `scripts/setup.sh` · `scripts/setup.ps1`(sha256 확인 후 빌드), TUM 영상을 받는 `scripts/get_data.sh`, 모델 목록 · 라이선스 `docs/models.md`.
 - 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.
 - 보드(aarch64) YUYV→RGB · 회색조와 설명자 해밍 거리를 NEON 으로 계산한다(결과 비트 동일).
 - Rust 로 다시 짠 위치 프로그램 `slam/`(`ondevice --slam` · `ondevice slam`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
@@ -36,6 +37,7 @@
 - 검색의 이름 일치 기준을 이름 1,225 개에 맞췄다("화면" 같은 이름 아닌 말이 엉뚱한 물체를 찾지 않음).
 
 ### Removed
+- 깊이 모델 시절의 평가 표 `bench`(지금 프로그램에 없는 `--depth` · `--pose` 를 썼음).
 - 쓰지 않던 입력·위치 방식: 웹캠 입력(`--cam` · `--rec`), 카메라만으로 위치(`--pose vo|dvo`|dvo` · `--fast-pose` · SuperPoint), 딥러닝 깊이(`--depth <모델>` · `--scale-win`), `--snaps` · `--npu-par` 와 `cam` 빌드 기능.
 - librealsense 판 녹화 도구 `rs_info` · `rs_rec`(같은 일은 `rsd_info` · `rsd_rec`), 개발용 `objcrop` · `objdup` · `onnx_info`, 문서에 쓰이지 않는 결과 그림 51 개.
 
@@ -97,6 +99,7 @@
 - 장면 넘기기와 보관 장면 압축이 가벼워짐(결과 값은 같음).
 
 ### Removed
+- 깊이 모델 시절의 평가 표 `bench`(지금 프로그램에 없는 `--depth` · `--pose` 를 썼음).
 - **호환 변경:** 표면 지도(`--surface`, TSDF 서브맵·사진 텍스처)와 옵션 `--points`, 도구 `surfcmp`·`meshshot`.
 
 ### Fixed
@@ -143,6 +146,7 @@
 - README·문서를 지금 구성으로 다시 쓰고 표지를 다시 찍음.
 
 ### Removed
+- 깊이 모델 시절의 평가 표 `bench`(지금 프로그램에 없는 `--depth` · `--pose` 를 썼음).
 - **호환 변경:** 파이썬 코드 전부(`tools/*.py`, `train/ObjectSAM` 의 파이썬). 실행은 `pipeline/` 으로.
 
 ### Fixed

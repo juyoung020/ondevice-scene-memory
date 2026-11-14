@@ -44,15 +44,36 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
 
 측정 방법과 기록은 [docs/performance_log.md](docs/performance_log.md)에, 최적화별 전·후 요약은 [docs/optimization.md](docs/optimization.md)에 있습니다.
 
+## 다른 컴퓨터에서 재현
+
+필요한 것: git, [Rust](https://rustup.rs)(cargo), curl · tar. 모델은 GitHub 릴리스 [`models-v1`](https://github.com/juyoung020/ondevice-scene-memory/releases/tag/models-v1)에서 받고, 파일 목록 · 출처 · 라이선스 · sha256 은 [docs/models.md](docs/models.md)에 있습니다.
+
+```bash
+# 1. 받기
+git clone https://github.com/juyoung020/ondevice-scene-memory.git && cd ondevice-scene-memory
+
+# 2. 모델 받기(sha256 확인) + 빌드
+bash scripts/setup.sh                    # 리눅스 · WSL (CPU ONNX)
+#    powershell -ExecutionPolicy Bypass -File scripts\setup.ps1     # 윈도우 (DirectML, -Cpu 로 CPU)
+#    bash scripts/setup.sh --board        # 보드(Pi 5 + DX-M1, dxrt)
+
+# 3. 시험 영상(TUM RGB-D 공식 주소: 책상 328 MB + 사무실 1.4 GB)
+bash scripts/get_data.sh
+
+# 4. 실행 → 브라우저로 http://127.0.0.1:8091
+target/release/ondevice --slam "--tum data/tum/rgbd_dataset_freiburg3_long_office_household --config docs/rtabmap_pi.ini" \
+    --every 2 --seg models/yolo26s-seg.onnx --embed models/siglip2-base-patch32-256/vision_model.onnx --vocab vocab/names.voc \
+    --max-depth 3.5 --out data/memory/office \
+    --serve "8091 --bind 127.0.0.1 --search-model models/siglip2-base-patch32-256 --vocab vocab/names.voc"
+```
+
+윈도우에서는 `get_data.sh` 를 Git Bash 나 WSL 에서 돌리고, 실행 파일은 `target\release\ondevice.exe` 입니다. 보드의 분할 모델(`yolo26-s-seg_640x640.dxnn`)은 DEEPX dx-all-suite 에서 받습니다([docs/models.md](docs/models.md)).
+
 ## 빠른 시작 — PC(Windows·WSL)
 
 보드 없이 PC에서 같은 과정을 돌려 볼 수 있습니다.
 
-**1. 모델 받기** — `models/` 폴더에 둡니다.
-
-| 파일 | 하는 일 | 받는 곳 |
-|---|---|---|
-| `yolo26s-seg.onnx` | 물체 찾기(분할) | Hugging Face `prithivMLmods/YOLO26-ONNX` |
+**1. 모델 받기** — `bash scripts/setup.sh --no-build`(윈도우 `scripts\setup.ps1 -NoBuild`)가 `models/` 에 풉니다. 파일별 내용은 [docs/models.md](docs/models.md).
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).
 
@@ -91,7 +112,7 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 
 - **D435 입력 고르기:** 리눅스 빌드의 기본은 `rsdriver`(librealsense2 없이 V4L2·UVC 직접)입니다. librealsense2 판은 `--features slam-realsense` 로 빌드하고 `--slam "--realsense --driver librealsense …"` 로 고릅니다. rsdriver 의 장면 시각은 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한 값이라(librealsense 의 global time 처럼 시계 차이를 계속 따라가지 않음) 두 판의 절대 시각은 다를 수 있고, 장면 간격은 같습니다. rsdriver 입력은 실제 카메라 확인이 남아 있습니다.
 
-- **아무 말로 찾기(보드):** 물체 기억에 `--embed <SigLIP2 영상 인코더>.dxnn`(NPU), 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
+- **아무 말로 찾기(보드):** 물체 기억에 `--embed models/board/siglip2-vision_v8.dxnn`(NPU, `setup.sh --board` 가 받음), 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
 - **움직일 때 번지면:** `--slam "… --exposure 8 --gain 110"` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
 
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.
@@ -135,4 +156,4 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 
 [PolyForm Noncommercial License 1.0.0](LICENSE.md) — 개인 공부·연구·교육·비영리 목적으로는 자유롭게 쓰고 고치고 나눌 수 있고, **상업적 이용은 허용하지 않습니다.** 나눌 때는 `LICENSE.md` 의 저작권 표시(Required Notice)를 함께 전합니다.
 
-저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다.
+저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, YOLO26, DEEPX 런타임)은 각자의 라이선스를 따릅니다. 모델 파일별 라이선스는 [docs/models.md](docs/models.md).

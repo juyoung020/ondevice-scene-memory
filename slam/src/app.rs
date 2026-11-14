@@ -439,7 +439,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms(기본 8.3, 0 = 카메라 자동)] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms(기본 8.3, 0 = 카메라 자동)] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -458,6 +458,8 @@ pub struct Args {
     realsense: bool,
     driver: String,
     reloc_wait: f64,
+    /// 놓친 뒤 다시 시작할 때 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙임(광류 경로, --no-bridge 로 끔)
+    bridge: bool,
     reset_at: i64,
     stride: usize,
     block: i32,
@@ -490,7 +492,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         driver: String::new(),
         reset_at: -1,
         stride: 1,
-        reloc_wait: 1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도
+        reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
+        bridge: true,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
@@ -556,6 +559,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--max-frames" => a.max_frames = num(&val()?)? as i64,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
+            "--no-bridge" => a.bridge = false,
             "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
             // 프로세스 설정(ondevice 가 처음에 읽음): 실시간 배치·메모리 묶기·조용히
             "--rt" => {
@@ -680,6 +684,10 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     // 다시 잡기: 놓치기 전의 장면(기준 장면)과 지금 장면의 특징점을 직접 맞춰 위치를 구함
     let reloc_min = params.get("Vis/MinInliers", 20i32).max(25);
     let mut eng = engine::Engine::new(&params, &odom_params, reloc_min);
+    let klt_path = params.get("Odom/Strategy", 0i32) == 9;
+    let reloc_wait = if a.reloc_wait >= 0.0 { a.reloc_wait } else if klt_path { 0.0 } else { 1.0 };
+    let bridge = a.bridge && klt_path;
+    let mut n_bridge = 0i64;
 
     let mut refs: VecDeque<Ref> = VecDeque::new();
     let mut ref_next = 0usize;
@@ -799,7 +807,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             }
             s_reloc.add(ms_since(cr));
             // 기다려도 못 잡으면 마지막 위치에서 다시 시작 → 새 지도(이전 지도와 이어질 때까지 보내지 않음)
-            if !relocalized && (!anchored || fr.t - lost_since > a.reloc_wait) {
+            if !relocalized && (!anchored || fr.t - lost_since > reloc_wait) {
                 // 믿는 지도가 3 초 몫도 안 되면 붙들 것이 없다: 처음부터 다시
                 if anchored && good_t1 - good_t0 < 3.0 {
                     restart = true;
@@ -819,6 +827,15 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
 
         // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다
         let mut new_map = false;
+        if bridge && anchored && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
+            // 이어 붙이기: 위치 추적은 마지막 위치에서 다시 시작했다. 같은 지도에 큰 불확실성(0.5 m², 0.5 rad²)으로 이어
+            // 지도가 끊기지 않게 하고, 실제로 어긋났으면 뒤의 루프 클로저가 그래프 최적화로 바로잡는다
+            info.cov = [0.0; 36];
+            for i in 0..6 {
+                info.cov[i * 7] = 0.5;
+            }
+            n_bridge += 1;
+        }
         if !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
             common::info!("장면 {n}: 위치 추적 다시 시작 → 새 지도");
             let id = eng.trigger_new_map();
@@ -1027,6 +1044,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     drop(poses_f);
     drop(stats_f);
 
+    if bridge {
+        common::info!("놓친 뒤 같은 지도로 이어 붙임 {n_bridge} 번");
+    }
     common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
     common::info!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");
     common::info!("같은 지도에서 다시 잡음 {n_reloc} 번, ms/회 {}", s_reloc.str());

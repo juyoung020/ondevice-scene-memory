@@ -1354,7 +1354,7 @@ function fitView(top, instant = true) {
   const b = contentBox(); if (!b) return;
   stageFor(b);
   const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
-  const r = 0.5 * Math.hypot(s.x, s.y, s.z * 0.6), fov = camera.fov * Math.PI / 180, fit = r / Math.sin(Math.min(fov, fov * camera.aspect) / 2) * 0.66;
+  const r = 0.5 * (top ? Math.hypot(s.x, s.y) : Math.hypot(s.x, s.y, s.z * 0.6)), fov = camera.fov * Math.PI / 180, fit = r / Math.sin(Math.min(fov, fov * camera.aspect) / 2) * 0.66;
   const tgt = new THREE.Vector3(c.x, c.y, top ? b.min.z : b.min.z + s.z * 0.3);
   const az = -2.25, el = top ? 1.5697 : 0.66;
   const pos = new THREE.Vector3(tgt.x + fit * Math.cos(el) * Math.cos(az), tgt.y + fit * Math.cos(el) * Math.sin(az), tgt.z + fit * Math.sin(el));
@@ -1428,8 +1428,12 @@ function applyView(v) {
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
   let sObj = ""; for (const o of view.objects) sObj += o.id + "|" + o.state + "|" + o.pos[0] + "," + o.pos[1] + "," + o.pos[2] + "|" + o.extent[0] + "," + o.extent[1] + "," + o.extent[2] + "|" + (o.points ? o.points.stamp : "") + "|" + (o.rgbd ? 1 : 0) + "|" + (o.room ?? "") + ";";
   if (view.scene_points) sObj += "scene|" + (view.scene_points.octree ? "o" + view.scene_points.octree.run + ":" + view.scene_points.octree.ver : (view.scene_points.chunks ?? view.scene_points.stamp)) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3] * 1000 + (r[4] || 0)).reduce((a, b) => a + b, 0) : "");
-  const sGraph = JSON.stringify(view.graph), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
-  const objChanged = sObj !== prev.obj, graphChanged = objChanged || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
+  // graph: edges compared as text; the trajectory (grows every keyframe in a live run) only by its length, redrawn at most once a second
+  const sGraph = JSON.stringify(view.graph.edges || []), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
+  const nTraj = (view.graph.nodes || []).length, nowT = performance.now();
+  const trajDue = nTraj !== prev.nTraj && nowT - (prev.trajT || 0) > 1000;
+  const objChanged = sObj !== prev.obj, graphChanged = objChanged || trajDue || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
+  if (graphChanged) { prev.nTraj = nTraj; prev.trajT = nowT; }
   if (objChanged) { fillSelect(); drawObjects(); findRefresh(); }
   if (graphChanged) drawGraph();
   if (!objChanged && selected != null) renderInfoSoon();

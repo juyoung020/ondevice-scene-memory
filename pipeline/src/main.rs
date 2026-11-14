@@ -261,7 +261,8 @@ impl Clock {
 
 /// 한 장면의 '대략 수평'인 가장 큰 면(바닥·책상)을 RANSAC 으로 찾아 그 위쪽 법선을 세계 좌표로(IMU 없이 중력 방향 단서).
 /// 여러 장면의 법선을 모아 다수결로 수평을 정한다(gravity 합의).
-fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V3> {
+/// floor_only: 카메라보다 0.3 m 넘게 아래인 면만(실시간: 천장 · 책상 위를 바닥으로 잡지 않게)
+fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3, floor_only: bool) -> Option<V3> {
     let [fx, fy, cx, cy] = k;
     let mut pts: Vec<V3> = vec![];
     for v in (0..h).step_by(8) {
@@ -299,6 +300,9 @@ fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V
             continue; // 가정한 위에서 50° 넘게 기운 면(벽)은 제외
         }
         let d = dot(&n, &a);
+        if floor_only && d > -0.3 {
+            continue; // 위쪽(가정한 위 기준) 면 = 천장 · 높은 면
+        }
         let cnt = pts.iter().filter(|q| (dot(&n, q) - d).abs() < 0.02 + 0.01 * q[2]).count();
         if cnt > best_c {
             (best_n, best_c) = (n, cnt);
@@ -984,7 +988,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let c_vo = Instant::now();
         // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
         if (!leveled || refine) && a.stream.is_some() {
-            if let Some(n) = up_normal(&depth, w, h, seq.k, &r) {
+            if let Some(n) = up_normal(&depth, w, h, seq.k, &r, refine) {
                 grav_obs.push(n);
             }
             if grav_obs.len() >= 15 {
@@ -996,8 +1000,16 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let m0 = mean(&grav_obs);
                 let inl: Vec<V3> = grav_obs.iter().copied().filter(|n| dot(n, &m0) > 10f64.to_radians().cos()).collect();
                 if inl.len() * 10 >= grav_obs.len() * 6 {
+                    'lv: {
                     let up = mean(&inl);
                     let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
+                    let tilt = up[2].clamp(-1.0, 1.0).acos().to_degrees();
+                    if refine && tilt > 25.0 {
+                        // 첫 장면이 똑바르다는 가정과 크게 다르면 믿지 않음(세계를 뒤집지 않음): 모은 것을 버리고 계속
+                        common::info!("수평 맞춤: 바닥 합의가 처음 가정과 {tilt:.1}° 달라 버림");
+                        grav_obs.clear();
+                        break 'lv;
+                    }
                     if std::mem::take(&mut refine) {
                         // 처음 가정(첫 장면이 똑바름)을 바닥 합의로 고침: 지난 위치 · 바닥 높이 원점도 새 좌표로, 지도는 다시 쌓음
                         for e in est_traj.iter_mut() {
@@ -1011,6 +1023,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     stream_fix = mm(&fix, &stream_fix);
                     leveled = true;
                     common::info!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
+                    }
                 } else if grav_obs.len() > 60 {
                     grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
                 }

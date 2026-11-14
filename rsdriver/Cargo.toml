@@ -13,9 +13,6 @@ path = "src/lib.rs"
 libc = "0.2"
 tools = { path = "../tools" }
 
-[profile.release]
-codegen-units = 1
-opt-level = 3
 
 [[bin]]
 name = "rsd_info"

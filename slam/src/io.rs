@@ -41,10 +41,25 @@ pub fn to_gray(color: &[u8], is_rgb: bool) -> Vec<u8> {
         .collect()
 }
 
+/// 깊이 단위가 mm(1000/m)라 원본 값이 곧 mm 인가
+pub fn is_mm(depth_per_m: f32) -> bool {
+    (depth_per_m - 1000.0).abs() <= 1e-3
+}
+
+/// 원본 깊이 → (mm 깊이, 스트림용 원본). 1000/m 이면 두 값이 같아 버퍼 하나만 mm 칸에 두고 원본 칸은 비운다
+/// (복사 614,400 B 없음, 보낼 때 `Frame::take_stream_depth` 가 mm 칸을 넘김)
+pub fn split_depth(raw: Vec<u16>, depth_per_m: f32) -> (Vec<u16>, Vec<u16>) {
+    if is_mm(depth_per_m) {
+        (raw, Vec::new())
+    } else {
+        (depth_to_mm(&raw, depth_per_m), raw)
+    }
+}
+
 /// 깊이 값 → mm(u16). 원본 bridge main.cpp: 1000/m 이 아니면 Mat 를 (값/m ÷ 1000) 으로 나눔.
 /// OpenCV convertTo(16U→16U, 배율) 는 float 로 값×배율을 구해 짝수 쪽 반올림 후 0..65535 로 자름
 pub fn depth_to_mm(raw: &[u16], depth_per_m: f32) -> Vec<u16> {
-    if (depth_per_m - 1000.0).abs() <= 1e-3 {
+    if is_mm(depth_per_m) {
         return raw.to_vec();
     }
     let div = depth_per_m as f64 / 1000.0;

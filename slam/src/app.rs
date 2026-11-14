@@ -921,7 +921,7 @@ fn run_in(argv: &[String], to_mem: Option<std::sync::mpsc::Sender<stream::Receiv
             // 장면 버퍼를 복사 없이 넘김(기준 장면은 make_ref 가 필요한 것을 이미 가져감)
             of.color = std::mem::take(&mut fr.color);
             of.color_is_rgb = fr.color_is_rgb;
-            of.depth = std::mem::take(&mut fr.depth_raw);
+            of.depth = fr.take_stream_depth();
             if !writer.push(of) {
                 eprintln!("받는 쪽이 닫힘: 끝냄");
                 break;

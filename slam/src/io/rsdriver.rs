@@ -2,7 +2,7 @@
 //! (컬러 RGB8, 컬러 격자에 정렬한 깊이, 보정값 = 컬러 카메라).
 //! 시각: rsdriver 는 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한다(librealsense 의 global time 처럼
 //! 장치·시스템 시계 차이를 계속 따라가지 않음). 장면끼리의 간격은 장치 시각 그대로다.
-use super::{depth_to_mm, optical_rotation, to_gray, FrameSource};
+use super::{optical_rotation, split_depth, to_gray, FrameSource};
 use crate::{Camera, Frame};
 use rsdriver::camera::{Camera as RsCamera, Config, Output};
 use std::time::Instant;
@@ -19,6 +19,7 @@ impl RsDriverSource {
     pub fn new(w: u32, h: u32, fps: u32, serial: &str, exposure_ms: f64, gain: i32) -> Result<RsDriverSource, String> {
         let cam = RsCamera::open(Config { width: w, height: h, fps, serial: serial.to_string(), exposure_ms, gain, ..Default::default() })?;
         let desc = cam.describe();
+        crate::bufpool::enable();
         Ok(RsDriverSource { cam, out: Output::default(), id: 0, read_ms: 0.0, desc })
     }
 }
@@ -26,14 +27,22 @@ impl RsDriverSource {
 impl FrameSource for RsDriverSource {
     fn next(&mut self) -> Result<Option<Frame>, String> {
         let c0 = Instant::now();
+        // 받는 쪽이 다 쓰고 돌려준 버퍼가 있으면 그것에 채움(길이가 맞아 0 으로 채우지 않음, 화소는 모두 덮어씀)
+        let n = self.cam.cfg.width as usize * self.cam.cfg.height as usize;
+        if self.out.rgb.capacity() == 0 {
+            self.out.rgb = crate::bufpool::take_rgb(n * 3);
+        }
+        if self.out.aligned.capacity() == 0 {
+            self.out.aligned = crate::bufpool::take_depth(n);
+        }
         let info = self.cam.next_into(&mut self.out)?;
-        // 장치 버퍼에서 한 번 채운 컬러·깊이를 그대로 장면으로 넘김(다음 장면은 새 버퍼에: 앞 장면은 memmap 이 들고 있음)
+        // 장치 버퍼에서 한 번 채운 컬러·깊이를 그대로 장면으로 넘김(다음 장면은 돌려받은 버퍼나 새 버퍼에: 앞 장면은 memmap 이 들고 있음)
         let color = std::mem::take(&mut self.out.rgb);
         let depth_raw = std::mem::take(&mut self.out.aligned);
         let k = &self.cam.calib.color;
         let dpm = self.cam.depth_per_m();
         let gray = to_gray(&color, true);
-        let depth_mm = depth_to_mm(&depth_raw, dpm);
+        let (depth_mm, depth_raw) = split_depth(depth_raw, dpm); // 1000/m 이면 복사 없이 한 버퍼
         self.id += 1;
         self.read_ms = c0.elapsed().as_secs_f64() * 1e3;
         Ok(Some(Frame {

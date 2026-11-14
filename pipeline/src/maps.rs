@@ -959,7 +959,7 @@ impl Memory {
     }
 
     /// 보여야 할 자리(화면 안, 40 화소 이상, 깊이 일치)에서 그 자리에 아무것도 검출되지 않은 채 15 장 연속이면 사라짐
-    pub fn check_missing(&mut self, seen: &std::collections::HashSet<u32>, k: [f64; 4], rwc: &crate::geom::M3, pwc: &V3, depth: &[f32], w: usize, h: usize) {
+    pub fn check_missing(&mut self, seen: &std::collections::HashSet<u32>, k: [f64; 4], rwc: &crate::geom::M3, pwc: &V3, depth: &crate::depth::Depth, w: usize, h: usize) {
         let miss_need = 15u32; // 보여야 할 자리에서 15 장 연속 안 보이면 사라짐(8 장은 검출이 잠깐 빠져도 사라짐이 됐음)
         // 이번 장면에 보인 물체 위치: 그 자리에서 다른 물체가 검출됐으면(중복이거나 이름이 바뀌어 검출됨, 예: 곰 인형 → 고양이) 놓친 걸로 세지 않음
         let seen_at: Vec<V3> = self.objs.iter().filter(|o| seen.contains(&o.id)).map(|o| o.pos).collect();
@@ -986,7 +986,7 @@ impl Memory {
             if !(0.1 * w as f64..0.9 * w as f64).contains(&u) || !(0.1 * h as f64..0.9 * h as f64).contains(&v) {
                 continue;
             }
-            let dz = depth[v as usize * w + u as usize] as f64;
+            let dz = depth.at(v as usize * w + u as usize) as f64;
             if dz <= 0.0 || (dz - pc[2]).abs() > 0.3 {
                 continue;
             }            o.miss += 1;

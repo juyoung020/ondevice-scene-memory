@@ -311,7 +311,7 @@ impl FrameSource for RealSenseSource {
                 }
             }
             let gray = to_gray(&rgb, true);
-            let depth_mm = super::depth_to_mm(&depth_raw, self.depth_per_m);
+            let (depth_mm, depth_raw) = super::split_depth(depth_raw, self.depth_per_m); // 1000/m 이면 복사 없이 한 버퍼
             self.id += 1;
             let k = self.k;
             self.wait_ms = (c1 - c0).as_secs_f64() * 1e3;

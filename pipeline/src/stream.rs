@@ -49,7 +49,8 @@ impl StreamFrame {
     pub fn held(&self) -> bool {
         self.flags & HELD != 0
     }
-    /// 깊이(미터, 0 = 없음). TUM Kinect 입력(tum.rs)과 같은 계산(값 / 배율)
+    /// 깊이(미터, 0 = 없음). TUM Kinect 입력(tum.rs)과 같은 계산(값 / 배율). memmap 은 `depth::Depth::Raw` 로 쓸 때 바꾸고, objcrop 이 씀
+    #[allow(dead_code)]
     pub fn depth_m(&self) -> Vec<f32> {
         self.depth.iter().map(|&v| v as f32 / self.depth_per_m).collect()
     }

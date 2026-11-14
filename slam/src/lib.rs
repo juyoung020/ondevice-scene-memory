@@ -12,6 +12,7 @@ pub mod params;
 pub mod register;
 pub mod stream;
 pub mod app;
+pub mod bufpool;
 
 use nalgebra::{Isometry3, Point3};
 
@@ -39,10 +40,21 @@ pub struct Frame {
     pub color: Vec<u8>,
     pub color_is_rgb: bool,
     pub depth_mm: Vec<u16>,
-    /// 원본 깊이 값 / 미터(스트림에 그대로 씀: RealSense 1000, TUM 5000)
+    /// 원본 깊이 값 / 미터(스트림에 그대로 씀: RealSense 1000, TUM 5000). 비었고 1000/m 이면 depth_mm 이 곧 원본(`io::split_depth`)
     pub depth_raw: Vec<u16>,
     pub depth_per_m: f32,
     pub cam: Camera,
+}
+
+impl Frame {
+    /// 스트림으로 보낼 원본 깊이를 꺼냄(1000/m 이라 원본 칸을 비워 둔 장면은 mm 깊이가 곧 원본)
+    pub fn take_stream_depth(&mut self) -> Vec<u16> {
+        if self.depth_raw.is_empty() && io::is_mm(self.depth_per_m) {
+            std::mem::take(&mut self.depth_mm)
+        } else {
+            std::mem::take(&mut self.depth_raw)
+        }
+    }
 }
 
 /// 특징점(OpenCV KeyPoint 와 같은 칸)

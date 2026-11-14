@@ -17,9 +17,6 @@ default = []
 # RealSense 도구(librealsense2 C API 를 직접 부름: rs_info · rs_rec · rs_align_check · align_sdk_check)
 realsense = []
 
-[profile.release]
-codegen-units = 1
-opt-level = 3
 
 [[bin]]
 name = "bench_align"

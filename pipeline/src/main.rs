@@ -8,6 +8,7 @@
 //! 깊이는 1 단계로 TUM Kinect 실측을 쓴다(딥러닝 깊이는 다음 단계).
 #[cfg(feature = "cam")]
 mod cam;
+mod depth;
 mod dvo;
 mod embed;
 mod geom;
@@ -24,6 +25,7 @@ mod stream;
 mod vo;
 mod tum;
 
+use depth::Depth;
 use geom::*;
 use maps::*;
 use serde_json::json;
@@ -302,12 +304,12 @@ fn run_models(dnet: &mut Option<Box<dyn seg::DepthNet>>, seg: &mut Box<dyn seg::
 
 /// 한 장면의 '대략 수평'인 가장 큰 면(바닥·책상)을 RANSAC 으로 찾아 그 위쪽 법선을 세계 좌표로(IMU 없이 중력 방향 단서).
 /// 여러 장면의 법선을 모아 다수결로 수평을 정한다(gravity 합의).
-fn up_normal(depth: &[f32], w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V3> {
+fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V3> {
     let [fx, fy, cx, cy] = k;
     let mut pts: Vec<V3> = vec![];
     for v in (0..h).step_by(8) {
         for u in (0..w).step_by(8) {
-            let z = depth[v * w + u] as f64;
+            let z = depth.at(v * w + u) as f64;
             if z > 0.2 && z < 4.0 {
                 pts.push([(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]);
             }
@@ -382,7 +384,7 @@ struct Frame {
     rgb: Vec<u8>,
     w: usize,
     h: usize,
-    depth: Vec<f32>,
+    depth: Depth,
     dets: Option<Vec<seg::Det>>, // 이번 장면에 분할을 안 돌렸으면 None(--seg-every)
     load: f64,
     seg: f64,
@@ -408,7 +410,7 @@ struct SegStages {
 /// 스트림 장면 하나가 분할 단계(전처리 → 추론 → 후처리)를 지나며 들고 다니는 것. 분할을 안 하는 장면(위치 놓침·생략)도 순서를 지키려 같은 길로 지나간다.
 struct SegJob {
     sf: stream::StreamFrame,
-    depth: Vec<f32>,
+    depth: Depth, // 받은 u16 그대로(쓸 때 미터로)
     do_seg: bool, // 이 장면에 분할을 돌림(위치를 놓친 장면은 늘 false)
     load: f64,
     graph: Vec<stream::Node>,
@@ -484,7 +486,7 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         d
     });
     let sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: sf.rgb, w, h, depth: j.pd.unwrap_or(j.depth), dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], scale: f64::NAN, feat: j.feat,
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: sf.rgb, w, h, depth: j.pd.map_or(j.depth, Depth::M), dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], scale: f64::NAN, feat: j.feat,
                     track_only: false, lost, held, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
@@ -761,7 +763,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         if sf.flags & stream::NEW_MAP != 0 {
                             eprintln!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
                         }
-                        let depth = sf.depth_m();
+                        // 깊이는 u16 그대로 넘김(미터 값은 쓰는 곳에서 같은 식으로)
+                        let depth = Depth::Raw { d: std::mem::take(&mut sf.depth), per_m: sf.depth_per_m };
                         // --seg-skip: 직전 분할 키프레임에서 조금만 움직였으면 화면이 거의 같으니 분할을 건너뜀(물체 기억은 그 장면을 안 본 것으로)
                         let want_seg = match (seg_skip, &last_seg) {
                             // 밀리지 않았으면(NPU 가 따라감) 늘 분할: 생략은 밀릴 때 지연을 줄이는 데만 쓴다(안 밀려도 건너뛰면 물체 관측만 줄어 물체를 잃음)
@@ -853,7 +856,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
                 graph.append(&mut rd.take_graph());
                 if !graph.is_empty() {
-                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: vec![], dets: None, load: 0.0, seg: 0.0,
+                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0,
                                     scale: f64::NAN, feat: None, track_only: false, lost: true, held: false, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
@@ -911,7 +914,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             nj += 1;
                             let (pd, dets, feat) = run_models(&mut dnet, &mut seg, &mut spnet, &rgb, w, h, conf, (nj - 1) % seg_every == 0, npu_par, (nj - 1) % sp_every == 0);
                             let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
-                            let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: 0.0, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
+                            let f = Frame { t, p: p0, r: r0, rgb, w, h, depth: Depth::M(depth), dets, load: 0.0, seg: c1.elapsed().as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
                             if tx2.send(f).is_err() {
                                 break;
                             }
@@ -951,7 +954,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let c1 = Instant::now();
                     if let Some((jtx, _)) = &model {
                         // 위치만 추적하는 장면으로 먼저 보내고(같은 장면의 깊이 결과보다 앞서 도착), 모델이 쉬고 있으면 이 장면을 맡긴다
-                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: Depth::default(), dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
                         if tx.send(f).is_err() {
                             break;
                         }
@@ -960,7 +963,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     }
                     if fast_pose {
                         // 녹화 최대 속도: 위치만 추적 장면을 먼저, depth_every 장마다 아래에서 모델까지
-                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
+                        let f = Frame { t, p: p0, r: r0, rgb: rgb.clone(), w, h, depth: Depth::default(), dets: None, load: (c1 - c0).as_secs_f64(), seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
                         if tx.send(f).is_err() {
                             break;
                         }
@@ -976,7 +979,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let (pd, dets, feat) = run_models(&mut dnet, seg_slot.as_mut().unwrap(), &mut spnet, &rgb, w, h, conf, do_seg, npu_par, (nf - 1) % sp_every == 0);
                     let depth = pd.expect("--cam needs --depth <.dxnn|.onnx>");
                     let c2 = Instant::now();
-                    let f = Frame { t, p: p0, r: r0, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
+                    let f = Frame { t, p: p0, r: r0, rgb, w, h, depth: Depth::M(depth), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale: f64::NAN, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
                     if tx.send(f).is_err() {
                         break;
                     }
@@ -1018,7 +1021,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let rgb = img.into_raw();
                 if fast_pose {
                     // 실시간과 같게: 모든 장면은 먼저 위치만 추적, 깊이·분할은 depth_every 장마다
-                    let f = Frame { t, p, r, rgb: rgb.clone(), w, h, depth: vec![], dets: None, load: 0.0, seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
+                    let f = Frame { t, p, r, rgb: rgb.clone(), w, h, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, scale: f64::NAN, feat: None, track_only: true, lost: false, held: false, anchor: 0, graph: vec![] };
                     if tx.send(f).is_err() {
                         break;
                     }
@@ -1049,7 +1052,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     None => (kin, f64::NAN),
                 };
                 let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth, dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
+                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(depth), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), scale, feat, track_only: false, lost: false, held: false, anchor: 0, graph: vec![] };
                 if fast_pose && depth_lag > 0 {
                     lagged.push_back((n_to + depth_lag, f));
                     continue;
@@ -1166,6 +1169,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 끝나면 본 스레드가 갈아 끼운다(그동안 실시간 장면은 계속 들어옴)
     let mut kfs = kfstore::KfStore::new(a.kf_store_mb);
     let mut last_rebuild = Instant::now();
+    // 재생(밀림을 재지 않음: TUM, --stream-rate 없는 --no-drop 스트림)은 다시 쌓기 시작과 갈아 끼우기를 장면 시각으로 정한다:
+    // 시작 = 앞 시작에서 장면 시각 --rebuild-every 초 뒤, 갈아 끼우기 = 시작한 장면 시각 + --rebuild-every 초가 된 장면(덜 끝났으면 기다림).
+    // 벽시계로 정하면 시작 때의 물체 id · 갈아 끼우는 장면이 실행마다 달라 같은 입력에서 결과가 달랐다. 실시간 입력은 지연이 늘지 않게 벽시계 그대로
+    let det_rb = !lag_on;
+    let (mut rb_t0, mut rb_due) = (f64::NAN, f64::INFINITY);
     let mut n_rebuild = 0u32;
     let mut prune_objs = false;
     let mut view_due = false; // 다음 장면에서 view.json 쓰기
@@ -1191,11 +1199,15 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         clock.add(P::Graph, c_g);
         let c_in = Instant::now();
-        if let Some(job) = rb_job.take_if(|j| j.is_finished()) {
+        if rb_t0.is_nan() && w > 0 {
+            rb_t0 = t;
+        }
+        if let Some(job) = rb_job.take_if(|j| if det_rb { w > 0 && t >= rb_due } else { j.is_finished() }) {
             let mut rb = job.join().expect("다시 쌓기 스레드");
             let newer = newer_than(&kfs, &stream_fix, z0.unwrap_or(0.0), rb.last_seq);
             if newer.len() > CATCH_UP_MAX {
                 // 쌓는 동안 들어온 장면이 많으면 작업 스레드가 먼저 이어 넣고 다시 옴(그사이 들어온 몇 장만 본 스레드가)
+                rb_due = t + a.rebuild_every;
                 let (ar, k) = (a_rb.clone(), seq.k);
                 rb_job = Some(std::thread::spawn(move || {
                     out::thread_role(out::Role::Rebuild);
@@ -1224,13 +1236,14 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         clock.add(P::Install, c_in);
         let c_rs = Instant::now();
-        if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && (force_rb || last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every) {
+        if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && (force_rb || if det_rb { t - rb_t0 >= a.rebuild_every } else { last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every }) {
             force_rb = false;
             let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
             kfs.clear_dirty();
             rb_job = Some(std::thread::spawn(move || { out::thread_role(out::Role::Rebuild); let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved); out::slow(c_rb); r }));
             last_rebuild = Instant::now();
+            (rb_t0, rb_due) = (t, t + a.rebuild_every);
         }
         clock.add(P::RbStart, c_rs);
         let raw = (r, p); // 받은 위치(수평 맞춤 전): 다시 쌓기용 보관
@@ -1368,8 +1381,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             // 딥러닝 깊이 배율: 기준 장면 깊이를 이번 장면으로 옮긴 거리에 맞춘다
             if let (true, true, Some((_, rd)), Some((rk, pk))) = (hok, a.depth != "kinect", &dvo_prev, dvo_ref_pose) {
                 let (rr, tt) = (mm(&tr(&r), &rk), mv(&tr(&r), &sub(&pk, &p)));
-                let sc = dvo::depth_ratio(rd, &depth, w, h, seq.k, &rr, &tt) as f32;
-                for d in depth.iter_mut() {
+                let sc = dvo::depth_ratio(rd, depth.m(), w, h, seq.k, &rr, &tt) as f32;
+                for d in depth.m().iter_mut() {
                     *d *= sc;
                 }
             }
@@ -1379,11 +1392,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 기준이 이미 더 새 장면(깊이 전파): 이번 진짜 깊이를 그 기준으로 옮겨 기준 깊이를 바꿈
                 if let (Some((rp, _)), Some((rk, pk))) = (dvo_prev.take(), dvo_ref_pose) {
                     let (rr, tt) = (mm(&tr(&rk), &r), mv(&tr(&rk), &sub(&p, &pk)));
-                    dvo_prev = Some((rp, dvo::warp_depth(&depth, w, h, seq.k, &rr, &tt)));
+                    dvo_prev = Some((rp, dvo::warp_depth(depth.m(), w, h, seq.k, &rr, &tt)));
                 }
             } else if !hok || moved || dvo_prev.is_none() {
                 dvo_ref_t = t;
-                dvo_prev = Some((dvo::pyramid(&rgb, w, h, dvo_levels, dvo_minlv), depth.clone()));
+                dvo_prev = Some((dvo::pyramid(&rgb, w, h, dvo_levels, dvo_minlv), depth.m().clone()));
                 dvo_ref_pose = Some((r, p));
             }
         } else if a.vo {
@@ -1402,13 +1415,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             vo_ok = false;
             if let (Some(f), Some(rf)) = (&feat, &vo_ref) {
                 let dl = a.depth != "kinect";
-                let (e, ms, rej) = vo_try(rf, f, &depth, w, seq.k, pred, (r, p), dl, vo_pose, dt);
+                let (e, ms, rej) = vo_try(rf, f, depth.m(), w, seq.k, pred, (r, p), dl, vo_pose, dt);
                 vo_reject += rej as u32;
                 (est, vo_ms) = (e, ms);
                 // 기준과 안 맞으면 바로 앞 장면(움직임이 작아 짝이 많다)과 한 번 더, 맞으면 그 장면을 새 기준으로
                 if est.is_none() {
                     if let Some(lf) = &vo_last {
-                        let (e, ms, rej) = vo_try(lf, f, &depth, w, seq.k, pred, (r, p), dl, vo_pose, dt);
+                        let (e, ms, rej) = vo_try(lf, f, depth.m(), w, seq.k, pred, (r, p), dl, vo_pose, dt);
                         vo_reject += rej as u32;
                         if e.is_some() {
                             (est, vo_ms) = (e, ms);
@@ -1429,9 +1442,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let dd = dt.max(0.03);
                     let i3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
                     let sane = |b: &(M3, V3, usize, f64, f64)| norm(&b.1) <= 0.05 + 2.0 * dd && rot_angle(&b.0, &i3) <= (10.0 + 180.0 * dd).to_radians();
-                    let b1 = dvo::track(pp, pd, &pyr, &depth, seq.k, id3, dvo_minlv);
+                    let b1 = dvo::track(pp, pd, &pyr, depth.m(), seq.k, id3, dvo_minlv);
                     // 실패했거나 불가능한 움직임으로 나왔을 때만 '직전 움직임'으로도 풀어 본다(밝기 오차로 둘을 견주면 사무실 15 장 간격 0.91 → 1.16 m 로 나빴다)
-                    let b2 = if dvo_dual && b1.as_ref().is_none_or(|b| !sane(b)) { dvo::track(pp, pd, &pyr, &depth, seq.k, dvo_rel, dvo_minlv) } else { None };
+                    let b2 = if dvo_dual && b1.as_ref().is_none_or(|b| !sane(b)) { dvo::track(pp, pd, &pyr, depth.m(), seq.k, dvo_rel, dvo_minlv) } else { None };
                     let any = b1.is_some() || b2.is_some();
                     let best = [b1, b2].into_iter().flatten().filter(|b| sane(b)).min_by(|x, y| x.3.partial_cmp(&y.3).unwrap());
                     if let Some((rr, tt, n, _, sc)) = best {
@@ -1440,7 +1453,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                         dvo_used = true;
                         vo_dvo += 1;
                         if a.depth != "kinect" {
-                            for d in depth.iter_mut() {
+                            for d in depth.m().iter_mut() {
                                 *d *= sc as f32;
                             }
                         }
@@ -1453,7 +1466,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 for &(i, j) in &vo_ms {
                     let Some((xw, _)) = rf.lm[i] else { continue };
                     let (u1, v1) = f.kp[j];
-                    let z1 = depth[v1 as usize * w + u1 as usize] as f64;
+                    let z1 = depth.at(v1 as usize * w + u1 as usize) as f64;
                     if z1 < 0.2 {
                         continue;
                     }
@@ -1464,7 +1477,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     }
                 }
                 if let Some(s) = depth_scale(&rs) {
-                    for d in depth.iter_mut() {
+                    for d in depth.m().iter_mut() {
                         *d *= s as f32;
                     }
                 }
@@ -1504,7 +1517,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let r1t = [0, 1, 2].map(|i| [0, 1, 2].map(|j| r1[j][i]));
                 dvo_rel = (mm(&r1t, &r0), mv(&r1t, &sub(&p0, &p1)));
             }
-            dvo_prev = Some((pyr, depth.clone()));
+            dvo_prev = Some((pyr, depth.m().clone()));
             dvo_ref_pose = vo_pose;
             dvo_ref_t = t;
             vo_last_t = Some(t);
@@ -1524,7 +1537,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             // 위치를 정답으로 받을 때만: 위치 추정(vo)과 함께 쓰면 서로의 배율을 끌어내려 무너진다
             let cur = scale::View { gray: scale::gray(&rgb), w, h, r, p };
             let prev = views.iter().rev().find(|v| norm(&sub(&v.p, &p)) >= 0.06).or(views.front());
-            if let Some((sm, _n)) = prev.and_then(|pv| scale::metric_scale(&cur, pv, seq.k, &depth)) {
+            if let Some((sm, _n)) = prev.and_then(|pv| scale::metric_scale(&cur, pv, seq.k, depth.m())) {
                 s_hist.push(sm.clamp(0.3, 3.0));
             }
             if !s_hist.is_empty() {
@@ -1536,7 +1549,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             if views.len() > 6 {
                 views.pop_front();
             }
-            for d in depth.iter_mut() {
+            for d in depth.m().iter_mut() {
                 *d *= s_fix as f32;
             }
         }
@@ -1566,7 +1579,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             continue;
                         }
                         track += 1;
-                        let z1 = depth[v1 as usize * w + u1 as usize] as f64;
+                        let z1 = depth.at(v1 as usize * w + u1 as usize) as f64;
                         if z1 < 0.2 || z1 > 6.0 || (zc - z1).abs() > 0.1 * zc || depth_edge(&depth, w, h, u1 as usize, v1 as usize) {
                             carry.push((j, *x0, *n));
                             continue;
@@ -1598,7 +1611,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     .kp
                     .iter()
                     .map(|&(u, v)| {
-                        let z = depth[v as usize * w + u as usize] as f64;
+                        let z = depth.at(v as usize * w + u as usize) as f64;
                         (z > 0.2 && z < 6.0 && !depth_edge(&depth, w, h, u as usize, v as usize))
                             .then(|| (add(&mv(&r, &[(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]), &p), 1.0))
                     })
@@ -1668,7 +1681,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
 
         // 바닥 높이: 화면 아래쪽 점이 카메라 아래로 얼마나 떨어졌나(95 %) → 카메라 높이, 짧게 평활
         let back = |u: usize, v: usize| -> Option<V3> {
-            let z = depth[v * w + u] as f64;
+            let z = depth.at(v * w + u) as f64;
             (z > 0.2 && z < 6.0).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
         };
         let mut below = vec![];
@@ -1973,7 +1986,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (i, (kf, r, pwc)) in snap.iter().enumerate() {
         let cd = Instant::now();
-        let (kd, kr) = (kf.depth(), kf.rgb());
+        let (kd, kr) = (Depth::M(kf.depth()), kf.rgb());
         t_dec += cd.elapsed().as_secs_f64();
         let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kf.dets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
         {
@@ -2019,7 +2032,7 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
         }
     }
     for (kf, r, pwc) in newer.iter() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, true, grid, mem, traj, map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets, true, grid, mem, traj, map_traj);
     }
     eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
@@ -2068,7 +2081,7 @@ impl PtsGrid {
 /// 깊이는 5×5 이웃 중 같은 면(Kinect 잡음 폭 안)의 평균으로 — 평면에서는 가운데 값과 같고
 /// 잡음은 이웃 수의 제곱근만큼 줄어 면이 얇아짐.
 /// part: Some(p) = 간격 PTS_SUB 배 격자의 p 번째 어긋남(점 1/PTS_SUB²) — 가까운 자리 장면이 돌아가며 모든 칸을 채움
-fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize, part: Option<usize>) -> PtsGrid {
+fn pts_grid(a: &Args, k: [f64; 4], depth: &Depth, rgb: &[u8], w: usize, h: usize, part: Option<usize>) -> PtsGrid {
     use rayon::prelude::*;
     let [fx, fy, cx, cy] = k;
     let maxd = a.max_depth.min(a.pts_depth);
@@ -2081,23 +2094,44 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
     let mut c = vec![0u8; gw * gh * 3];
     let ax: Vec<f64> = (0..w).map(|x| (x as f64 - cx) / fx).collect();
     let ay: Vec<f64> = (0..h).map(|y| (y as f64 - cy) / fy).collect();
-    out::par(|| d.par_chunks_mut(gw).zip(c.par_chunks_mut(gw * 3)).enumerate().for_each(|(gy, (dr, cr))| {
-        let v = off[1] + gy * step;
-        for gx in 0..gw {
-            let u = off[0] + gx * step;
-            let z = depth[v * w + u] as f64;
-            if !(z > 0.2 && z < 6.0) {
-                continue;
-            }
-            // 가장자리 2 화소 안은 facing 이 늘 거짓 → 이웃 창(5×5)을 범위 검사 없이 읽는 안쪽 판만 부름
-            if u < 2 || v < 2 || u + 2 >= w || v + 2 >= h {
-                continue;
-            }
-            let pc = [ax[u] * z, ay[v] * z, z];
-            if pc[2] < maxd && !depth_edge_in(depth, w, u, v) && facing(depth, w, h, &ax, &ay, u, v, &pc) {
-                dr[gx] = smooth_depth(depth, w, u, v);
-                let o = (v * w + u) * 3;
-                cr[gx * 3..gx * 3 + 3].copy_from_slice(&rgb[o..o + 3]);
+    // 격자 줄 G 개씩 한 일감. 깊이는 쓰는 줄만 미터로: 스트림 u16 은 일감마다 필요한 줄을 한 번 바꿔 담고(창이 겹치는 간격 < 5 면 줄 묶음 통째,
+    // 아니면 격자 줄마다 v−2 … v+2 다섯 줄), f32 면 그 자리 조각(복사 없음). 창 안에서 가운데 줄 = 2
+    const G: usize = 8;
+    out::par(|| d.par_chunks_mut(gw * G).zip(c.par_chunks_mut(gw * 3 * G)).enumerate().for_each_init(|| (Vec::new(), Vec::new()), |(b1, b2), (ci, (dc, cc))| {
+        // 가장자리 2 화소 안은 facing 이 늘 거짓 → 창(5×5)이 온전한 줄(2 ≤ v < h−2)만, 이웃 창을 범위 검사 없이 읽는 안쪽 판만 부름
+        let (mut lo, mut hi) = (ci * G, ci * G + dc.len() / gw);
+        while lo < hi && off[1] + lo * step < 2 {
+            lo += 1;
+        }
+        while hi > lo && off[1] + (hi - 1) * step + 2 >= h {
+            hi -= 1;
+        }
+        if lo == hi {
+            return;
+        }
+        let span = step < 5;
+        let ylo = off[1] + lo * step - 2;
+        let blk: &[f32] = if span { depth.rows(ylo, off[1] + (hi - 1) * step + 3 - ylo, w, b1) } else { &[] };
+        for gy in lo..hi {
+            let v = off[1] + gy * step;
+            let win: &[f32] = if span { &blk[(v - 2 - ylo) * w..(v + 3 - ylo) * w] } else { depth.rows(v - 2, 5, w, b2) };
+            let (dr, cr) = (&mut dc[(gy - ci * G) * gw..][..gw], &mut cc[(gy - ci * G) * gw * 3..][..gw * 3]);
+            let ayw = &ay[v - 2..v + 3];
+            for gx in 0..gw {
+                let u = off[0] + gx * step;
+                let z = win[2 * w + u] as f64;
+                if !(z > 0.2 && z < 6.0) {
+                    continue;
+                }
+                if u < 2 || u + 2 >= w {
+                    continue;
+                }
+                let pc = [ax[u] * z, ay[v] * z, z];
+                if pc[2] < maxd && !depth_edge_in(win, w, u, 2) && facing(win, w, 5, &ax, ayw, u, 2, &pc) {
+                    dr[gx] = smooth_depth(win, w, u, 2);
+                    let o = (v * w + u) * 3;
+                    cr[gx * 3..gx * 3 + 3].copy_from_slice(&rgb[o..o + 3]);
+                }
             }
         }
     }));
@@ -2141,11 +2175,21 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, scene: &mut SceneMap,
     }
 }
 
+/// 다 쓴 장면 컬러·깊이 버퍼를 카메라 입력(rsdriver)에 돌려줌(카메라 입력이 아니면 그냥 버림)
+fn give_back(rgb: Vec<u8>, depth: Depth) {
+    if slam::bufpool::enabled() {
+        slam::bufpool::give_rgb(rgb);
+        if let Some(d) = depth.into_raw() {
+            slam::bufpool::give_depth(d);
+        }
+    }
+}
+
 enum PtsMsg {
     /// 실시간 장면: 점을 고르고(보관 장면이면 점 격자를 압축해 붙임) 지도에 넣음
-    Frame { kf: u32, r: M3, pwc: V3, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, part: Option<usize> },
+    Frame { kf: u32, r: M3, pwc: V3, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, part: Option<usize> },
     /// 맡아 둘 장면: 점 격자만 만들어 붙임(지도에는 이어진 뒤 다시 쌓기가 넣음)
-    Hold { depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf> },
+    Hold { depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf> },
     /// 보관 장면(다시 쌓은 뒤 이어 넣기): 붙여 둔 점 격자로
     Stored { kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf> },
     /// 노드 파일 쓰기(점 수 상한, 0 = 모두), 다 쓰면 알림(기다리는 모드)
@@ -2188,6 +2232,7 @@ impl PtsWorker {
                     PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep, part } => {
                         let c0 = Instant::now();
                         let g = pts_grid(&a, k, &depth, &rgb, w, h, part);
+                        give_back(rgb, depth);
                         if let Some(s) = keep {
                             let _ = s.pts.set(Some(g.pack()));
                         }
@@ -2200,6 +2245,7 @@ impl PtsWorker {
                     PtsMsg::Hold { depth, rgb, w, h, keep } => {
                         let c0 = Instant::now();
                         let _ = keep.pts.set(Some(pts_grid(&a, k, &depth, &rgb, w, h, None).pack()));
+                        give_back(rgb, depth);
                         out::slow(c0);
                         q2.fetch_sub(1, Relaxed);
                     }
@@ -2239,7 +2285,7 @@ impl PtsWorker {
     /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게.
     /// 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면은 점 격자 일부만(어긋남을 돌려 가며) 넣음: 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
     #[allow(clippy::too_many_arguments)]
-    fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, thin: bool) {
+    fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, thin: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
@@ -2260,7 +2306,7 @@ impl PtsWorker {
         self.send(PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep, part });
     }
     /// 맡아 둘 장면: 점 격자만 만들어 붙이게 넘김(밀렸으면 빈 점 격자로 표시)
-    fn hold(&mut self, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
+    fn hold(&mut self, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
@@ -2367,13 +2413,13 @@ fn fresh_outputs(run_id: &mut u64, vox: f64, pw: Option<&PtsWorker>) -> serde_js
 /// 한 장면을 지도(점유 격자)·물체·지나온 길에 넣는다. 실시간 장면과 루프 클로저 뒤 다시 쌓기가 같이 쓴다.
 /// r, pwc: 카메라 → 지도(바닥 높이 맞춘 뒤), floor_z: 이 장면의 바닥 높이. 돌려줌: (지도 끝, 물체 끝) 시각
 #[allow(clippy::too_many_arguments)]
-fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, depth: &[f32], rgb: &[u8], w: usize, h: usize, dets: &Option<Vec<seg::Det>>,
+fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, depth: &Depth, rgb: &[u8], w: usize, h: usize, dets: &Option<Vec<seg::Det>>,
              map_ok: bool, grid: &mut Grid, mem: &mut Memory,
              traj: &mut Vec<(f64, [f64; 3])>, map_traj: &mut Vec<(f64, V3, M3)>) -> (Instant, Instant) {
     let (r, pwc) = (*r_, *pwc_);
     let [fx, fy, cx, cy] = k;
     let back = |u: usize, v: usize| -> Option<V3> {
-        let z = depth[v * w + u] as f64;
+        let z = depth.at(v * w + u) as f64;
         (z > 0.2 && z < 6.0).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
     };
     let to_w = |pc: &V3| add(&mv(&r, pc), &pwc);
@@ -2419,9 +2465,9 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
         // 한 번 훑어 깊이 있는 화소 자리를 모아 두고(마스크·깊이를 두 번 읽지 않게) 그 간격으로 고름
         valid.clear();
         for yy in 0..bh {
-            let (mr, dr) = (&m[yy * bw..(yy + 1) * bw], &depth[(y1 + yy) * w + x1..(y1 + yy) * w + x1 + bw]);
+            let (mr, o0) = (&m[yy * bw..(yy + 1) * bw], (y1 + yy) * w + x1);
             for xx in 0..bw {
-                if mr[xx] && dr[xx] as f64 > 0.2 {
+                if mr[xx] && depth.at(o0 + xx) as f64 > 0.2 {
                     valid.push(((y1 + yy) * w + x1 + xx) as u32);
                 }
             }
@@ -2433,7 +2479,7 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
         let step = (cnt / 2500).max(1);
         let pix: Vec<(usize, usize, f64)> = valid.iter().step_by(step).map(|&o| {
             let o = o as usize;
-            (o % w, o / w, depth[o] as f64)
+            (o % w, o / w, depth.at(o) as f64)
         }).collect();
         let mut zs: Vec<f64> = pix.iter().map(|q| q.2).collect();
         let mid = zs.len() / 2;
@@ -2460,7 +2506,7 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
                 let o = ((y1 + yy) * w + x1) * 3;
                 crgb.extend_from_slice(&rgb[o..o + bw * 3]);
                 for xx in 0..bw {
-                    cdep.push((depth[(y1 + yy) * w + x1 + xx] * 1000.0).clamp(0.0, 65535.0) as u16);
+                    cdep.push((depth.at((y1 + yy) * w + x1 + xx) * 1000.0).clamp(0.0, 65535.0) as u16);
                 }
             }
             Crop { w: bw as u32, h: bh as u32, rgb: crgb.into(), mask: std::sync::Arc::new(m.iter().map(|&b| if b { 255 } else { 0 }).collect()), depth: cdep.into() }
@@ -2588,11 +2634,11 @@ fn facing(d: &[f32], w: usize, h: usize, ax: &[f64], ay: &[f64], u: usize, v: us
 }
 
 /// 점 주변 5×5 깊이가 8 % 넘게 들쭉날쭉하면 경계
-fn depth_edge(d: &[f32], w: usize, h: usize, u: usize, v: usize) -> bool {
+fn depth_edge(d: &Depth, w: usize, h: usize, u: usize, v: usize) -> bool {
     let (mut lo, mut hi) = (f32::MAX, 0f32);
     for y in v.saturating_sub(2)..(v + 3).min(h) {
         for x in u.saturating_sub(2)..(u + 3).min(w) {
-            let z = d[y * w + x];
+            let z = d.at(y * w + x);
             lo = lo.min(z);
             hi = hi.max(z);
         }
@@ -2795,7 +2841,7 @@ const CATCH_UP_MAX: usize = 3;
 fn catch_up(a: &Args, k: [f64; 4], rb: &mut Rebuilt, newer: Snap) {
     let c0 = Instant::now();
     for (kf, r, pwc) in newer.iter() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kf.depth(), &kf.rgb(), kf.w, kf.h, &kf.dets, true, &mut rb.grid, &mut rb.mem, &mut rb.traj, &mut rb.map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets, true, &mut rb.grid, &mut rb.mem, &mut rb.traj, &mut rb.map_traj);
         rb.last_seq = kf.seq;
     }
     rb.secs += c0.elapsed().as_secs_f64();

@@ -21,13 +21,24 @@ pub struct Kf {
     pub h_cam: f64, // 카메라 높이(바닥 위): 다시 쌓을 때 바닥 높이 = 카메라 z − h_cam
     pub w: usize,
     pub h: usize,
-    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 비어 있음)
-    depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4(줄인 보관이면 4 화소 간격)
-    crops: Vec<Crop>, // 줄인 보관: 검출 상자 안 컬러·깊이
+    /// 압축한 컬러·깊이: 장면을 받는 점 작업 스레드가 채움([`Kf::fill`]). 읽는 쪽(다시 쌓기)은 채워질 때까지 기다림
+    z: std::sync::OnceLock<KfZ>,
     sparse: bool,
     dets: Option<Vec<DetZ>>,
     /// 점 지도에 넣은 점(거른 뒤 --scene-step 간격 격자의 깊이 mm·색, LZ4): 점 작업 스레드가 채움 → 다시 쌓기는 온 장면 없이 이것만 읽는다
     pub pts: std::sync::OnceLock<Option<PtsZ>>,
+}
+
+struct KfZ {
+    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 비어 있음)
+    depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4(줄인 보관이면 4 화소 간격)
+    crops: Vec<Crop>, // 줄인 보관: 검출 상자 안 컬러·깊이
+}
+
+impl KfZ {
+    fn bytes(&self) -> usize {
+        self.rgb_z.len() + self.depth_z.len() + self.crops.iter().map(|c| c.rgb_z.len() + c.depth_z.len()).sum::<usize>()
+    }
 }
 
 /// 점 격자 압축본: gw×gh(장면 화소 off + step 간격), 깊이 0 = 점 없음
@@ -88,10 +99,10 @@ const Q: usize = 4; // 줄인 보관의 깊이 화소 간격
 impl Kf {
     pub fn depth(&self) -> Vec<f32> {
         if !self.sparse {
-            return unpack_depth(&self.depth_z, self.w, self.h).iter().map(|&v| v as f32 * 1e-3).collect();
+            return unpack_depth(&self.z().depth_z, self.w, self.h).iter().map(|&v| v as f32 * 1e-3).collect();
         }
         let (qw, qh) = (self.w.div_ceil(Q), self.h.div_ceil(Q));
-        let q = unpack_depth(&self.depth_z, qw, qh);
+        let q = unpack_depth(&self.z().depth_z, qw, qh);
         // 4 화소 간격 깊이를 늘려 채움: 줄마다 Q 칸씩 같은 값을 채우고, 같은 줄 묶음의 나머지 줄은 첫 줄을 복사
         // (화소마다 나눗셈 두 번 하던 것과 같은 값, 다시 쌓기 풀기 시간의 대부분이었음)
         let w = self.w;
@@ -108,7 +119,7 @@ impl Kf {
                 d.copy_within(src..src + w, y * w);
             }
         }
-        for c in &self.crops {
+        for c in &self.z().crops {
             let z = unpack_depth(&c.depth_z, c.w, c.h);
             for y in 0..c.h {
                 for x in 0..c.w {
@@ -124,10 +135,10 @@ impl Kf {
     }
     pub fn rgb(&self) -> Vec<u8> {
         if !self.sparse {
-            return unpack_rgb(&self.rgb_z, self.w, self.h);
+            return unpack_rgb(&self.z().rgb_z, self.w, self.h);
         }
         let mut rgb = vec![0u8; self.w * self.h * 3];
-        for c in &self.crops {
+        for c in &self.z().crops {
             let z = unpack_rgb(&c.rgb_z, c.w, c.h);
             for y in 0..c.h {
                 let o = ((c.y + y) * self.w + c.x) * 3;
@@ -136,10 +147,44 @@ impl Kf {
         }
         rgb
     }
-    fn bytes(&self) -> usize {
-        self.rgb_z.len() + self.depth_z.len() + self.crops.iter().map(|c| c.rgb_z.len() + c.depth_z.len()).sum::<usize>()
-            + self.dets.iter().flatten().map(|d| d.bits.len()).sum::<usize>()
-            + self.pts.get().and_then(|p| p.as_ref()).map_or(0, |p| p.bytes())
+    /// 압축본(채워질 때까지 기다림)
+    fn z(&self) -> &KfZ {
+        self.z.wait()
+    }
+    /// 보관 바이트: 아직 압축 전이면 None
+    fn bytes(&self) -> Option<usize> {
+        Some(self.z.get()?.bytes() + self.dets.iter().flatten().map(|d| d.bits.len()).sum::<usize>()
+            + self.pts.get().and_then(|p| p.as_ref()).map_or(0, |p| p.bytes()))
+    }
+    /// 압축 전 장면의 바이트 위쪽 한계(LZ4 는 입력보다 조금 커질 수 있음: 넉넉히 두 배)
+    fn bound(&self) -> usize {
+        2 * self.w * self.h * (3 + 2 + 5) + 4096
+    }
+    /// 받은 컬러·깊이를 압축해 채움(점 작업 스레드, 밀려 건너뛰는 장면이면 본 스레드). 한 번만
+    pub fn fill(&self, rgb: &[u8], depth: &crate::depth::Depth) {
+        let (w, h) = (self.w, self.h);
+        let z = if self.sparse {
+            let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
+            let q: Vec<u16> = (0..qw * qh).map(|i| depth.mm_round((i / qw) * Q * w + (i % qw) * Q)).collect();
+            let crops = self.dets.iter().flatten().filter_map(|d| {
+                let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
+                let (x2, y2) = (x2.min(w), y2.min(h));
+                (x2 > x1 && y2 > y1).then(|| {
+                    let (cw, ch) = (x2 - x1, y2 - y1);
+                    let mut cr = Vec::with_capacity(cw * ch * 3);
+                    let mut cd = Vec::with_capacity(cw * ch);
+                    for y in y1..y2 {
+                        cr.extend_from_slice(&rgb[(y * w + x1) * 3..(y * w + x2) * 3]);
+                        cd.extend((y * w + x1..y * w + x2).map(|i| depth.mm_round(i)));
+                    }
+                    Crop { x: x1, y: y1, w: cw, h: ch, rgb_z: pack_rgb(&cr, cw, ch), depth_z: pack_depth(&cd, cw, ch) }
+                })
+            }).collect();
+            KfZ { rgb_z: vec![], depth_z: pack_depth(&q, qw, qh), crops }
+        } else {
+            KfZ { rgb_z: pack_rgb(rgb, w, h), depth_z: pack_depth_it((0..w * h).map(|i| depth.mm_round(i)), w, h), crops: vec![] }
+        };
+        let _ = self.z.set(z);
     }
 }
 
@@ -194,9 +239,35 @@ impl KfStore {
         self.kfs.len()
     }
 
-    /// 보관한 장면 바이트(압축 뒤)
-    pub fn bytes(&self) -> usize {
+    /// 보관한 장면 바이트(압축 뒤, 압축이 끝날 때까지 기다림)
+    pub fn bytes(&mut self) -> usize {
+        self.settle(true);
         self.bytes
+    }
+
+    /// 예산 맞추기: 압축이 덜 끝난 장면은 위쪽 한계로 어림해 예산 안이면 기다리지 않고, 넘을 수 있으면 압축을 기다려 정확히 센 뒤
+    /// 예산을 넘으면 하나 걸러 버리고 앞으로도 두 배 간격으로 보관한다. 보관 목록을 보는 곳(보관 · 그래프 · 다시 쌓기 시작 · 끝) 앞에서 부른다
+    pub fn settle(&mut self, exact: bool) {
+        let est: usize = self.kfs.iter().map(|k| k.bytes().unwrap_or_else(|| k.bound())).sum();
+        if !exact && est <= self.budget {
+            return;
+        }
+        self.bytes = self.kfs.iter().map(|k| {
+            k.z.wait();
+            k.bytes().unwrap()
+        }).sum(); // 점 격자는 점 작업 스레드가 나중에 채우니 매번 다시 셈
+        while self.bytes > self.budget && self.kfs.len() > 2 {
+            let old = std::mem::take(&mut self.kfs);
+            self.bytes = 0;
+            for (i, k) in old.into_iter().enumerate() {
+                if i % 2 == 0 {
+                    self.bytes += k.bytes().unwrap();
+                    self.kfs.push(k);
+                }
+            }
+            self.stride *= 2;
+            common::info!("장면 보관: 예산 {} MB 넘음 → {} 장만 남기고 {} 장마다 보관", self.budget >> 20, self.kfs.len(), self.stride);
+        }
     }
 
     /// 그래프 블록: 새 노드는 더하고, 있던 노드가 문턱 넘게 움직였으면 다시 쌓기 표시.
@@ -239,9 +310,11 @@ impl KfStore {
         (n - w, w)
     }
 
-    /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음)
+    /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음).
+    /// 컬러·깊이 압축은 [`Kf::fill`] 로 따로(점 작업 스레드): 여기서는 위치·검출만 담아 바로 돌려준다
     #[allow(clippy::too_many_arguments)]
-    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &crate::depth::Depth, dets: Option<Vec<Det>>, sparse: bool) -> Option<Arc<Kf>> {
+    pub fn push_lazy(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, dets: Option<Vec<Det>>, sparse: bool) -> Option<Arc<Kf>> {
+        self.settle(false);
         self.count += 1;
         if (self.count - 1) % self.stride != 0 {
             return None;
@@ -257,48 +330,22 @@ impl KfStore {
                 return None;
             }
         }
-        let (rgb_z, depth_z, crops) = if sparse {
-            let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
-            let q: Vec<u16> = (0..qw * qh).map(|i| depth.mm_round((i / qw) * Q * w + (i % qw) * Q)).collect();
-            let crops = dets.iter().flatten().filter_map(|d| {
-                let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
-                let (x2, y2) = (x2.min(w), y2.min(h));
-                (x2 > x1 && y2 > y1).then(|| {
-                    let (cw, ch) = (x2 - x1, y2 - y1);
-                    let mut cr = Vec::with_capacity(cw * ch * 3);
-                    let mut cd = Vec::with_capacity(cw * ch);
-                    for y in y1..y2 {
-                        cr.extend_from_slice(&rgb[(y * w + x1) * 3..(y * w + x2) * 3]);
-                        cd.extend((y * w + x1..y * w + x2).map(|i| depth.mm_round(i)));
-                    }
-                    Crop { x: x1, y: y1, w: cw, h: ch, rgb_z: pack_rgb(&cr, cw, ch), depth_z: pack_depth(&cd, cw, ch) }
-                })
-            }).collect();
-            (vec![], pack_depth(&q, qw, qh), crops)
-        } else {
-            (pack_rgb(rgb, w, h), pack_depth_it((0..w * h).map(|i| depth.mm_round(i)), w, h), vec![])
-        };
-        let kf = Kf {
-            seq: self.count as u64, held: self.held.contains(&anchor), t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
+        let kf = Arc::new(Kf {
+            seq: self.count as u64, held: self.held.contains(&anchor), t, anchor, rel, raw: (r, p), h_cam, w, h, z: Default::default(), sparse,
             dets: dets.map(|v| v.iter().map(DetZ::pack).collect()), // 장면의 검출은 여기서 끝: 비트로 묶어 보관
             pts: Default::default(),
-        };
-        let kf = Arc::new(kf);
+        });
         self.kfs.push(kf.clone());
-        self.bytes = self.kfs.iter().map(|k| k.bytes()).sum(); // 점 격자는 점 작업 스레드가 나중에 채우니 매번 다시 셈
-        // 예산을 넘으면 하나 걸러 버리고 앞으로도 두 배 간격으로 보관
-        while self.bytes > self.budget && self.kfs.len() > 2 {
-            let old = std::mem::take(&mut self.kfs);
-            self.bytes = 0;
-            for (i, k) in old.into_iter().enumerate() {
-                if i % 2 == 0 {
-                    self.bytes += k.bytes();
-                    self.kfs.push(k);
-                }
-            }
-            self.stride *= 2;
-            common::info!("장면 보관: 예산 {} MB 넘음 → {} 장만 남기고 {} 장마다 보관", self.budget >> 20, self.kfs.len(), self.stride);
-        }
+        Some(kf)
+    }
+
+    /// 보관 + 바로 압축(시험)
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &crate::depth::Depth, dets: Option<Vec<Det>>, sparse: bool) -> Option<Arc<Kf>> {
+        let kf = self.push_lazy(t, anchor, r, p, h_cam, w, h, dets, sparse)?;
+        kf.fill(rgb, depth);
+        self.settle(false);
         self.kfs.last().filter(|k| Arc::ptr_eq(k, &kf)).cloned()
     }
 
@@ -516,7 +563,7 @@ mod tests {
         st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &vec![0; w * h * 3], &crate::depth::Depth::M(d.clone()), None, true);
         let kf = &st.kfs()[0];
         let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
-        let q = unpack_depth(&kf.depth_z, qw, qh);
+        let q = unpack_depth(&kf.z().depth_z, qw, qh);
         let old: Vec<f32> = (0..w * h).map(|i| q[(i / w / Q) * qw + (i % w) / Q] as f32 * 1e-3).collect();
         assert_eq!(kf.depth().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), old.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     }

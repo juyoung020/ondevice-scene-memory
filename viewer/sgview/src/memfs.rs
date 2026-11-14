@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 static ON: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +32,7 @@ pub fn publish(p: &Path, bytes: Arc<Vec<u8>>) {
     if let Some(m) = FILES.lock().unwrap().as_mut() {
         m.insert(key(p), (ver, bytes));
     }
+    bump();
 }
 
 /// 파일 하나를 내림
@@ -63,6 +64,33 @@ pub fn read(p: &Path) -> Option<Arc<Vec<u8>>> {
         Some((_, b)) => Some(b),
         None => std::fs::read(p).ok().map(Arc::new),
     }
+}
+
+/// 판이 바뀔 때마다 늘어나는 번호(파일 걸기 · 지우기 · view 판 걸기): /stream 은 이것을 기다렸다 바뀐 것만 보낸다
+static CHANGE: Mutex<u64> = Mutex::new(0);
+static CHANGED: Condvar = Condvar::new();
+
+pub fn bump() {
+    *CHANGE.lock().unwrap() += 1;
+    CHANGED.notify_all();
+}
+
+/// 번호가 seen 과 달라질 때까지(최대 timeout) 기다려 지금 번호를 돌려줌
+pub fn wait_change(seen: u64, timeout: std::time::Duration) -> u64 {
+    let g = CHANGE.lock().unwrap();
+    let (g, _) = CHANGED.wait_timeout_while(g, timeout, |c| *c == seen).unwrap();
+    *g
+}
+
+/// 폴더 아래 걸린 파일 경로(기억 폴더를 디스크 대신 메모리에 둘 때 목록 보기)
+pub fn list(dir: &Path) -> Vec<PathBuf> {
+    let k = key(dir);
+    FILES.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.keys().filter(|q| q.starts_with(&k)).cloned().collect())
+}
+
+/// 걸린 파일 전부(디스크에 저장할 때)
+pub fn all() -> Vec<(PathBuf, Arc<Vec<u8>>)> {
+    FILES.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.iter().map(|(p, (_, b))| (p.clone(), b.clone())).collect())
 }
 
 #[cfg(test)]

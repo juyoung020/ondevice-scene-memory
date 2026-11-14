@@ -11,7 +11,7 @@ RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librea
 
 # 실시간: D435 → 위치 추적 → 물체 기억(NPU 분할) → 뷰어(:8091), 한 프로세스
 M=~/dx-all-suite_my/workspace/res/models
-target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
+target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
     --every 1 --live 1 --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 ```
 

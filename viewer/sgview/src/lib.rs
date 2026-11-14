@@ -9,27 +9,32 @@
 //! GET /                      the page
 //! GET /api/view?v=<ver>      {"v": ver, "map_v": ver, "view": <view.json>} or {"unchanged": true} (poll; ver = mtime+size)
 //! GET /api/map[?since=<ver>] PGM pixels (row 0 = max y); with since only the changed rows (X-Y0/X-Y1/X-Full)
-//! GET /api/level             the camera is level now: turn the map so the current camera pose is horizontal (writes level.req)
-//! GET /api/reset             ask the running pipeline to start over (writes reset.req in the memory dir)
+//! GET /api/level             the camera is level now: turn the map so the current camera pose is horizontal
+//! GET /api/reset             ask the running pipeline to start over
+//! GET /api/save              write the in-memory memory dir to disk now (`ondevice --serve`)
+//!                            (one program: common::control flags; a separate viewer leaves level.req / reset.req in the dir)
 //! GET /api/walls?x=&y=&yaw=  {"segments": [[ax,ay,bx,by]..], "state": [56 floats], "pose": [x,y,yaw]}
 //! GET /api/depth?path=<rel>  16-bit grey PNG → u16 little-endian pixels (X-W / X-H)
 //! GET /file/<relative path>  any file below the memory dir (PNG crops, PLY points)
 //! GET /api/search?q=<text>   objects ranked against the text (see search.rs); optional k (20) and min score (0.2)
 //! GET /api/files?p=a,b,..   many files below the memory dir in one reply (see pack_files)
-//! GET /stream               SSE: live stream (--ingest), else folder events vv (view.json version) / fpose (pose.json)
+//! GET /stream               SSE: vv (view version) / fpose (pose.json), pushed when they change
+//!
+//! In one program (`ondevice --serve`) the view comes from [`live`] (structure handed over by the pipeline, JSON built on
+//! request) and every other file from [`memfs`]; a separate viewer reads the folder.
+pub mod live;
 pub mod memfs;
 mod search;
 mod walls;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const THREE_JS: &[u8] = include_bytes!("../assets/three.min.js");
@@ -132,33 +137,18 @@ const MAP_HIST: usize = 8;
 struct State {
     dir: PathBuf,
     walls: Mutex<Option<Arc<WallMap>>>,
-    view: Mutex<(String, Arc<String>)>,   // view.json text by version: several clients/polls read the file once
+    view: Mutex<Option<Arc<live::View>>>, // view.json read from the folder, by version (a separate viewer)
     maps: Mutex<MapHist>,
-    live_mode: bool,                      // --ingest: the C++ side streams here, no files
-    live: Mutex<Live>,
-    clients: Mutex<Vec<SyncSender<Arc<String>>>>,
+    streams: Mutex<Vec<StreamClient>>,    // open /stream pages (one thread pushes to all of them)
     #[cfg(feature = "search")]
     text_enc: std::sync::OnceLock<search::TextEnc>, // --search-model: set once the model is loaded (search is by the letters of the name until then)
 }
 
-/// Live state fed by the C++ stream (scenemap/stream.hpp): the grid, the latest summary and pose, and the wall segments derived from them.
-struct Live {
-    w: i32,
-    h: i32,
-    res: f64,
-    ox: f64,
-    oy: f64,
-    cells: Vec<i8>,          // scenemap layout (row 0 = min y)
-    view: Option<Arc<String>>,
-    pose: Option<[f64; 4]>,
-    joints: Option<String>,  // last joints event (SSE text), resent to new pages
-    ig: Vec<f64>,            // furniture footprints from the summary
-    segs: Vec<f64>,
-    theta: f64,              // wall direction of the grid [rad], with the segments
-    seg_ver: u64,            // bumps when the segments actually change
-    seg_sent: u64,           // version last broadcast
-    segs_dirty: bool,
-    last_walls: Instant,
+/// An open /stream page and the versions it was last sent
+struct StreamClient {
+    s: TcpStream,
+    vv: String,
+    pv: String,
 }
 
 /// 파일 바이트: memmap 이 같은 프로세스에서 걸어 둔 것(memfs)이 있으면 그것, 아니면 디스크
@@ -191,10 +181,18 @@ fn file_ver(p: &Path) -> Option<String> {
     Some(format!("{}-{}", t, m.len()))
 }
 
+/// map.pgm pixels: the file bytes shared as they are (no copy), pixels from `off`
 pub struct Pgm {
     w: usize,
     h: usize,
-    px: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
+    off: usize,
+}
+
+impl Pgm {
+    fn px(&self) -> &[u8] {
+        &self.bytes[self.off..self.off + self.w * self.h]
+    }
 }
 
 fn read_pgm(p: &Path) -> Option<Pgm> {
@@ -228,7 +226,7 @@ fn read_pgm(p: &Path) -> Option<Pgm> {
     if b.len() < i + w * h {
         return None;
     }
-    Some(Pgm { w, h, px: b[i..i + w * h].to_vec() })
+    Some(Pgm { w, h, bytes: b, off: i })
 }
 
 /// resolution and origin (x, y) of a ROS map.yaml
@@ -251,35 +249,36 @@ fn read_yaml(p: &Path) -> (f64, f64, f64) {
     (res, ox, oy)
 }
 
-/// view.json text of the current version (cached; `None` while the file is missing or mid-write).
-fn load_view(st: &State) -> Option<(String, Arc<String>)> {
+/// The current view: the one the pipeline in this process handed over, else view.json from the folder
+/// (cached by version; `None` while the file is missing or mid-write).
+fn load_view(st: &State) -> Option<Arc<live::View>> {
+    if let Some(v) = live::current() {
+        return Some(v);
+    }
     let vp = st.dir.join("view.json");
     let ver = file_ver(&vp)?;
     let mut c = st.view.lock().unwrap();
-    if c.0 != ver {
-        let t = read_text(&vp)?;
-        if !(t.trim_start().starts_with('{') && t.trim_end().ends_with('}')) {
+    if c.as_ref().is_none_or(|v| v.ver != ver) {
+        let b = read_file(&vp)?;
+        let t = b.trim_ascii();
+        if !(t.starts_with(b"{") && t.ends_with(b"}")) {
             return None;
         }
-        *c = (ver, Arc::new(t));
+        *c = Some(Arc::new(live::View::file(ver, b)));
     }
-    Some((c.0.clone(), c.1.clone()))
+    c.clone()
 }
 
-/// Footprints (x0 y0 x1 y1) of free-standing objects from view.json: bottom below 0.4 m, not room-sized, not gone, +0.1 m.
+/// Footprints (x0 y0 x1 y1) of free-standing objects from the view: bottom below 0.4 m, not room-sized, not gone, +0.1 m.
 /// Their occupied cells are furniture (sofa, table …), not walls. Wall-mounted things (frames, lamps) start higher and are left alone.
 fn furniture_rects(st: &State) -> Vec<f64> {
-    match load_view(st) {
-        Some((_, t)) => furniture_rects_of(&t),
+    match load_view(st).as_ref().and_then(|v| v.doc()) {
+        Some(v) => furniture_rects_of(v),
         None => Vec::new(),
     }
 }
 
-fn furniture_rects_of(text: &str) -> Vec<f64> {
-    let v: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+fn furniture_rects_of(v: &serde_json::Value) -> Vec<f64> {
     let mut out = Vec::new();
     for o in v["objects"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         if o["state"] == "gone" {
@@ -342,7 +341,7 @@ fn wall_map(st: &State) -> Option<Arc<WallMap>> {
     // PGM: row 0 = max y, grey ≤ 90 occupied, 205 unknown, else free  →  scenemap layout (row 0 = min y)
     let mut cells = vec![0i8; w * h];
     for y in 0..h {
-        let src = &pgm.px[(h - 1 - y) * w..(h - y) * w];
+        let src = &pgm.px()[(h - 1 - y) * w..(h - y) * w];
         let dst = &mut cells[y * w..(y + 1) * w];
         for x in 0..w {
             dst[x] = if src[x] <= 90 { 100 } else if src[x] == 205 { -1 } else { 0 };
@@ -380,7 +379,7 @@ fn changed_rows(old: &Pgm, new: &Pgm) -> Option<(usize, usize)> {
     let mut first = None;
     let mut last = 0;
     for y in 0..new.h {
-        if old.px[y * w..(y + 1) * w] != new.px[y * w..(y + 1) * w] {
+        if old.px()[y * w..(y + 1) * w] != new.px()[y * w..(y + 1) * w] {
             if first.is_none() {
                 first = Some(y);
             }
@@ -587,10 +586,10 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// One connection: HTTP/1.1 keep-alive, so the page's requests (view on change, batched point files, object files) at
-/// load reuse one socket and one thread instead of a TCP handshake + thread spawn per request. Idle connections close after 15 s.
+/// load reuse one socket and one thread instead of a TCP handshake + thread spawn per request. Idle connections close after 5 s (a pool thread serves one connection at a time).
 fn handle(s: TcpStream, st: Arc<State>) {
     let mut s = s;
-    let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let mut rd = BufReader::new(s.try_clone().unwrap());
     loop {
         let mut line = String::new();
@@ -647,29 +646,38 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         },
         "/OrbitControls.js" => respond_static(&mut s, "application/javascript", ORBIT_JS),
         "/favicon.ico" => respond(&mut s, 204, "image/x-icon", "", b""),
-        // Reset button: leave a request file in the memory dir; rtab_bridge (--reset-file) picks it up, restarts tracking and tells memmap to start an empty map
-        "/api/reset" => match std::fs::write(st.dir.join("reset.req"), b"") {
-            Ok(()) => respond(&mut s, 200, "application/json", "", b"{\"ok\":true}"),
-            Err(e) => respond(&mut s, 500, "text/plain", "", e.to_string().as_bytes()),
-        },
-        // Level button: the camera is held level now. Leave level.req for memmap, which takes the current camera pose as horizontal and re-stacks the map it has with that rotation
-        "/api/level" => match std::fs::write(st.dir.join("level.req"), b"") {
-            Ok(()) => respond(&mut s, 200, "application/json", "", b"{\"ok\":true}"),
-            Err(e) => respond(&mut s, 500, "text/plain", "", e.to_string().as_bytes()),
-        },
+        // Buttons: in one program (ondevice --serve) a shared flag the pipeline / tracker read every frame;
+        // a separate viewer leaves a request file in the memory dir (slam --reset-file, memmap level.req)
+        "/api/reset" => signal(&mut s, &st.dir, "reset.req", common::control::request_reset),
+        // Level button: the camera is held level now; the pipeline takes the current camera pose as horizontal and re-stacks the map with that rotation
+        "/api/level" => signal(&mut s, &st.dir, "level.req", common::control::request_level),
+        // Save button: write the in-memory memory dir to disk now (one program only)
+        "/api/save" => {
+            if common::control::wired() {
+                common::control::request_save();
+                respond(&mut s, 200, "application/json", "", b"{\"ok\":true}")
+            } else {
+                respond(&mut s, 200, "application/json", "", b"{\"ok\":false,\"why\":\"the folder is on disk already\"}")
+            }
+        }
         "/api/search" => {
-            let Some((_, text)) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") };
-            let Ok(view) = serde_json::from_str::<serde_json::Value>(&text) else { return respond(&mut s, 500, "text/plain", "", b"view.json") };
+            let Some(v) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") };
+            let Some(view) = v.doc() else { return respond(&mut s, 500, "text/plain", "", b"view.json") };
             #[cfg(feature = "search")]
             let enc = |t: &str| st.text_enc.get().and_then(|e| e.encode(t).map_err(|e| eprintln!("search: {e}")).ok());
             #[cfg(not(feature = "search"))]
             let enc = |_: &str| None;
             let k = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(20);
             let min = q.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.2);
-            let body = search::search(&st.dir, &view, q.get("q").map_or("", |v| v.as_str()), &enc, k, min).to_string();
+            let body = search::search(&st.dir, view, q.get("q").map_or("", |v| v.as_str()), &enc, k, min).to_string();
             respond(&mut s, 200, "application/json", "", body.as_bytes())
         }
-        "/api/mode" => respond(&mut s, 200, "application/json", "", format!("{{\"live\":{}}}", st.live_mode).as_bytes()),
+        // ?metrics=1 page: frames drawn and pose → screen latency every 2 s, logged here (measuring on the board screen)
+        "/api/metric" => {
+            eprintln!("viewer: {} fps, pose→screen p50 {} p95 {} ms (n {})", q.get("fps").map_or("-", |v| v), q.get("lat50").map_or("-", |v| v), q.get("lat95").map_or("-", |v| v), q.get("n").map_or("-", |v| v));
+            respond(&mut s, 204, "text/plain", "", b"")
+        }
+        "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),
         "/api/robot" => {
             let body = match robot_kind(&st) {
                 Some(r) => format!("{{\"robot\":{}}}", serde_json::Value::String(r)),
@@ -679,25 +687,17 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         }
         "/stream" => {
             REQ.with(|r| r.borrow_mut().keep = false); // the event stream owns this connection until the page goes away
-            let (st2, s2) = (st.clone(), match s.try_clone() { Ok(c) => c, Err(_) => return });
-            return serve_stream(s2, st2);
+            if let Ok(c) = s.try_clone() {
+                open_stream(c, st);
+            }
         }
         "/api/view" => {
-            let vp = st.dir.join("view.json");
-            let ver = file_ver(&vp).unwrap_or_default();
-            if ver.is_empty() {
-                return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}");
-            }
-            if q.get("v").map(|v| v == &ver).unwrap_or(false) {
+            let Some(v) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") }; // none yet or mid-write: next poll
+            if q.get("v").is_some_and(|x| *x == v.ver) {
                 return respond(&mut s, 200, "application/json", "", b"{\"unchanged\":true}");
             }
-            let text = match load_view(&st) {
-                Some((_, t)) => t,
-                None => return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}"), // mid-write: next poll
-            };
             let map_v = file_ver(&st.dir.join("map.pgm")).unwrap_or_default();
-            let body = format!("{{\"v\":\"{}\",\"map_v\":\"{}\",\"view\":{}}}", ver, map_v, text);
-            respond(&mut s, 200, "application/json", "", body.as_bytes())
+            respond(&mut s, 200, "application/json", "", &v.api_body(&map_v))
         }
         // full map, or with ?since=<map_v> only the rows changed since that version (X-Y0..X-Y1, PGM row order; X-Full: 0)
         "/api/map" => match current_map(&st) {
@@ -716,7 +716,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                     }
                 }
                 let hdr = format!("X-W: {}\r\nX-H: {}\r\nX-Y0: {}\r\nX-Y1: {}\r\nX-Full: {}\r\nX-Ver: {}\r\n", cur.w, cur.h, y0, y1, full, ver);
-                let body: &[u8] = if y0 > y1 { &[] } else { &cur.px[y0 * cur.w..(y1 + 1) * cur.w] };
+                let body: &[u8] = if y0 > y1 { &[] } else { &cur.px()[y0 * cur.w..(y1 + 1) * cur.w] };
                 respond(&mut s, 200, "application/octet-stream", &hdr, body)
             }
             None => respond(&mut s, 404, "text/plain", "", b"no map"),
@@ -750,6 +750,12 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         },
         _ if path.starts_with("/file/") => {
             let rel = &path["/file/".len()..];
+            // the handed-over view (one program): its bytes, built once per version
+            if rel == "view.json" {
+                if let Some(v) = live::current() {
+                    return respond_tagged(&mut s, "application/json", &v.ver.clone(), || Some(Shared(v.bytes())));
+                }
+            }
             // ETag = mtime + size: a page reload (or a second viewer) revalidates the map/objects it already has with 304
             match safe_join(&st.dir, rel).and_then(|p| file_ver(&p).map(|v| (p, v))) {
                 Some((p, ver)) => respond_tagged(&mut s, content_type(rel), &ver, || read_file(&p).map(Shared)),
@@ -761,248 +767,88 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Live stream: C++ (sgrt) -> TCP ingest -> state + SSE broadcast -> browsers
+// /stream: server-sent events pushed on change. One thread serves every open page: it sleeps until a file or the view
+// changes (memfs::bump: the pipeline in this process publishes, or a 50 ms folder check for a separate viewer), then
+// sends each page what is new for it. An idle page gets a keepalive comment every 10 s.
 // ---------------------------------------------------------------------------------------------------------------------
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn base64(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        out.push(B64[(n >> 18) as usize & 63] as char);
-        out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { B64[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-/// scenemap cell (-1 unknown, 0..100 %) -> the grey the page draws (same mapping as map.pgm)
-fn cell_grey(v: i8) -> u8 {
-    let v = v as i32;
-    if v < 0 { 205 } else if v >= 65 { 0 } else if v <= 25 { 254 } else { (254 - (v * 254) / 100) as u8 }
-}
-
 fn sse(event: &str, data: &str) -> String {
     format!("event: {}\ndata: {}\n\n", event, data)
 }
 
-fn broadcast(st: &State, msg: String) {
-    let m = Arc::new(msg);
-    st.clients.lock().unwrap().retain(|tx| tx.try_send(m.clone()).is_ok());   // a client that cannot keep up is dropped; it reconnects and gets the snapshot
-}
-
-fn map_event(l: &Live, x0: i32, y0: i32, x1: i32, y1: i32) -> String {
-    let mut grey = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1)) as usize);
-    for y in y0..=y1 {
-        let row = &l.cells[(y * l.w) as usize..((y + 1) * l.w) as usize];
-        grey.extend(row[x0 as usize..=x1 as usize].iter().map(|&v| cell_grey(v)));
+/// Button press: shared flag in one program, else a request file in the memory dir
+fn signal(s: &mut TcpStream, dir: &Path, req: &str, flag: fn()) {
+    if common::control::wired() {
+        flag();
+        return respond(s, 200, "application/json", "", b"{\"ok\":true}");
     }
-    sse("map", &format!("{{\"w\":{},\"h\":{},\"res\":{},\"ox\":{},\"oy\":{},\"x0\":{},\"y0\":{},\"x1\":{},\"y1\":{},\"b64\":\"{}\"}}", l.w, l.h, l.res, l.ox, l.oy, x0, y0, x1, y1, base64(&grey)))
-}
-
-fn pose_event(p: &[f64; 4]) -> String {
-    sse("pose", &format!("{{\"t\":{:.3},\"x\":{:.4},\"y\":{:.4},\"yaw\":{:.4}}}", p[0], p[1], p[2], p[3]))
-}
-
-fn recompute_segments(l: &mut Live) {
-    l.segs_dirty = false;
-    if l.w <= 0 || l.h <= 0 {
-        return;
-    }
-    let (buf, theta) = walls::wall_segments(&walls::Grid { cells: &l.cells, w: l.w, h: l.h, res: l.res, ox: l.ox, oy: l.oy }, &l.ig);
-    if buf != l.segs || theta != l.theta {
-        l.segs = buf;
-        l.theta = theta;
-        l.seg_ver += 1;
+    match std::fs::write(dir.join(req), b"") {
+        Ok(()) => respond(s, 200, "application/json", "", b"{\"ok\":true}"),
+        Err(e) => respond(s, 500, "text/plain", "", e.to_string().as_bytes()),
     }
 }
 
-fn walls_event(l: &Live, with_segments: bool) -> Option<String> {
-    let p = l.pose?;
-    if l.w <= 0 {
-        return None;
-    }
-    let pose = [p[1], p[2], p[3]];
-    let out: [f32; WALL_STATE_LEN] = walls::wall_state(&walls::Grid { cells: &l.cells, w: l.w, h: l.h, res: l.res, ox: l.ox, oy: l.oy }, &l.segs, &pose);
-    let segs = if with_segments {
-        let v: Vec<String> = l.segs.chunks(4).map(|c| json_f64s(c)).collect();
-        format!("[{}],\"theta\":{:.6}", v.join(","), l.theta)
-    } else {
-        "null".to_string()   // unchanged: the page keeps the segments (and wall direction) it has
-    };
-    let state: Vec<String> = out.iter().map(|x| format!("{:.5}", x)).collect();
-    Some(sse("walls", &format!("{{\"segments\":{},\"state\":[{}],\"pose\":{},\"max_range\":4.0}}", segs, state.join(","), json_f64s(&pose))))
-}
-
-/// Walls are recomputed at most every 100 ms (only when the map or the furniture changed); the state vector goes out with them.
-fn maybe_walls(st: &State, l: &mut Live) {
-    if l.last_walls.elapsed() < Duration::from_millis(100) {
-        return;
-    }
-    l.last_walls = Instant::now();
-    if l.segs_dirty {
-        recompute_segments(l);
-    }
-    let with = l.seg_ver != l.seg_sent;
-    if let Some(e) = walls_event(l, with) {
-        l.seg_sent = l.seg_ver;
-        broadcast(st, e);
-    }
-}
-
-fn handle_frame(st: &State, ty: u8, pl: &[u8]) {
-    let mut l = st.live.lock().unwrap();
-    match ty {
-        1 if pl.len() == 32 => {
-            let f = |i: usize| f64::from_le_bytes(pl[i * 8..i * 8 + 8].try_into().unwrap());
-            let p = [f(0), f(1), f(2), f(3)];
-            l.pose = Some(p);
-            broadcast(st, pose_event(&p));
-            maybe_walls(st, &mut l);
-        }
-        2 if pl.len() >= 48 => {
-            let i32at = |o: usize| i32::from_le_bytes(pl[o..o + 4].try_into().unwrap());
-            let f64at = |o: usize| f64::from_le_bytes(pl[o..o + 8].try_into().unwrap());
-            let (w, h, res, ox, oy) = (i32at(0), i32at(4), f64at(8), f64at(16), f64at(24));
-            let (x0, y0, x1, y1) = (i32at(32), i32at(36), i32at(40), i32at(44));
-            if w <= 0 || h <= 0 || x0 < 0 || y0 < 0 || x1 >= w || y1 >= h || x1 < x0 || y1 < y0 || (x1 - x0 + 1) as usize * (y1 - y0 + 1) as usize + 48 != pl.len() {
-                return;
-            }
-            if w != l.w || h != l.h || res != l.res || ox != l.ox || oy != l.oy {
-                l.w = w; l.h = h; l.res = res; l.ox = ox; l.oy = oy;
-                l.cells = vec![-1i8; (w * h) as usize];
-            }
-            let rw = (x1 - x0 + 1) as usize;
-            for y in y0..=y1 {
-                let dst = (y * w + x0) as usize;
-                let src = 48 + (y - y0) as usize * rw;
-                for k in 0..rw {
-                    l.cells[dst + k] = pl[src + k] as i8;
-                }
-            }
-            l.segs_dirty = true;
-            let e = map_event(&l, x0, y0, x1, y1);
-            broadcast(st, e);
-        }
-        4 if pl.len() >= 12 => {
-            let t = f64::from_le_bytes(pl[0..8].try_into().unwrap());
-            let n = i32::from_le_bytes(pl[8..12].try_into().unwrap()) as usize;
-            if n > 0 && pl.len() == 12 + n * 4 {
-                let q: Vec<String> = (0..n).map(|i| format!("{:.4}", f32::from_le_bytes(pl[12 + i * 4..16 + i * 4].try_into().unwrap()))).collect();
-                let e = sse("joints", &format!("{{\"t\":{:.3},\"q\":[{}]}}", t, q.join(",")));
-                l.joints = Some(e.clone());
-                broadcast(st, e);
-            }
-        }
-        3 => {
-            if let Ok(t) = std::str::from_utf8(pl) {
-                let line = t.replace('\n', "");
-                let ig = furniture_rects_of(&line);
-                if ig != l.ig {
-                    l.ig = ig;
-                    l.segs_dirty = true;
-                }
-                let msg = Arc::new(line);
-                l.view = Some(msg.clone());
-                broadcast(st, sse("view", &msg));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn ingest_conn(st: Arc<State>, mut s: TcpStream) {
-    let _ = s.set_nodelay(true);
-    {
-        // a new simulator run (or a restart) starts from an empty state; the pages are told to clear theirs too
-        let mut l = st.live.lock().unwrap();
-        l.w = 0; l.h = 0; l.cells.clear(); l.view = None; l.pose = None; l.joints = None; l.ig.clear(); l.segs.clear(); l.theta = 0.0; l.seg_ver += 1; l.segs_dirty = false;
-        broadcast(&st, sse("reset", "{}"));
-    }
-    let mut head = [0u8; 5];
-    let mut pl = Vec::new();
-    loop {
-        if s.read_exact(&mut head).is_err() {
-            return;
-        }
-        let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        if len > (256 << 20) {
-            return;
-        }
-        pl.resize(len, 0);
-        if s.read_exact(&mut pl).is_err() {
-            return;
-        }
-        handle_frame(&st, head[4], &pl);
-    }
-}
-
-fn ingest_loop(st: Arc<State>, addr: String) {
-    let l = TcpListener::bind(&addr).unwrap_or_else(|e| {
-        eprintln!("cannot listen for the stream on {}: {}", addr, e);
-        std::process::exit(1);
-    });
-    eprintln!("sgview: stream ingest on {}", addr);
-    for c in l.incoming().flatten() {
-        let st = st.clone();
-        std::thread::spawn(move || ingest_conn(st, c));
-    }
-}
-
-/// GET /stream: server-sent events. The snapshot (map, summary, pose, walls) goes first, then every update as it arrives.
-fn serve_stream(mut s: TcpStream, st: Arc<State>) {
+fn open_stream(mut s: TcpStream, st: &Arc<State>) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
     if s.write_all(head.as_bytes()).is_err() {
         return;
     }
-    if !st.live_mode {
-        return serve_file_events(s, st);
-    }
-    let (tx, rx) = sync_channel::<Arc<String>>(1024);
-    {
-        // build the snapshot and register under the live lock so no update is missed or duplicated
-        let l = st.live.lock().unwrap();
-        let mut snap = String::new();
-        if l.w > 0 {
-            snap.push_str(&map_event(&l, 0, 0, l.w - 1, l.h - 1));
-        }
-        if let Some(v) = &l.view {
-            snap.push_str(&sse("view", v));
-        }
-        if let Some(p) = &l.pose {
-            snap.push_str(&pose_event(p));
-        }
-        if let Some(j) = &l.joints {
-            snap.push_str(j);
-        }
-        if let Some(w) = walls_event(&l, true) {
-            snap.push_str(&w);
-        }
-        if s.write_all(snap.as_bytes()).is_err() {
-            return;
-        }
-        st.clients.lock().unwrap().push(tx);
-    }
     let _ = s.set_nodelay(true);
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5))); // a stuck page is dropped instead of holding the others
+    st.streams.lock().unwrap().push(StreamClient { s, vv: String::new(), pv: String::new() });
+    memfs::bump(); // the pusher sends the new page what it has now
+}
+
+/// The current view version (the handed-over view, else view.json's)
+fn view_ver(st: &State) -> Option<String> {
+    match live::current() {
+        Some(v) => Some(v.ver.clone()),
+        None => file_ver(&st.dir.join("view.json")),
+    }
+}
+
+fn stream_pusher(st: Arc<State>) {
+    let pp = st.dir.join("pose.json");
+    let mut seen = 0u64;
+    let mut quiet = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(m) => {
-                // several queued events go out in one write
-                let mut buf = String::from(m.as_str());
-                while let Ok(m2) = rx.try_recv() {
-                    buf.push_str(&m2);
-                }
-                if s.write_all(buf.as_bytes()).is_err() {
-                    return;
+        // in one program every change bumps; a separate viewer also looks at the folder every 50 ms
+        let wait = if memfs::enabled() { Duration::from_secs(10) } else { Duration::from_millis(50) };
+        seen = memfs::wait_change(seen, wait);
+        let mut cl = st.streams.lock().unwrap();
+        if cl.is_empty() {
+            continue;
+        }
+        let vv = view_ver(&st);
+        let pose = file_ver(&pp).and_then(|v| {
+            let t = read_file(&pp)?;
+            let t = std::str::from_utf8(t.trim_ascii()).ok()?;
+            // a half-written file is skipped; the next look sees it again
+            (t.starts_with('{') && t.ends_with('}')).then(|| (v, sse("fpose", &t.replace('\n', " "))))
+        });
+        let keep = quiet.elapsed() > Duration::from_secs(10);
+        let mut any = false;
+        cl.retain_mut(|c| {
+            let mut out = String::new();
+            if let Some(v) = &vv {
+                if *v != c.vv {
+                    out.push_str(&sse("vv", &serde_json::Value::String(v.clone()).to_string()));
+                    c.vv = v.clone();
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if s.write_all(b": keepalive\n\n").is_err() {
-                    return;
+            if let Some((v, e)) = &pose {
+                if *v != c.pv {
+                    out.push_str(e);
+                    c.pv = v.clone();
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => return,
+            if out.is_empty() && keep {
+                out.push_str(": keepalive\n\n");
+            }
+            any |= !out.is_empty();
+            out.is_empty() || c.s.write_all(out.as_bytes()).is_ok()
+        });
+        if any {
+            quiet = std::time::Instant::now();
         }
     }
 }
@@ -1013,14 +859,13 @@ pub struct Config {
     pub dir: Option<String>,
     pub port: u16,
     pub bind: String,
-    pub ingest: Option<String>,
     pub search_model: Option<String>,
     pub vocab: Option<String>,
     pub encode_vocab: Option<(String, String)>,
 }
 
 impl Config {
-    /// 뷰어 인자(프로그램 이름 뺀 것): `<기억 폴더> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <파일>] [--ingest <주소>]`
+    /// 뷰어 인자(프로그램 이름 뺀 것): `<기억 폴더> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <파일>]`
     pub fn parse(args: Vec<String>) -> Config {
         let mut c = Config { port: 8080, bind: "0.0.0.0".into(), ..Default::default() };
         let mut it = args.into_iter();
@@ -1028,7 +873,6 @@ impl Config {
             match a.as_str() {
                 "--port" => c.port = it.next().and_then(|v| v.parse().ok()).unwrap_or(c.port),
                 "--bind" => c.bind = it.next().unwrap_or(c.bind),
-                "--ingest" => c.ingest = it.next(),
                 "--search-model" => c.search_model = it.next(),
                 "--vocab" => c.vocab = it.next(),
                 "--encode-vocab" => c.encode_vocab = it.next().zip(it.next()),
@@ -1039,6 +883,9 @@ impl Config {
     }
 }
 
+/// HTTP connection threads (the page opens up to 6 sockets per host)
+const HTTP_THREADS: usize = 8;
+
 /// 서버 실행(막힘): 뷰어 명령줄 인자(프로그램 이름 뺀 것, `ondevice view …`)
 pub fn run(args: Vec<String>) {
     serve(Config::parse(args))
@@ -1046,7 +893,7 @@ pub fn run(args: Vec<String>) {
 
 /// 서버 실행(막힘): 읽어 둔 설정으로. `ondevice --serve` 는 이것을 스레드로 부른다
 pub fn serve(c: Config) {
-    let Config { dir, port, bind, ingest, search_model, vocab, encode_vocab } = c;
+    let Config { dir, port, bind, search_model, vocab, encode_vocab } = c;
     // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
     if let Some((list, out)) = &encode_vocab {
         #[cfg(feature = "search")]
@@ -1070,14 +917,13 @@ pub fn serve(c: Config) {
             std::process::exit(2);
         }
     };
-    let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new((String::new(), Arc::new(String::new()))), maps: Mutex::new(MapHist { vers: Vec::new() }), live_mode: ingest.is_some(), live: Mutex::new(Live { w: 0, h: 0, res: 0.05, ox: 0.0, oy: 0.0, cells: Vec::new(), view: None, pose: None, joints: None, ig: Vec::new(), segs: Vec::new(), theta: 0.0, seg_ver: 0, seg_sent: 0, segs_dirty: false, last_walls: Instant::now() }), clients: Mutex::new(Vec::new()),
+    let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()),
         #[cfg(feature = "search")]
         text_enc: std::sync::OnceLock::new() });
     let l = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("cannot listen on {}:{}: {}", bind, port, e);
         std::process::exit(1);
     });
-    let _ = SystemTime::now();
     #[cfg(feature = "search")]
     if let Some(m) = search_model {
         // the model takes seconds to load: the page is served meanwhile
@@ -1105,54 +951,27 @@ pub fn serve(c: Config) {
         eprintln!("search: built without the search feature — searching by name only");
     }
     eprintln!("sgview: http://localhost:{}  (memory dir {})", port, st.dir.display());
-    if let Some(a) = ingest {
+    {
         let st2 = st.clone();
-        std::thread::spawn(move || ingest_loop(st2, a));
+        std::thread::Builder::new().name("sgview-stream".into()).spawn(move || stream_pusher(st2)).unwrap();
+    }
+    // a small fixed pool of connection threads: the page keeps a few keep-alive sockets (idle ones close after 5 s);
+    // /stream sockets go to the one pusher thread
+    let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..HTTP_THREADS {
+        let (st, rx) = (st.clone(), rx.clone());
+        std::thread::Builder::new().name(format!("sgview-http{i}")).spawn(move || loop {
+            let c = rx.lock().unwrap().recv();
+            match c {
+                Ok(c) => handle(c, st.clone()),
+                Err(_) => return,
+            }
+        }).unwrap();
     }
     for c in l.incoming().flatten() {
         let _ = c.set_nodelay(true);
-        let st = st.clone();
-        std::thread::spawn(move || handle(c, st));
-    }
-}
-
-/// GET /stream without --ingest (a memory folder written by memmap/scenemap): the server watches the folder for the page instead
-/// of the page polling. `vv` = view.json version (the page then fetches /api/view once), `fpose` = pose.json text (fast camera
-/// pose). Checks are two file stats every 50 ms on the server; an idle viewer gets only a keepalive comment every 10 s.
-fn serve_file_events(mut s: TcpStream, st: Arc<State>) {
-    let _ = s.set_nodelay(true);
-    let (vp, pp) = (st.dir.join("view.json"), st.dir.join("pose.json"));
-    let (mut vv, mut pv) = (String::new(), String::new());
-    let mut quiet = Instant::now();
-    loop {
-        let mut out = String::new();
-        if let Some(v) = file_ver(&vp) {
-            if v != vv {
-                out.push_str(&sse("vv", &serde_json::Value::String(v.clone()).to_string()));
-                vv = v;
-            }
-        }
-        if let Some(v) = file_ver(&pp) {
-            if v != pv {
-                if let Some(t) = read_text(&pp) {
-                    let t = t.trim();
-                    if t.starts_with('{') && t.ends_with('}') {   // a half-written file is skipped; the next stat sees it again
-                        out.push_str(&sse("fpose", &t.replace('\n', " ")));
-                        pv = v;
-                    }
-                }
-            }
-        }
-        if out.is_empty() && quiet.elapsed() > Duration::from_secs(10) {
-            out.push_str(": keepalive\n\n");
-        }
-        if !out.is_empty() {
-            if s.write_all(out.as_bytes()).is_err() {
-                return;
-            }
-            quiet = Instant::now();
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = tx.send(c);
     }
 }
 

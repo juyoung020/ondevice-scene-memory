@@ -27,7 +27,7 @@ RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rg
 cargo build --release
 
 # 카메라 → 위치 추적 → 물체 기억 → 뷰어, 한 프로세스(실시간). D435 입력은 리눅스 기본 rsdriver(V4L2 직접), --driver librealsense 는 --features slam-realsense 빌드
-ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
+ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
   --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 
 # TUM 재생(카메라 없이): --rate 1 이면 찍은 시각대로(밀리면 건너뜀), 생략하면 최대 속도로 빠짐없이
@@ -51,7 +51,7 @@ ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-
 | `--queue N`, `--block`·`--drop` | 쓰기 큐 길이(기본 4), 큐가 차면 기다림·가장 오래된 장면 버림. 기본은 최대 속도 재생 = 기다림, 카메라·`--rate` = 버림 |
 | `--poses <파일>` | 보낸 위치(TUM 형식, OpenCV 카메라 → RTAB-Map 지도) |
 | `--final-poses <파일>` | 끝에 최적화된 지도 노드 위치(TUM 형식, 같은 좌표) |
-| `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(뷰어 리셋 아이콘이 기억 폴더의 `reset.req` 를 만듦) |
+| `--reset-file <파일>` | 이 파일이 생기면 지우고 위치 추적·지도를 처음부터(따로 띄운 뷰어의 리셋 아이콘이 기억 폴더의 `reset.req` 를 만듦. 한 프로그램 `--serve` 는 인자 없이 리셋 버튼이 됨) |
 | `--reloc-wait 초` | 놓친 뒤 같은 지도에서 다시 잡기만 시도하는 시간(기본 1) |
 | `--stats <파일>` | 장면별 시간·놓침·새 지도·지도 보정·특징 수(CSV) |
 | `--max-frames N` | 앞 N 장만 |

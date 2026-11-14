@@ -339,6 +339,38 @@ pub struct SegRaw {
     pub pc: usize,
     pub ph: usize,
     pub pw: usize,
+    /// 머리 출력 모델(NPU 만, 상위 300 고르기를 이 프로그램이 함): 단계 3 개마다 (상자 4, 점수 1, 계수 pc) 의 buf 안 시작. 없으면 det 가 [300, 6 + pc]
+    pub heads: Option<[[usize; 3]; 3]>,
+}
+
+/// 머리 출력(상자 거리 [4,n,n] · 점수 로짓 [1,n,n] · 계수 [pc,n,n], 보폭 8 · 16 · 32)에서 점수 conf 이상만 골라 [k, 6 + pc] 행으로(점수 큰 순, 최대 300).
+/// 모델 안 후처리(ONNX: 시그모이드 → 상위 300 → 상자 = (격자 + 0.5 ∓ 거리) × 보폭)와 같은 값. 로짓 문턱을 먼저 견줘 시그모이드는 남은 것만
+pub fn heads_to_det(buf: &[f32], heads: &[[usize; 3]; 3], pc: usize, s: usize, conf: f32, out: &mut Vec<f32>) {
+    let thr = (conf / (1.0 - conf)).ln();
+    let mut cand: Vec<(f32, u8, u32)> = Vec::new();
+    for (l, hd) in heads.iter().enumerate() {
+        let n = s >> (3 + l);
+        let cls = &buf[hd[1]..hd[1] + n * n];
+        for (i, &v) in cls.iter().enumerate() {
+            if v >= thr {
+                cand.push((1.0 / (1.0 + (-v).exp()), l as u8, i as u32));
+            }
+        }
+    }
+    if cand.len() > 300 {
+        cand.select_nth_unstable_by(299, |a, b| b.0.total_cmp(&a.0));
+        cand.truncate(300);
+    }
+    cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out.clear();
+    for &(sc, l, i) in &cand {
+        let (hd, n, st) = (&heads[l as usize], s >> (3 + l), (8u32 << l) as f32);
+        let (i, nn) = (i as usize, n * n);
+        let (ax, ay) = ((i % n) as f32 + 0.5, (i / n) as f32 + 0.5);
+        let b = |k: usize| buf[hd[0] + k * nn + i];
+        out.extend_from_slice(&[(ax - b(0)) * st, (ay - b(1)) * st, (ax + b(2)) * st, (ay + b(3)) * st, sc, 0.0]);
+        out.extend((0..pc).map(|k| buf[hd[2] + k * nn + i]));
+    }
 }
 
 /// 전처리 단계: 레터박스. 추론과 다른 스레드에서 돌려도 된다.
@@ -349,6 +381,13 @@ pub fn seg_pre(rgb: &[u8], w: usize, h: usize, inp: &mut SegIn) {
 
 /// 후처리 단계: 마스크 해독. 추론과 다른 스레드에서 돌려도 된다.
 pub fn seg_post(raw: &SegRaw, geom: LbGeom, w: usize, h: usize, conf: f32) -> Vec<Det> {
+    if let Some(hd) = &raw.heads {
+        thread_local!(static DET: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) });
+        return DET.with_borrow_mut(|det| {
+            heads_to_det(&raw.buf, hd, raw.pc, SEG_S, conf, det);
+            decode(det, &raw.buf[raw.proto.0..raw.proto.0 + raw.proto.1], raw.pc, raw.ph, raw.pw, SEG_S, geom, w, h, conf)
+        });
+    }
     decode(&raw.buf[raw.det.0..raw.det.0 + raw.det.1], &raw.buf[raw.proto.0..raw.proto.0 + raw.proto.1], raw.pc, raw.ph, raw.pw, SEG_S, geom, w, h, conf)
 }
 
@@ -479,6 +518,7 @@ pub mod dx {
         fn dxrt_engine_wait(e: *mut c_void, job_id: c_int, output: *mut c_void) -> c_int;
         fn dxrt_engine_get_output_size(e: *mut c_void, size: *mut u64) -> c_int;
         fn dxrt_engine_get_output_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
+        fn dxrt_engine_get_input_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
         fn dxrt_last_error_message() -> *const c_char;
     }
 
@@ -487,6 +527,7 @@ pub mod dx {
         e: *mut c_void,
         pub out: Vec<u8>,
         pub tensors: Vec<(String, Vec<i64>, usize)>, // 이름, 모양, 바이트 오프셋
+        pub input: String,                          // 첫 입력 텐서 이름
     }
     impl Engine {
         pub fn new(path: &str) -> Engine {
@@ -520,7 +561,10 @@ pub mod dx {
                         r
                     })
                     .collect();
-                Engine { e, out: vec![0u8; sz as usize], tensors }
+                let mut n: c_int = 16;
+                dxrt_engine_get_input_tensor_info(e, infos.as_mut_ptr(), &mut n);
+                let input = if n > 0 { CStr::from_ptr(infos[0].name.as_ptr()).to_string_lossy().into_owned() } else { String::new() };
+                Engine { e, out: vec![0u8; sz as usize], tensors, input }
             }
         }
         pub fn run(&mut self, input: &[u8]) {
@@ -595,11 +639,45 @@ pub mod dx {
 pub struct DxSeg {
     eng: dx::Engine,
     scratch: (SegIn, SegRaw),
+    lay: Layout,
+}
+#[cfg(feature = "dxrt")]
+/// dxnn 출력 배치: 검출 [300,38] + 원형(모델 안 CPU 후처리 포함, 공식 파일) 또는 머리 9 개 + 원형(NPU 만)
+#[derive(Clone, Copy)]
+struct Layout {
+    det: (usize, usize),
+    proto: (usize, usize),
+    p: (usize, usize, usize),
+    heads: Option<[[usize; 3]; 3]>,
+}
+#[cfg(feature = "dxrt")]
+impl Layout {
+    fn apply(&self, raw: &mut SegRaw) {
+        (raw.det, raw.proto, raw.heads) = (self.det, self.proto, self.heads);
+        (raw.pc, raw.ph, raw.pw) = self.p;
+    }
 }
 #[cfg(feature = "dxrt")]
 impl DxSeg {
     pub fn new(path: &str) -> DxSeg {
-        DxSeg { eng: dx::Engine::new(path), scratch: Default::default() }
+        let eng = dx::Engine::new(path);
+        let find = |key: &str| eng.tensors.iter().position(|t| t.0.contains(key));
+        let lay = if let (Some(pi), true) = (find("output1"), eng.tensors.len() == 10) {
+            let ps = &eng.tensors[pi].1;
+            let mut heads = [[0usize; 3]; 3];
+            for (l, hd) in heads.iter_mut().enumerate() {
+                for (k, c) in [2, 3, 4].iter().enumerate() {
+                    let i = find(&format!("one2one_cv{c}.{l}/")).unwrap_or_else(|| panic!("{path}: 머리 출력 cv{c}.{l} 없음"));
+                    hd[k] = eng.f32_span(i).0;
+                }
+            }
+            common::info!("seg: NPU 만 도는 머리 출력 모델 {path}(상위 고르기는 이 프로그램이)");
+            Layout { det: (0, 0), proto: eng.f32_span(pi), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize), heads: Some(heads) }
+        } else {
+            let ps = &eng.tensors[1].1;
+            Layout { det: eng.f32_span(0), proto: eng.f32_span(1), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize), heads: None }
+        };
+        DxSeg { eng, scratch: Default::default(), lay }
     }
 }
 #[cfg(feature = "dxrt")]
@@ -607,25 +685,19 @@ impl Segmenter for DxSeg {
     fn scratch(&mut self) -> &mut (SegIn, SegRaw) {
         &mut self.scratch
     }
-    /// 동기 호출(NPU 는 한 번에 하나). 결과를 raw 버퍼에 바로 받아, 후처리 스레드가 그것을 읽는 동안 다음 장면을 돌린다.
+    /// 동기 호출. 결과를 raw 버퍼에 바로 받아, 후처리 스레드가 그것을 읽는 동안 다음 장면을 돌린다.
     fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw) {
         self.eng.run_into(&inp.u8, &mut raw.buf);
-        raw.det = self.eng.f32_span(0);
-        raw.proto = self.eng.f32_span(1);
-        let ps = &self.eng.tensors[1].1;
-        (raw.pc, raw.ph, raw.pw) = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+        self.lay.apply(raw);
     }
     fn submit(&mut self, inp: &SegIn) -> Option<i32> {
         Some(self.eng.submit(&inp.u8))
     }
     fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
-        let (w, det, proto) = (self.eng.waiter(), self.eng.f32_span(0), self.eng.f32_span(1));
-        let ps = &self.eng.tensors[1].1;
-        let p = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+        let (w, lay) = (self.eng.waiter(), self.lay);
         Some(Box::new(move |id, raw| {
             w.wait_into(id, &mut raw.buf);
-            (raw.det, raw.proto) = (det, proto);
-            (raw.pc, raw.ph, raw.pw) = p;
+            lay.apply(raw);
         }))
     }
 }

@@ -9,15 +9,36 @@ pub const SIZE: usize = 256;
 pub const DIM: usize = 768;
 
 /// w×h RGB 를 256×256 으로 늘려(작아질 땐 넓게 평균) NCHW, 값 −1..1 (SigLIP 전처리: (x/255 − 0.5)/0.5)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn preprocess(rgb: &[u8], w: u32, h: u32, out: &mut Vec<f32>) {
-    let img = image::RgbImage::from_raw(w, h, rgb.to_vec()).expect("crop size");
-    let r = image::imageops::resize(&img, SIZE as u32, SIZE as u32, image::imageops::FilterType::Triangle);
+    preprocess_into(rgb, w, h, false, out)
+}
+
+/// 사진(RGB w×h) → 256×256 쌍선형으로 줄여 (값 / 127.5 − 1) 을 out 에 바로 쓴다(중간 사진 없음).
+/// patches = false: [3, 256, 256] (채널, 행, 열). true: 32×32 조각 64 개 [64, 3·32·32] (조각 = 행 우선, 안은 채널·행·열) —
+/// 조각 나누기 합성곱을 행렬곱으로 바꿔 NPU 에 다 올린 모델(입력 `patches`)이 받는 배치
+pub fn preprocess_into(rgb: &[u8], w: u32, h: u32, patches: bool, out: &mut Vec<f32>) {
+    let (w, h) = (w as usize, h as usize);
     let n = SIZE * SIZE;
-    out.clear();
     out.resize(3 * n, 0.0);
-    for (i, p) in r.pixels().enumerate() {
-        for c in 0..3 {
-            out[c * n + i] = p.0[c] as f32 / 127.5 - 1.0;
+    let axis = |dst: usize, src: usize| -> (usize, usize, f32) {
+        let f = ((dst as f32 + 0.5) * src as f32 / SIZE as f32 - 0.5).max(0.0);
+        let a = (f as usize).min(src - 1);
+        (a, (a + 1).min(src - 1), f - a as f32)
+    };
+    let xs: Vec<(usize, usize, f32)> = (0..SIZE).map(|x| axis(x, w)).collect();
+    const K: f32 = 1.0 / 127.5;
+    for y in 0..SIZE {
+        let (y0, y1, fy) = axis(y, h);
+        let (r0, r1) = (&rgb[y0 * w * 3..(y0 + 1) * w * 3], &rgb[y1 * w * 3..(y1 + 1) * w * 3]);
+        for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
+            for c in 0..3 {
+                let top = r0[x0 * 3 + c] as f32 * (1.0 - fx) + r0[x1 * 3 + c] as f32 * fx;
+                let bot = r1[x0 * 3 + c] as f32 * (1.0 - fx) + r1[x1 * 3 + c] as f32 * fx;
+                let v = (top * (1.0 - fy) + bot * fy) * K - 1.0;
+                let i = if patches { ((y / 32) * 8 + x / 32) * 3072 + c * 1024 + (y % 32) * 32 + x % 32 } else { c * n + y * SIZE + x };
+                out[i] = v;
+            }
         }
     }
 }
@@ -149,6 +170,15 @@ mod worker {
             #[cfg(not(feature = "onnx"))]
             panic!("--embed {model}: 이 빌드는 NPU 모델(.dxnn)을 받는다");
         }
+        /// 입력이 조각 배치(`patches`)인 NPU 모델인가
+        fn patches(&self) -> bool {
+            match self {
+                #[cfg(feature = "dxrt")]
+                Net::Dx(e) => e.input == "patches",
+                #[allow(unreachable_patterns)]
+                _ => false,
+            }
+        }
         fn submit(&mut self, buf: &[f32]) -> Ticket {
             match self {
                 #[cfg(feature = "dxrt")]
@@ -226,6 +256,7 @@ mod worker {
 
     pub fn start(model: &str) {
         let mut net = Net::open(model);
+        let patches = net.patches();
         let (tx, rx) = mpsc::channel::<Job>();
         let th = std::thread::Builder::new().name("embed".into()).spawn(move || {
             let mut bufs = [Vec::new(), Vec::new()];
@@ -243,7 +274,7 @@ mod worker {
                 let mut prev: Option<(Job, Ticket, std::time::Instant, f64)> = None;
                 for (i, j) in jobs.into_values().enumerate() {
                     let t = std::time::Instant::now();
-                    preprocess(&j.rgb, j.w, j.h, &mut bufs[i % 2]);
+                    preprocess_into(&j.rgb, j.w, j.h, patches, &mut bufs[i % 2]);
                     let pre = t.elapsed().as_secs_f64() * 1e3;
                     if let Some(p) = prev.take() {
                         finish_job(&mut net, p, &mut st);
@@ -276,7 +307,7 @@ mod worker {
         let (mut buf, mut all, mut ms) = (Vec::new(), Vec::<f32>::new(), 0.0f64);
         for (i, f) in files.iter().enumerate() {
             let img = image::open(f).unwrap_or_else(|e| panic!("{}: {e}", f.display())).to_rgb8();
-            preprocess(img.as_raw(), img.width(), img.height(), &mut buf);
+            preprocess_into(img.as_raw(), img.width(), img.height(), net.patches(), &mut buf);
             let t = std::time::Instant::now();
             let mut v = net.run(&buf);
             if i > 0 {

@@ -55,6 +55,13 @@ mod engine {
     use crate::loopclose::mem::{Kp, NodeFeatures, Signature};
     use crate::loopclose::{GtsamOptimizer, LoopRegistration, NodeInput, RegOut, Slam, WordIndex};
     use crate::odom::OdometryF2F;
+    use crate::klt::OdometryKlt;
+
+    /// 위치 추적 방식: Odom/Strategy=9 → 광류(klt.rs, 기본), 그 밖 → RTAB-Map F2F(비교용)
+    enum Odom {
+        F2f(OdometryF2F),
+        Klt(OdometryKlt),
+    }
     use crate::params::Params;
     use crate::register::{new_shared_rng, RegistrationVis, SharedRng, Tf};
     use crate::{Camera, Features, Frame};
@@ -189,7 +196,7 @@ mod engine {
 
     pub struct Engine {
         ext: Extractor,
-        odom: OdometryF2F,
+        odom: Odom,
         reloc: RegistrationVis,
         slam: Slam,
         cam: Arc<Mutex<Option<Camera>>>,
@@ -207,8 +214,13 @@ mod engine {
         /// params = Rtabmap 설정, odom_params = 위치 추적 설정, reloc_min = 다시 잡기 Vis/MinInliers
         pub fn new(params: &Params, odom_params: &Params, reloc_min: i32) -> Engine {
             let rng = new_shared_rng();
-            let mut odom = OdometryF2F::new(odom_params);
-            odom.set_rng(rng.clone());
+            let odom = if odom_params.get("Odom/Strategy", 0i32) == 9 {
+                Odom::Klt(OdometryKlt::new(odom_params))
+            } else {
+                let mut o = OdometryF2F::new(odom_params);
+                o.set_rng(rng.clone());
+                Odom::F2f(o)
+            };
             let mut rp = params.clone();
             rp.set("Vis/MinInliers", &reloc_min.to_string());
             let mut reloc = RegistrationVis::new(&rp);
@@ -243,10 +255,19 @@ mod engine {
                     *c = Some(f.cam.clone());
                 }
             }
-            let feats = feats.unwrap_or_else(|| self.ext.extract(f));
             let stamp = f.t;
             let dt = if self.prev_stamp > 0.0 || (self.prev_stamp == 0.0 && self.frames == 1) { stamp - self.prev_stamp } else { 0.0 };
-            let r = self.odom.process(f, feats);
+            let r = match &mut self.odom {
+                Odom::F2f(o) => {
+                    let feats = feats.unwrap_or_else(|| self.ext.extract(f));
+                    o.process(f, feats)
+                }
+                Odom::Klt(o) => o.process(f),
+            };
+            let n_feat = match &self.odom {
+                Odom::Klt(o) => o.tracks() as i32,
+                _ => r.features.kps.len() as i32,
+            };
             if r.pose.is_some() {
                 self.prev_stamp = stamp;
                 self.frames += 1;
@@ -256,7 +277,7 @@ mod engine {
                 pose: r.pose.map(|_| r.tf),
                 lost: r.lost,
                 cov: cov36(&r.covariance),
-                features: r.features.kps.len() as i32,
+                features: n_feat,
                 inliers: r.inliers as i32,
                 transform: r.transform,
                 interval: if dt > 0.0 { dt } else { 0.0 },
@@ -266,19 +287,33 @@ mod engine {
         }
 
         /// 지금 장면에 붙은 특징(다시 잡은 뒤 같은 data 로 위치 추적을 한 번 더 할 때)
+        /// 광류 경로는 특징(BRIEF)을 장면마다 뽑지 않는다: 지도 노드·다시 잡기에 필요할 때만 이 장면에서 뽑음
+        pub fn ensure_cur(&mut self, f: &Frame) {
+            if matches!(self.odom, Odom::Klt(_)) && self.cur.kps.is_empty() {
+                self.cur = self.ext.extract(f);
+            }
+        }
+
+
         pub fn cur_features(&self) -> Features {
             self.cur.clone()
         }
 
         /// Odometry::reset(p)
         pub fn odom_reset(&mut self, p: Tf) {
-            self.odom.reset_tf(p);
+            match &mut self.odom {
+                Odom::F2f(o) => o.reset_tf(p),
+                Odom::Klt(o) => o.reset_tf(p),
+            }
             self.prev_stamp = 0.0;
             self.frames = 0;
         }
 
         pub fn odom_pose(&self) -> Tf {
-            self.odom.pose_tf()
+            match &self.odom {
+                Odom::F2f(o) => o.pose_tf(),
+                Odom::Klt(o) => o.pose_tf(),
+            }
         }
 
         /// 회색조는 이 뒤 쓰지 않아 옮김. mm 깊이는 스트림으로 보낼 원본이 따로 있으면 옮기고, 같은 버퍼면(1000/m) 스트림과 나눠 듦(Arc)
@@ -326,11 +361,15 @@ mod engine {
 
         /// Rtabmap::process(data, odomPose, covariance, velocity). node = false 면 중간 장면(특징 없음)
         pub fn slam_process(&mut self, f: &Frame, node: bool, pose: Option<Tf>, cov: &[f64; 36], velocity: Vec<f32>) {
+            if node {
+                self.ensure_cur(f);
+            }
             let features = if node {
+                // 이 장면 특징은 노드로 넘기면 더 쓰지 않음: 설명자는 복사 없이 옮김
                 NodeFeatures {
                     kps: self.cur.kps.iter().map(|k| Kp { x: k.x, y: k.y, size: k.size, angle: k.angle, response: k.response, octave: k.octave, class_id: -1 }).collect(),
                     pts3d: self.cur.pts3d.iter().map(|p| [p.x, p.y, p.z]).collect(),
-                    desc: self.cur.desc.clone(),
+                    desc: std::mem::take(&mut self.cur.desc),
                 }
             } else {
                 NodeFeatures::default()
@@ -400,7 +439,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms(0 = 카메라 자동, 기본)] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -419,10 +458,14 @@ pub struct Args {
     realsense: bool,
     driver: String,
     reloc_wait: f64,
+    /// 놓친 뒤 다시 시작할 때 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙임(광류 경로, --no-bridge 로 끔)
+    bridge: bool,
     reset_at: i64,
+    stride: usize,
     block: i32,
     rate: f64,
     exposure_ms: f64,
+    ae_cap_ms: f64,
     gain: i32,
     send_every: i64,
     queue: usize,
@@ -448,10 +491,13 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         realsense: false,
         driver: String::new(),
         reset_at: -1,
-        reloc_wait: 1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도
+        stride: 1,
+        reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
+        bridge: true,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
+        ae_cap_ms: 0.0, // 노출 상한(ms). 0 = 카메라 자동 노출. 밝은 방에서 번짐을 줄이려면 8.3(60 Hz 조명 한 주기)
         gain: -1,
         send_every: 1,
         queue: 4,
@@ -483,9 +529,11 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--realsense" => a.realsense = true,
             "--driver" => a.driver = val()?,
             "--rate" => a.rate = num(&val()?)?,
+            "--stride" => a.stride = num(&val()?)? as usize,
             "--align" => a.align = val()?,
             "--serial" => a.serial = val()?,
             "--exposure" => a.exposure_ms = num(&val()?)?,
+            "--ae-cap" => a.ae_cap_ms = num(&val()?)?,
             "--gain" => a.gain = num(&val()?)? as i32,
             "--size" => {
                 let s = val()?;
@@ -511,6 +559,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--max-frames" => a.max_frames = num(&val()?)? as i64,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
+            "--no-bridge" => a.bridge = false,
             "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
             // 프로세스 설정(ondevice 가 처음에 읽음): 실시간 배치·메모리 묶기·조용히
             "--rt" => {
@@ -591,7 +640,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     #[allow(unused_assignments)]
     let mut skipped = None;
     let src: Box<dyn FrameSource> = if !a.tum.is_empty() {
-        let ts = TumSource::new(&a.tum, a.rate)?;
+        let ts = TumSource::with_stride(&a.tum, a.rate, a.stride)?;
         skipped = Some(ts.skipped_counter());
         Box::new(ts)
     } else {
@@ -607,10 +656,16 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     }
     // 위치 추적 특징 추출(GFTT/BRIEF·3D 점)도 읽기 스레드에서: 난수를 안 쓰고 장면만 보므로 어디서 뽑아도 결과가 같다
     let ext = crate::features::Extractor::new(&params);
-    let mut src = PrefetchSource::with_prep(src, !replay_max, Some(Box::new(move |f: &crate::Frame| match &pool {
-        Some(p) => p.install(|| ext.extract(f)),
-        None => ext.extract(f),
-    })));
+    let klt = params.get("Odom/Strategy", 0i32) == 9;
+    let prep: Option<crate::io::Prep> = if klt {
+        None // 광류 경로: 장면마다 특징을 뽑지 않음
+    } else {
+        Some(Box::new(move |f: &crate::Frame| match &pool {
+            Some(p) => p.install(|| ext.extract(f)),
+            None => ext.extract(f),
+        }))
+    };
+    let mut src = PrefetchSource::with_prep(src, !replay_max, prep);
     params.0.remove("Rtabmap/PublishRAMUsage");
     let intermediate = params.get_bool("Rtabmap/CreateIntermediateNodes", false);
     let detection_rate: f32 = params.get("Rtabmap/DetectionRate", 1.0);
@@ -629,6 +684,10 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     // 다시 잡기: 놓치기 전의 장면(기준 장면)과 지금 장면의 특징점을 직접 맞춰 위치를 구함
     let reloc_min = params.get("Vis/MinInliers", 20i32).max(25);
     let mut eng = engine::Engine::new(&params, &odom_params, reloc_min);
+    let klt_path = params.get("Odom/Strategy", 0i32) == 9;
+    let reloc_wait = if a.reloc_wait >= 0.0 { a.reloc_wait } else if klt_path { 0.0 } else { 1.0 };
+    let bridge = a.bridge && klt_path;
+    let mut n_bridge = 0i64;
 
     let mut refs: VecDeque<Ref> = VecDeque::new();
     let mut ref_next = 0usize;
@@ -652,7 +711,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let _ = writeln!(f, "# timestamp x y z qx qy qz qw (OpenCV 카메라 → RTAB-Map 지도, 보낸 그대로)");
     }
     if let Some(f) = stats_f.as_mut() {
-        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held");
+        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose");
     }
     #[cfg(unix)]
     if !in_proc {
@@ -720,6 +779,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 lost_since = fr.t;
             }
             let cr = Instant::now();
+            eng.ensure_cur(&fr);
             // 기준 장면을 최근 것부터 한 장면에 둘씩 돌아가며 맞춰 봄
             let mut k = 0;
             while anchored && k < 2 && k < refs.len() {
@@ -747,7 +807,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             }
             s_reloc.add(ms_since(cr));
             // 기다려도 못 잡으면 마지막 위치에서 다시 시작 → 새 지도(이전 지도와 이어질 때까지 보내지 않음)
-            if !relocalized && (!anchored || fr.t - lost_since > a.reloc_wait) {
+            if !relocalized && (!anchored || fr.t - lost_since > reloc_wait) {
                 // 믿는 지도가 3 초 몫도 안 되면 붙들 것이 없다: 처음부터 다시
                 if anchored && good_t1 - good_t0 < 3.0 {
                     restart = true;
@@ -761,10 +821,21 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if pose.is_some() {
             lost_since = -1.0;
         }
+        // 위치 추적 자체가 위치를 못 낸 장면(지도 잇기 여부와 별개)
+        let no_pose = pose.is_none();
         let odom_ms = ms_since(c1);
 
         // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다
         let mut new_map = false;
+        if bridge && anchored && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
+            // 이어 붙이기: 위치 추적은 마지막 위치에서 다시 시작했다. 같은 지도에 큰 불확실성(0.5 m², 0.5 rad²)으로 이어
+            // 지도가 끊기지 않게 하고, 실제로 어긋났으면 뒤의 루프 클로저가 그래프 최적화로 바로잡는다
+            info.cov = [0.0; 36];
+            for i in 0..6 {
+                info.cov[i * 7] = 0.5;
+            }
+            n_bridge += 1;
+        }
         if !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
             common::info!("장면 {n}: 위치 추적 다시 시작 → 새 지도");
             let id = eng.trigger_new_map();
@@ -948,8 +1019,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if let Some(f) = stats_f.as_mut() {
             let _ = writeln!(
                 f,
-                "{n},{:.6},{read_ms:.3},{odom_ms:.3},{slam_ms:.3},{send_ms:.3},{},{},{},{},{},{},{}",
-                fr.t, lost as i32, new_map as i32, corrected as i32, loop_ as i32, info.features, info.inliers, held as i32
+                "{n},{:.6},{read_ms:.3},{odom_ms:.3},{slam_ms:.3},{send_ms:.3},{},{},{},{},{},{},{},{}",
+                fr.t, lost as i32, new_map as i32, corrected as i32, loop_ as i32, info.features, info.inliers, held as i32, no_pose as i32
             );
         }
         n += 1;
@@ -973,6 +1044,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     drop(poses_f);
     drop(stats_f);
 
+    if bridge {
+        common::info!("놓친 뒤 같은 지도로 이어 붙임 {n_bridge} 번");
+    }
     common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
     common::info!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");
     common::info!("같은 지도에서 다시 잡음 {n_reloc} 번, ms/회 {}", s_reloc.str());
@@ -997,9 +1071,9 @@ fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
     let want = if a.driver.is_empty() { if cfg!(feature = "rsdriver") { "rsdriver" } else { "librealsense" } } else { a.driver.as_str() };
     match want {
         #[cfg(feature = "rsdriver")]
-        "rsdriver" => Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain)?)),
+        "rsdriver" => Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms)?)),
         #[cfg(feature = "realsense")]
-        "librealsense" => Ok(Box::new(crate::io::RealSenseSource::new(a.w, a.h, a.fps, &a.align, &a.serial, a.exposure_ms, a.gain)?)),
+        "librealsense" => Ok(Box::new(crate::io::RealSenseSource::new(a.w, a.h, a.fps, &a.align, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms)?)),
         d => Err(format!("카메라 입력 {d} 이 이 빌드에 없음(--features rsdriver 또는 realsense 로 빌드)")),
     }
 }

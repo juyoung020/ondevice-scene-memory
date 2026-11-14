@@ -8,6 +8,7 @@ pub mod graph;
 pub mod io;
 pub mod loopclose;
 pub mod odom;
+pub mod klt;
 pub mod params;
 pub mod register;
 pub mod stream;

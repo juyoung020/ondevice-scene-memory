@@ -20,6 +20,11 @@ pub const CID_GAIN: u32 = 0x0098_0913;
 pub const CID_EXPOSURE_AUTO: u32 = 0x009a_0901;
 pub const CID_EXPOSURE_ABSOLUTE: u32 = 0x009a_0902;
 pub const CID_EXPOSURE_AUTO_PRIORITY: u32 = 0x009a_0903;
+pub const CID_AUTO_WHITE_BALANCE: u32 = 0x0098_090c;
+pub const CID_POWER_LINE_FREQUENCY: u32 = 0x0098_0918;
+pub const CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
+/// 전원 주파수 60 Hz(한국·미국 형광등 깜빡임 맞춤)
+pub const POWER_LINE_60HZ: i32 = 2;
 pub const EXPOSURE_MANUAL: i32 = 1;
 pub const EXPOSURE_APERTURE_PRIORITY: i32 = 3;
 

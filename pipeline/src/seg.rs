@@ -432,6 +432,25 @@ impl Segmenter for OnnxSeg {
 #[cfg(feature = "dxrt")]
 pub mod dx {
     use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    /// NPU 코어 묶기(DXRT bound_option): 0 = 셋 다, 1 · 2 · 3 = 코어 0 · 1 · 2, 4 = 0+1, 5 = 1+2, 6 = 0+2.
+    /// 분할(`--seg-npu`)과 사진 벡터(`--embed-npu`)를 다른 코어에 두면 서로 줄 서지 않고 함께 돈다
+    pub static SEG_BOUND: AtomicU32 = AtomicU32::new(0);
+    pub static EMBED_BOUND: AtomicU32 = AtomicU32::new(0);
+    /// "all" · "0" · "1" · "2" · "01" · "12" · "02" → bound_option
+    pub fn parse_bound(s: &str) -> u32 {
+        match s {
+            "all" | "" => 0,
+            "0" => 1,
+            "1" => 2,
+            "2" => 3,
+            "01" | "10" => 4,
+            "12" | "21" => 5,
+            "02" | "20" => 6,
+            _ => panic!("NPU 코어 지정 {s}: all · 0 · 1 · 2 · 01 · 12 · 02"),
+        }
+    }
 
     #[repr(C)]
     pub struct Options {
@@ -471,14 +490,14 @@ pub mod dx {
     }
     impl Engine {
         pub fn new(path: &str) -> Engine {
-            Engine::open(path, -1)
+            Engine::open(path, -1, SEG_BOUND.load(Relaxed))
         }
         /// 모델 안의 CPU 부분까지 런타임이 돌리게 연다(ONNX Runtime). 입력·출력이 모델 원래의 것(f32)이 된다
         pub fn with_cpu_tasks(path: &str) -> Engine {
-            Engine::open(path, 1)
+            Engine::open(path, 1, EMBED_BOUND.load(Relaxed))
         }
-        fn open(path: &str, use_ort: c_int) -> Engine {
-            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option: 0, use_ort, reserved: [0; 6] };
+        fn open(path: &str, use_ort: c_int, bound_option: u32) -> Engine {
+            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option, use_ort, reserved: [0; 6] };
             let mut e = std::ptr::null_mut();
             let p = CString::new(path).unwrap();
             unsafe {

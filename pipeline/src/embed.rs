@@ -149,6 +149,31 @@ mod worker {
             #[cfg(not(feature = "onnx"))]
             panic!("--embed {model}: 이 빌드는 NPU 모델(.dxnn)을 받는다");
         }
+        fn submit(&mut self, buf: &[f32]) -> Ticket {
+            match self {
+                #[cfg(feature = "dxrt")]
+                Net::Dx(e) => {
+                    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
+                    Ticket::Job(e.submit(bytes))
+                }
+                #[allow(unreachable_patterns)]
+                _ => Ticket::Done(self.run(buf)),
+            }
+        }
+        fn wait(&mut self, t: Ticket) -> Vec<f32> {
+            match (self, t) {
+                #[cfg(feature = "dxrt")]
+                (Net::Dx(e), Ticket::Job(id)) => {
+                    let mut v = Vec::new();
+                    e.waiter().wait_into(id, &mut v);
+                    v.truncate(DIM);
+                    v
+                }
+                (_, Ticket::Done(v)) => v,
+                #[allow(unreachable_patterns)]
+                _ => unreachable!(),
+            }
+        }
         fn run(&mut self, buf: &[f32]) -> Vec<f32> {
             match self {
                 #[cfg(feature = "onnx")]
@@ -169,11 +194,42 @@ mod worker {
         }
     }
 
+    #[derive(Default)]
+    struct Stat {
+        n: u32,
+        pre: f64,
+        net: f64,
+        write: f64,
+    }
+    /// 올린 추론 하나: NPU 는 작업 번호, CPU(ONNX)는 이미 끝난 벡터
+    enum Ticket {
+        Done(Vec<f32>),
+        #[cfg(feature = "dxrt")]
+        Job(i32),
+    }
+    fn finish_job(net: &mut Net, (j, tk, t0, pre): (Job, Ticket, std::time::Instant, f64), st: &mut Stat) {
+        let mut v = net.wait(tk);
+        let t1 = std::time::Instant::now();
+        normalize(&mut v);
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
+        let tmp = j.path.with_extension("bin.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &j.path).is_ok() {
+            crate::out::publish(&j.path, bytes); // --serve: 검색이 파일을 다시 읽지 않게
+        }
+        put(j.id, v);
+        st.n += 1;
+        st.pre += pre;
+        st.net += (t1 - t0).as_secs_f64() * 1e3;
+        st.write += t1.elapsed().as_secs_f64() * 1e3;
+    }
+
     pub fn start(model: &str) {
         let mut net = Net::open(model);
         let (tx, rx) = mpsc::channel::<Job>();
         let th = std::thread::Builder::new().name("embed".into()).spawn(move || {
-            let (mut buf, mut n, mut ms) = (Vec::new(), 0u32, 0.0f64);
+            let mut bufs = [Vec::new(), Vec::new()];
+            let mut st = Stat::default();
             while let Ok(first) = rx.recv() {
                 // 밀린 일은 물체(파일)마다 가장 새 사진만
                 let mut jobs: HashMap<PathBuf, Job> = HashMap::new();
@@ -183,24 +239,25 @@ mod worker {
                     jobs.insert(j.path.clone(), j);
                     taken += 1;
                 }
-                for j in jobs.into_values() {
+                // NPU 에 한 장 올려 둔 동안 다음 사진을 전처리(입력 버퍼 둘을 번갈아)
+                let mut prev: Option<(Job, Ticket, std::time::Instant, f64)> = None;
+                for (i, j) in jobs.into_values().enumerate() {
                     let t = std::time::Instant::now();
-                    preprocess(&j.rgb, j.w, j.h, &mut buf);
-                    let mut v = net.run(&buf);
-                    normalize(&mut v);
-                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                    // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
-                    let tmp = j.path.with_extension("bin.tmp");
-                    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &j.path).is_ok() {
-                        crate::out::publish(&j.path, bytes); // --serve: 검색이 파일을 다시 읽지 않게
+                    preprocess(&j.rgb, j.w, j.h, &mut bufs[i % 2]);
+                    let pre = t.elapsed().as_secs_f64() * 1e3;
+                    if let Some(p) = prev.take() {
+                        finish_job(&mut net, p, &mut st);
                     }
-                    put(j.id, v);
-                    n += 1;
-                    ms += t.elapsed().as_secs_f64() * 1e3;
+                    let tk = net.submit(&bufs[i % 2]);
+                    prev = Some((j, tk, std::time::Instant::now(), pre));
+                }
+                if let Some(p) = prev.take() {
+                    finish_job(&mut net, p, &mut st);
                 }
                 PENDING.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
             }
-            common::info!("embed: {n} vectors, {:.1} ms each", ms / n.max(1) as f64);
+            let k = st.n.max(1) as f64;
+            common::info!("embed: {} vectors, 전처리 {:.1} ms · 모델(올림 → 받음) {:.1} ms · 쓰기 {:.1} ms 씩", st.n, st.pre / k, st.net / k, st.write / k);
         }).unwrap();
         *W.lock().unwrap() = Some((tx, th));
     }

@@ -2085,6 +2085,13 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args(&argv);
+    #[cfg(feature = "dxrt")]
+    {
+        // --seg-npu · --embed-npu: 두 NPU 모델을 다른 NPU 코어에 묶음(기본 all)
+        use std::sync::atomic::Ordering::Relaxed;
+        seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
+        seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
+    }
     // 물체만 자르는 1 클래스 모델(파일 이름에 objectsam)은 --seg-names 가 없으면 object
     match &a.seg_names {
         Some(n) => seg::set_names(n),

@@ -1459,6 +1459,7 @@ async function fetchView() {
       const first = !view;
       viewVer = j.v;
       if (first || j.map_v !== mapVer) { mapVer = j.map_v; view = j.view; await loadMap(); }
+      if (j.view.wall) viewWall = j.view.wall;   // ?metrics=1: 지도 판을 낸 장면 → 화면
       applyView(j.view);
       if (latestPose && latestPose.t >= (view.stamp ?? 0)) { view.cam = latestPose.cam; view.pose = latestPose.pose; drawRobot(); }   // keep the newer fast pose
       updateWalls();
@@ -1471,12 +1472,12 @@ async function fetchView() {
 // fast camera pose (pose.json, a few hundred bytes, written every keyframe): the handheld camera moves without waiting for view.json
 let latestPose = null;
 // ?metrics=1: 2 초마다 그린 프레임 수 · 위치(pose.json wall) → 화면 지연을 서버 로그로(/api/metric)
-let poseWall = 0;
-const met = { frames: 0, lat: [], t0: performance.now() };
+let poseWall = 0, viewWall = 0;
+const met = { frames: 0, lat: [], vlat: [], t0: performance.now() };
 if (QS.get("metrics") === "1") setInterval(() => {
-  const dt = (performance.now() - met.t0) / 1000, l = met.lat.sort((a, b) => a - b), q = p => l.length ? l[Math.min(l.length - 1, Math.floor(l.length * p))].toFixed(0) : "-";
-  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${q(0.5)}&lat95=${q(0.95)}&n=${l.length}`).catch(() => {});
-  met.frames = 0; met.lat = []; met.t0 = performance.now();
+  const dt = (performance.now() - met.t0) / 1000, qq = (a, p) => { a.sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(0) : "-"; };
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}`).catch(() => {});
+  met.frames = 0; met.lat = []; met.vlat = []; met.t0 = performance.now();
 }, 2000);
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
@@ -1932,6 +1933,7 @@ function frame() {
   perf.frames++; perf.renderMs += performance.now() - tr;
   met.frames++;
   if (poseWall) { met.lat.push(Date.now() - poseWall); poseWall = 0; }
+  if (viewWall) { met.vlat.push(Date.now() - viewWall); viewWall = 0; }
 }
 (function loop() { requestAnimationFrame(loop); frame(); })();
 loadRobotModel();

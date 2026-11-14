@@ -674,7 +674,8 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         }
         // ?metrics=1 page: frames drawn and pose → screen latency every 2 s, logged here (measuring on the board screen)
         "/api/metric" => {
-            eprintln!("viewer: {} fps, pose→screen p50 {} p95 {} ms (n {})", q.get("fps").map_or("-", |v| v), q.get("lat50").map_or("-", |v| v), q.get("lat95").map_or("-", |v| v), q.get("n").map_or("-", |v| v));
+            let g = |k: &str| q.get(k).map_or("-", |v| v.as_str());
+            eprintln!("viewer: {} fps, pose→screen p50 {} p95 {} ms (n {}), map→screen p50 {} p95 {} ms (n {})", g("fps"), g("lat50"), g("lat95"), g("n"), g("vlat50"), g("vlat95"), g("vn"));
             respond(&mut s, 204, "text/plain", "", b"")
         }
         "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),

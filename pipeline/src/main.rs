@@ -503,7 +503,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none() || a.no_drop) // --no-drop: 스트림도 기다림
     });
     let mut mem = Memory::new(0.012, 0.04);
-    let mut view = ViewWorker::spawn(a.out.clone()); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
+    let mut view = ViewWorker::spawn(a.out.clone(), a.live > 0.0); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
     let mut z0: Option<f64> = None;
@@ -2013,7 +2013,8 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
     let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).collect();
     let traj = view.traj_update(traj);
-    view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone() });
+    let wall = if view.live { wall_ms() } else { 0.0 };
+    view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });
 }
 
 /// 지나온 길 바뀐 몫: 덧붙인 점, 또는 다시 쌓기로 새로 만든 길 전체
@@ -2033,6 +2034,7 @@ struct ViewJob {
     pose: [f64; 3],
     cam: serde_json::Value,
     scene: serde_json::Value,
+    wall: f64, // 실시간: 이 판을 낸 장면의 벽시계(ms) — 뷰어(?metrics=1)가 지도 → 화면 지연을 잼. 재생은 0(view.json 에 안 실음)
 }
 
 enum ViewMsg {
@@ -2047,10 +2049,11 @@ struct ViewWorker {
     handle: Option<std::thread::JoinHandle<()>>,
     sent: usize,   // 넘긴 길 점 수
     fresh: bool,   // 길이 새로 만들어짐(다시 쌓기 갈아 끼우기)
+    live: bool,    // 실시간 입력(판에 벽시계를 실음)
 }
 
 impl ViewWorker {
-    fn spawn(dir: PathBuf) -> ViewWorker {
+    fn spawn(dir: PathBuf, live: bool) -> ViewWorker {
         let (tx, rx) = std::sync::mpsc::channel::<ViewMsg>();
         let handle = std::thread::Builder::new().name("view".into()).spawn(move || {
             out::thread_role(out::Role::Writer);
@@ -2116,6 +2119,9 @@ impl ViewWorker {
                 if !j.scene.is_null() {
                     head["scene_points"] = j.scene;
                 }
+                if j.wall > 0.0 {
+                    head["wall"] = json!(j.wall);
+                }
                 n += 1;
                 let len = log.len();
                 if out::memory_only() {
@@ -2125,7 +2131,7 @@ impl ViewWorker {
                 }
             }
         }).unwrap();
-        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true }
+        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true, live }
     }
     fn traj_update(&mut self, traj: &[(f64, [f64; 3])]) -> TrajUpd {
         let u = if std::mem::take(&mut self.fresh) || traj.len() < self.sent { TrajUpd::Reset(traj.to_vec()) } else { TrajUpd::Append(traj[self.sent..].to_vec()) };

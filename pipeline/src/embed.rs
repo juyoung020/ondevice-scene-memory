@@ -432,9 +432,9 @@ mod tests {
         let (n, p) = look_name(&names, &vecs, &e).unwrap();
         assert_eq!(n, "monitor");
         assert!(p > 0.99, "{p}");
-        // 어느 이름도 닮지 않은 사진: 몫이 셋으로 갈려 NAME_MIN 근처
+        // 어느 이름도 닮지 않은 사진: 1 등과 2 등의 차가 NAME_MARGIN 아래라 몫 0(이름 안 붙음)
         e[1] = 0.0;
-        assert!((look_name(&names, &vecs, &e).unwrap().1 - 1.0 / 3.0).abs() < 1e-4);
+        assert_eq!(look_name(&names, &vecs, &e).unwrap().1, 0.0);
     }
 
     #[test]

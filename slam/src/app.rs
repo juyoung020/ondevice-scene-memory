@@ -439,7 +439,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms(기본 8.3, 0 = 카메라 자동)] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms(0 = 카메라 자동, 기본)] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -497,7 +497,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
-        ae_cap_ms: 8.3, // 노출 상한(ms): 60 Hz 조명 한 주기(8.3 ms) = 깜빡임 없고 번짐 작음
+        ae_cap_ms: 0.0, // 노출 상한(ms). 0 = 카메라 자동 노출. 밝은 방에서 번짐을 줄이려면 8.3(60 Hz 조명 한 주기)
         gain: -1,
         send_every: 1,
         queue: 4,

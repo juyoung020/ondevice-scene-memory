@@ -19,7 +19,7 @@ const NAME_GAP_HI: f32 = 0.10;
 /// cosine distance from the closest name over which a name's share drops by e
 const NAME_FALLOFF: f32 = 0.035;
 /// Texts that describe no object: a picture these fit as well as the query is no hit for the query
-const NULLS: [&str; 5] = ["a photo", "an image", "a blurry photo", "nothing", "background"];
+pub const NULLS: [&str; 5] = ["a photo", "an image", "a blurry photo", "nothing", "background"];
 /// Token count the text encoder was trained with
 const TOKENS: usize = 64;
 

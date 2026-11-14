@@ -1074,3 +1074,18 @@ LVIS 동의어 전부 · Open Images 600 · BEHAVIOR-1K 범주 · object-memory-
 | ObjectSAM: 틀린 이름 | can opener, tights, pen, keycard, pegboard | baseball bat | baseball bat |
 
 - 틀린 이름은 줄지만 잘 맞던 이름(bucket 0.70)도 같이 빠진다: 작고 흐리게 본 앞 장면들이 섞여 몫이 내려간다. 가장 새 벡터 하나로 붙이는 지금 방식을 유지한다.
+
+## 보드 NPU 에서 이름 붙이기와 검색 (Pi 5 + DX-M1, DXRT 3.4.0, 2026-11-14)
+
+TUM fr1 책상을 찍은 속도대로 재생(RTAB-Map → memmap, 분할 yolo26-s-seg · 사진 벡터 siglip2-vision_v8, 둘 다 NPU)해 세 설정을 차례로 돌렸다.
+
+| | 분할만 | + `--embed` | + `--embed --vocab` |
+|---|---|---|---|
+| 분할 추론(ms) | 51.9 | 53.1 | 56.4 |
+| 사진 벡터 | – | – | 147 개, 27.0 ms |
+| 물체 | 18 | 16 | 20 |
+| CPU 온도 | 35.1 °C | 35.6 °C | 37.8 °C |
+
+- NPU 사진 벡터(PC 벡터와 코사인 0.93)로도 이름이 붙는다: tv → monitor 0.80 · 0.35, keyboard → computer keyboard 0.72, laptop → laptop computer 0.40, mouse 0.86, remote → joystick 0.84. 이름 1,225 개와의 비교는 벡터 하나에 한 번이라 속도에 보이지 않는다.
+- 사진 벡터를 켜도 분할은 4.5 ms 느려지는 데 그친다(카메라 실시간에서 본 59 → 80 ms 는 이 재생으로는 나오지 않음).
+- 보드의 뷰어 검색(글 인코더는 보드 CPU): 새 질의 0.45 초, 같은 질의 다시 0.02 초. 뷰어를 켜고 첫 질의는 물체를 가리키지 않는 글 다섯 개를 그때 계산해 2.6 초였다 → 뷰어가 뜰 때 미리 계산한다.

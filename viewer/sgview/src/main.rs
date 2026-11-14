@@ -1061,14 +1061,14 @@ fn main() {
         let st2 = st.clone();
         std::thread::spawn(move || match search::TextEnc::load(Path::new(&m)) {
             Ok(e) => {
-                // class names are asked on every query: take their vectors from the file, or encode them once now
+                // class names and the null texts are asked on every query: take their vectors from the file, or encode them once now
                 match vocab.as_deref().map(|f| search::read_vocab(Path::new(f))) {
                     Some(Ok(v)) => e.know(v),
                     Some(Err(err)) => eprintln!("search: {err}"),
                     None => {}
                 }
                 let names: Vec<String> = fs::read_to_string(st2.dir.join("vocab.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-                for n in &names {
+                for n in names.iter().map(String::as_str).chain(search::NULLS) {
                     let _ = e.encode(n);
                 }
                 let _ = st2.text_enc.set(e);

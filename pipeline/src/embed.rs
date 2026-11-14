@@ -70,6 +70,9 @@ pub const NAME_MIN: f32 = 0.3;
 /// 이름 없는 물체(object)에 사진 이름을 쓰는 가장 낮은 몫. ObjectSAM v1.0 으로 돌린 사무실 녹화에서 0.15 아래는 대부분 틀렸다
 /// (breechcloth 0.06, ping-pong ball 0.08, vending machine 0.10), 0.2 대는 맞았다(chair 0.27, bottle 0.23, file cabinet 0.20)
 pub const NAME_MIN_UNNAMED: f32 = 0.15;
+/// 1 등 이름과 2 등 이름의 코사인 차가 이보다 작으면 이름을 붙이지 않는다. fr1_desk 물체 23 개(사람이 이름을 단 것)에서
+/// 몫 0.15 만 쓸 때 맞은 이름 비율 0.52, 차 0.003 을 더하면 0.67(이름 붙은 물체 15 개)
+pub const NAME_MARGIN: f32 = 0.003;
 
 /// 물체가 아닌 면의 이름(이름 목록에 함께 넣어 둠)
 pub const STRUCTURAL: [&str; 4] = ["floor", "wall", "ceiling", "baseboard"];
@@ -100,12 +103,15 @@ pub fn load_vocab(path: &str) -> Vec<String> {
     names
 }
 
-/// 사진 벡터(길이 1)가 가장 닮은 이름과 그 몫: 이름 전체에 대한 softmax(SCALE · 코사인)
+/// 사진 벡터(길이 1)가 가장 닮은 이름과 그 몫: 이름 전체에 대한 softmax(SCALE · 코사인). 1 등과 2 등의 코사인 차가 NAME_MARGIN 보다
+/// 작으면(두 이름 사이에서 갈팡질팡) 몫을 0 으로 돌려 이름을 붙이지 않게 한다
 fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)> {
     let l: Vec<f32> = vecs.chunks(DIM).map(|t| SCALE * t.iter().zip(e).map(|(a, b)| a * b).sum::<f32>()).collect();
     let (i, m) = l.iter().cloned().enumerate().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let second = l.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, x)| *x).fold(f32::NEG_INFINITY, f32::max);
     let z: f32 = l.iter().map(|x| (x - m).exp()).sum();
-    Some((names[i].clone(), 1.0 / z))
+    let share = if (m - second) / SCALE >= NAME_MARGIN { 1.0 / z } else { 0.0 };
+    Some((names[i].clone(), share))
 }
 
 /// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,

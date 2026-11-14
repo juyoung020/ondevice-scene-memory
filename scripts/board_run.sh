@@ -17,7 +17,7 @@ OUT=${OUT:-data/memory/live}
 SRC="--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file $OUT/reset.req"
 if [ "${1:-}" = "--tum" ]; then SRC="--tum $2 --config docs/rtabmap_pi.ini --send-every 2"; shift 2; fi
 RT=${RT:-auto}
-# NPU 코어 묶기(DX-M1 코어 0·1·2, all = 셋 다): 분할과 사진 벡터를 다른 코어에 두어 줄 서지 않고 함께 돌게
+# NPU 코어 묶기(DX-M1 코어 0·1·2, all = 셋 다). 2026-11-15 fr1_desk 에서 all/all 과 01/2 는 같은 속도(NPU 는 분할 9 ms · 사진 13 ms 로 한가하고, 시간은 CPU 쪽)
 SEG_NPU=${SEG_NPU:-all}
 EMB_NPU=${EMB_NPU:-all}
 rm -rf "$OUT"; mkdir -p "$OUT"

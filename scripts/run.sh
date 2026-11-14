@@ -5,7 +5,7 @@
 #   bash scripts/run.sh d435 [기억 폴더] [인자…]                                      D435 실시간
 # 뷰어: http://localhost:${PORT:-8080}. 기억 폴더는 메모리에 두고 끝에 디스크에 쓴다(SAVE_EVERY=초 이면 그 간격으로도, 뷰어 저장 버튼도).
 # BIN=<실행 파일>(기본 target/release/ondevice), SEG=<분할 모델>(기본 models/ObjectSAM-416_640.onnx), EMB=<SigLIP2 영상 인코더>, VOCAB=<이름 표>(기본 vocab/indoor.voc)
-# 물체는 ObjectSAM 으로 자르고 이름은 SigLIP2 사진 벡터가 가장 닮은 실내 낱말로 붙인다. COCO 이름(YOLO)은 SEG=models/yolo26s-seg.onnx 로 직접, INI=<RTAB-Map 설정>(기본 docs/rtabmap_pi.ini)
+# 물체는 ObjectSAM 으로 자르고 이름은 SigLIP2 사진 벡터가 가장 닮은 실내 낱말로 붙인다., INI=<RTAB-Map 설정>(기본 docs/rtabmap_pi.ini)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${BIN:-$ROOT/target/release/ondevice}

@@ -66,7 +66,6 @@ struct Args {
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
     vocab: Option<String>,  // --vocab <글 벡터 파일>: 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(--embed 와 함께, 파일은 sgview --encode-vocab 이 만듦)
-    seg_names: Option<String>, // --seg-names <이름,이름,…>: 분할 모델의 클래스 이름. ObjectSAM(기본)은 object, --seg 로 COCO 모델(YOLO)을 주면 COCO 80 개
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -79,7 +78,6 @@ fn args(v: &common::cli::Argv) -> Args {
         seg: get("--seg").unwrap_or_else(|| models::seg()),
         embed: models::opt(get("--embed"), models::embed),
         vocab: models::opt(get("--vocab"), models::vocab).filter(|_| get("--embed").is_none_or(|e| e != "off" && e != "none")), // 이름은 사진 벡터가 있어야
-        seg_names: get("--seg-names"),
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
@@ -312,7 +310,7 @@ fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V
 
 /// 기본 모델: ObjectSAM 분할(물체만, 이름 없음) + SigLIP2 사진 벡터 + 실내 이름 표(vocab/indoor.voc).
 /// 모델 폴더 = $ONDEVICE_MODELS, 없으면 보드(dxrt) ~/models · PC models/. `--embed off` · `--vocab off` 로 끔.
-/// COCO 이름 분할(YOLO)은 `--seg <yolo 모델>` 로 직접 줄 때만.
+/// 분할은 클래스 없는 ObjectSAM 만(클래스를 내는 모델은 seg::seg_post 가 멈춤).
 mod models {
     use std::path::PathBuf;
     fn dir() -> PathBuf {
@@ -570,8 +568,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     out::remove_dir_all(&a.out.join("scene"));
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
-    // 물체가 가질 수 있는 이름 전체(분할 모델의 이름 + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
-    let mut names: Vec<String> = seg::names();
+    // 물체가 가질 수 있는 이름 전체(object + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
+    let mut names: Vec<String> = vec!["object".into()];
     if let Some(f) = &a.vocab {
         names.extend(embed::load_vocab(f));
         names.sort();
@@ -1893,10 +1891,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     // 깊이 > 0.2 m 판정: 원래 값이면 문턱 값 하나와 비교(나눗셈 없이 같은 판정)
     let raw_th = depth.raw().zip(depth.raw_above(0.2));
     for d in dets.iter().flatten().filter(|_| map_ok) {
-        let name = seg::name(d.cls);
-        if name == "person" {
-            continue;
-        }
+        let name = "object";
         let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
         let (bw, bh) = (x2 - x1, y2 - y1);
         erode_into(&d.mask, bw, bh, 3, &mut eb);
@@ -2317,12 +2312,6 @@ fn main() {
         use std::sync::atomic::Ordering::Relaxed;
         seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
         seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
-    }
-    // 기본은 이름 없는 물체(object, ObjectSAM). COCO 이름은 --seg 로 YOLO 모델(파일 이름에 yolo)을 줄 때만
-    match &a.seg_names {
-        Some(n) => seg::set_names(n),
-        None if a.seg.to_ascii_lowercase().contains("yolo") => {}
-        None => seg::set_names("object"),
     }
     if let Some(m) = &a.embed {
         embed::start(m);

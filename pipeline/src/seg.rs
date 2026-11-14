@@ -1,18 +1,9 @@
-//! YOLO26-seg, end-to-end 출력: [1,300,38] = x1 y1 x2 y2 점수 클래스 + 계수 32, 원형 [1,32,160,160].
+//! ObjectSAM 분할(클래스 없는 물체 1 클래스, YOLO 형 머리), end-to-end 출력: [1,300,38] = x1 y1 x2 y2 점수 클래스(늘 0) + 계수 32, 원형 [1,32,160,160].
+//! 이름은 분할이 아니라 SigLIP2 사진 벡터(embed.rs)가 붙인다.
 //! 실행기 두 개가 같은 전처리(레터박스 RGB, 회색 114)·후처리(상자 안 화소만 계수·원형 내적)를 쓴다.
-//!   - PC: ONNX Runtime (feature "onnx", 기본 models/ObjectSAM-416_640.onnx, --seg 로 YOLO COCO 모델도, 입력 f32 NCHW /255)
-//!   - Pi5 + DX-M1: DXRT C API (feature "dxrt", 기본 ~/models/objectsam-416_640.dxnn, 입력 u8 NHWC)
+//!   - PC: ONNX Runtime (feature "onnx", 기본 models/ObjectSAM-416_640.onnx, 입력 f32 NCHW /255)
+//!   - Pi5 + DX-M1: DXRT C API (feature "dxrt", 기본 ~/models/objectsam-416_640.dxnn, NPU 만 도는 머리 출력, 입력 u8 NHWC)
 
-pub const COCO: [&str; 80] = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant",
-    "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
-    "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut",
-    "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
-    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
-    "teddy bear", "hair drier", "toothbrush",
-];
 
 pub struct Det {
     pub cls: usize,
@@ -22,27 +13,6 @@ pub struct Det {
 }
 
 /// 분할 모델 입력 한 변
-/// 분할 모델이 내는 이름(`--seg-names`). 기본 object(ObjectSAM), YOLO 모델이면 COCO 80 개
-static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
-/// 클래스 이름 목록을 바꾼다: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `object`
-pub fn set_names(list: &str) {
-    let _ = NAMES.set(list.split(',').map(|s| s.trim().to_string()).collect());
-}
-
-/// 분할 모델이 낼 수 있는 이름 전체
-pub fn names() -> Vec<String> {
-    NAMES.get().cloned().unwrap_or_else(|| COCO.iter().map(|s| s.to_string()).collect())
-}
-
-/// 클래스 번호의 이름(목록 밖이면 object)
-pub fn name(cls: usize) -> &'static str {
-    match NAMES.get() {
-        Some(n) => n.get(cls).map_or("object", |s| s.as_str()),
-        None => COCO.get(cls).copied().unwrap_or("object"),
-    }
-}
-
 pub const SEG_S: usize = 640;
 
 /// 레터박스 자리: 배율 r, 여백 (px, py)
@@ -381,6 +351,15 @@ pub fn seg_pre(rgb: &[u8], w: usize, h: usize, inp: &mut SegIn) {
 
 /// 후처리 단계: 마스크 해독. 추론과 다른 스레드에서 돌려도 된다.
 pub fn seg_post(raw: &SegRaw, geom: LbGeom, w: usize, h: usize, conf: f32) -> Vec<Det> {
+    let dets = seg_post_any(raw, geom, w, h, conf);
+    // 클래스 없는 물체 모델(ObjectSAM)만 받는다: 클래스가 둘 이상인 모델(COCO 등)은 멈춤
+    if let Some(d) = dets.iter().find(|d| d.cls != 0) {
+        panic!("--seg: 클래스 {} 을 낸 모델 — 클래스 없는 ObjectSAM 분할 모델(1 클래스)만 쓴다", d.cls);
+    }
+    dets
+}
+
+fn seg_post_any(raw: &SegRaw, geom: LbGeom, w: usize, h: usize, conf: f32) -> Vec<Det> {
     if let Some(hd) = &raw.heads {
         thread_local!(static DET: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) });
         return DET.with_borrow_mut(|det| {
@@ -642,7 +621,7 @@ pub struct DxSeg {
     lay: Layout,
 }
 #[cfg(feature = "dxrt")]
-/// dxnn 출력 배치: 검출 [300,38] + 원형(모델 안 CPU 후처리 포함, 공식 파일) 또는 머리 9 개 + 원형(NPU 만)
+/// dxnn 출력 배치: 머리 9 개 + 원형(NPU 만, ObjectSAM)
 #[derive(Clone, Copy)]
 struct Layout {
     det: (usize, usize),
@@ -674,8 +653,7 @@ impl DxSeg {
             common::info!("seg: NPU 만 도는 머리 출력 모델 {path}(상위 고르기는 이 프로그램이)");
             Layout { det: (0, 0), proto: eng.f32_span(pi), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize), heads: Some(heads) }
         } else {
-            let ps = &eng.tensors[1].1;
-            Layout { det: eng.f32_span(0), proto: eng.f32_span(1), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize), heads: None }
+            panic!("--seg {path}: NPU 만 도는 머리 출력(출력 10 개) ObjectSAM 모델이 아님 — tools npu_prep 으로 만든 objectsam-*.dxnn 을 쓴다");
         };
         DxSeg { eng, scratch: Default::default(), lay }
     }

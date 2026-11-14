@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### Added
+- 모델 기본값: `--seg` ObjectSAM(PC `models/ObjectSAM-416_640.onnx`, 보드 `~/models/objectsam-416_640.dxnn`) · `--embed` SigLIP2 영상 인코더 · `--vocab vocab/indoor.voc`. 모델 폴더는 `ONDEVICE_MODELS`, `--embed off` 로 이름 붙이기 끔.
 - 빠른 움직임에도 끊기지 않는 광류 위치 추적 `Odom/Strategy=9`(기본): 등속 예측 · 광류 · PnP, 끊기면 깊이 ICP · 키프레임 기술자로 같은 장면에서 되찾음. 사용자 손카메라 녹화에서 위치 못 낸 장면 21.5 % → 1.7 %, 새 지도 192 → 0.
 - 위치 프로그램 `--stride N`(TUM 재생에서 N 장마다 한 장), rsd_rec 녹화 폴더(calib.json) 재생, 통계 CSV 의 `no_pose` 칸, D435 컬러 노출 상한 `--ae-cap ms`.
 - `--serve` 는 기억 폴더를 메모리에 두고 끝에(또는 `--save-every S` 초마다 · 뷰어 저장 버튼으로) 디스크에 쓴다.
@@ -23,9 +24,10 @@
 - 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
 - 물체 이름을 사진으로 붙이기 `ondevice --vocab vocab/names.voc`: 이름 1,225 개(LVIS · COCO 등) 중 사진이 가장 닮은 이름을 쓴다(tv → monitor · laptop computer).
 - 이름 글 벡터를 미리 만들어 두는 `ondevice view --encode-vocab <이름 목록> <파일>` 과 그 파일을 읽는 뷰어 `--vocab`.
-- 분할 모델의 클래스 이름 `ondevice --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
+- 물체 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
 
 ### Changed
+- **호환 변경:** 물체 분할은 클래스 없는 ObjectSAM 만 쓴다. COCO 이름 표 · `--seg-names` · YOLO26 공식 dxnn(모델 안 CPU 후처리) 출력 배치를 뺐고, 클래스를 내는 모델은 첫 검출에서 멈춘다. 이름은 늘 SigLIP2 사진 벡터로 붙인다.
 - 놓친 뒤 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙인다(광류 경로, `--no-bridge` 로 예전 동작). 광류 경로에서는 다시 잡기 대기가 0 초다.
 - D435 컬러를 60 Hz 깜빡임 맞춤 · 자동 화이트 밸런스 · 역광 보정 끔으로 연다.
 - 실시간 뷰어는 받은 장면마다 새 판을 받고, 서버는 바뀔 때만 밀어 준다(연결 스레드는 고정 8 개).

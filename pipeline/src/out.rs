@@ -1,6 +1,7 @@
 //! 기억 폴더 쓰기: 임시 파일에 쓴 뒤 바꾸기(윈도우에서 뷰어가 읽는 중이면 잠깐 기다렸다 다시).
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 pub fn replace(tmp: &Path, dst: &Path) {
     for _ in 0..100 {
@@ -89,8 +90,13 @@ fn run_job(dst: &Path, job: Job) {
     let c0 = std::time::Instant::now();
     let b = job();
     write_now(dst, &b);
+    let n = b.len();
+    // --serve: 자주 바뀌는 파일은 같은 바이트를 서버에도 걸어 둠(복사 없이 넘김, 파일을 다 쓴 뒤라 디스크와 같은 차례)
+    if sgview::memfs::is_hot(dst) {
+        sgview::memfs::publish(dst, std::sync::Arc::new(b));
+    }
     slow(c0);
-    stats::add(stats::kind(dst), b.len(), c0.elapsed().as_nanos() as u64);
+    stats::add(stats::kind(dst), n, c0.elapsed().as_nanos() as u64);
 }
 
 fn write_now(dst: &Path, bytes: &[u8]) {
@@ -127,30 +133,25 @@ pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
     write_owned(dst, b);
 }
 
-// PNG 압축은 기록 스레드에서(물체 사진이 바뀔 때 본 스레드가 장당 수십 ms 멈추던 것)
-pub fn png_rgb(dst: &Path, w: u32, h: u32, rgb: &[u8]) {
-    let px = rgb.to_vec();
-    write_lazy(dst, Box::new(move || {
-        let mut v = vec![];
-        image::RgbImage::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-        v
-    }));
+// PNG 압축은 기록 스레드에서(물체 사진이 바뀔 때 본 스레드가 장당 수십 ms 멈추던 것). 화소는 Arc 로 나눠 받아 복사 없이 압축
+pub fn png_rgb(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
+    write_lazy(dst, Box::new(move || png_of::<image::Rgb<u8>>(w, h, &px)));
 }
-pub fn png_gray(dst: &Path, w: u32, h: u32, g: &[u8]) {
-    let px = g.to_vec();
-    write_lazy(dst, Box::new(move || {
-        let mut v = vec![];
-        image::GrayImage::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-        v
-    }));
+pub fn png_gray(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
+    write_lazy(dst, Box::new(move || png_of::<image::Luma<u8>>(w, h, &px)));
 }
-pub fn png_u16(dst: &Path, w: u32, h: u32, d: &[u16]) {
-    let px = d.to_vec();
-    write_lazy(dst, Box::new(move || {
-        let mut v = vec![];
-        image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
-        v
-    }));
+pub fn png_u16(dst: &Path, w: u32, h: u32, px: Arc<Vec<u16>>) {
+    write_lazy(dst, Box::new(move || png_of::<image::Luma<u16>>(w, h, &px)));
+}
+
+/// 빌린 화소로 PNG(ImageBuffer::write_to 와 같은 인코더·설정이라 같은 바이트)
+fn png_of<P: image::Pixel + image::PixelWithColorType>(w: u32, h: u32, px: &[P::Subpixel]) -> Vec<u8>
+where
+    [P::Subpixel]: image::EncodableLayout,
+{
+    let mut v = vec![];
+    image::ImageBuffer::<P, &[P::Subpixel]>::from_raw(w, h, px).unwrap().write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
+    v
 }
 
 /// 기록 통계(종류별 파일 수·바이트·짜기+쓰기 시간): 끝에 한 줄로 출력해 어느 파일이 디스크·기록 스레드를 먹는지 본다
@@ -410,4 +411,10 @@ pub mod cpu {
         }
         (ns.map(|v| v as f64 * 1e-9), clock_ns(2) as f64 * 1e-9)
     }
+}
+
+/// 지금 스레드를 어느 역할에도 묶지 않음(nice 0, 프로세스 코어 전부): 같은 프로세스에서 도는 다른 프로그램(--slam)을 띄울 때
+pub fn thread_free() {
+    BG.with(|b| b.set(false));
+    apply(0, 0);
 }

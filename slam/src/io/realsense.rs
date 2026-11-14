@@ -289,8 +289,16 @@ impl FrameSource for RealSenseSource {
                 }
                 Ok((w, h, out))
             };
-            let (_, _, db) = read_plane(ad, 2)?;
-            let depth_raw: Vec<u16> = db.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            // 깊이는 장치 버퍼에서 u16 벡터로 한 번만 복사(리틀 엔디언 기계라 바이트 그대로)
+            let depth_raw: Vec<u16> = {
+                let (w, h, st) = unsafe { (ck(|e| rs2_get_frame_width(ad, e))? as usize, ck(|e| rs2_get_frame_height(ad, e))? as usize, ck(|e| rs2_get_frame_stride_in_bytes(ad, e))? as usize) };
+                let d = ck(|e| unsafe { rs2_get_frame_data(ad, e) })? as *const u8;
+                let mut out = vec![0u16; w * h];
+                for r in 0..h {
+                    unsafe { std::ptr::copy_nonoverlapping(d.add(r * st), (out.as_mut_ptr() as *mut u8).add(r * w * 2), w * 2) };
+                }
+                out
+            };
             let c2 = Instant::now();
             // 장면마다 새 버퍼에 담는다: 쓰기 큐·지도가 들고 있는 앞 장면과 메모리를 나누지 않게
             let (w, h, rgb) = read_plane(color, 3)?;

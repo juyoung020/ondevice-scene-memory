@@ -12,8 +12,16 @@ ort = { version = "2.0.0-rc.15", optional = true }
 rayon = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# 한 프로세스 모드(--slam): 위치 프로그램을 라이브러리로 부르고 장면을 메모리로 받음
+slam = { path = "../slam" }
+# --serve: 뷰어 서버(sgview)를 같은 프로세스에서, 자주 바뀌는 기억 파일은 메모리로 넘김
+sgview = { path = "../viewer/sgview" }
 
 v4l = { version = "0.14", optional = true }
+
+# 리눅스(보드): --slam --realsense 의 D435 입력은 rsdriver(V4L2 직접)가 기본
+[target.'cfg(target_os = "linux")'.dependencies]
+slam = { path = "../slam", features = ["rsdriver"] }
 
 [features]
 default = ["onnx"]
@@ -22,12 +30,20 @@ onnx = ["dep:ort", "dep:ndarray"]
 directml = ["onnx", "ort/directml"]
 dxrt = []
 cam = ["dep:v4l"]
+# --slam --realsense(한 프로세스 D435 입력)
+slam-realsense = ["slam/realsense"]
 
 [[bin]]
 name = "onnx_info"
 path = "src/bin/onnx_info.rs"
 required-features = ["onnx"]
 
-[profile.release]
-# 크레이트마다 한 덩어리로 최적화: 인라인이 코드 배치에 따라 달라지지 않게(PC 분할 단계가 빌드마다 1 ms 넘게 흔들렸다)
-codegen-units = 1
+
+[[bin]]
+name = "memmap"
+path = "src/main.rs"
+
+# 한 명령: ondevice [run] … = memmap, ondevice slam … = slam_bridge, ondevice view … = sgview (같은 main.rs)
+[[bin]]
+name = "ondevice"
+path = "src/main.rs"

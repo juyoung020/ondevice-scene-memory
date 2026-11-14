@@ -1,14 +1,18 @@
 # 보드에 연결 프로그램 올리기 (Pi 5 · Debian 13 trixie arm64)
 
-연결 프로그램은 `slam_bridge`(`slam/`, Rust, [bridge.md](bridge.md))다. 보드에 필요한 것은 Rust 와 librealsense2(D435) 뿐이다.
+연결 프로그램은 `slam_bridge`(`slam/`, Rust, [bridge.md](bridge.md))이고, 한 명령 `ondevice` 는 같은 위치 루프를 memmap · 뷰어와 한 프로세스에서 돌린다. 저장소 맨 위 Cargo 작업 공간에서 빌드하며 결과는 `target/release/` 에 생긴다. D435 입력은 rsdriver(V4L2 직접, Rust 만)와 librealsense2 판 두 가지다.
 
 ```bash
-# librealsense2 는 아래 "librealsense2 v2.59.1" 순서로 ~/opt/librealsense 에 설치
-RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \n  cargo build --release --features realsense --manifest-path slam/Cargo.toml
+# 한 명령(memmap + 위치 루프 + 뷰어, D435 입력은 rsdriver)
+cargo build --release --no-default-features --features dxrt,cam      # target/release/ondevice · memmap
+# librealsense2 판 입력도 넣을 때(~/opt/librealsense, 아래 "librealsense2 v2.59.1" 순서로 설치)
+RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \
+  cargo build --release --no-default-features --features dxrt,cam,slam-realsense
+# 따로 도는 slam_bridge(비교용)
+RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \
+  cargo build --release -p slam --features realsense,rsdriver
 # 처음 할 확인: C++ 원본과 같은 입력·설정으로 돌려 스트림·위치 파일 바이트 비교(아래 "C++ 원본")
 ```
-
-memmap 은 `cargo build --release --no-default-features --features dxrt,cam`.
 
 ## C++ 원본 `rtab_bridge`(비교 기준, 지금 보드 실시간 스크립트)
 

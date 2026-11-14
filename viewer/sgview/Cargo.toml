@@ -16,5 +16,3 @@ default = ["search"]
 # 글 검색: SigLIP2 글 인코더(ONNX Runtime) + 토크나이저. 끄면 이름 글자 검색만 남는다.
 search = ["dep:ort", "dep:tokenizers"]
 
-[profile.release]
-opt-level = 3

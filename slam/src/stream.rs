@@ -167,6 +167,13 @@ impl Writer {
         Ok(Writer { sh, cap: queue.max(1), block, th: Some(th) })
     }
 
+    /// 같은 프로세스로 넘기기: 쓰기 스레드·인코딩 없이 받는 쪽(Receiver)이 이 큐에서 장면을 그대로 꺼낸다.
+    /// 큐 길이·기다림/버림·그래프 블록을 버리지 않는 규칙은 파이프와 같다
+    pub fn channel(queue: usize, block: bool) -> (Writer, Receiver) {
+        let sh = Arc::new((Mutex::new(Q { q: VecDeque::new(), done: false, broken: false, written: 0, dropped: 0, write_ms: vec![] }), Condvar::new()));
+        (Writer { sh: sh.clone(), cap: queue.max(1), block, th: None }, Receiver { sh })
+    }
+
     /// 받는 쪽이 닫혔으면 false
     pub fn push(&self, f: OutFrame) -> bool {
         let (m, cv) = &*self.sh;
@@ -217,6 +224,34 @@ impl Writer {
 impl Drop for Writer {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// 같은 프로세스의 받는 쪽(Writer::channel): 장면·그래프·리셋 블록을 보낸 차례 그대로 꺼낸다
+pub struct Receiver {
+    sh: Arc<(Mutex<Q>, Condvar)>,
+}
+
+impl Receiver {
+    /// 다음 항목(장면이면 컬러는 보낸 그대로: color_is_rgb 를 보고 받는 쪽이 RGB 로 맞춘다). 보내는 쪽이 끝냈고 다 꺼냈으면 None
+    pub fn recv(&self) -> Option<OutFrame> {
+        let (m, cv) = &*self.sh;
+        let mut s = cv.wait_while(m.lock().unwrap(), |s| s.q.is_empty() && !s.done).unwrap();
+        let f = s.q.pop_front()?;
+        if !f.is_graph() {
+            s.written += 1;
+        }
+        cv.notify_all();
+        Some(f)
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        // 받는 쪽이 그만둠 = 파이프가 닫힘과 같음: 보내는 쪽 push 가 false
+        let (m, cv) = &*self.sh;
+        m.lock().unwrap().broken = true;
+        cv.notify_all();
     }
 }
 

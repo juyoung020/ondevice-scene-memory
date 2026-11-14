@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 pub mod realsense;
 #[cfg(feature = "realsense")]
 pub use realsense::RealSenseSource;
+#[cfg(feature = "rsdriver")]
+pub mod rsdriver;
+#[cfg(feature = "rsdriver")]
+pub use self::rsdriver::RsDriverSource;
 
 /// 장면 입력의 공통 모양
 pub trait FrameSource: Send {
@@ -168,19 +172,16 @@ impl FrameSource for TumSource {
             });
             let (ci, di) = (ci?, di?);
             let (w, h) = (ci.width(), ci.height());
-            // imread(IMREAD_COLOR) 처럼 BGR 3 채널로
-            let mut color = match ci {
+            // 푼 RGB 그대로 둔다(스트림·memmap 이 RGB 를 씀). 회색조는 채널 차례만 맞춰 imread(BGR) + cvtColor 와 같은 값
+            let color = match ci {
                 image::DynamicImage::ImageRgb8(b) => b.into_raw(),
                 o => o.to_rgb8().into_raw(),
             };
-            for p in color.chunks_exact_mut(3) {
-                p.swap(0, 2);
-            }
             let depth_raw = match di {
                 image::DynamicImage::ImageLuma16(b) if b.width() == w && b.height() == h => b.into_raw(),
                 _ => return Err(format!("장면 읽기 실패: {rel}")),
             };
-            let gray = to_gray(&color, false);
+            let gray = to_gray(&color, true);
             let depth_mm = depth_to_mm(&depth_raw, 5000.0);
             self.id += 1;
             let k = self.k;
@@ -189,7 +190,7 @@ impl FrameSource for TumSource {
                 t,
                 gray,
                 color,
-                color_is_rgb: false,
+                color_is_rgb: true,
                 depth_mm,
                 depth_raw,
                 depth_per_m: 5000.0,

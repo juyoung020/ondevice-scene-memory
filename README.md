@@ -56,21 +56,22 @@ D435(컬러 + 깊이) → slam_bridge(Rust, 위치 추적·루프 클로저) →
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).
 
-**3. 빌드하고 실행** — 위치 프로그램 `slam_bridge` 는 Rust 만으로 빌드됩니다(카메라 입력은 `--features realsense`, librealsense2 필요). 자세한 것은 [slam/README.md](slam/README.md)와 [docs/bridge.md](docs/bridge.md).
+**3. 빌드하고 실행** — 저장소 맨 위가 Cargo 작업 공간 하나입니다(`slam` · `pipeline` · `viewer/sgview` · `tools` · `rsdriver`, 빌드 결과는 `target/release/` 한 곳). 기본 명령 `ondevice` 하나가 위치 추적(slam) → 지도·물체(memmap) → 뷰어 서버(sgview)를 한 프로세스에서 돌립니다. 장면은 프로세스 사이 파이프 대신 메모리 큐로 복사 없이 넘어가고, 뷰어는 자주 바뀌는 기억 파일(view.json · pose.json · map.pgm · map.yaml)을 메모리에서 바로 받습니다. 기억 폴더의 파일은 그대로 쓰여 기록·검증에 씁니다. 자세한 것은 [slam/README.md](slam/README.md)와 [docs/bridge.md](docs/bridge.md).
 
 ```bash
-cargo build --release --features directml --manifest-path pipeline/Cargo.toml
-cargo build --release --manifest-path viewer/sgview/Cargo.toml
-cargo build --release --manifest-path slam/Cargo.toml
+cargo build --release --features directml        # target/release/ondevice · memmap
+cargo build --release -p slam -p sgview          # 따로 돌릴 때: target/release/slam_bridge · sgview
 
-# TUM 영상 → slam_bridge → memmap(점 지도 + 물체)
-slam/target/release/slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
-  | pipeline/target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx \
-      --embed models/siglip2-base-patch32-256/vision_model.onnx --vocab vocab/names.voc --max-depth 3.5 --out data/memory/office
-
-# 다른 창에서 뷰어 → 브라우저로 http://127.0.0.1:8091
-viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.0.1   --search-model models/siglip2-base-patch32-256 --vocab vocab/names.voc
+# TUM 영상 → 위치 추적 → 점 지도 + 물체 → 뷰어(http://127.0.0.1:8091), 한 명령
+target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
+    --every 2 --seg models/yolo26s-seg.onnx --embed models/siglip2-base-patch32-256/vision_model.onnx --vocab vocab/names.voc \
+    --max-depth 3.5 --out data/memory/office \
+    --serve "8091 --bind 127.0.0.1 --search-model models/siglip2-base-patch32-256 --vocab vocab/names.voc"
 ```
+
+- `--slam "<slam_bridge 인자>"`: 위치 프로그램을 같은 프로세스의 스레드로 돌립니다. 인자·큐 규칙(`--queue`, `--block`/`--drop`, 그래프 블록은 버리지 않음)은 `slam_bridge` 와 같고, memmap 출력은 `slam_bridge … | memmap --stream - …` 와 바이트까지 같습니다.
+- `--serve "<포트> [sgview 인자]"`: 뷰어 서버를 같은 프로세스에서 띄웁니다. 입력이 끝나도 뷰어는 계속 떠 있고(Ctrl-C 로 끝냄), `--serve-exit` 를 주면 입력이 끝날 때 함께 끝납니다.
+- 따로 돌리는 방식도 그대로입니다: `ondevice slam …`(= `slam_bridge`), `ondevice view …`(= `sgview`), `memmap --stream -` 로 파이프를 받습니다.
 
 검색 모델은 Hugging Face 의 SigLIP2 base patch32-256 을 ONNX 로 내보낸 것으로, `models/siglip2-base-patch32-256/` 에 `vision_model.onnx`(memmap 이 물체 사진에), `text_model_fp16.onnx`·`tokenizer.json`(뷰어가 검색어에) 을 둡니다. `--embed`·`--search-model` 을 빼면 검색창은 저장된 이름의 글자만 비교합니다.
 
@@ -81,18 +82,21 @@ viewer/sgview/target/release/sgview data/memory/office --port 8091 --bind 127.0.
 보드 실시간 스크립트는 지금 C++ `rtab_bridge` 를 씁니다(빌드: [docs/board_bridge.md](docs/board_bridge.md)). `slam_bridge` 의 바이트 동일 확인은 PC(x86) 원본 기준이라, 보드(ARM)에서 같은 비교를 마치면 스크립트를 `slam_bridge` 로 바꿉니다. 두 프로그램의 인자는 같아 아래 명령에서 이름만 바꿔 쓸 수 있습니다.
 
 ```bash
-cargo build --release --no-default-features --features dxrt,cam --manifest-path pipeline/Cargo.toml
-cargo build --release --features realsense --manifest-path slam/Cargo.toml   # slam_bridge(카메라 입력 포함)
+cargo build --release --no-default-features --features dxrt,cam   # target/release/ondevice · memmap (D435 입력은 rsdriver: V4L2 직접)
 M=~/dx-all-suite_my/workspace/res/models
 
-# D435 → 위치 프로그램 → memmap(실시간)
+# 지금 스크립트: D435 → rtab_bridge → memmap(실시간), 뷰어는 따로
 rtab_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req \
-  | pipeline/target/release/memmap --stream - --every 1 --live 1 \
+  | target/release/memmap --stream - --every 1 --live 1 \
       --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live
+sgview data/memory/live --port 8091 --bind 0.0.0.0     # 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
 
-# 뷰어: 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
-sgview data/memory/live --port 8091 --bind 0.0.0.0
+# 한 명령(보드 비교를 마치면 이것으로): D435 → 위치 추적 → memmap → 뷰어가 한 프로세스
+target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
+    --every 1 --live 1 --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 ```
+
+- **D435 입력 고르기:** 리눅스 빌드의 기본은 `rsdriver`(librealsense2 없이 V4L2·UVC 직접)입니다. librealsense2 판은 `--features slam-realsense` 로 빌드하고 `--slam "--realsense --driver librealsense …"` 로 고릅니다. rsdriver 의 장면 시각은 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한 값이라(librealsense 의 global time 처럼 시계 차이를 계속 따라가지 않음) 두 판의 절대 시각은 다를 수 있고, 장면 간격은 같습니다. rsdriver 입력은 실제 카메라 확인이 남아 있습니다.
 
 - **아무 말로 찾기(보드):** memmap 에 `--embed <SigLIP2 영상 인코더>.dxnn`(NPU), 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
 - **움직일 때 번지면:** `--exposure 8 --gain 110`(`rtab_bridge`·`slam_bridge` 같음) 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
@@ -105,6 +109,8 @@ sgview data/memory/live --port 8091 --bind 0.0.0.0
 | 옵션 | 뜻 |
 |---|---|
 | `--stream -\|<파일>` | `slam_bridge`·`rtab_bridge` 장면 스트림 입력(표준입력 또는 남겨 둔 파일) |
+| `--slam "<slam_bridge 인자>"` | 위치 프로그램을 같은 프로세스에서 돌려 장면을 메모리로 받음(`--stream -` 과 같은 결과) |
+| `--serve "<포트> [sgview 인자]"` · `--serve-exit` | 뷰어 서버를 같은 프로세스에서 띄움 / 입력이 끝나면 함께 끝냄 |
 | `--rebuild-every S` / `--no-rebuild` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5) / 끄기 |
 | `--no-drop` | 밀려도 장면을 버리지 않음(재생 결과를 늘 같게) |
 | `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · rebuild · writer · infer) |

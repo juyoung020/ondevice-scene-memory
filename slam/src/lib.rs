@@ -11,6 +11,7 @@ pub mod odom;
 pub mod params;
 pub mod register;
 pub mod stream;
+pub mod app;
 
 use nalgebra::{Isometry3, Point3};
 

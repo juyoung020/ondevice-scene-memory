@@ -514,9 +514,9 @@ pub const LOOK_OVL: f32 = 0.25;
 pub struct Crop {
     pub w: u32,
     pub h: u32,
-    pub rgb: Vec<u8>,
-    pub mask: Vec<u8>,
-    pub depth: Vec<u16>,
+    pub rgb: std::sync::Arc<Vec<u8>>, // 기록 스레드·사진 벡터와 복사 없이 나눠 씀
+    pub mask: std::sync::Arc<Vec<u8>>, // 기록 스레드·사진 벡터와 복사 없이 나눠 씀
+    pub depth: std::sync::Arc<Vec<u16>>, // 기록 스레드·사진 벡터와 복사 없이 나눠 씀
 }
 
 pub struct Obj {
@@ -1020,7 +1020,7 @@ mod tests {
                 }
             }
         }
-        m.update(name, 0.9, &pts, 1.0, 0.0, 1, || Crop { w: 1, h: 1, rgb: vec![0; 3], mask: vec![255], depth: vec![0] }, None)
+        m.update(name, 0.9, &pts, 1.0, 0.0, 1, || Crop { w: 1, h: 1, rgb: vec![0; 3].into(), mask: vec![255].into(), depth: vec![0].into() }, None)
     }
 
     /// 두 벡터의 코사인이 c 가 되게

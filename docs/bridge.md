@@ -17,26 +17,37 @@ RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rg
 
 ## 쓰는 법
 
-```bash
-# 빌드: 기본은 TUM 재생만, --features realsense 면 카메라 입력(librealsense2 C API 링크)
-cargo build --release --manifest-path slam/Cargo.toml
-cargo build --release --features realsense --manifest-path slam/Cargo.toml
+위치 프로그램은 두 가지로 붙인다. 결과(memmap 기억 폴더)는 두 방식이 바이트까지 같다.
 
-# 카메라 → memmap(실시간)
-slam_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 \
-  | memmap --stream - --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live
+- **한 프로세스(기본):** `ondevice --slam "<slam_bridge 인자>" …`(= `memmap --slam …`). 위치 루프(`slam::app`)가 같은 프로세스의 스레드로 돌고, 장면은 아래 스트림 형식으로 바꾸지 않고 메모리 큐(`slam::stream::Writer::channel`)로 넘어간다. 컬러·깊이 버퍼는 PNG·카메라에서 채운 그대로 memmap 까지 옮겨지고(복사 0 번), 큐 길이·`--block`/`--drop`·그래프 블록을 버리지 않는 규칙·리셋 블록 차례는 파이프와 같다. `--serve "<포트> …"` 를 더하면 뷰어 서버(sgview)도 같은 프로세스에서 뜬다.
+- **파이프:** `slam_bridge … | memmap --stream - …`. 스트림을 파일로 남겨 다시 돌리거나 C++ `rtab_bridge` 와 견줄 때.
+
+```bash
+# 빌드(저장소 맨 위 작업 공간): ondevice · memmap, 따로 쓸 slam_bridge · sgview
+cargo build --release
+cargo build --release -p slam -p sgview
+
+# 카메라 → 위치 추적 → memmap → 뷰어, 한 프로세스(실시간). D435 입력은 리눅스 기본 rsdriver(V4L2 직접), --driver librealsense 는 --features slam-realsense 빌드
+ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
+  --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 
 # TUM 재생(카메라 없이): --rate 1 이면 찍은 시각대로(밀리면 건너뜀), 생략하면 최대 속도로 빠짐없이
+ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
+  --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+
+# 같은 것을 두 프로세스로(파이프)
 slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
   | memmap --stream - --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
 ```
 
+`--slam` 의 인자는 공백으로 나눈다(경로에 공백이 없어야 함). `ondevice slam …` 은 `slam_bridge …`, `ondevice view …` 는 `sgview …` 와 같다.
+
 | `slam_bridge` 인자(`rtab_bridge` 와 같음) | 뜻 |
 |---|---|
-| `--realsense [--align rs2] [--serial S] [--size 640x480] [--fps 30]` | RealSense 입력(IMU 는 켜지 않음) |
+| `--realsense [--driver rsdriver\|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30]` | RealSense 입력(IMU 는 켜지 않음). `--driver` 는 빌드에 든 것 중에서(기본 rsdriver), `--align` 은 librealsense 판의 정렬 방식. rsdriver 의 장면 시각 = 컬러 장치 시각 + 첫 장면에서 한 번 정한 시스템 시계 차이(librealsense global time 과 절대값이 다를 수 있음, 간격은 같음) |
 | `--tum <폴더> [--rate R]` | TUM 폴더 재생. 보정값은 memmap `tum.rs` 와 같이 폴더 이름으로(freiburg1·2·3), 폴더에 `calibration.txt`(fx fy cx cy, ETH3D 형식)가 있으면 그 값 |
 | `--config <ini>` | RTAB-Map 설정(`[Core]`), 그 뒤 `--Group/Name 값` 으로 덮어씀 |
-| `--out -\|<파일>` | 스트림 출력(기본 표준출력). 파일로 남겨 두면 `memmap --stream <파일>` 로 다시 돌릴 수 있음 |
+| `--out -\|<파일>` | 스트림 출력(기본 표준출력, `--slam` 에서는 쓰지 않음). 파일로 남겨 두면 `memmap --stream <파일>` 로 다시 돌릴 수 있음 |
 | `--send-every N` | N 장마다 보냄(위치 추적은 모든 장면) |
 | `--queue N`, `--block`·`--drop` | 쓰기 큐 길이(기본 4), 큐가 차면 기다림·가장 오래된 장면 버림. 기본은 최대 속도 재생 = 기다림, 카메라·`--rate` = 버림 |
 | `--poses <파일>` | 보낸 위치(TUM 형식, OpenCV 카메라 → RTAB-Map 지도) |
@@ -63,7 +74,7 @@ ninja -C ~/build/bridge
 
 | `memmap` 인자 | 뜻 |
 |---|---|
-| `--stream -\|<파일>` | 장면 스트림 입력. 위치·깊이는 받은 그대로, 분할은 memmap 이 돌림. `--every N` 은 받은 장면 N 장마다 |
+| `--stream -\|<파일>` · `--slam "<slam_bridge 인자>"` | 장면 스트림 입력 · 같은 프로세스의 위치 프로그램. 위치·깊이는 받은 그대로, 분할은 memmap 이 돌림. `--every N` 은 받은 장면 N 장마다 |
 | `--no-level` | 받은 위치의 z 를 그대로 위로 씀(기본은 아래 "바닥 맞추기") |
 | `--rebuild-every S`, `--kf-store-mb M`, `--no-rebuild` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5, 0 = 끝에만)·장면 보관 예산(MB, 기본 3000)·끄기(아래 "루프 클로저 뒤 다시 쌓기") |
 

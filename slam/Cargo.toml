@@ -9,15 +9,14 @@ description = "RTAB-Map 0.24.2 의 우리가 쓰는 경로(F2F 위치 추적 · 
 nalgebra = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
+rsdriver = { path = "../rsdriver", optional = true }
 
 [features]
 default = []
 # D435 입력(librealsense2 C API 를 직접 부름)
 realsense = []
-
-[profile.release]
-codegen-units = 1
-opt-level = 3
+# D435 입력(rsdriver: V4L2·UVC 직접, librealsense2 없이). 둘 다 켜면 --driver 로 고름(기본 rsdriver)
+rsdriver = ["dep:rsdriver"]
 
 [[bin]]
 name = "slam_bridge"

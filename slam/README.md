@@ -23,10 +23,10 @@ RTAB-Map 0.24.2 에서 우리 설정(`docs/rtabmap_pi.ini`)이 지나가는 경�
 | `graph` (+ `geom` · `solve`) | 그래프 최적화(GTSAM 가우스-뉴턴, Pose3 지수·로그 사상) | `OptimizerGTSAM.cpp`, GTSAM 4.2 |
 | `graph/ccolamd` | 변수 순서 | CCOLAMD(GTSAM 4.2 `3rdparty/CCOLAMD`) |
 | `graph/exact` | 선형 풀이를 원본 덧셈 순서 그대로(소거 트리 → 접합 트리 → 클리크 Cholesky) | GTSAM 4.2 `GaussianFactorGraph::optimize`, Eigen 3.4 |
-| `io` (+ `io/realsense`) | TUM 재생, RealSense 입력(`realsense` 기능), 읽기 스레드(위치 추적 특징점도 여기서 뽑음) | `bridge/src` 의 입력 코드, OpenCV `cvtColor` |
-| `stream` | 장면 스트림 쓰기 스레드 | `bridge/src/stream_writer.cpp` |
+| `io` (+ `io/realsense` · `io/rsdriver`) | TUM 재생(PNG 를 푼 RGB 그대로), D435 입력(`realsense` 기능 = librealsense2, `rsdriver` 기능 = V4L2 직접, `--driver` 로 고름), 읽기 스레드(위치 추적 특징점도 여기서 뽑음) | `bridge/src` 의 입력 코드, OpenCV `cvtColor` |
+| `stream` | 장면 스트림 쓰기 스레드, 같은 프로세스로 넘기는 메모리 큐(`Writer::channel` · `Receiver`) | `bridge/src/stream_writer.cpp` |
 | `params` | 설정: 기본값 ← ini `[Core]` ← 명령줄 `--Group/Name 값` | RTAB-Map `Parameters.h` |
-| `main` | `slam_bridge`: 명령줄, 장면마다의 판단(다시 잡기 · 새 지도 · 맡아 둠 · 그래프 블록), 끝 요약 | `bridge/src/main.cpp` |
+| `app` | 위치 루프(`run` = `slam_bridge`, `spawn` = memmap `--slam` 용 스레드 + 자기 스레드 풀): 명령줄, 장면마다의 판단(다시 잡기 · 새 지도 · 맡아 둠 · 그래프 블록), 끝 요약 | `bridge/src/main.cpp` |
 
 난수(`rand()` · `std::random_device`)는 프로세스 하나에 하나인 `register::SharedRng` 를 모든 모듈이 원본과 같은 순서로 쓴다.
 
@@ -45,14 +45,19 @@ RTAB-Map 0.24.2 에서 우리 설정(`docs/rtabmap_pi.ini`)이 지나가는 경�
 ## 빌드 · 실행
 
 ```bash
-# TUM 재생만
-cargo build --release --manifest-path slam/Cargo.toml
-# RealSense 입력 포함(librealsense2 C API 를 링크, 라이브러리 경로는 docs/board_bridge.md)
-cargo build --release --features realsense --manifest-path slam/Cargo.toml
+# 저장소 맨 위 작업 공간에서. TUM 재생만
+cargo build --release -p slam
+# D435 입력: rsdriver(V4L2 직접) 또는 librealsense2 C API(라이브러리 경로는 docs/board_bridge.md)
+cargo build --release -p slam --features rsdriver
+cargo build --release -p slam --features realsense
 
-# TUM 재생 → memmap
-slam/target/release/slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
-  | pipeline/target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
+# 한 프로세스: memmap 안에서 위치 루프를 돌림(라이브러리 `slam::app::spawn`, 장면은 메모리 큐 `stream::Writer::channel`)
+target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
+  --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
+
+# 두 프로세스: TUM 재생 → memmap
+target/release/slam_bridge --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini \
+  | target/release/memmap --stream - --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
 
 # 카메라 → memmap(실시간)
 slam_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req \

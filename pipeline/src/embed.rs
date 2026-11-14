@@ -115,7 +115,7 @@ mod worker {
         path: PathBuf,
         w: u32,
         h: u32,
-        rgb: Vec<u8>,
+        rgb: std::sync::Arc<Vec<u8>>, // 물체 사진(기억의 사진과 나눠 씀)
     }
     type Handle = (mpsc::Sender<Job>, std::thread::JoinHandle<()>);
     static W: Mutex<Option<Handle>> = Mutex::new(None);
@@ -245,10 +245,10 @@ mod worker {
         }
     }
 
-    pub fn submit(dir: &Path, id: u32, w: u32, h: u32, rgb: &[u8]) {
+    pub fn submit(dir: &Path, id: u32, w: u32, h: u32, rgb: std::sync::Arc<Vec<u8>>) {
         if let Some((tx, _)) = &*W.lock().unwrap() {
             PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = tx.send(Job { id, path: dir.join(rel_path(id)), w, h, rgb: rgb.to_vec() });
+            let _ = tx.send(Job { id, path: dir.join(rel_path(id)), w, h, rgb });
         }
     }
 
@@ -284,7 +284,7 @@ pub fn on() -> bool {
     false
 }
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
-pub fn submit(_dir: &Path, _id: u32, _w: u32, _h: u32, _rgb: &[u8]) {}
+pub fn submit(_dir: &Path, _id: u32, _w: u32, _h: u32, _rgb: std::sync::Arc<Vec<u8>>) {}
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn finish() {}
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]

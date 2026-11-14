@@ -1,0 +1,15 @@
+[workspace]
+# 한 작업 공간: 위치(slam) · 물체 기억(pipeline = memmap · ondevice) · 뷰어 서버(sgview) · 정렬·RealSense 도구(tools · rsdriver)
+# 빌드 산출물은 한 곳(target/ 또는 CARGO_TARGET_DIR), Cargo.lock 하나
+members = ["slam", "pipeline", "viewer/sgview", "tools", "rsdriver"]
+default-members = ["pipeline"]
+resolver = "3"
+
+[profile.release]
+opt-level = 3
+# 크레이트마다 한 덩어리로 최적화: 인라인이 코드 배치에 따라 달라지지 않게(PC 분할 단계가 빌드마다 1 ms 넘게 흔들렸다)
+codegen-units = 1
+# 크레이트 사이 인라인(slam → memmap 장면 넘기기, 이미지·PNG 풀기). Rust 는 곱셈·덧셈을 FMA 로 합치지 않아 출력 바이트가 같다
+lto = "fat"
+# 스레드 패닉을 잡아 이어 가는 곳이 없어 풀기 코드를 뺀다
+panic = "abort"

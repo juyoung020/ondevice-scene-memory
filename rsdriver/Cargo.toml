@@ -1,0 +1,26 @@
+[package]
+name = "rsdriver"
+version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
+edition = "2024"
+description = "RealSense D435 를 librealsense2 없이 리눅스 V4L2(uvcvideo)·UVC 확장 단위로 직접 다루는 드라이버: 장치 찾기, 스트림, 제어, 보정값, 장면 짝, 정렬(tools::fast_align)."
+
+[lib]
+name = "rsdriver"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+tools = { path = "../tools" }
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+
+[[bin]]
+name = "rsd_info"
+path = "src/bin/rsd_info.rs"
+
+[[bin]]
+name = "rsd_rec"
+path = "src/bin/rsd_rec.rs"

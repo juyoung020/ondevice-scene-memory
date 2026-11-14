@@ -7,6 +7,7 @@
 //! - `ort`(`onnx` 기능): 프로세스에 하나인 ONNX Runtime 환경
 pub mod cli;
 pub mod img;
+pub mod log;
 pub mod quat;
 pub mod threads;
 pub mod tum;

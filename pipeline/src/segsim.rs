@@ -110,7 +110,7 @@ impl Segmenter for CachedSeg {
 
 impl Drop for CachedSeg {
     fn drop(&mut self) {
-        eprintln!("분할 대역(--seg-cache): 읽어 옴 {} 번, 모델로 돌려 남김 {} 번", self.hits, self.misses);
+        common::info!("분할 대역(--seg-cache): 읽어 옴 {} 번, 모델로 돌려 남김 {} 번", self.hits, self.misses);
     }
 }
 

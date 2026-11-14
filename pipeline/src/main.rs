@@ -126,30 +126,57 @@ fn args(v: &common::cli::Argv) -> Args {
 }
 
 /// 마스크 침식(정사각 k×k): 가장자리 깊이 번짐 제거
+#[cfg(test)]
 fn erode(m: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
-    let mut a = vec![false; w * h];
-    // 가로 → 세로 두 번(분리 가능)
+    let mut s = ErodeBuf::default();
+    erode_into(m, w, h, r, &mut s);
+    s.b
+}
+
+/// 침식 작업 칸(장면·검출마다 다시 씀: 할당 없음)
+#[derive(Default)]
+struct ErodeBuf {
+    a: Vec<bool>,
+    b: Vec<bool>,
+    run: Vec<u32>,
+}
+
+/// 마스크 침식 결과를 s.b 에(가로 → 세로 두 번, 분리 가능)
+fn erode_into(m: &[bool], w: usize, h: usize, r: usize, s: &mut ErodeBuf) {
+    let n = w * h;
+    s.a.clear();
+    s.a.resize(n, false);
+    s.b.clear();
+    s.b.resize(n, false);
+    let (a, b) = (&mut s.a, &mut s.b);
+    let lim = 2 * r;
     for y in 0..h {
+        let (mr, ar) = (&m[y * w..(y + 1) * w], &mut a[y * w..(y + 1) * w]);
         let mut run = 0usize;
         for x in 0..w {
-            run = if m[y * w + x] { run + 1 } else { 0 };
-            if run > 2 * r {
-                a[y * w + x - r] = true;
+            run = if mr[x] { run + 1 } else { 0 };
+            if run > lim {
+                ar[x - r] = true;
             }
         }
     }
     // 세로는 열마다 이어진 길이를 들고 줄 순서로 훑음(메모리를 차례로 읽게)
-    let mut b = vec![false; w * h];
-    let mut run = vec![0usize; w];
+    s.run.clear();
+    s.run.resize(w, 0);
+    let run = &mut s.run;
     for y in 0..h {
+        let ar = &a[y * w..(y + 1) * w];
         for x in 0..w {
-            run[x] = if a[y * w + x] { run[x] + 1 } else { 0 };
-            if run[x] > 2 * r {
-                b[(y - r) * w + x] = true;
+            // 분기 없이: 칸이 켜졌으면 +1, 아니면 0
+            run[x] = (run[x] + 1) * ar[x] as u32;
+        }
+        if y >= lim {
+            let br = &mut b[(y - r) * w..(y - r + 1) * w];
+            for x in 0..w {
+                br[x] = run[x] as usize > lim;
             }
         }
     }
-    b
 }
 
 /// 얇고 넓은 수직면(두께 < 8 cm, 폭 > 0.8 m, 법선 수평)이면 벽 — 물체에서 뺀다
@@ -644,12 +671,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             }
                         }
                         if sf.k != k0 {
-                            eprintln!("스트림 장면 {}: 보정값이 바뀜 {:?} → {:?}(처음 값으로 계속)", sf.seq, k0, sf.k);
+                            common::info!("스트림 장면 {}: 보정값이 바뀜 {:?} → {:?}(처음 값으로 계속)", sf.seq, k0, sf.k);
                         }
                         let c1 = Instant::now();
                         let lost = sf.lost();
                         if sf.flags & stream::NEW_MAP != 0 {
-                            eprintln!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
+                            common::info!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
                         }
                         // 깊이는 u16 그대로 넘김(미터 값은 쓰는 곳에서 같은 식으로)
                         let depth = Depth::Raw { d: std::mem::take(&mut sf.depth), per_m: sf.depth_per_m };
@@ -747,10 +774,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
-                eprintln!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
+                common::info!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
                 if st.n > 0 {
                     let m = 1e3 / st.n as f64;
-                    eprintln!("분할 단계({}) 평균 ms: 전처리 {:.2}, 추론 {:.1}, 후처리 {:.2} · 분할 {:.2} 번/초", if seg_pipe { "겹침" } else { "차례" }, st.pre * m, st.infer * m, st.post * m,
+                    common::info!("분할 단계({}) 평균 ms: 전처리 {:.2}, 추론 {:.1}, 후처리 {:.2} · 분할 {:.2} 번/초", if seg_pipe { "겹침" } else { "차례" }, st.pre * m, st.infer * m, st.post * m,
                               st.n as f64 / st.wall.max(1e-9));
                 }
                 seg_n_r.store(n_seg as u32, Relaxed);
@@ -872,7 +899,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             mem.merge_pass();
             busy = true;
             if std::env::var_os("MEMMAP_PARTS").is_some() {
-                eprintln!("갈아 끼우기 나눔: 지도·물체 {:.0} · 출력 {:.0} · 병합 {:.0} ms", (i2 - i1).as_secs_f64() * 1e3, (i3 - i2).as_secs_f64() * 1e3, i3.elapsed().as_secs_f64() * 1e3);
+                common::info!("갈아 끼우기 나눔: 지도·물체 {:.0} · 출력 {:.0} · 병합 {:.0} ms", (i2 - i1).as_secs_f64() * 1e3, (i3 - i2).as_secs_f64() * 1e3, i3.elapsed().as_secs_f64() * 1e3);
             }
             prune_objs = true; // 옛 id 파일은 다음 기록 때 지움(뷰어가 지금 view.json 을 받기 전 옛 것을 읽는 동안은 남겨 둠)
             }
@@ -897,7 +924,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             }
             if a.live > 0.0 {
                 // 뷰어: 마지막 위치 그대로, 놓침 표시(손카메라 빨간색)
-                out::write_owned(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false}).to_string().into_bytes());
+                out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false})));
             }
             continue;
         }
@@ -914,7 +941,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }
             }
             if a.live > 0.0 {
-                out::write_owned(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false}).to_string().into_bytes());
+                out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false})));
             }
             continue;
         }
@@ -934,7 +961,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             z0 = Some(mv(&stream_fix, &raw.1)[2] - cam_height(&hist_h)); // 바닥 높이 원점도 새 좌표로
             kfs.dirty = true;
             force_rb = true;
-            eprintln!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
+            common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
         }
         if a.stream.is_some() {
             r = mm(&stream_fix, &r);
@@ -961,7 +988,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     p = mv(&fix, &p);
                     stream_fix = mm(&fix, &stream_fix);
                     leveled = true;
-                    eprintln!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
+                    common::info!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
                 } else if grav_obs.len() > 60 {
                     grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
                 }
@@ -988,8 +1015,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             }
         }
         if below.len() > 50 {
-            below.sort_by(|x, y| x.partial_cmp(y).unwrap());
-            let ch = below[(below.len() as f64 * 0.95) as usize];
+            let k95 = (below.len() as f64 * 0.95) as usize;
+            let ch = *below.select_nth_unstable_by(k95, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
             if (0.5..2.5).contains(&ch) {
                 hist_h.push(ch);
             }
@@ -1021,7 +1048,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(뷰어가 0.1 초마다 받아 손카메라를 바로 움직임),
         // 지도·물체·그래프(view.json)는 0.4 초마다
         if a.live > 0.0 {
-            out::write_owned(&a.out.join("pose.json"), json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true}).to_string().into_bytes());
+            out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true})));
         }
         let write_now = write_late || if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= 0.4 || nkf == 1 } else { nkf % (if behind { 15 } else { 5 }) == 0 || nkf == 1 };
         // 3D 점 지도: 실시간은 1 초마다(전에는 장면 번호가 기록 시점과 우연히 맞을 때만 나가 몇 초씩 비었다), 아니면 장면 수로
@@ -1123,9 +1150,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         fresh_outputs(&mut run_id, a.scene_vox, None); // scene_json 은 아래 마지막 기록에서 다시 만듦
     }
     if a.stream.is_some() {
-        eprintln!("다시 쌓기 {n_rebuild} 번, 보관 장면 {} 개({:.0} MB)", kfs.len(), kfs.bytes() as f64 / 1048576.0);
+        common::info!("다시 쌓기 {n_rebuild} 번, 보관 장면 {} 개({:.0} MB)", kfs.len(), kfs.bytes() as f64 / 1048576.0);
     }
-    eprintln!("{}", out::stats::report());
+    common::info!("{}", out::stats::report());
     if !est_traj.is_empty() {
         let mut s = String::from("# timestamp x y z qx qy qz qw (OpenCV 카메라 → 세계)\n");
         for (t, p, r) in &est_traj {
@@ -1245,8 +1272,8 @@ fn cam_height(hist: &[f64]) -> f64 {
         return 1.4;
     }
     let mut s: Vec<f64> = hist.iter().rev().take(15).copied().collect();
-    s.sort_by(|x, y| x.partial_cmp(y).unwrap());
-    s[s.len() / 2]
+    let mid = s.len() / 2;
+    *s.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1
 }
 
 fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
@@ -1304,7 +1331,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let t_exp = ce.elapsed().as_secs_f64();
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
-    eprintln!("다시 쌓기 나눔: 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", t_map);
+    common::info!("다시 쌓기 나눔: 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", t_map);
     Rebuilt { pts, grid, scene, mem, traj, map_traj, last_seq, extra: vec![], n: snap.len(), secs, moved }
 }
 
@@ -1328,7 +1355,7 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
     for (kf, r, pwc) in newer.iter() {
         map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets(), true, grid, mem, traj, map_traj);
     }
-    eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
+    common::info!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
 }
 
@@ -1482,7 +1509,7 @@ impl Give for Vec<u8> {
 impl Give for Depth {
     fn give(self) {
         if let Some(d) = self.into_raw() {
-            slam::bufpool::give_depth(d);
+            slam::bufpool::give_depth_buf(d);
         }
     }
 }
@@ -1510,7 +1537,7 @@ fn give_back(rgb: Vec<u8>, depth: Depth) {
     if slam::bufpool::enabled() {
         slam::bufpool::give_rgb(rgb);
         if let Some(d) = depth.into_raw() {
-            slam::bufpool::give_depth(d);
+            slam::bufpool::give_depth_buf(d);
         }
     }
 }
@@ -1603,7 +1630,7 @@ impl PtsWorker {
             }
             if std::env::var("MEMMAP_PTS_LOG").is_ok() {
                 let n = nf.max(1) as f64;
-                eprintln!("점 작업 스레드: 장면 {nf} 개, 점 고르기 {:.1} ms/장 + 지도 넣기 {:.1} ms/장, 노드 쓰기 합 {t_write:.2} 초", t_grid / n * 1e3, t_add / n * 1e3);
+                common::info!("점 작업 스레드: 장면 {nf} 개, 점 고르기 {:.1} ms/장 + 지도 넣기 {:.1} ms/장, 노드 쓰기 합 {t_write:.2} 초", t_grid / n * 1e3, t_add / n * 1e3);
             }
             scene
         });
@@ -1727,7 +1754,7 @@ fn write_points(dir: &Path, scene: &mut SceneMap, budget: usize, pre: Option<Pts
         out::write_owned(&dir.join(format!("{sub}/octree.json")), serde_json::to_vec(&json!({"run": scene.run, "voxel": scene.vox, "g": maps::OCT_G, "depth": maps::OCT_DEPTH, "nodes": idx})).unwrap());
     }
     if std::env::var("MEMMAP_PTS_LOG").is_ok() {
-        eprintln!("점 지도: 새 점 {added}, 노드 {} 개 씀, 전체 {} 점 / 노드 {} 개, {:.1} ms, {:.0} MB", dirty.len(), scene.n_points(), idx.len(), c0.elapsed().as_secs_f64() * 1e3, scene.bytes() as f64 / 1048576.0);
+        common::info!("점 지도: 새 점 {added}, 노드 {} 개 씀, 전체 {} 점 / 노드 {} 개, {:.1} ms, {:.0} MB", dirty.len(), scene.n_points(), idx.len(), c0.elapsed().as_secs_f64() * 1e3, scene.bytes() as f64 / 1048576.0);
     }
     j
 }
@@ -1785,6 +1812,11 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
         mem.n_seg += 1;
     }
     let mut valid: Vec<u32> = vec![];
+    // 침식 작업 칸은 스레드에 하나(장면·검출마다 다시 씀)
+    thread_local! { static EB: std::cell::Cell<ErodeBuf> = std::cell::Cell::new(ErodeBuf { a: vec![], b: vec![], run: vec![] }); }
+    let mut eb = EB.with(|c| c.take());
+    // 깊이 > 0.2 m 판정: 원래 값이면 문턱 값 하나와 비교(나눗셈 없이 같은 판정)
+    let raw_th = depth.raw().zip(depth.raw_above(0.2));
     for d in dets.iter().flatten().filter(|_| map_ok) {
         let name = seg::name(d.cls);
         if name == "person" {
@@ -1792,15 +1824,28 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
         }
         let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
         let (bw, bh) = (x2 - x1, y2 - y1);
-        let m = erode(&d.mask, bw, bh, 3);
+        erode_into(&d.mask, bw, bh, 3, &mut eb);
+        let m = &eb.b;
         // 마스크 안 깊이 있는 화소: 먼저 세어 간격을 정하고, 그 간격으로 최대 약 2,500 개만 모은다
         // 한 번 훑어 깊이 있는 화소 자리를 모아 두고(마스크·깊이를 두 번 읽지 않게) 그 간격으로 고름
         valid.clear();
         for yy in 0..bh {
             let (mr, o0) = (&m[yy * bw..(yy + 1) * bw], (y1 + yy) * w + x1);
-            for xx in 0..bw {
-                if mr[xx] && depth.at(o0 + xx) as f64 > 0.2 {
-                    valid.push(((y1 + yy) * w + x1 + xx) as u32);
+            match raw_th {
+                Some((dr, th)) => {
+                    let dr = &dr[o0..o0 + bw];
+                    for xx in 0..bw {
+                        if mr[xx] && dr[xx] as u32 >= th {
+                            valid.push((o0 + xx) as u32);
+                        }
+                    }
+                }
+                None => {
+                    for xx in 0..bw {
+                        if mr[xx] && depth.at(o0 + xx) as f64 > 0.2 {
+                            valid.push((o0 + xx) as u32);
+                        }
+                    }
                 }
             }
         }
@@ -1837,15 +1882,14 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             for yy in 0..bh {
                 let o = ((y1 + yy) * w + x1) * 3;
                 crgb.extend_from_slice(&rgb[o..o + bw * 3]);
-                for xx in 0..bw {
-                    cdep.push((depth.at((y1 + yy) * w + x1 + xx) * 1000.0).clamp(0.0, 65535.0) as u16);
-                }
+                depth.extend_mm_trunc((y1 + yy) * w + x1, bw, &mut cdep);
             }
             Crop { w: bw as u32, h: bh as u32, rgb: crgb.into(), mask: std::sync::Arc::new(m.iter().map(|&b| if b { 255 } else { 0 }).collect()), depth: cdep.into() }
         };
         let id = mem.update(name, d.score, &pts, med as f32, t, (bw * bh) as u32, crop, None);
         seen.insert(id);
     }
+    EB.with(|c| c.set(eb));
     if dets.is_some() && map_ok {
         mem.check_missing(&seen, k, &r, &pwc, &depth, w, h);
     }
@@ -1881,7 +1925,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
         mem.prune(stamp);
         mem.merge_pass();
     }
-    let gi = grid.image();
+    let mut gi = grid.image();
     let mut objs = vec![];
     for i in 0..mem.objs.len() {
         // 점 파일은 점(칸)이 5 % 넘게 늘었을 때만 다시 쓴다(관측마다 통째로 다시 쓰지 않게). 그 사이 바뀐 것은 다음 기록 때 함께.
@@ -1928,13 +1972,13 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
         }
         objs.push(e);
     }
-    let (grid_j, rooms, doors, edges) = match &gi {
+    let (grid_j, rooms, doors, edges) = match &mut gi {
         Some(g) => {
-            out::pgm(&dir.join("map.pgm"), g.w, g.h, &g.px);
             // 방 이름의 근거가 되는 물체 이름: 사진으로 붙인 이름이 있으면 그것
             let shown: Vec<String> = mem.objs.iter().map(|o| embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0)).collect();
             let ol: Vec<_> = mem.objs.iter().zip(&shown).map(|(o, n)| (o.id, o.pos, o.extent, o.state == "gone", n.as_str())).collect();
             let (rj, dj, ej) = graph::build(room_tr, g, grid.res, &ol);
+            out::write_owned(&dir.join("map.pgm"), std::mem::take(&mut g.pgm)); // 머리까지 짜 둔 바이트 그대로(복사 없음)
             (json!({"width": g.w, "height": g.h, "resolution": grid.res, "origin": [g.x0 as f64 * grid.res, g.y0 as f64 * grid.res]}), rj, dj, ej)
         }
         None => (json!(null), json!([]), json!([]), json!([])),
@@ -2007,9 +2051,19 @@ fn limit_malloc_arenas() {
     }
 }
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // 한 프로그램(ondevice): 첫 인자가 slam · view 면 위치 프로그램만 · 뷰어 서버만, 그 밖(run 또는 없음)은 물체 기억(+ --slam · --serve)
     let argv = common::cli::Argv::env();
+    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등), --mlock: 메모리를 RAM 에 묶음. 권한이 없으면 조용히 그대로
+    common::threads::set_rt(&argv.get("--rt").unwrap_or_default());
+    common::log::set_quiet(argv.flag("--quiet"));
+    if argv.flag("--mlock") && !common::threads::mlock_all() {
+        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
+    }
     match argv.0.get(1).map(String::as_str) {
         Some("slam") => {
             let code = slam::app::run(&argv.0[1..]).unwrap_or_else(|e| {
@@ -2074,7 +2128,7 @@ fn main() {
         seg = run(&a, seg);
         // 리셋 블록으로 끝났으면 같은 스트림을 이어 읽어 빈 지도에서 다시 시작
         if stream::reset_pending() {
-            eprintln!("리셋: 지도를 비우고 다시 시작");
+            common::info!("리셋: 지도를 비우고 다시 시작");
             continue;
         }
         if !a.looping {
@@ -2089,7 +2143,7 @@ fn main() {
     if let Some(th) = serve_th {
         out::flush_writer();
         if !a.serve_exit {
-            eprintln!("입력 끝: 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄)");
+            common::info!("입력 끝: 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄)");
             let _ = th.join();
         }
     }
@@ -2112,4 +2166,46 @@ fn catch_up(a: &Args, k: [f64; 4], rb: &mut Rebuilt, newer: Snap) {
     }
     rb.secs += c0.elapsed().as_secs_f64();
     rb.extra.extend(newer);
+}
+
+#[cfg(test)]
+mod erode_tests {
+    /// 바꾸기 전 식(새 버퍼 둘)
+    fn erode_ref(m: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+        let mut a = vec![false; w * h];
+        for y in 0..h {
+            let mut run = 0usize;
+            for x in 0..w {
+                run = if m[y * w + x] { run + 1 } else { 0 };
+                if run > 2 * r {
+                    a[y * w + x - r] = true;
+                }
+            }
+        }
+        let mut b = vec![false; w * h];
+        let mut run = vec![0usize; w];
+        for y in 0..h {
+            for x in 0..w {
+                run[x] = if a[y * w + x] { run[x] + 1 } else { 0 };
+                if run[x] > 2 * r {
+                    b[(y - r) * w + x] = true;
+                }
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn erode_same_as_before() {
+        let mut s = 99u64;
+        let mut eb = super::ErodeBuf::default();
+        for (w, h) in [(1, 1), (7, 3), (40, 31), (64, 64), (5, 90)] {
+            for r in 0..4 {
+                let m: Vec<bool> = (0..w * h).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 61) != 0 }).collect();
+                super::erode_into(&m, w, h, r, &mut eb);
+                assert_eq!(eb.b, erode_ref(&m, w, h, r), "{w}x{h} r{r}");
+                assert_eq!(super::erode(&m, w, h, r), eb.b);
+            }
+        }
+    }
 }

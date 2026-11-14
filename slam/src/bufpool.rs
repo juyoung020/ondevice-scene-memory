@@ -60,6 +60,13 @@ pub fn give_depth(v: Vec<u16>) {
     put(&DEPTH, v);
 }
 
+/// 나눠 든 깊이 버퍼: 마지막으로 놓는 쪽일 때만 돌려줌(다른 쪽이 아직 들고 있으면 그쪽이 놓을 때)
+pub fn give_depth_buf(a: crate::DepthBuf) {
+    if let Ok(v) = std::sync::Arc::try_unwrap(a) {
+        give_depth(v);
+    }
+}
+
 pub fn take_rgb(n: usize) -> Vec<u8> {
     get(&RGB, n)
 }

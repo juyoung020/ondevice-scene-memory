@@ -369,8 +369,17 @@ pub struct GridImg {
     pub h: usize,
     pub x0: i32,
     pub y0: i32,
-    pub px: Vec<u8>, // 254 빔, 0 막힘, 205 모름; 위가 +y
+    /// PGM 파일 바이트 그대로(머리 + 화소): 기록할 때 복사 없이 넘김. 화소는 [`GridImg::px`]
+    pub pgm: Vec<u8>,
+    hdr: usize,
     pub wall: Vec<bool>, // 막힌 칸 중 가구보다 높은 것(벽·문틀·키 큰 장) — 방은 이것으로만 나뉜다
+}
+
+impl GridImg {
+    /// 화소(254 빔, 0 막힘, 205 모름; 위가 +y)
+    pub fn px(&self) -> &[u8] {
+        &self.pgm[self.hdr..]
+    }
 }
 
 impl Grid {
@@ -480,7 +489,11 @@ impl Grid {
         }
         let (x0, y0, x1, y1) = (x0 - 5, y0 - 5, x1 + 5, y1 + 5);
         let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
-        let mut px = vec![205u8; w * h];
+        let mut pgm = Vec::with_capacity(24 + w * h);
+        std::io::Write::write_fmt(&mut pgm, format_args!("P5\n{w} {h}\n255\n")).unwrap();
+        let hdr = pgm.len();
+        pgm.resize(hdr + w * h, 205);
+        let px = &mut pgm[hdr..];
         let mut wall = vec![false; w * h];
         for ((x, y), (hit, free, tall)) in self.cells() {
             let i = (h - 1 - (y - y0) as usize) * w + (x - x0) as usize;
@@ -491,7 +504,7 @@ impl Grid {
                 px[i] = 254;
             }
         }
-        Some(GridImg { w, h, x0, y0, px, wall })
+        Some(GridImg { w, h, x0, y0, pgm, hdr, wall })
     }
 }
 
@@ -857,7 +870,7 @@ impl Memory {
                         let ok = s.len() >= 3 && hit >= LOOK_OVL * s.len() as f32;
                         if ok {
                             // 다른 조건이 모두 아닐 때만 여기까지 온다: 사진 벡터가 정한 병합
-                            eprintln!("merge(look): {}#{} + {}#{} cos {cos:.2} overlap {:.2}", a.name, a.id, b.name, b.id, hit / s.len() as f32);
+                            common::info!("merge(look): {}#{} + {}#{} cos {cos:.2} overlap {:.2}", a.name, a.id, b.name, b.id, hit / s.len() as f32);
                         }
                         ok
                     };

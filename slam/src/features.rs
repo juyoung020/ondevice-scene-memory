@@ -674,6 +674,7 @@ fn candidates(eig: &[f32], w: usize, mask: Option<&[u8]>, th: f32, ya: usize, yb
 thread_local! {
     /// 9×9 상자 합 그림 버퍼(스레드마다 하나)
     static BOX_BUF: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static COL_BUF: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// BriefDescriptorExtractor::compute(32 바이트, 방향 없음): 가장자리 28 화소(PATCH 48/2 + KERNEL 9/2) 안의 점은 지우고
@@ -724,7 +725,12 @@ pub fn describe(gray: &[u8], w: usize, h: usize, kps: &mut Vec<KeyPoint>) -> Vec
 fn box9(gray: &[u8], w: usize, h: usize, out: &mut Vec<i32>) {
     out.resize(w * h, 0);
     // 세로 9 줄 합(열마다), 줄을 내려가며 한 줄 더하고 한 줄 뺌
-    let mut col = vec![0i32; w];
+    with_buf(&COL_BUF, |col| box9_with(gray, w, h, out, col));
+}
+
+fn box9_with(gray: &[u8], w: usize, h: usize, out: &mut [i32], col: &mut Vec<i32>) {
+    col.clear();
+    col.resize(w, 0);
     for y in 0..9 {
         for (c, &g) in col.iter_mut().zip(&gray[y * w..(y + 1) * w]) {
             *c += g as i32;
@@ -854,8 +860,8 @@ mod tests {
             gray,
             color: vec![],
             color_is_rgb: false,
-            depth_mm: depth,
-            depth_raw: vec![],
+            depth_mm: depth.into(),
+            depth_raw: Default::default(),
             depth_per_m: 1000.0,
             cam: Camera { fx: 500.0, fy: 500.0, cx: 159.5, cy: 119.5, width: w, height: h, local: crate::io::optical_rotation() },
         }

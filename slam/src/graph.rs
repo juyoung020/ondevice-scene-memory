@@ -575,7 +575,7 @@ mod tests {
             if colamd_order(&fs, x0.len()) == gord {
                 s_ord += 1;
             } else if s_ord + 3 > n_ord {
-                eprintln!("  순서 다름: {}", tp.display());
+                common::info!("  순서 다름: {}", tp.display());
             }
             let vals = |r: &mut Rd| -> Vec<Pose3> {
                 let n = i64::from_le_bytes(r.take());
@@ -649,7 +649,7 @@ mod tests {
                 // 원본 선형계를 정확 이식 풀이로(같은 순서 gord)
                 let ours = exact::solve(x.len(), &lins, &gord).expect("정확 풀이 실패");
                 if n_d == s_d && ours.iter().flatten().zip(delta.iter().flatten()).any(|(a, b)| a.to_bits() != b.to_bits()) {
-                    eprintln!("  첫 δ 불일치: {}", tp.display());
+                    common::info!("  첫 δ 불일치: {}", tp.display());
                 }
                 for (a, b) in ours.iter().flatten().zip(delta.iter().flatten()) {
                     n_d += 1;
@@ -669,7 +669,7 @@ mod tests {
                 s_err += (graph_error(&fs, &x).to_bits() == e.to_bits()) as usize;
             }
         }
-        eprintln!(
+        common::info!(
             "단계별: 순서 같음 {s_ord}/{n_ord}, 오차 같음 {s_err}/{n_err}, 선형화 A·b 같음 {s_ab}/{n_ab}(최대 {max_ab} ulp), retract 같음 {s_ret}/{n_ret}, δ 같음 {s_d}/{n_d}(최대 차이 {max_d:e})"
         );
     }
@@ -679,7 +679,7 @@ mod tests {
     fn ref_dumps() {
         let files = dump_files();
         if files.is_empty() {
-            eprintln!("덤프 없음, 건너뜀");
+            common::info!("덤프 없음, 건너뜀");
             return;
         }
         let (mut calls, mut same_calls, mut vals, mut same_vals, mut max_ulp, mut same_it, mut same_fe) = (0, 0, 0usize, 0usize, 0u64, 0, 0);
@@ -721,7 +721,7 @@ mod tests {
             same_calls += call_same as i32;
             same_it += (r.iterations == d.it) as i32;
             same_fe += (r.final_error.to_bits() == d.fe.to_bits()) as i32;
-            eprintln!(
+            common::info!(
                 "{}: 노드 {} 링크 {} | 출력 {} | 반복 {}/{} | 최종 오차 {:e}/{:e} | 최대 {} ulp | 원본 {:.0} us, 정확 Rust {:.0} us, 빠른 Rust {:.0} us",
                 f.display(),
                 d.poses.len(),
@@ -737,6 +737,6 @@ mod tests {
                 us_fast
             );
         }
-        eprintln!("합계: 호출 {calls}, 출력 전부 같음 {same_calls}, float 값 같음 {same_vals}/{vals}, 최대 {max_ulp} ulp, 반복 수 같음 {same_it}, 최종 오차 비트 같음 {same_fe}");
+        common::info!("합계: 호출 {calls}, 출력 전부 같음 {same_calls}, float 값 같음 {same_vals}/{vals}, 최대 {max_ulp} ulp, 반복 수 같음 {same_it}, 최종 오차 비트 같음 {same_fe}");
     }
 }

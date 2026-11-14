@@ -26,7 +26,7 @@ pub struct StreamFrame {
     /// 깊이 값 / 미터(RealSense 1000, TUM 5000)
     pub depth_per_m: f32,
     pub rgb: Vec<u8>,
-    pub depth: Vec<u16>,
+    pub depth: slam::DepthBuf,
     /// 기준 지도 노드 id(0 = 없음): 이 장면 위치 = 그 노드 위치 × 상대 위치(루프 클로저 뒤 다시 쌓기용)
     pub anchor: u32,
     /// 이 장면 앞에 온 그래프 블록의 노드
@@ -38,7 +38,7 @@ impl Drop for StreamFrame {
     fn drop(&mut self) {
         if slam::bufpool::enabled() {
             slam::bufpool::give_rgb(std::mem::take(&mut self.rgb));
-            slam::bufpool::give_depth(std::mem::take(&mut self.depth));
+            slam::bufpool::give_depth_buf(std::mem::take(&mut self.depth));
         }
     }
 }

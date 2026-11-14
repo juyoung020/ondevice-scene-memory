@@ -136,7 +136,7 @@ mod worker {
             if model.ends_with(".dxnn") {
                 let e = crate::seg::dx::Engine::with_cpu_tasks(model);
                 assert_eq!(e.out.len(), DIM * 4, "embed model output");
-                eprintln!("embed: NPU 모델 {model}, 출력 {}", e.tensors[0].0);
+                common::info!("embed: NPU 모델 {model}, 출력 {}", e.tensors[0].0);
                 return Net::Dx(e);
             }
             #[cfg(feature = "onnx")]
@@ -200,7 +200,7 @@ mod worker {
                 }
                 PENDING.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
             }
-            eprintln!("embed: {n} vectors, {:.1} ms each", ms / n.max(1) as f64);
+            common::info!("embed: {n} vectors, {:.1} ms each", ms / n.max(1) as f64);
         }).unwrap();
         *W.lock().unwrap() = Some((tx, th));
     }

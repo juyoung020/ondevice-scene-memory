@@ -48,11 +48,11 @@ pub fn is_mm(depth_per_m: f32) -> bool {
 
 /// 원본 깊이 → (mm 깊이, 스트림용 원본). 1000/m 이면 두 값이 같아 버퍼 하나만 mm 칸에 두고 원본 칸은 비운다
 /// (복사 614,400 B 없음, 보낼 때 `Frame::take_stream_depth` 가 mm 칸을 넘김)
-pub fn split_depth(raw: Vec<u16>, depth_per_m: f32) -> (Vec<u16>, Vec<u16>) {
+pub fn split_depth(raw: Vec<u16>, depth_per_m: f32) -> (crate::DepthBuf, crate::DepthBuf) {
     if is_mm(depth_per_m) {
-        (raw, Vec::new())
+        (raw.into(), Default::default())
     } else {
-        (depth_to_mm(&raw, depth_per_m), raw)
+        (depth_to_mm(&raw, depth_per_m).into(), raw.into())
     }
 }
 
@@ -180,7 +180,8 @@ impl FrameSource for TumSource {
                 _ => return Err(format!("장면 읽기 실패: {rel}")),
             };
             let gray = to_gray(&color, true);
-            let depth_mm = depth_to_mm(&depth_raw, 5000.0);
+            let depth_mm = depth_to_mm(&depth_raw, 5000.0).into();
+            let depth_raw = depth_raw.into();
             self.id += 1;
             let k = self.k;
             let f = Frame {
@@ -236,6 +237,7 @@ impl PrefetchSource {
         let dropped = Arc::new(AtomicUsize::new(0));
         let (sh2, dr2) = (sh.clone(), dropped.clone());
         let th = std::thread::spawn(move || {
+            common::threads::rt("camera"); // --rt camera=우선순위[@코어]: 장면 받는 스레드
             let (m, cv) = &*sh2;
             loop {
                 match inner.next() {
@@ -347,6 +349,6 @@ mod tests {
             n += 1;
         }
         assert_eq!(off, r.len());
-        eprintln!("같은 장면 {n} 개, 읽기 평균 {:.2} ms", ms / n as f64);
+        common::info!("같은 장면 {n} 개, 읽기 평균 {:.2} ms", ms / n as f64);
     }
 }

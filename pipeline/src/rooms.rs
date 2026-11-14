@@ -772,16 +772,17 @@ impl Tracker {
     /// 점유 지도 그림(위가 +y)으로 다시 나누고 지난 나눔과 번호를 잇는다. 지도가 지난번과 같으면 지난 나눔 그대로.
     pub fn update(&mut self, g: &GridImg, res: f64) -> &Seg {
         let (w, h) = (g.w, g.h);
-        if self.prev.as_ref().is_some_and(|p| (p.w, p.h, p.gx0, p.gy0) == (w, h, g.x0, g.y0)) && self.seen.0 == g.px && self.seen.1 == g.wall {
+        if self.prev.as_ref().is_some_and(|p| (p.w, p.h, p.gx0, p.gy0) == (w, h, g.x0, g.y0)) && self.seen.0 == g.px() && self.seen.1 == g.wall {
             return self.prev.as_ref().unwrap();
         }
-        self.seen.0.clone_from(&g.px);
+        self.seen.0.clear();
+        self.seen.0.extend_from_slice(g.px());
         self.seen.1.clone_from(&g.wall);
         let mut cls = vec![0u8; w * h];
         for y in 0..h {
             for x in 0..w {
                 let i = (h - 1 - y) * w + x;
-                cls[y * w + x] = match g.px[i] {
+                cls[y * w + x] = match g.px()[i] {
                     254 => 1,
                     0 => 2 - !g.wall[i] as u8, // 낮은 막힘(가구)은 방 안
                     _ => 0,

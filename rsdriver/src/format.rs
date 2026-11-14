@@ -60,6 +60,8 @@ pub fn yuyv_to_rgb8(src: &[u8], stride: usize, w: usize, out: &mut [u8], rule: Y
     for r in 0..h {
         let s = &src[r * stride..r * stride + w * 2];
         let o = &mut out[r * w * 3..(r + 1) * w * 3];
+        let n0 = simd_row(rule, s, o, None, w, true);
+        let (s, o) = (&s[n0 * 2..], &mut o[n0 * 3..]);
         for (q, os) in s.chunks_exact(4).zip(o.chunks_exact_mut(6)) {
             let a = px(q[0], q[1], q[3], rule);
             let b = px(q[2], q[1], q[3], rule);
@@ -82,6 +84,8 @@ pub fn yuyv_to_rgb8_gray(src: &[u8], stride: usize, w: usize, out: &mut [u8], gr
         let s = &src[r * stride..r * stride + w * 2];
         let o = &mut out[r * w * 3..(r + 1) * w * 3];
         let g = &mut gray[r * w..(r + 1) * w];
+        let n0 = simd_row(rule, s, o, Some(&mut *g), w, true);
+        let (s, o, g) = (&s[n0 * 2..], &mut o[n0 * 3..], &mut g[n0..]);
         for ((q, os), gs) in s.chunks_exact(4).zip(o.chunks_exact_mut(6)).zip(g.chunks_exact_mut(2)) {
             let a = px(q[0], q[1], q[3], rule);
             let b = px(q[2], q[1], q[3], rule);
@@ -129,5 +133,119 @@ mod fused_tests {
             yuyv_to_rgb8_gray(&src, 4, 2, &mut o, &mut g, Yuy2Rule::NATIVE);
             assert_eq!(g[0], gray_of(&[o[0], o[1], o[2]]));
         }}}
+    }
+}
+
+/// aarch64 NEON: [`Yuy2Rule::Neon`] 식을 8 묶음(16 화소)씩 — librealsense `image-neon.cpp` 와 같은 i16 감김 곱·산술 밀기·포화.
+/// 줄 끝 나머지(16 화소 미만)는 스칼라 식으로. rgb·gray 결과는 스칼라와 비트 단위로 같다(시험 `neon_same_as_scalar`, qemu-aarch64)
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use core::arch::aarch64::*;
+
+    /// 한 줄: s = YUYV 2w 바이트, o = RGB 3w, g = 회색 w(None 이면 RGB 만)
+    #[inline]
+    pub fn row(s: &[u8], o: &mut [u8], mut g: Option<&mut [u8]>, w: usize) -> usize {
+        let n = w / 16 * 16;
+        // SAFETY: aarch64 는 NEON 이 늘 있음. 읽기 s[..2n], 쓰기 o[..3n], g[..n] 범위 안
+        unsafe {
+            let k42 = vdupq_n_s16(298 - 256);
+            let k153 = vdupq_n_s16(409 - 256);
+            let k100 = vdupq_n_s16(100);
+            let k208 = vdupq_n_s16(208);
+            let k260 = vdupq_n_s16(516 - 256);
+            let c16 = vdupq_n_s16(16);
+            let c128 = vdupq_n_s16(128);
+            let mut x = 0;
+            while x < n {
+                let q = vld4_u8(s.as_ptr().add(x * 2)); // y0 u y1 v × 8
+                let d = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(q.1)), c128);
+                let e = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(q.3)), c128);
+                let m = |a: int16x8_t, k: int16x8_t| vshrq_n_s16::<8>(vmulq_s16(a, k));
+                let rv = vaddq_s16(m(e, k153), e);
+                let bv = vaddq_s16(m(d, k260), d);
+                let px = |y: uint8x8_t| {
+                    let c = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(y)), c16);
+                    let t0 = vaddq_s16(m(c, k42), c);
+                    // g = t0 - m(d,100) - m(e,208): 스칼라와 같은 감김 차례(빼기 둘)
+                    let gg = vsubq_s16(vsubq_s16(t0, m(d, k100)), m(e, k208));
+                    (vqmovun_s16(vaddq_s16(t0, rv)), vqmovun_s16(gg), vqmovun_s16(vaddq_s16(t0, bv)))
+                };
+                let (ra, ga, ba) = px(q.0);
+                let (rb, gb, bb) = px(q.2);
+                let z = |a: uint8x8_t, b: uint8x8_t| vcombine_u8(vzip1_u8(a, b), vzip2_u8(a, b));
+                let (r, gr, b) = (z(ra, rb), z(ga, gb), z(ba, bb));
+                vst3q_u8(o.as_mut_ptr().add(x * 3), uint8x16x3_t(r, gr, b));
+                if let Some(g) = g.as_deref_mut() {
+                    // (B·3735 + G·19235 + R·9798 + 2^14) >> 15, u32 로
+                    let half = |r: uint8x8_t, gr: uint8x8_t, b: uint8x8_t| {
+                        let (r, gr, b) = (vmovl_u8(r), vmovl_u8(gr), vmovl_u8(b));
+                        let rnd = vdupq_n_u32(1 << 14);
+                        let lo = vaddq_u32(vaddq_u32(vmull_n_u16(vget_low_u16(b), 3735), vmull_n_u16(vget_low_u16(gr), 19235)), vaddq_u32(vmull_n_u16(vget_low_u16(r), 9798), rnd));
+                        let hi = vaddq_u32(vaddq_u32(vmull_high_n_u16(b, 3735), vmull_high_n_u16(gr, 19235)), vaddq_u32(vmull_high_n_u16(r, 9798), rnd));
+                        vmovn_u16(vcombine_u16(vshrn_n_u32::<15>(lo), vshrn_n_u32::<15>(hi)))
+                    };
+                    let gl = half(vget_low_u8(r), vget_low_u8(gr), vget_low_u8(b));
+                    let gh = half(vget_high_u8(r), vget_high_u8(gr), vget_high_u8(b));
+                    vst1q_u8(g.as_mut_ptr().add(x), vcombine_u8(gl, gh));
+                }
+                x += 16;
+            }
+        }
+        n
+    }
+}
+
+/// NEON 으로 줄 앞부분을 처리한 화소 수(짝수). 다른 규칙·다른 기계·`simd` false 면 0(전부 스칼라)
+#[inline(always)]
+#[allow(unused_variables)]
+fn simd_row(rule: Yuy2Rule, s: &[u8], o: &mut [u8], g: Option<&mut [u8]>, w: usize, simd: bool) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    if simd && rule == Yuy2Rule::Neon {
+        return neon::row(s, o, g, w);
+    }
+    0
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod neon_tests {
+    use super::*;
+    /// 스칼라 식만으로(줄 전체)
+    fn scalar(src: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
+        let (mut o, mut g) = (vec![0u8; w * h * 3], vec![0u8; w * h]);
+        for r in 0..h {
+            for x in (0..w).step_by(2) {
+                let q = &src[r * w * 2 + x * 2..];
+                let a = px(q[0], q[1], q[3], Yuy2Rule::Neon);
+                let b = px(q[2], q[1], q[3], Yuy2Rule::Neon);
+                o[(r * w + x) * 3..][..3].copy_from_slice(&a);
+                o[(r * w + x + 1) * 3..][..3].copy_from_slice(&b);
+                g[r * w + x] = gray_of(&a);
+                g[r * w + x + 1] = gray_of(&b);
+            }
+        }
+        (o, g)
+    }
+    #[test]
+    fn neon_same_as_scalar() {
+        // 모든 Y0·U·V(Y1 은 섞음): 65536×256 조합을 16 화소 줄로
+        let w = 640;
+        let mut src = Vec::with_capacity(256 * 256 * 4 * 256);
+        for y in 0..=255u8 { for u in 0..=255u8 { for v in 0..=255u8 { src.extend([y, u, y ^ v, v]); } } }
+        let h = src.len() / (w * 2);
+        let src = &src[..h * w * 2];
+        let (eo, eg) = scalar(src, w, h);
+        let (mut o, mut g) = (vec![1u8; w * h * 3], vec![1u8; w * h]);
+        yuyv_to_rgb8_gray(src, w * 2, w, &mut o, &mut g, Yuy2Rule::Neon);
+        assert!(o == eo && g == eg, "rgb+gray");
+        let mut o2 = vec![2u8; w * h * 3];
+        yuyv_to_rgb8(src, w * 2, w, &mut o2, Yuy2Rule::Neon);
+        assert!(o2 == eo, "rgb");
+        // 16 의 배수가 아닌 폭(나머지는 스칼라)
+        let (w, h) = (38, 50);
+        let src = &src[..w * h * 2];
+        let (eo, eg) = scalar(src, w, h);
+        let (mut o, mut g) = (vec![1u8; w * h * 3], vec![1u8; w * h]);
+        yuyv_to_rgb8_gray(src, w * 2, w, &mut o, &mut g, Yuy2Rule::Neon);
+        assert!(o == eo && g == eg, "나머지");
     }
 }

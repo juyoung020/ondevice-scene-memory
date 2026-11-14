@@ -16,6 +16,8 @@ serde_json = "1.0.154"
 slam = { path = "../slam" }
 # --serve: 뷰어 서버(sgview)를 같은 프로세스에서, 기억 폴더에 쓴 파일은 메모리로 넘김
 sgview = { path = "../viewer/sgview" }
+# --features mimalloc: 할당기를 mimalloc 으로(장면마다 크고 작은 버퍼를 잡고 놓는 비용·조각남 줄임). 값은 같음
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # 리눅스(보드): --slam --realsense 의 D435 입력은 rsdriver(V4L2 직접)가 기본
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -29,6 +31,7 @@ directml = ["onnx", "ort/directml"]
 dxrt = []
 # --slam --realsense 를 librealsense2 로(rsdriver 와 견줄 때)
 slam-realsense = ["slam/realsense"]
+mimalloc = ["dep:mimalloc"]
 
 # 한 프로그램: ondevice [run] … = 물체 기억(memmap), ondevice slam … = 위치 프로그램, ondevice view … = 뷰어 서버
 [[bin]]

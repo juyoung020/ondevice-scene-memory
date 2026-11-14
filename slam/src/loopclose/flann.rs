@@ -204,8 +204,7 @@ static BYTE_MASK: [[u32; 8]; 256] = {
 /// L1<float> 거리: 0/1 값이라 popcount(xor) 와 비트까지 같다
 #[inline]
 fn l1(a: &[u64; 4], b: &[u64; 4]) -> f32 {
-    ((a[0] ^ b[0]).count_ones() + (a[1] ^ b[1]).count_ones() + (a[2] ^ b[2]).count_ones() + (a[3] ^ b[3]).count_ones())
-        as f32
+    crate::simd::hamming256(a, b) as f32
 }
 
 /// 나무 마디. 잎이면 divfeat = 점 번호
@@ -838,7 +837,7 @@ mod tests {
             mix(*a as u64);
             mix(b.to_bits() as u64);
         }
-        eprintln!("짓기 {tb:.2} ms, 찾기(500) {ts:.2} ms, 지문 {h:016x}");
+        common::info!("짓기 {tb:.2} ms, 찾기(500) {ts:.2} ms, 지문 {h:016x}");
         assert_eq!(h, 0xe2629005165aef3d, "지문 {h:016x}");
     }
 

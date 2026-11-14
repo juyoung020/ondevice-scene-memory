@@ -238,7 +238,7 @@ mod tests {
     use nalgebra::{Translation3, UnitQuaternion, Vector3};
 
     fn frame(t: f64, cam: &Camera) -> Frame {
-        Frame { id: 0, t, gray: vec![], color: vec![], color_is_rgb: false, depth_mm: vec![], depth_raw: vec![], depth_per_m: 1000.0, cam: cam.clone() }
+        Frame { id: 0, t, gray: vec![], color: vec![], color_is_rgb: false, depth_mm: Default::default(), depth_raw: Default::default(), depth_per_m: 1000.0, cam: cam.clone() }
     }
 
     #[test]

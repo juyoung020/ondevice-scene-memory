@@ -281,10 +281,10 @@ mod engine {
             self.odom.pose_tf()
         }
 
-        /// 회색조는 이 뒤 쓰지 않아 옮김. mm 깊이는 스트림으로 보낼 원본이 따로 있으면 옮기고, 같은 버퍼면(1000/m) 복사
+        /// 회색조는 이 뒤 쓰지 않아 옮김. mm 깊이는 스트림으로 보낼 원본이 따로 있으면 옮기고, 같은 버퍼면(1000/m) 스트림과 나눠 듦(Arc)
         pub fn make_ref(&self, f: &mut Frame) -> RefSig {
-            let depth_mm = if f.depth_raw.is_empty() { f.depth_mm.clone() } else { std::mem::take(&mut f.depth_mm) };
-            let frame = Frame { id: f.id, t: f.t, gray: std::mem::take(&mut f.gray), color: Vec::new(), color_is_rgb: f.color_is_rgb, depth_mm, depth_raw: Vec::new(), depth_per_m: f.depth_per_m, cam: f.cam.clone() };
+            let depth_mm = if f.depth_raw.is_empty() { f.depth_mm.clone() } else { std::mem::take(&mut f.depth_mm) }; // 같은 버퍼면 나눠 듦(복사 없음)
+            let frame = Frame { id: f.id, t: f.t, gray: std::mem::take(&mut f.gray), color: Vec::new(), color_is_rgb: f.color_is_rgb, depth_mm, depth_raw: Default::default(), depth_per_m: f.depth_per_m, cam: f.cam.clone() };
             RefSig { frame, feats: None, ids: None }
         }
 
@@ -399,7 +399,7 @@ mod sys {
 }
 
 fn usage() {
-    eprintln!(
+    common::info!(
         "ondevice slam (--tum <폴더> [--rate R] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
@@ -464,7 +464,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
     let mut i = 1;
     let num = |s: &str| -> Result<f64, i32> {
         s.parse::<f64>().map_err(|_| {
-            eprintln!("숫자가 아님: {s}");
+            common::info!("숫자가 아님: {s}");
             2
         })
     };
@@ -506,12 +506,17 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--stats" => a.stats = val()?,
             "--db" => {
                 let _ = val()?;
-                eprintln!("--db: 이 판에는 데이터베이스 저장이 없어 넘어감");
+                common::info!("--db: 이 판에는 데이터베이스 저장이 없어 넘어감");
             }
             "--max-frames" => a.max_frames = num(&val()?)? as i64,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
             "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
+            // 프로세스 설정(ondevice 가 처음에 읽음): 실시간 배치·메모리 묶기·조용히
+            "--rt" => {
+                let _ = val()?;
+            }
+            "--mlock" | "--quiet" => {}
             "-h" | "--help" => {
                 usage();
                 return Err(0);
@@ -521,7 +526,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
                 a.overrides.push((name, val()?));
             }
             _ => {
-                eprintln!("모르는 인자: {k}");
+                common::info!("모르는 인자: {k}");
                 usage();
                 return Err(2);
             }
@@ -555,7 +560,7 @@ pub fn spawn(a: Args, pool: rayon::ThreadPool) -> Result<(stream::Receiver, std:
             match pool.install(|| run_in(a, Some(tx), Some(p2))) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("slam 오류: {e}");
+                    common::info!("slam 오류: {e}");
                     1
                 }
             }
@@ -610,13 +615,13 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let intermediate = params.get_bool("Rtabmap/CreateIntermediateNodes", false);
     let detection_rate: f32 = params.get("Rtabmap/DetectionRate", 1.0);
 
-    eprintln!("입력: {}", src.describe());
+    common::info!("입력: {}", src.describe());
     let mut line = format!("slam (RTAB-Map 0.24.2 경로), 설정 {}, 바꾼 파라미터 {} 개:", if a.config.is_empty() { "(기본값)" } else { &a.config }, params.0.len());
     for (k, v) in &params.0 {
         line += &format!(" {k}={v}");
     }
-    eprintln!("{line}");
-    eprintln!("출력: {} ({}, 큐 {}, {} 장마다)", if in_proc { "물체 기억 메모리 큐" } else { &a.out }, if block { "받는 쪽을 기다림" } else { "밀리면 오래된 장면 버림" }, a.queue, a.send_every);
+    common::info!("{line}");
+    common::info!("출력: {} ({}, 큐 {}, {} 장마다)", if in_proc { "물체 기억 메모리 큐" } else { &a.out }, if block { "받는 쪽을 기다림" } else { "밀리면 오래된 장면 버림" }, a.queue, a.send_every);
 
     // 놓쳤을 때 다시 잡기는 아래에서 직접 한다: 위치 추적이 혼자 '마지막 위치'에서 다시 시작하지 않게 함
     let mut odom_params = params.clone();
@@ -682,7 +687,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             let _ = std::fs::remove_file(&a.reset_file);
         }
         if reset_req || restart {
-            eprintln!("장면 {n}: {} → 위치 추적·지도를 처음부터", if reset_req { "리셋" } else { "지도가 작을 때 놓침" });
+            common::info!("장면 {n}: {} → 위치 추적·지도를 처음부터", if reset_req { "리셋" } else { "지도가 작을 때 놓침" });
             restart = false;
             good_t0 = -1.0;
             good_t1 = -1.0;
@@ -737,7 +742,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 info.inliers = ri.inliers;
                 relocalized = true;
                 n_reloc += 1;
-                eprintln!("장면 {n}: 같은 지도에서 다시 잡음({:.2} 초 전 장면, 맞은 점 {})", fr.t - rt, ri.inliers);
+                common::info!("장면 {n}: 같은 지도에서 다시 잡음({:.2} 초 전 장면, 맞은 점 {})", fr.t - rt, ri.inliers);
                 break;
             }
             s_reloc.add(ms_since(cr));
@@ -761,7 +766,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다
         let mut new_map = false;
         if !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
-            eprintln!("장면 {n}: 위치 추적 다시 시작 → 새 지도");
+            common::info!("장면 {n}: 위치 추적 다시 시작 → 새 지도");
             let id = eng.trigger_new_map();
             map_id = if id >= 0 { id as u32 } else { map_id + 1 };
             new_map = true;
@@ -798,7 +803,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             let last = eng.last_location_id();
             if !anchored && lp.contains_key(&good_id) {
                 anchored = true;
-                eprintln!("장면 {n}: 이전 지도와 다시 이어짐");
+                common::info!("장면 {n}: 이전 지도와 다시 이어짐");
             }
             if anchored && lp.contains_key(&last) {
                 good_id = last;
@@ -877,7 +882,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 n_graph_nodes += upd.len() as i64;
                 n_graph += 1;
                 if !writer.push(OutFrame { graph: upd, ..Default::default() }) {
-                    eprintln!("받는 쪽이 닫힘: 끝냄");
+                    common::info!("받는 쪽이 닫힘: 끝냄");
                     break;
                 }
             }
@@ -925,7 +930,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             of.color_is_rgb = fr.color_is_rgb;
             of.depth = fr.take_stream_depth();
             if !writer.push(of) {
-                eprintln!("받는 쪽이 닫힘: 끝냄");
+                common::info!("받는 쪽이 닫힘: 끝냄");
                 break;
             }
             send_ms = ms_since(c3); // 큐에 넣기(기다림 포함)
@@ -963,26 +968,26 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         for (_, t, p) in &g {
                 write_tum(&mut f, *t, &p.mul(&optical));
         }
-        eprintln!("최적화된 지도 노드 {} 개 → {}", g.len(), a.final_poses);
+        common::info!("최적화된 지도 노드 {} 개 → {}", g.len(), a.final_poses);
     }
     drop(poses_f);
     drop(stats_f);
 
-    eprintln!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
-    eprintln!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");
-    eprintln!("같은 지도에서 다시 잡음 {n_reloc} 번, ms/회 {}", s_reloc.str());
-    eprintln!("루프 정합에서 단어 id 가 겹치지 않는 노드(원본은 id 순서를 씀) {} 번, 다시 잡기에서 원본이 고쳐 둔 기준 장면을 다시 씀 {} 번(두 번째 판 순서를 모름 {} 번)", eng.loop_unique_ids.load(Ordering::Relaxed), eng.ref_reuse, eng.ref_unknown);
+    common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
+    common::info!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");
+    common::info!("같은 지도에서 다시 잡음 {n_reloc} 번, ms/회 {}", s_reloc.str());
+    common::info!("루프 정합에서 단어 id 가 겹치지 않는 노드(원본은 id 순서를 씀) {} 번, 다시 잡기에서 원본이 고쳐 둔 기준 장면을 다시 씀 {} 번(두 번째 판 순서를 모름 {} 번)", eng.loop_unique_ids.load(Ordering::Relaxed), eng.ref_reuse, eng.ref_unknown);
     if let Some(s) = skipped {
-        eprintln!("재생에서 밀려 건너뛴 장면 {}", s.load(Ordering::Relaxed));
+        common::info!("재생에서 밀려 건너뛴 장면 {}", s.load(Ordering::Relaxed));
     }
-    eprintln!("위치 추적이 밀려 버린 장면 {}", src.dropped());
-    eprintln!("보냄 {}, 밀려 버림 {}, 그래프 블록 {n_graph} 개(노드 {n_graph_nodes} 개)", writer.written(), writer.dropped());
-    eprintln!("ms/장  읽기    {}", s_read.str());
-    eprintln!("ms/장  위치추적 {}", s_odom.str());
-    eprintln!("ms/회  지도갱신 {}", s_slam.str());
-    eprintln!("ms/장  큐넣기  {}", s_send.str());
-    eprintln!("ms/장  파이프쓰기(쓰기 스레드) {}", s_write.str());
-    eprintln!("ms/장  합(본 스레드) {}", s_total.str());
+    common::info!("위치 추적이 밀려 버린 장면 {}", src.dropped());
+    common::info!("보냄 {}, 밀려 버림 {}, 그래프 블록 {n_graph} 개(노드 {n_graph_nodes} 개)", writer.written(), writer.dropped());
+    common::info!("ms/장  읽기    {}", s_read.str());
+    common::info!("ms/장  위치추적 {}", s_odom.str());
+    common::info!("ms/회  지도갱신 {}", s_slam.str());
+    common::info!("ms/장  큐넣기  {}", s_send.str());
+    common::info!("ms/장  파이프쓰기(쓰기 스레드) {}", s_write.str());
+    common::info!("ms/장  합(본 스레드) {}", s_total.str());
     Ok(0)
 }
 

@@ -1,0 +1,4 @@
+# 보드(Raspberry Pi 5, Cortex-A76) 빌드: aarch64 로 빌드하면(보드에서 바로 또는 PC 에서 교차) A76 명령·일정에 맞춘다.
+# Rust 는 곱셈·덧셈을 FMA 로 합치지 않아 출력 값은 기본 aarch64 빌드와 같다.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=cortex-a76"]

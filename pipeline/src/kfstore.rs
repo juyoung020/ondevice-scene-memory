@@ -297,7 +297,7 @@ impl KfStore {
                 }
             }
             self.stride *= 2;
-            eprintln!("장면 보관: 예산 {} MB 넘음 → {} 장만 남기고 {} 장마다 보관", self.budget >> 20, self.kfs.len(), self.stride);
+            common::info!("장면 보관: 예산 {} MB 넘음 → {} 장만 남기고 {} 장마다 보관", self.budget >> 20, self.kfs.len(), self.stride);
         }
         self.kfs.last().filter(|k| Arc::ptr_eq(k, &kf)).cloned()
     }
@@ -452,7 +452,7 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(unpack_rgb(&zr, w, h), rgb);
         assert_eq!(unpack_depth(&zd, w, h), d);
-        eprintln!("컬러 {} → {} B, 깊이 {} → {} B, 묶기 {:?}, 풀기 {:?}", rgb.len(), zr.len(), d.len() * 2, zd.len(), tp, t.elapsed());
+        common::info!("컬러 {} → {} B, 깊이 {} → {} B, 묶기 {:?}, 풀기 {:?}", rgb.len(), zr.len(), d.len() * 2, zd.len(), tp, t.elapsed());
     }
 
     #[test]

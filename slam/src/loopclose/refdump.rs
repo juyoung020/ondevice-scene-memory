@@ -342,7 +342,7 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
     let home = std::env::var("HOME").ok()?;
     let dir = format!("{home}/slamref/out/{seq}");
     if !std::path::Path::new(&format!("{dir}/main.txt")).exists() {
-        eprintln!("{dir} 없음: 건너뜀");
+        common::info!("{dir} 없음: 건너뜀");
         return None;
     }
     let steps = parse_main(&format!("{dir}/main.txt"));
@@ -460,26 +460,26 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
     let loops = steps.iter().filter(|s| s.loop_id > 0).count();
     let proxs = steps.iter().filter(|s| s.prox > 0).count();
     let posts = steps.iter().filter(|s| !s.post.is_empty()).count();
-    eprintln!("{seq}: getConnectedGraph {} 번", slam.connected_graph_calls);
-    eprintln!("{seq}: Rust 루프 {my_loops} 근접 {my_prox}");
-    eprintln!("{seq}: 루프 {loops} 근접 {proxs} 사후 확률 있는 단계 {posts}");
+    common::info!("{seq}: getConnectedGraph {} 번", slam.connected_graph_calls);
+    common::info!("{seq}: Rust 루프 {my_loops} 근접 {my_prox}");
+    common::info!("{seq}: 루프 {loops} 근접 {proxs} 사후 확률 있는 단계 {posts}");
     let orig: f64 = std::fs::read_to_string(format!("{dir}/time.txt")).unwrap_or_default().lines().filter_map(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()).sum();
     let ap = APPLY_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
     let ad = ADD_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
     let op = OPT_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-    eprintln!("{seq}: 사전 더하기 {ad:.1} ms, 그래프 최적화 {op:.1} ms");
+    common::info!("{seq}: 사전 더하기 {ad:.1} ms, 그래프 최적화 {op:.1} ms");
     let kn = KNN_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
     let slam_ms = slam_ms - ap;
-    eprintln!("{seq}: 그중 사전 knn {kn:.1} ms, 시험용 난수 맞추기 {ap:.1} ms(뺌)");
-    eprintln!("{seq}: process 합 Rust {slam_ms:.1} ms(정합은 덤프 대역) / 원본 {orig:.1} ms(정합·특징 포함)");
+    common::info!("{seq}: 그중 사전 knn {kn:.1} ms, 시험용 난수 맞추기 {ap:.1} ms(뺌)");
+    common::info!("{seq}: process 합 Rust {slam_ms:.1} ms(정합은 덤프 대역) / 원본 {orig:.1} ms(정합·특징 포함)");
     Some((ok_steps, steps.len(), diffs))
 }
 
 fn check(seq: &str, real: bool) {
     if let Some((ok, n, diffs)) = run(seq, real) {
-        eprintln!("{seq}: 단계 {ok}/{n} 비트 일치");
+        common::info!("{seq}: 단계 {ok}/{n} 비트 일치");
         for d in diffs.iter().take(20) {
-            eprintln!("  {d}");
+            common::info!("  {d}");
         }
         assert!(diffs.is_empty(), "{seq}: 다른 곳 {}", diffs.len());
     }
@@ -611,10 +611,10 @@ fn nearest_nodes_ties() {
         if got == want {
             ok += 1;
         } else if n - ok <= 5 {
-            eprintln!("다름 r={r} a={a} k={k}: {got:?} vs {want:?}");
+            common::info!("다름 r={r} a={a} k={k}: {got:?} vs {want:?}");
         }
     }
-    eprintln!("findNearestNodes {ok}/{n} 같음");
+    common::info!("findNearestNodes {ok}/{n} 같음");
     assert_eq!(ok, n);
 }
 

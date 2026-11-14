@@ -74,7 +74,13 @@ pub fn letterbox_keep(rgb: &[u8], w: usize, h: usize, s: usize, buf: &mut Vec<u8
     }
     let same = r == 1.0;
     // 가로 원본 위치는 줄마다 같으니 한 번만 계산
-    let xs: Vec<usize> = if same { vec![] } else { (0..nw).map(|x| (((x as f32 + 0.5) / r) as usize).min(w - 1) * 3).collect() };
+    // 표는 스레드에 하나 두고 다시 씀(장면마다 할당 없음)
+    thread_local! { static XS: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) }; }
+    let mut xs = XS.with(|c| c.take());
+    xs.clear();
+    if !same {
+        xs.extend((0..nw).map(|x| (((x as f32 + 0.5) / r) as usize).min(w - 1) * 3));
+    }
     for y in 0..nh {
         let row = &mut buf[(py + y) * s * 3..(py + y + 1) * s * 3];
         if !bands_ok {
@@ -92,6 +98,7 @@ pub fn letterbox_keep(rgb: &[u8], w: usize, h: usize, s: usize, buf: &mut Vec<u8
             }
         }
     }
+    XS.with(|c| c.set(xs));
     LbGeom { r, px, py }
 }
 

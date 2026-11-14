@@ -133,12 +133,6 @@ pub fn ply(dst: &Path, pts: Vec<([f32; 3], [u8; 3])>) {
     write_lazy(dst, Box::new(move || common::img::ply(&pts)));
 }
 
-pub fn pgm(dst: &Path, w: usize, h: usize, px: &[u8]) {
-    let mut b = format!("P5\n{w} {h}\n255\n").into_bytes();
-    b.extend_from_slice(px);
-    write_owned(dst, b);
-}
-
 // PNG 압축은 기록 스레드에서(물체 사진이 바뀔 때 본 스레드가 장당 수십 ms 멈추던 것). 화소는 Arc 로 나눠 받아 복사 없이 압축
 pub fn png_rgb(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
     write_lazy(dst, Box::new(move || common::img::png_rgb(w, h, &px)));
@@ -246,7 +240,7 @@ pub fn set_layout(spec: &str) {
         }
     }
     let _ = LAYOUT.set(l);
-    eprintln!("스레드 배치(코어 {:?}): {}", cpus, ROLE_NAMES.iter().zip(&l).map(|(n, (ni, m))| format!("{n} nice {ni}{}", if *m == 0 { String::new() } else { format!(" 코어 {m:#x}") })).collect::<Vec<_>>().join(", "));
+    common::info!("스레드 배치(코어 {:?}): {}", cpus, ROLE_NAMES.iter().zip(&l).map(|(n, (ni, m))| format!("{n} nice {ni}{}", if *m == 0 { String::new() } else { format!(" 코어 {m:#x}") })).collect::<Vec<_>>().join(", "));
 }
 
 /// 지금 스레드를 역할에 맞게(우선순위·코어). 리눅스만, 실패해도 그대로 진행
@@ -256,6 +250,7 @@ pub fn thread_role(r: Role) {
     #[cfg(target_os = "linux")]
     cpu::enter(common::threads::tid(), r as usize);
     common::threads::apply(nice, mask);
+    common::threads::rt(ROLE_NAMES[r as usize]);
 }
 
 thread_local! {
@@ -370,4 +365,11 @@ pub mod cpu {
 pub fn thread_free() {
     BG.with(|b| b.set(false));
     common::threads::apply(0, 0);
+}
+
+/// JSON → 바이트(문자열과 같은 바이트). 버퍼를 알맞은 크기로 한 번 잡아 늘림 복사 없이
+pub fn json_bytes(v: &serde_json::Value) -> Vec<u8> {
+    let mut b = Vec::with_capacity(512);
+    serde_json::to_writer(&mut b, v).expect("json");
+    b
 }

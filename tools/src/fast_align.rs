@@ -401,11 +401,11 @@ impl DepthAligner {
         assert!(depth.len() >= h * self.core.d.width as usize, "fast_align: 깊이 버퍼가 작음");
         assert!(out.len() >= (self.core.c.width * self.core.c.height) as usize, "fast_align: 출력 버퍼가 작음");
         let n_out = (self.core.c.width * self.core.c.height) as usize;
-        out[..n_out].fill(0);
         self.fell_back = false;
         let t = self.threads;
         let op = OutPtr(out.as_mut_ptr());
         if t == 1 || h < 4 * t {
+            out[..n_out].fill(0);
             self.core.rows(depth, op, 0, h, self.scratch[0].get_mut().unwrap());
             return;
         }
@@ -414,6 +414,13 @@ impl DepthAligner {
         let core = &self.core;
         let scratch = &self.scratch;
         let pool = self.pool.as_ref().unwrap();
+        // 0 채우기도 일꾼이 나눠서(앞 판의 차례 채우기 대신, 값은 같음)
+        pool.run(t, &|j: usize| {
+            let op = op;
+            let (a, b) = (n_out * j / t, n_out * (j + 1) / t);
+            // SAFETY: [a, b) 는 j 마다 겹치지 않는 출력 칸
+            unsafe { std::slice::from_raw_parts_mut(op.0.add(a), b - a).fill(0) };
+        });
         for pass in 0..2 {
             pool.run(t, &|j: usize| {
                 let op = op;
@@ -442,7 +449,12 @@ impl DepthAligner {
             }
         }
         if self.fell_back {
-            out[..n_out].fill(0);
+            // 쓴 컬러 줄만 다시 0 으로(나머지 줄은 아직 0)
+            let cw = self.core.c.width as usize;
+            let (lo, hi) = scratch.iter().filter(|s| s.1 >= s.0).fold((usize::MAX, 0usize), |(lo, hi), s| (lo.min(s.0 as usize), hi.max(s.1 as usize + 1)));
+            if lo < hi {
+                out[lo * cw..hi * cw].fill(0);
+            }
             self.core.rows(depth, op, 0, h, self.scratch[0].get_mut().unwrap());
         }
     }

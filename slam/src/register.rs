@@ -137,7 +137,7 @@ fn desc_words(d: &[u8; 32]) -> [u64; 4] {
 }
 #[inline]
 fn hamming(a: &[u64; 4], b: &[u64; 4]) -> u32 {
-    (a[0] ^ b[0]).count_ones() + (a[1] ^ b[1]).count_ones() + (a[2] ^ b[2]).count_ones() + (a[3] ^ b[3]).count_ones()
+    crate::simd::hamming256(a, b)
 }
 
 #[inline]

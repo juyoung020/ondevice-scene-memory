@@ -77,3 +77,124 @@ pub fn pool(name: &'static str, nice: i32, mask: u64) -> rayon::ThreadPool {
         .build()
         .expect("스레드 풀")
 }
+
+/// 실시간 배치(`--rt`): 역할 이름마다 SCHED_FIFO 우선순위(1..99)와 코어 묶음(선택).
+/// 형식 `camera=50@1,infer=40,reader=30@0+1` (역할=우선순위[@코어 목록, `a-b`·`+` 로 잇기]), `auto` = camera=50, infer=40, reader=30, main=20, `none`/빈칸 = 끔.
+/// 권한(CAP_SYS_NICE·rtprio 한도)이 없으면 조용히 보통 스케줄로 남는다. 출력 값에는 영향 없음(순서·차례만)
+static RT: OnceLock<Vec<(String, i32, u64)>> = OnceLock::new();
+
+/// 코어 목록 글 `0-2+5` → 묶음 비트
+pub fn parse_cores(s: &str) -> u64 {
+    let mut cs = vec![];
+    for r in s.split('+').filter(|x| !x.is_empty()) {
+        let (a, b) = r.split_once('-').unwrap_or((r, r));
+        if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+            cs.extend(a..=b);
+        }
+    }
+    bits(&cs)
+}
+
+/// `--rt` 해석(처음 한 번). 잘못된 조각은 건너뜀
+pub fn set_rt(spec: &str) {
+    let spec = if spec == "auto" { "camera=50,infer=40,reader=30,main=20" } else { spec };
+    let v = spec
+        .split(',')
+        .filter(|p| !p.is_empty() && *p != "none")
+        .filter_map(|p| {
+            let (name, rest) = p.split_once('=')?;
+            let (pr, cores) = rest.split_once('@').map_or((rest, ""), |x| x);
+            Some((name.to_string(), pr.parse::<i32>().ok()?.clamp(1, 99), parse_cores(cores)))
+        })
+        .collect();
+    let _ = RT.set(v);
+}
+
+/// 지금 스레드가 `name` 역할을 맡음: `--rt` 에 있으면 SCHED_FIFO 우선순위·코어 묶음을 건다(없거나 권한이 없으면 그대로). 걸었으면 true
+pub fn rt(name: &str) -> bool {
+    let Some(v) = RT.get().filter(|v| !v.is_empty()) else { return false };
+    let Some(&(_, prio, mask)) = v.iter().find(|e| e.0 == name) else {
+        other(); // 같은 스레드가 실시간 역할을 맡았다 내려놓을 때(본 스레드 → 추론 → 본 스레드)
+        return false;
+    };
+    if mask != 0 {
+        pin(mask);
+    }
+    fifo(prio)
+}
+
+/// 지금 스레드를 보통 스케줄(SCHED_OTHER)로
+pub fn other() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn gettid() -> i32;
+            fn sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> i32;
+        }
+        sched_setscheduler(gettid(), 0, &0);
+    }
+}
+
+/// 지금 스레드를 묶음 비트의 코어에만(우선순위는 그대로)
+pub fn pin(mask: u64) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn gettid() -> i32;
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+        }
+        let mut m = [0u64; 16];
+        m[0] = mask;
+        sched_setaffinity(gettid(), 128, m.as_ptr());
+    }
+    let _ = mask;
+}
+
+/// 지금 스레드를 SCHED_FIFO(우선순위 1..99)로. 권한이 없으면 false(보통 스케줄 그대로)
+pub fn fifo(prio: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn gettid() -> i32;
+            fn sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> i32;
+        }
+        const SCHED_FIFO: i32 = 1;
+        let p = prio.clamp(1, 99);
+        return sched_setscheduler(gettid(), SCHED_FIFO, &p) == 0;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = prio;
+        false
+    }
+}
+
+/// 프로세스 메모리를 RAM 에 묶음(`--mlock`: 지금 것 + 앞으로 할당할 것, 페이지 내보내기로 생기는 멈춤 없앰). 권한·한도가 모자라면 false
+pub fn mlock_all() -> bool {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn mlockall(flags: i32) -> i32;
+        }
+        return mlockall(1 | 2) == 0; // MCL_CURRENT | MCL_FUTURE
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cores_and_rt_spec() {
+        assert_eq!(parse_cores("0-2+5"), 0b100111);
+        assert_eq!(parse_cores(""), 0);
+        set_rt("camera=50@1,infer=200,bad,x=y");
+        let v = RT.get().unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], ("camera".to_string(), 50, 2));
+        assert_eq!(v[1].1, 99);
+        // 없는 역할은 아무것도 하지 않음
+        assert!(!rt("nothing"));
+    }
+}

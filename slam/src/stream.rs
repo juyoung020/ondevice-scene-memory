@@ -45,7 +45,7 @@ pub struct OutFrame {
     /// 컬러 3 채널: color_is_rgb 이면 그대로, 아니면(BGR) 쓸 때 RGB 로 바꿈
     pub color: Vec<u8>,
     pub color_is_rgb: bool,
-    pub depth: Vec<u16>,
+    pub depth: crate::DepthBuf,
     /// 기준 지도 노드 id(0 = 없음): 장면 위치 = 노드 위치 × 상대 위치
     pub anchor: u32,
     /// 비어 있지 않으면 장면이 아니라 그래프 블록(MMG1): 새로 생기거나 움직인 노드. 큐가 차도 버리지 않음
@@ -71,7 +71,7 @@ impl Default for OutFrame {
             height: 0,
             color: vec![],
             color_is_rgb: false,
-            depth: vec![],
+            depth: Default::default(),
             anchor: 0,
             graph: vec![],
             reset: false,
@@ -192,7 +192,7 @@ impl Writer {
                 // 가장 오래된 장면을 버림(그래프 블록은 남김)
                 if let Some(mut old) = s.q.remove(i) {
                     crate::bufpool::give_rgb(std::mem::take(&mut old.color));
-                    crate::bufpool::give_depth(std::mem::take(&mut old.depth));
+                    crate::bufpool::give_depth_buf(std::mem::take(&mut old.depth));
                 }
                 s.dropped += 1;
             }
@@ -356,7 +356,7 @@ mod tests {
         let mut w = Writer::new(&p, None, 2, true).unwrap();
         w.push(OutFrame { reset: true, ..Default::default() });
         w.push(OutFrame { graph: vec![GraphNode { id: 7, held: 1, t: IDENTITY }], ..Default::default() });
-        let f = OutFrame { flags: LOST | HELD, map_id: 3, seq: 9, t: 1.5, width: 2, height: 1, color: vec![1, 2, 3, 4, 5, 6], depth: vec![10, 20], depth_per_m: 5000.0, anchor: 7, ..Default::default() };
+        let f = OutFrame { flags: LOST | HELD, map_id: 3, seq: 9, t: 1.5, width: 2, height: 1, color: vec![1, 2, 3, 4, 5, 6], depth: vec![10, 20].into(), depth_per_m: 5000.0, anchor: 7, ..Default::default() };
         w.push(f.clone());
         w.close();
         let b = std::fs::read(&p).unwrap();
@@ -432,7 +432,7 @@ mod tests {
         w.close();
         let mine = std::fs::read(&p).unwrap();
         let _ = std::fs::remove_file(&p);
-        eprintln!("장면 {nf} 개, 그래프 블록 {ng} 개, {} 바이트, {:.1} 초", cpp.len(), c0.elapsed().as_secs_f64());
+        common::info!("장면 {nf} 개, 그래프 블록 {ng} 개, {} 바이트, {:.1} 초", cpp.len(), c0.elapsed().as_secs_f64());
         assert_eq!(mine.len(), cpp.len());
         if let Some(i) = mine.iter().zip(&cpp).position(|(a, b)| a != b) {
             panic!("바이트 {i} 에서 다름");
@@ -528,11 +528,12 @@ impl<R: std::io::Read> Reader<R> {
         // 깊이는 리틀 엔디언 u16 이라 받을 자리에 바로 읽는다
         #[cfg(not(target_endian = "little"))]
         compile_error!("스트림 깊이를 바로 읽는 것은 리틀 엔디언 기계 기준");
-        f.depth = vec![0u16; n];
-        let db = unsafe { std::slice::from_raw_parts_mut(f.depth.as_mut_ptr() as *mut u8, n * 2) };
+        let mut d = vec![0u16; n];
+        let db = unsafe { std::slice::from_raw_parts_mut(d.as_mut_ptr() as *mut u8, n * 2) };
         if self.r.read_exact(&mut f.color).is_err() || self.r.read_exact(db).is_err() {
             return None;
         }
+        f.depth = d.into();
         Some(f)
     }
 }
@@ -555,7 +556,7 @@ mod reader_tests {
         let mut r = Reader::new(&bytes[..]);
         assert_eq!(r.recv().unwrap().graph, nodes);
         let fr = r.recv().unwrap();
-        assert_eq!((fr.color, fr.depth), (vec![1, 2, 3, 4, 5, 6], vec![7, 8]));
+        assert_eq!((fr.color, (*fr.depth).clone()), (vec![1, 2, 3, 4, 5, 6], vec![7, 8]));
         assert!(r.recv().unwrap().reset);
         assert!(r.recv().is_none());
     }

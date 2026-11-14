@@ -1148,7 +1148,7 @@ fn hamming_all(q: &[u64; 4], ws: &[[u64; 4]], out: &mut Vec<f32>) {
 
 #[inline(always)]
 fn hamming_all_plain(q: &[u64; 4], ws: &[[u64; 4]], out: &mut Vec<f32>) {
-    out.extend(ws.iter().map(|w| ((q[0] ^ w[0]).count_ones() + (q[1] ^ w[1]).count_ones() + (q[2] ^ w[2]).count_ones() + (q[3] ^ w[3]).count_ones()) as f32));
+    out.extend(ws.iter().map(|w| crate::simd::hamming256(q, w) as f32));
 }
 
 #[cfg(target_arch = "x86_64")]

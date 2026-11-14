@@ -48,6 +48,15 @@ impl Depth {
         }
     }
 
+    /// mm(u16) 반올림: `(미터 × 1000).round()` 를 0..65535 로(보관 장면 깊이). 1000/m 원래 값은 모든 u16 에서 그 값 그대로라(시험 `mm_identity`) 바꾸지 않고 씀
+    #[inline(always)]
+    pub fn mm_round(&self, i: usize) -> u16 {
+        match self {
+            Depth::Raw { d, per_m } if *per_m == 1000.0 => d[i],
+            _ => (self.at(i) * 1000.0).round().clamp(0.0, 65535.0) as u16,
+        }
+    }
+
     /// 다 쓴 원래 깊이 버퍼(u16)를 꺼냄(카메라 버퍼 돌려주기용)
     pub fn into_raw(self) -> Option<Vec<u16>> {
         match self {
@@ -60,6 +69,17 @@ impl Depth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1000/m 깊이: 미터로 바꿨다 mm 로 반올림해 되돌린 값이 모든 u16 에서 원래 값과 같음
+    #[test]
+    fn mm_identity() {
+        let d: Vec<u16> = (0..=65535u16).collect();
+        let raw = Depth::Raw { d: d.clone(), per_m: 1000.0 };
+        let m = Depth::M(d.iter().map(|&v| v as f32 / 1000.0).collect());
+        for i in 0..d.len() {
+            assert_eq!(raw.mm_round(i), m.mm_round(i), "반올림 {i}");
+        }
+    }
 
     #[test]
     fn same_values() {

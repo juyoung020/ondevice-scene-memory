@@ -485,8 +485,8 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         (s.pre, s.infer, s.post, s.n) = (s.pre + j.t[0], s.infer + j.t[1], s.post + j.t[2], s.n + 1);
         d
     });
-    let sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: sf.rgb, w, h, depth: j.pd.map_or(j.depth, Depth::M), dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], scale: f64::NAN, feat: j.feat,
+    let mut sf = j.sf;
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.pd.map_or(j.depth, Depth::M), dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], scale: f64::NAN, feat: j.feat,
                     track_only: false, lost, held, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
@@ -1182,7 +1182,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
-    while let Ok(Frame { t, mut p, mut r, mut rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, held, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, scale, feat, track_only, lost, held, anchor, graph }) = rx.recv() {
+        // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
+        let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
         *taken.n.lock().unwrap() += 1;
         taken.cv.notify_all();
         let c_top = Instant::now();
@@ -1263,9 +1265,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             // 기준 노드가 믿는 노드로 바뀌면(루프 클로저로 이어짐) 다시 쌓기가 고친 위치로 넣는다
             stream_held += 1;
             if leveled && a.rebuild_every >= 0.0 && kfs.holds(anchor) {
-                let keep = kfs.push(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, &rgb, &depth, &dets, true);
+                let keep = kfs.push(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, &rgb, &depth, dets, true);
                 match (pw.as_mut(), keep) {
-                    (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut depth), std::mem::take(&mut rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김
+                    (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut *depth), std::mem::take(&mut *rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김
                     (None, Some(kf)) => { let _ = kf.pts.set(None); }
                     _ => {}
                 }
@@ -1714,12 +1716,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let c_pt = Instant::now();
         // 보관(줄인 보관이어도 점 지도는 점 작업 스레드가 붙이는 점 격자로 다시 쌓음)
         let keep = (map_ok && a.stream.is_some() && a.rebuild_every >= 0.0)
-            .then(|| kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, true))
+            .then(|| kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, dets, true))
             .flatten();
         if let (Some(p), true) = (pw.as_mut(), map_ok) {
             // 깊이·사진은 이 뒤 본 스레드가 쓰지 않으므로 복사 없이 넘김(스냅샷 장면만 사진을 남김: 아래 nkf += 1 뒤에 봄)
-            let rgb_pts = if a.snaps.contains(&(nkf + 1)) { rgb.clone() } else { std::mem::take(&mut rgb) };
-            p.frame(nkf, r, pwc, std::mem::take(&mut depth), rgb_pts, w, h, keep, behind);
+            let rgb_pts = if a.snaps.contains(&(nkf + 1)) { rgb.clone() } else { std::mem::take(&mut *rgb) };
+            p.frame(nkf, r, pwc, std::mem::take(&mut *depth), rgb_pts, w, h, keep, behind);
         }
         clock.add(P::Pts, c_pt);
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
@@ -2175,6 +2177,42 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, scene: &mut SceneMap,
     }
 }
 
+/// 장면 버퍼를 쥔 채 쓰다가 버려질 때 카메라 입력에 돌려줌(Deref 로 안의 값을 그대로 씀)
+struct Recycle<T: Give + Default>(T);
+trait Give {
+    fn give(self);
+}
+impl Give for Vec<u8> {
+    fn give(self) {
+        slam::bufpool::give_rgb(self);
+    }
+}
+impl Give for Depth {
+    fn give(self) {
+        if let Some(d) = self.into_raw() {
+            slam::bufpool::give_depth(d);
+        }
+    }
+}
+impl<T: Give + Default> Drop for Recycle<T> {
+    fn drop(&mut self) {
+        if slam::bufpool::enabled() {
+            std::mem::take(&mut self.0).give();
+        }
+    }
+}
+impl<T: Give + Default> std::ops::Deref for Recycle<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<T: Give + Default> std::ops::DerefMut for Recycle<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// 다 쓴 장면 컬러·깊이 버퍼를 카메라 입력(rsdriver)에 돌려줌(카메라 입력이 아니면 그냥 버림)
 fn give_back(rgb: Vec<u8>, depth: Depth) {
     if slam::bufpool::enabled() {
@@ -2289,6 +2327,7 @@ impl PtsWorker {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
+            give_back(rgb, depth);
             if let Some(s) = keep {
                 let _ = s.pts.set(None);
             }
@@ -2310,6 +2349,7 @@ impl PtsWorker {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
+            give_back(rgb, depth);
             let _ = keep.pts.set(None);
             return;
         }

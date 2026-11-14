@@ -46,6 +46,18 @@ pub struct Frame {
     pub cam: Camera,
 }
 
+/// 카메라 입력이면 버려지는 장면의 버퍼를 드라이버에 돌려줌(읽기 스레드가 덮어쓴 장면, 보내지 않은 장면, 기준 장면 등 어디서 버려지든)
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if bufpool::enabled() {
+            bufpool::give_rgb(std::mem::take(&mut self.color));
+            bufpool::give_gray(std::mem::take(&mut self.gray));
+            bufpool::give_depth(std::mem::take(&mut self.depth_mm));
+            bufpool::give_depth(std::mem::take(&mut self.depth_raw));
+        }
+    }
+}
+
 impl Frame {
     /// 스트림으로 보낼 원본 깊이를 꺼냄(1000/m 이라 원본 칸을 비워 둔 장면은 mm 깊이가 곧 원본)
     pub fn take_stream_depth(&mut self) -> Vec<u16> {

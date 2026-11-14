@@ -190,7 +190,10 @@ impl Writer {
                 }
             } else if let Some(i) = s.q.iter().position(|x| !x.is_graph()) {
                 // 가장 오래된 장면을 버림(그래프 블록은 남김)
-                s.q.remove(i);
+                if let Some(mut old) = s.q.remove(i) {
+                    crate::bufpool::give_rgb(std::mem::take(&mut old.color));
+                    crate::bufpool::give_depth(std::mem::take(&mut old.depth));
+                }
                 s.dropped += 1;
             }
         }
@@ -415,9 +418,9 @@ mod tests {
                         depth_per_m: fr.depth_per_m,
                         width: fr.cam.width,
                         height: fr.cam.height,
-                        color: fr.color,
+                        color: std::mem::take(&mut fr.color),
                         color_is_rgb: fr.color_is_rgb,
-                        depth: fr.depth_raw,
+                        depth: std::mem::take(&mut fr.depth_raw),
                         anchor: u32_at(172),
                         graph: vec![],
                         reset: false,

@@ -218,7 +218,7 @@ impl KfStore {
 
     /// 지도에 넣은 장면 보관(받은 위치 r, p 는 수평 맞춤 전, RTAB-Map 지도 좌표). sparse: 줄인 보관(점유 격자·물체만 다시 쌓음)
     #[allow(clippy::too_many_arguments)]
-    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &crate::depth::Depth, dets: &Option<Vec<Det>>, sparse: bool) -> Option<Arc<Kf>> {
+    pub fn push(&mut self, t: f64, anchor: u32, r: M3, p: V3, h_cam: f64, w: usize, h: usize, rgb: &[u8], depth: &crate::depth::Depth, dets: Option<Vec<Det>>, sparse: bool) -> Option<Arc<Kf>> {
         self.count += 1;
         if (self.count - 1) % self.stride != 0 {
             return None;
@@ -236,7 +236,7 @@ impl KfStore {
         }
         let (rgb_z, depth_z, crops) = if sparse {
             let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
-            let q: Vec<u16> = (0..qw * qh).map(|i| mm16(depth.at((i / qw) * Q * w + (i % qw) * Q))).collect();
+            let q: Vec<u16> = (0..qw * qh).map(|i| depth.mm_round((i / qw) * Q * w + (i % qw) * Q)).collect();
             let crops = dets.iter().flatten().filter_map(|d| {
                 let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
                 let (x2, y2) = (x2.min(w), y2.min(h));
@@ -246,18 +246,18 @@ impl KfStore {
                     let mut cd = Vec::with_capacity(cw * ch);
                     for y in y1..y2 {
                         cr.extend_from_slice(&rgb[(y * w + x1) * 3..(y * w + x2) * 3]);
-                        cd.extend((y * w + x1..y * w + x2).map(|i| mm16(depth.at(i))));
+                        cd.extend((y * w + x1..y * w + x2).map(|i| depth.mm_round(i)));
                     }
                     Crop { x: x1, y: y1, w: cw, h: ch, rgb_z: pack_rgb(&cr, cw, ch), depth_z: pack_depth(&cd, cw, ch) }
                 })
             }).collect();
             (vec![], pack_depth(&q, qw, qh), crops)
         } else {
-            (pack_rgb(rgb, w, h), pack_depth_it((0..w * h).map(|i| mm16(depth.at(i))), w, h), vec![])
+            (pack_rgb(rgb, w, h), pack_depth_it((0..w * h).map(|i| depth.mm_round(i)), w, h), vec![])
         };
         let kf = Kf {
             seq: self.count as u64, held: self.held.contains(&anchor), t, anchor, rel, raw: (r, p), h_cam, w, h, rgb_z, depth_z, crops, sparse,
-            dets: dets.as_ref().map(|v| v.iter().map(|d| Det { cls: d.cls, score: d.score, box_: d.box_, mask: d.mask.clone() }).collect()),
+            dets, // 장면의 검출은 여기서 끝: 마스크째 옮김(복사 없음)
             pts: Default::default(),
         };
         let kf = Arc::new(kf);
@@ -365,7 +365,7 @@ mod tests {
         let mut st = KfStore::new(100);
         st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0], false)]);
         // 노드 1 에서 x 로 1 m 앞의 장면
-        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), &None, false);
+        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), None, false);
         assert!(!st.dirty);
         // 노드가 원점에서 90° 돌고 (0, 2, 0) 으로 옮겨짐 → 장면은 (0, 3, 0), 90°
         st.apply_graph(&[(1, rz(std::f64::consts::FRAC_PI_2), [0.0, 2.0, 0.0], false)]);
@@ -379,11 +379,11 @@ mod tests {
     fn held_joins_later() {
         let mut st = KfStore::new(100);
         st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0], false)]);
-        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), &None, false);
+        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), None, false);
         // 새 지도의 노드 2(맡아 둠)와 그 노드에서 x 로 1 m 앞의 장면: 지도에 안 넣음
         st.apply_graph(&[(2, rz(0.0), [5.0, 0.0, 0.0], true)]);
         assert!(st.holds(2) && !st.holds(1));
-        st.push(1.0, 2, rz(0.0), [6.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), &None, false);
+        st.push(1.0, 2, rz(0.0), [6.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), None, false);
         st.apply_graph(&[(2, rz(0.0), [7.0, 0.0, 0.0], true)]);
         assert!(!st.dirty && !st.usable(&st.kfs()[1]) && st.usable(&st.kfs()[0]));
         assert_eq!(st.held_counts(), (0, 1));
@@ -399,7 +399,7 @@ mod tests {
     fn small_move_not_dirty() {
         let mut st = KfStore::new(100);
         st.apply_graph(&[(1, rz(0.0), [0.0, 0.0, 0.0], false)]);
-        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), &None, false);
+        st.push(0.0, 1, rz(0.0), [1.0, 0.0, 0.0], 1.0, 1, 1, &[0, 0, 0], &crate::depth::Depth::M(vec![1.0]), None, false);
         st.apply_graph(&[(1, rz(0.001), [0.005, 0.0, 0.0], false)]);
         assert!(!st.dirty);
     }
@@ -431,7 +431,7 @@ mod tests {
         let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
         let det = Det { cls: 1, score: 0.9, box_: [10, 5, 30, 21], mask: vec![true; 20 * 16] };
         let mut st = KfStore::new(100);
-        st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), &Some(vec![det]), true);
+        st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), Some(vec![det]), true);
         let kf = &st.kfs()[0];
         let (d2, c2) = (kf.depth(), kf.rgb());
         let mm = |v: f32| (v * 1000.0).round() * 1e-3;
@@ -455,7 +455,7 @@ mod tests {
         let (w, h) = (63, 47);
         let d: Vec<f32> = (0..w * h).map(|i| 0.3 + (i % 89) as f32 * 0.013).collect();
         let mut st = KfStore::new(100);
-        st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &vec![0; w * h * 3], &crate::depth::Depth::M(d.clone()), &None, true);
+        st.push(0.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &vec![0; w * h * 3], &crate::depth::Depth::M(d.clone()), None, true);
         let kf = &st.kfs()[0];
         let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
         let q = unpack_depth(&kf.depth_z, qw, qh);
@@ -470,13 +470,13 @@ mod tests {
         let (rgb, d) = (vec![0u8; w * h * 3], vec![1.0f32; w * h]);
         let mut st = KfStore::new(100);
         for i in 0..300 {
-            st.push(i as f64 / 30.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), &None, true);
+            st.push(i as f64 / 30.0, 0, rz(0.0), [0.0; 3], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), None, true);
         }
         assert_eq!(st.kfs().len(), 5);
         let n = st.kfs().len();
-        st.push(10.01, 0, rz(0.0), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), &None, true);
-        st.push(10.02, 0, rz(3f64.to_radians()), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), &None, true);
-        st.push(10.03, 0, rz(3f64.to_radians()), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), &None, true);
+        st.push(10.01, 0, rz(0.0), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), None, true);
+        st.push(10.02, 0, rz(3f64.to_radians()), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), None, true);
+        st.push(10.03, 0, rz(3f64.to_radians()), [0.04, 0.0, 0.0], 1.0, w, h, &rgb, &crate::depth::Depth::M(d.clone()), None, true);
         assert_eq!(st.kfs().len(), n + 2);
     }
 
@@ -489,7 +489,7 @@ mod tests {
         let rgb: Vec<u8> = (0..320 * 300 * 3).map(|_| rnd()).collect();
         let d: Vec<f32> = (0..320 * 300).map(|_| rnd() as f32 * 0.1).collect();
         for i in 0..10 {
-            st.push(i as f64, 0, rz(0.0), [i as f64 * 0.1, 0.0, 0.0], 1.0, 320, 300, &rgb, &crate::depth::Depth::M(d.clone()), &None, false);
+            st.push(i as f64, 0, rz(0.0), [i as f64 * 0.1, 0.0, 0.0], 1.0, 320, 300, &rgb, &crate::depth::Depth::M(d.clone()), None, false);
         }
         assert!(st.bytes <= 1 << 20);
         assert!(st.stride > 1);
@@ -556,6 +556,7 @@ pub fn pack_depth_m(d: &[f32], w: usize, h: usize) -> Vec<u8> {
     pack_depth_it(d.iter().map(|&v| mm16(v)), w, h)
 }
 
+#[allow(dead_code)]
 fn mm16(d: f32) -> u16 {
     (d * 1000.0).round().clamp(0.0, 65535.0) as u16
 }

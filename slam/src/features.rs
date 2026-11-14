@@ -970,7 +970,7 @@ mod tests {
 
     #[test]
     fn identity_local_keeps_optical() {
-        let mut cam = frame(vec![0; 16], vec![2000; 16], 4, 4).cam;
+        let mut cam = frame(vec![0; 16], vec![2000; 16], 4, 4).cam.clone();
         cam.local = Pose::identity();
         let k = KeyPoint { x: 2.0, y: 1.0, ..Default::default() };
         let p = keypoints_3d(&[2000; 16], &cam, &[k], 0.0, 0.0)[0];

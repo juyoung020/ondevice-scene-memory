@@ -281,8 +281,10 @@ mod engine {
             self.odom.pose_tf()
         }
 
-        pub fn make_ref(&self, f: &Frame) -> RefSig {
-            let frame = Frame { id: f.id, t: f.t, gray: f.gray.clone(), color: Vec::new(), color_is_rgb: f.color_is_rgb, depth_mm: f.depth_mm.clone(), depth_raw: Vec::new(), depth_per_m: f.depth_per_m, cam: f.cam.clone() };
+        /// 회색조는 이 뒤 쓰지 않아 옮김. mm 깊이는 스트림으로 보낼 원본이 따로 있으면 옮기고, 같은 버퍼면(1000/m) 복사
+        pub fn make_ref(&self, f: &mut Frame) -> RefSig {
+            let depth_mm = if f.depth_raw.is_empty() { f.depth_mm.clone() } else { std::mem::take(&mut f.depth_mm) };
+            let frame = Frame { id: f.id, t: f.t, gray: std::mem::take(&mut f.gray), color: Vec::new(), color_is_rgb: f.color_is_rgb, depth_mm, depth_raw: Vec::new(), depth_per_m: f.depth_per_m, cam: f.cam.clone() };
             RefSig { frame, feats: None, ids: None }
         }
 
@@ -815,7 +817,7 @@ fn run_in(argv: &[String], to_mem: Option<std::sync::mpsc::Sender<stream::Receiv
         if anchored && !new_map {
             if let Some(p) = pose {
                 if refs.back().is_none_or(|r| fr.t - r.t >= 0.4) {
-                    refs.push_back(Ref { sig: eng.make_ref(&fr), pose: p, t: fr.t });
+                    refs.push_back(Ref { sig: eng.make_ref(&mut fr), pose: p, t: fr.t });
                     if refs.len() > 6 {
                         refs.pop_front();
                     }

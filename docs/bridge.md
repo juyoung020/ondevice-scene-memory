@@ -32,11 +32,11 @@ ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
 
 # TUM 재생(카메라 없이): --rate 1 이면 찍은 시각대로(밀리면 건너뜀), 생략하면 최대 속도로 빠짐없이
 ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
-  --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+  --every 2 --max-depth 3.5 --out data/memory/office_stream
 
 # 같은 것을 장면 스트림 파일로(위치만 한 번, 물체 기억은 몇 번이고)
 ondevice slam --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini --out data/office.mmf
-ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+ondevice --stream data/office.mmf --every 2 --max-depth 3.5 --out data/memory/office_stream
 ```
 
 `--slam` · `--serve` 의 인자는 공백으로 나눈다(경로에 공백이 없어야 함). 명령줄은 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 잘못된 위치 인자는 스레드를 띄우기 전에 멈춘다. `ondevice view <기억 폴더> …` 는 뷰어만 띄운다.
@@ -156,7 +156,7 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 아래 두 절은 C++ `rtab_bridge` 로 잰 값이다. 위치 프로그램은 지금 ini(`docs/rtabmap_pi.ini`, GFTT/BRIEF + GTSAM)로 같은 입력을 넣으면 출력이 바이트까지 같아 그 조합의 정확도가 같다. ORB · g2o 조합은 C++ 원본에만 있다.
 
-`check_tum`(`tools/`, 환경 변수 `BRIDGE`·`MEMMAP`·`ATE`·`INI`·`SEG`) 으로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할, `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
+`check_tum`(`tools/`, 환경 변수 `BRIDGE`·`MEMMAP`·`ATE`·`INI`·`SEG`) 으로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할(당시 기본, 지금은 ObjectSAM), `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
 
 - **기준**: 같은 설정 + 모든 장면을 지도 노드로 끝까지 돌려 최적화한 위치 → `ondevice --tum --gt`(오프라인 경로).
 - **같은 위치 오프라인**: 스트림 실행이 보낸 위치 파일 그대로 → `ondevice --tum --gt`. 스트림과 위치가 같고 입력 경로만 다르다.

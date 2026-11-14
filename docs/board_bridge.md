@@ -10,9 +10,9 @@ RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librea
   cargo build --release --no-default-features --features dxrt,slam-realsense
 
 # 실시간: D435 → 위치 추적 → 물체 기억(NPU 분할) → 뷰어(:8091), 한 프로세스
-M=~/dx-all-suite_my/workspace/res/models
+# 기본 모델: ~/models/objectsam-416_640.dxnn(분할) + siglip2-vision_npu.dxnn(이름) + vocab/indoor.voc (scripts/board_run.sh 와 같음)
 target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
-    --every 1 --live 1 --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
+    --every 1 --live 1 --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 ```
 
 - NPU 는 한 번에 한 프로세스만: 새로 돌리기 전에 `pkill -f ondevice`(다른 NPU 프로그램도 멈춤).

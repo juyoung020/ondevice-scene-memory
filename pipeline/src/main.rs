@@ -1,6 +1,6 @@
 //! 손카메라 영상 + 포즈 → 점유 지도·3D 점 지도·물체 기억·씬그래프(방·엣지) → 기억 폴더(view.json, sgview 가 읽음).
 //!
-//!   ondevice --tum data/tum/<seq> --out data/memory/<name> [--seg models/yolo26s-seg.onnx] [--every 5] [--conf 0.35] [--live 1] [--no-skip] [--loop]
+//!   ondevice --tum data/tum/<seq> --out data/memory/<name> [--seg <분할 모델>(기본 ObjectSAM)] [--embed <SigLIP2>] [--vocab <이름 표>] [--every 5] [--conf 0.35] [--live 1] [--no-skip] [--loop]
 //!   ondevice --slam "<위치 인자>" --out <dir> [--serve "<포트> [뷰어 인자]" [--save-every S]] ...   (위치 프로그램을 같은 프로세스에서, docs/bridge.md)
 //!   ondevice --stream <파일|-> --out <dir> ...   (녹화한 장면 스트림)
 //!   ondevice slam <위치 인자> · ondevice view <기억 폴더> [뷰어 인자]
@@ -66,7 +66,6 @@ struct Args {
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
     vocab: Option<String>,  // --vocab <글 벡터 파일>: 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(--embed 와 함께, 파일은 sgview --encode-vocab 이 만듦)
-    seg_names: Option<String>, // --seg-names <이름,이름,…>: 분할 모델의 클래스 이름(기본 COCO 80 개). 물체만 자르는 1 클래스 모델은 object
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -76,10 +75,9 @@ fn args(v: &common::cli::Argv) -> Args {
     Args {
         tum: get("--tum").unwrap_or_default().into(),
         out: get("--out").or_else(|| get("--seg-check").map(|_| String::new())).expect("--out <dir>").into(), // --seg-check 는 쓰는 파일이 없음
-        seg: get("--seg").unwrap_or("models/yolo26s-seg.onnx".into()),
-        embed: get("--embed"),
-        vocab: get("--vocab"),
-        seg_names: get("--seg-names"),
+        seg: get("--seg").unwrap_or_else(|| models::seg()),
+        embed: models::opt(get("--embed"), models::embed),
+        vocab: models::opt(get("--vocab"), models::vocab).filter(|_| get("--embed").is_none_or(|e| e != "off" && e != "none")), // 이름은 사진 벡터가 있어야
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
@@ -314,6 +312,56 @@ fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3, floor_only:
     Some(mv(r, &best_n))
 }
 
+/// 기본 모델: ObjectSAM 분할(물체만, 이름 없음) + SigLIP2 사진 벡터 + 실내 이름 표(vocab/indoor.voc).
+/// 모델 폴더 = $ONDEVICE_MODELS, 없으면 보드(dxrt) ~/models · PC models/. `--embed off` · `--vocab off` 로 끔.
+/// 분할은 클래스 없는 ObjectSAM 만(클래스를 내는 모델은 seg::seg_post 가 멈춤).
+mod models {
+    use std::path::PathBuf;
+    fn dir() -> PathBuf {
+        if let Some(d) = std::env::var_os("ONDEVICE_MODELS") {
+            return d.into();
+        }
+        if cfg!(feature = "dxrt") {
+            if let Some(h) = std::env::var_os("HOME") {
+                let d = PathBuf::from(h).join("models");
+                if d.is_dir() {
+                    return d;
+                }
+            }
+        }
+        "models".into()
+    }
+    /// 처음 있는 파일(없으면 첫 후보: 여는 곳에서 경로째 알림)
+    fn first(c: Vec<PathBuf>) -> String {
+        c.iter().find(|p| p.exists()).unwrap_or(&c[0]).to_string_lossy().into_owned()
+    }
+    pub fn seg() -> String {
+        let d = dir();
+        if cfg!(feature = "dxrt") { first(vec![d.join("objectsam-416_640.dxnn"), d.join("ObjectSAM-416_640.onnx")]) } else { first(vec![d.join("ObjectSAM-416_640.onnx")]) }
+    }
+    pub fn embed() -> String {
+        let d = dir();
+        let onnx = d.join("siglip2-base-patch32-256").join("vision_model.onnx");
+        if cfg!(feature = "dxrt") { first(vec![d.join("siglip2-vision_npu.dxnn"), onnx]) } else { first(vec![onnx]) }
+    }
+    pub fn vocab() -> String {
+        let mut c = vec![PathBuf::from("vocab/indoor.voc"), dir().join("indoor.voc")];
+        if let Some(e) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            c.push(e.join("vocab/indoor.voc"));
+            c.push(e.join("../../vocab/indoor.voc"));
+        }
+        first(c)
+    }
+    /// 인자를 안 주면 기본, "off" 면 끔
+    pub fn opt(v: Option<String>, def: fn() -> String) -> Option<String> {
+        match v {
+            Some(s) if s == "off" || s == "none" => None,
+            Some(s) => Some(s),
+            None => Some(def()),
+        }
+    }
+}
+
 fn make_seg(path: &str) -> Box<dyn seg::Segmenter + Send> {
     #[cfg(feature = "dxrt")]
     if path.ends_with(".dxnn") {
@@ -524,8 +572,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     out::remove_dir_all(&a.out.join("scene"));
     std::fs::create_dir_all(a.out.join("scene")).unwrap();
-    // 물체가 가질 수 있는 이름 전체(분할 모델의 이름 + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
-    let mut names: Vec<String> = seg::names();
+    // 물체가 가질 수 있는 이름 전체(object + --vocab 의 이름): 검색이 "기억에 없는 이름"(고양이 → cat)을 가려내는 데 쓴다
+    let mut names: Vec<String> = vec!["object".into()];
     if let Some(f) = &a.vocab {
         names.extend(embed::load_vocab(f));
         names.sort();
@@ -1873,10 +1921,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     // 깊이 > 0.2 m 판정: 원래 값이면 문턱 값 하나와 비교(나눗셈 없이 같은 판정)
     let raw_th = depth.raw().zip(depth.raw_above(0.2));
     for d in dets.iter().flatten().filter(|_| map_ok) {
-        let name = seg::name(d.cls);
-        if name == "person" {
-            continue;
-        }
+        let name = "object";
         let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
         let (bw, bh) = (x2 - x1, y2 - y1);
         erode_into(&d.mask, bw, bh, 3, &mut eb);
@@ -2303,12 +2348,6 @@ fn main() {
         use std::sync::atomic::Ordering::Relaxed;
         seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
         seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
-    }
-    // 물체만 자르는 1 클래스 모델(파일 이름에 objectsam)은 --seg-names 가 없으면 object
-    match &a.seg_names {
-        Some(n) => seg::set_names(n),
-        None if a.seg.to_ascii_lowercase().contains("objectsam") => seg::set_names("object"),
-        None => {}
     }
     if let Some(m) = &a.embed {
         embed::start(m);

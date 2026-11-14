@@ -694,6 +694,12 @@ impl Segmenter for DxSeg {
         Some(self.eng.submit(&inp.u8))
     }
     fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
+        // 모델 안에 CPU 작업(DXRT 가 ONNX Runtime 으로 돌림)이 있는 파일은 한 장씩만: 여러 장을 함께 올리면
+        // 보드가 Illegal instruction 으로 죽거나 멈춘 적이 있다(2026-11-15). NPU 만 도는 머리 출력 모델만 겹쳐 올린다
+        if self.lay.heads.is_none() {
+            common::info!("seg: 모델 안에 CPU 작업이 있어 --npu-jobs 를 1 로 둠");
+            return None;
+        }
         let (w, lay) = (self.eng.waiter(), self.lay);
         Some(Box::new(move |id, raw| {
             w.wait_into(id, &mut raw.buf);

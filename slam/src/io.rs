@@ -86,6 +86,8 @@ pub struct TumSource {
     i: usize,
     skipped: Arc<AtomicUsize>,
     k: [f64; 4],
+    /// 깊이 PNG 값/m: TUM 5000, rsd_rec 녹화(calib.json 의 depth_png_per_m) 1000
+    depth_per_m: f32,
     read_ms: f64,
     start: Option<(f64, Instant)>,
     id: i64,
@@ -94,7 +96,12 @@ pub struct TumSource {
 impl TumSource {
     /// rate: 0 = 최대 속도(모든 장면), 1 = 찍은 시각 간격대로(밀리면 건너뜀), 2 = 두 배 빠르게 ...
     pub fn new(dir: &str, rate: f64) -> Result<TumSource, String> {
-        let rgb = read_list(&format!("{dir}/rgb.txt"))?;
+        TumSource::with_stride(dir, rate, 1)
+    }
+    /// stride N: N 장에 한 장만(빠른 움직임 흉내: 2 = 2 배 빠르게 움직인 것과 같은 장면 간 움직임)
+    pub fn with_stride(dir: &str, rate: f64, stride: usize) -> Result<TumSource, String> {
+        let st = stride.max(1);
+        let rgb: Vec<_> = read_list(&format!("{dir}/rgb.txt"))?.into_iter().step_by(st).collect();
         let depth = read_list(&format!("{dir}/depth.txt"))?;
         if rgb.is_empty() || depth.is_empty() {
             return Err(format!("빈 TUM 폴더: {dir}"));
@@ -108,7 +115,23 @@ impl TumSource {
                 k.copy_from_slice(&c);
             }
         }
-        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, read_ms: 0.0, start: None, id: 0 })
+        // rsd_rec 녹화 폴더: calib.json 의 컬러 보정·깊이 배율
+        let mut depth_per_m = 5000.0f32;
+        if let Ok(j) = std::fs::read_to_string(format!("{dir}/calib.json")) {
+            let num = |key: &str, from: usize| -> Option<f64> {
+                let i = j[from..].find(&format!("\"{key}\":"))? + from + key.len() + 3;
+                j[i..].trim_start().split(|c: char| c == ',' || c == '}' || c.is_whitespace()).next()?.parse().ok()
+            };
+            if let Some(v) = num("depth_png_per_m", 0) {
+                depth_per_m = v as f32;
+            }
+            if let Some(c0) = j.find("\"color_intrinsics\"") {
+                if let (Some(fx), Some(fy), Some(cx), Some(cy)) = (num("fx", c0), num("fy", c0), num("ppx", c0), num("ppy", c0)) {
+                    k = [fx, fy, cx, cy];
+                }
+            }
+        }
+        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, depth_per_m, read_ms: 0.0, start: None, id: 0 })
     }
     pub fn len(&self) -> usize {
         self.rgb.len()
@@ -180,7 +203,7 @@ impl FrameSource for TumSource {
                 _ => return Err(format!("장면 읽기 실패: {rel}")),
             };
             let gray = to_gray(&color, true);
-            let depth_mm = depth_to_mm(&depth_raw, 5000.0).into();
+            let depth_mm = depth_to_mm(&depth_raw, self.depth_per_m).into();
             let depth_raw = depth_raw.into();
             self.id += 1;
             let k = self.k;
@@ -192,7 +215,7 @@ impl FrameSource for TumSource {
                 color_is_rgb: true,
                 depth_mm,
                 depth_raw,
-                depth_per_m: 5000.0,
+                depth_per_m: self.depth_per_m,
                 cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h, local: optical_rotation() },
             };
             self.read_ms = c0.elapsed().as_secs_f64() * 1e3;

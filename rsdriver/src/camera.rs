@@ -154,6 +154,9 @@ pub struct Config {
     /// > 0 이면 컬러 노출 고정(ms), gain >= 0 이면 감도도
     pub exposure_ms: f64,
     pub gain: i32,
+    /// > 0 이면(그리고 exposure_ms 가 0 이면) 자동 노출을 우리가 함: 노출은 이 값(ms)까지만, 더 어두우면 감도를 올림.
+    /// 손에 든 카메라가 빨리 움직일 때 번짐을 막는다(D435 컬러 자체 자동 노출은 어두우면 33 ms 까지 길어짐)
+    pub ae_cap_ms: f64,
     pub emitter: bool,
     /// 처음 버리는 묶음 수
     pub warmup: u32,
@@ -164,7 +167,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { width: 640, height: 480, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
+        Config { width: 640, height: 480, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
     }
 }
 
@@ -290,6 +293,51 @@ pub struct Camera {
     depth: Side,
     aligner: DepthAligner,
     t_offset_ms: Option<f64>,
+    ae: Option<SoftAe>,
+}
+
+/// 노출 상한이 있는 자동 노출(밝기 = YUYV 의 Y 를 성기게 본 평균)
+struct SoftAe {
+    cap: i32,  // 100 µs 단위
+    exp: i32,
+    gain: i32,
+    n: u32,
+}
+
+impl SoftAe {
+    const TARGET: f32 = 110.0;
+    /// 몇 장마다 한 번 Y 평균을 보고 노출 → 감도 순으로 조금씩 움직임. 바꿀 값이 있으면 (노출, 감도)
+    fn step(&mut self, yuyv: &[u8], stride: usize, w: usize, h: usize) -> Option<(i32, i32)> {
+        self.n += 1;
+        if self.n % 3 != 0 {
+            return None;
+        }
+        let (mut s, mut c) = (0u64, 0u64);
+        for y in (0..h).step_by(16) {
+            let row = &yuyv[y * stride..y * stride + w * 2];
+            for x in (0..w).step_by(16) {
+                s += row[x * 2] as u64;
+                c += 1;
+            }
+        }
+        let mean = s as f32 / c.max(1) as f32;
+        let r = Self::TARGET / mean.max(1.0);
+        let (e0, g0) = (self.exp, self.gain);
+        if r > 1.12 {
+            if self.exp < self.cap {
+                self.exp = ((self.exp as f32 * r.min(1.5)) as i32).clamp(self.exp + 1, self.cap);
+            } else {
+                self.gain = (self.gain + ((r - 1.0) * 40.0).clamp(2.0, 16.0) as i32).min(128);
+            }
+        } else if r < 0.89 {
+            if self.gain > 16 {
+                self.gain = (self.gain - ((1.0 - r) * 40.0).clamp(2.0, 16.0) as i32).max(16);
+            } else {
+                self.exp = ((self.exp as f32 * r.max(0.67)) as i32).clamp(1, self.exp - 1).max(1);
+            }
+        }
+        (self.exp != e0 || self.gain != g0).then_some((self.exp, self.gain))
+    }
 }
 
 unsafe impl Send for Camera {}
@@ -328,7 +376,19 @@ impl Camera {
         // 제어: 컬러 PU 는 컬러 노드, 이미터는 깊이 XU
         let cc = &color.s.node;
         let _ = cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO_PRIORITY, 0);
-        if cfg.exposure_ms > 0.0 {
+        // 화질: 60 Hz 전원 깜빡임 맞춤, 자동 화이트 밸런스, 역광 보정 끔(밝은 창 쪽으로 노출이 늘지 않게)
+        let _ = cc.set_ctrl(v4l2::CID_POWER_LINE_FREQUENCY, v4l2::POWER_LINE_60HZ);
+        let _ = cc.set_ctrl(v4l2::CID_AUTO_WHITE_BALANCE, 1);
+        let _ = cc.set_ctrl(v4l2::CID_BACKLIGHT_COMPENSATION, 0);
+        let mut ae = None;
+        if cfg.exposure_ms <= 0.0 && cfg.ae_cap_ms > 0.0 {
+            let cap = ((cfg.ae_cap_ms * 10.0) as i32).max(1);
+            let g = if cfg.gain >= 0 { cfg.gain } else { 64 };
+            cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO, v4l2::EXPOSURE_MANUAL).map_err(|e| format!("자동 노출 끔: {e}"))?;
+            cc.set_ctrl(v4l2::CID_EXPOSURE_ABSOLUTE, cap).map_err(|e| format!("노출: {e}"))?;
+            let _ = cc.set_ctrl(v4l2::CID_GAIN, g);
+            ae = Some(SoftAe { cap, exp: cap, gain: g, n: 0 });
+        } else if cfg.exposure_ms > 0.0 {
             cc.set_ctrl(v4l2::CID_EXPOSURE_AUTO, v4l2::EXPOSURE_MANUAL).map_err(|e| format!("자동 노출 끔: {e}"))?;
             cc.set_ctrl(v4l2::CID_EXPOSURE_ABSOLUTE, (cfg.exposure_ms * 10.0) as f32 as i32).map_err(|e| format!("노출: {e}"))?;
             if cfg.gain >= 0 {
@@ -341,7 +401,7 @@ impl Camera {
         let _ = ctl.xu(DEPTH_XU_UNIT, XU_EMITTER_ENABLED, v4l2::UVC_SET_CUR, &mut em);
         let opt = Options { threads: cfg.align_threads.max(1), ..Default::default() };
         let aligner = DepthAligner::new(&calib.depth, &calib.color, &calib.depth_to_color, calib.depth_scale, &opt)?;
-        let mut cam = Camera { found, raw, calib, cfg, ctl, color, depth, aligner, t_offset_ms: None };
+        let mut cam = Camera { found, raw, calib, cfg, ctl, color, depth, aligner, t_offset_ms: None, ae };
         let mut scratch = Output::default();
         for _ in 0..cam.cfg.warmup {
             cam.next_into(&mut scratch)?;
@@ -433,6 +493,14 @@ impl Camera {
                 out.depth_raw.resize(w * h, 0);
                 format::z16_copy(ddata, self.depth.stride, w, &mut out.depth_raw);
                 self.aligner.process(&out.depth_raw, &mut out.aligned);
+            }
+        }
+        if let Some(ae) = &mut self.ae {
+            let cdata = self.color.s.data(&cb);
+            if let Some((e, g)) = ae.step(cdata, self.color.stride, w, h) {
+                let cc = &self.color.s.node;
+                let _ = cc.set_ctrl(v4l2::CID_EXPOSURE_ABSOLUTE, e);
+                let _ = cc.set_ctrl(v4l2::CID_GAIN, g);
             }
         }
         let t2 = Instant::now();

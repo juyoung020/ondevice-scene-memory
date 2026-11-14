@@ -16,8 +16,8 @@ pub struct RsDriverSource {
 }
 
 impl RsDriverSource {
-    pub fn new(w: u32, h: u32, fps: u32, serial: &str, exposure_ms: f64, gain: i32) -> Result<RsDriverSource, String> {
-        let cam = RsCamera::open(Config { width: w, height: h, fps, serial: serial.to_string(), exposure_ms, gain, ..Default::default() })?;
+    pub fn new(w: u32, h: u32, fps: u32, serial: &str, exposure_ms: f64, gain: i32, ae_cap_ms: f64) -> Result<RsDriverSource, String> {
+        let cam = RsCamera::open(Config { width: w, height: h, fps, serial: serial.to_string(), exposure_ms, gain, ae_cap_ms, ..Default::default() })?;
         let desc = cam.describe();
         crate::bufpool::enable();
         Ok(RsDriverSource { cam, out: Output { want_gray: true, ..Default::default() }, id: 0, read_ms: 0.0, desc })

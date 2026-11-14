@@ -1,5 +1,5 @@
 //! rsdriver 로 녹화(D435 녹화 도구): 정렬 확인 도구 rs_align_check 가 읽는 폴더 꼴.
-//!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms] [--gain g] [--emitter on|off] [--skip 30]
+//!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms] [--camera-profile librealsense|tracking] [--gain g] [--emitter on|off] [--skip 30]
 //! 폴더: rgb/ depth/(= depth_rs/, rsdriver 정렬) depth_raw/ yuyv/<시각>.bin(원본 YUYV) calib.json frames.tsv(시각·순번·메타·해시)
 #[cfg(target_os = "linux")]
 fn main() {
@@ -22,6 +22,10 @@ fn main() {
         exposure_ms: arg("--exposure").and_then(|s| s.parse().ok()).unwrap_or(0.0),
         gain: arg("--gain").and_then(|s| s.parse().ok()).unwrap_or(-1),
         ae_cap_ms: arg("--ae-cap").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        profile: arg("--camera-profile").map(|s| rsdriver::camera::Profile::parse(&s)).transpose().unwrap_or_else(|e| {
+            eprintln!("rsd_rec: {e}");
+            std::process::exit(2)
+        }).unwrap_or(rsdriver::camera::Profile::Librealsense),
         emitter: arg("--emitter").map(|s| s != "off").unwrap_or(true),
         warmup: arg("--skip").and_then(|s| s.parse().ok()).unwrap_or(30),
         ..Default::default()

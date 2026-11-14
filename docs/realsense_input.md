@@ -25,6 +25,33 @@
 
 D435 입력(rsdriver)과 녹화 도구 `rsd_rec` 이 위 값을 건다(`rsd_rec` 은 `--size`, `--fps`, `--exposure`, `--gain`, `--emitter`, `--skip` 으로 바꿈).
 
+## 컬러 제어(rsdriver `--camera-profile`)
+
+rsdriver 는 librealsense 를 옮긴 것이므로 기본 묶음 `librealsense` 는 librealsense 2.59.1 과 같은 제어 상태로 연다. librealsense 는 흐름을 열 때 컬러 제어를 쓰지 않는다(장치 값 그대로). UVC 제어는 앞 실행이 바꾼 값이 장치에 남으므로, rsdriver 는 열 때 모든 컬러 제어를 장치 기본값으로 되돌려 "켠 직후 librealsense" 와 같게 맞춘다. 깊이 쪽은 지금처럼 이미터 켬만 쓴다.
+
+기준값 = `rs-enumerate-devices -o`(librealsense 2.59.1, 펌웨어 5.16.0.1)의 RGB Camera default 열. 실측 = 보드에서 rsd_rec 이 흐름을 여는 동안 `v4l2-ctl -d /dev/video4 --list-ctrls`(2026-11-15). librealsense 가 흐름을 여는 동안에는 v4l2-ctl 이 값을 못 읽어(장치를 잡고 있음) 기본값 열로 견준다.
+
+| 제어 | librealsense 기본 | `librealsense` 묶음(기본) 실측 | `tracking` 묶음 실측 |
+|---|---|---|---|
+| Brightness | 0 | 0 | 0 |
+| Contrast | 50 | 50 | 50 |
+| Saturation | 64 | 64 | 64 |
+| Hue | 0 | 0 | 0 |
+| Gamma | 300 | 300 | 300 |
+| Sharpness | 50 | 50 | 50 |
+| Enable Auto White Balance | 1 | 1 | 1 |
+| White Balance | 4600 | 4600 | 4600 |
+| Backlight Compensation | 0 | 0 | 0 |
+| Power Line Frequency | 3(Auto) | 3 | **2(60 Hz)** |
+| Enable Auto Exposure | 1(조리개 우선) | 1 | **0(수동, 우리가 밝기 맞춤)** |
+| Auto Exposure Priority | 0 | 0 | 0 |
+| Exposure | 166(16.6 ms) | 166 | 상한 166, 어두우면 그대로 |
+| Gain | 64 | 64 | 어두우면 128 까지 |
+
+`tracking` = 60 Hz 깜빡임 맞춤 + 노출 상한(`--ae-cap`, 없으면 16.6 ms = 60 Hz 두 주기) + 모자란 밝기를 감도로. 번짐은 줄지만, 같은 어두운 방에서 평균 밝기가 85.8(librealsense) → 13.7(tracking), 선명도(라플라시안 평균) 20.2 → 4.3 이라 화질이 크게 나빠진다. 손카메라 위치 추적은 광류가 끊기면 깊이 ICP 로 이어 가므로(사용자 녹화 walk1 에서 위치 못 냄 1.7 %, 녹화는 librealsense 와 같은 제어 상태) **보드 기본은 `librealsense`**. 밝은 곳에서 번짐이 문제면 `--camera-profile tracking --ae-cap 8.3`.
+
+YUYV→RGB 는 librealsense 와 같은 BT.601 제한 범위 정수식(빌드 대상별 규칙까지, `rsdriver/src/format.rs`)이라 범위 차이로 어둡거나 바래 보이지 않는다.
+
 ## 정렬: rs2::align 이 실제로 하는 일
 
 librealsense v2.59.1 의 `rs2::align(RS2_STREAM_COLOR)` 은 빌드에 따라 세 구현 중 하나를 쓴다(`src/proc/align.cpp` 의 `create_align`):

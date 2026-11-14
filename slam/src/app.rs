@@ -439,7 +439,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms(0 = 카메라 자동, 기본)] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -466,6 +466,7 @@ pub struct Args {
     rate: f64,
     exposure_ms: f64,
     ae_cap_ms: f64,
+    camera_profile: String,
     gain: i32,
     send_every: i64,
     queue: usize,
@@ -497,6 +498,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
+        camera_profile: "librealsense".into(), // 컬러 제어: librealsense 와 같음(기본) | tracking(60 Hz · 노출 상한 16.6 ms)
         ae_cap_ms: 0.0, // 노출 상한(ms). 0 = 카메라 자동 노출. 밝은 방에서 번짐을 줄이려면 8.3(60 Hz 조명 한 주기)
         gain: -1,
         send_every: 1,
@@ -534,6 +536,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--serial" => a.serial = val()?,
             "--exposure" => a.exposure_ms = num(&val()?)?,
             "--ae-cap" => a.ae_cap_ms = num(&val()?)?,
+            "--camera-profile" => a.camera_profile = val()?,
             "--gain" => a.gain = num(&val()?)? as i32,
             "--size" => {
                 let s = val()?;
@@ -1071,7 +1074,7 @@ fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
     let want = if a.driver.is_empty() { if cfg!(feature = "rsdriver") { "rsdriver" } else { "librealsense" } } else { a.driver.as_str() };
     match want {
         #[cfg(feature = "rsdriver")]
-        "rsdriver" => Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms)?)),
+        "rsdriver" => Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, &a.camera_profile)?)),
         #[cfg(feature = "realsense")]
         "librealsense" => Ok(Box::new(crate::io::RealSenseSource::new(a.w, a.h, a.fps, &a.align, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms)?)),
         d => Err(format!("카메라 입력 {d} 이 이 빌드에 없음(--features rsdriver 또는 realsense 로 빌드)")),

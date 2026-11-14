@@ -1004,8 +1004,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     let up = mean(&inl);
                     let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
                     let tilt = up[2].clamp(-1.0, 1.0).acos().to_degrees();
-                    if refine && tilt > 25.0 {
-                        // 첫 장면이 똑바르다는 가정과 크게 다르면 믿지 않음(세계를 뒤집지 않음): 모은 것을 버리고 계속
+                    if refine && tilt > 70.0 {
+                        // 첫 장면이 똑바르다는 가정과 70° 넘게 다르면 믿지 않음(세계를 뒤집지 않음, 천장은 floor_only 로 이미 빠짐 · 녹화 첫 장면은 46° 숙여 있기도 함): 모은 것을 버리고 계속
                         common::info!("수평 맞춤: 바닥 합의가 처음 가정과 {tilt:.1}° 달라 버림");
                         grav_obs.clear();
                         break 'lv;

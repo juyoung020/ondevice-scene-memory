@@ -51,6 +51,10 @@ struct SV {
     best: u16,
 }
 
+impl SV {
+    const EMPTY: SV = SV { off: [0; 3], col: [0; 3], n: 0, nc: 0, nf: 0, last: 0, best: 0 };
+}
+
 /// Potree 식 옥트리: 수준 L 의 점 간격 = vox·2^(DEPTH−L), 노드 한 변 = 간격 × G. 점은 자기 칸(수준 L 간격)이 아직 비어 있는
 /// 가장 굵은 수준의 노드 하나에만 들어간다(겹침 없음) → 뷰어는 굵은 노드부터 받아 화면 크기 순으로 더 고운 노드를 더한다.
 pub const OCT_DEPTH: u32 = 5;
@@ -64,10 +68,33 @@ pub struct Node {
     pub written: usize, // 마지막으로 파일에 쓴 점 수
 }
 
+/// 최근 칸 덩어리: 칸 4×4×4 를 한 곳에(장면의 이웃 화소는 대개 같은 덩어리 → 해시는 덩어리가 바뀔 때만 찾고 칸 값이 붙어 있어 캐시를 덜 놓침)
+#[derive(Clone)]
+struct Brick {
+    occ: u64,  // 이 덩어리에 들어 있는 칸
+    last: u16, // 마지막으로 본 키프레임(덩어리 통째로 큰 표로 옮길 때를 정함)
+    v: [SV; 64],
+}
+
+/// 한동안 안 본 덩어리: 든 칸만 차례로(자리 = occ 에서 그 칸 아래 비트 수)
+struct ColdBrick {
+    occ: u64,
+    v: Box<[SV]>,
+}
+
+/// 칸 키 → (덩어리 키, 덩어리 안 자리)
+#[inline]
+fn brick_of(k: u64) -> (u64, usize) {
+    let (x, y, z) = ((k >> 42) & 0x1F_FFFF, (k >> 21) & 0x1F_FFFF, k & 0x1F_FFFF);
+    (((x >> 2) << 38) | ((y >> 2) << 19) | (z >> 2), ((x & 3) | ((y & 3) << 2) | ((z & 3) << 4)) as usize)
+}
+
 pub struct SceneMap {
     pub vox: f64,
-    cells: FastMap<u64, SV>, // 한동안 안 본 칸(큰 표: 칸마다 캐시·TLB 를 놓침)
-    hot: FastMap<u64, SV>,   // 최근 HOT_AGE 키프레임 안에 본 칸(작은 표: 장면마다 같은 칸을 거듭 보므로 넣기가 거의 여기서 끝남)
+    cells: FastMap<u64, ColdBrick>, // 한동안 안 본 덩어리(큰 표: 덩어리마다 캐시·TLB 를 놓침)
+    hot: FastMap<u64, u32>,  // 최근 HOT_AGE 키프레임 안에 본 덩어리 → bricks 자리(장면마다 같은 칸을 거듭 보므로 넣기가 거의 여기서 끝남)
+    bricks: Vec<Brick>,
+    free: Vec<u32>,          // 비운 덩어리 자리
     hot_kf: u32,             // 마지막으로 hot 을 비운 키프레임
     pub min_obs: u8, // 고운 칸을 본 키프레임 수 하한
     pending: Vec<u64>, // 막 확정된 칸(본 키프레임 수가 min_obs 에 닿은 칸): 다음 place 에서 옥트리로
@@ -77,6 +104,30 @@ pub struct SceneMap {
     pub n_placed: usize,
 }
 
+/// SceneMap::adder 손잡이: put 으로 점을 넣고, 놓을 때(drop) 오래된 칸을 큰 표로
+pub struct Adder<'a> {
+    m: &'a mut SceneMap,
+    kf: u32,
+    last_b: (u64, usize),
+    near: Box<[(u64, u32); NEAR]>, // 이 장면에서 찾은 덩어리(자리 = 덩어리 좌표 아래 비트): 윗줄 화소가 본 덩어리를 해시 없이 다시 찾음
+}
+
+/// Adder 의 최근 덩어리 표 크기(덩어리 좌표 x·y·z 아래 3 비트씩)
+const NEAR: usize = 512;
+
+impl Adder<'_> {
+    #[inline(always)]
+    pub fn put(&mut self, p: V3, c: [u8; 3], d: f32) {
+        self.m.put(&mut self.last_b, &mut self.near, self.kf, p, c, d);
+    }
+}
+
+impl Drop for Adder<'_> {
+    fn drop(&mut self) {
+        self.m.settle(self.kf);
+    }
+}
+
 static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SceneMap {
@@ -84,67 +135,130 @@ impl SceneMap {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let run = t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16;
         SceneMap {
-            vox, cells: FastMap::default(), hot: FastMap::default(), hot_kf: 0, min_obs: 2, pending: vec![],
+            vox, cells: FastMap::default(), hot: FastMap::default(), bricks: vec![], free: vec![], hot_kf: 0, min_obs: 2, pending: vec![],
             occ: (0..OCT_DEPTH).map(|_| FastSet::default()).collect(), nodes: FastMap::default(), run, n_placed: 0,
         }
     }
-    /// 한 키프레임의 점: (세계 점, 색, 카메라 거리)
-    pub fn add(&mut self, kf: u32, pts: &[(V3, [u8; 3], f32)]) {
+    /// 한 키프레임의 점((세계 점, 색, 카메라 거리))을 하나씩 넣는 손잡이(점을 만드는 반복문 안에서 바로 부름 → 점 벡터·반복자 호출 없이). 놓을 때 오래된 칸을 큰 표로
+    pub fn adder(&mut self, kf: u32) -> Adder<'_> {
+        Adder { m: self, kf, last_b: (u64::MAX, 0), near: Box::new([(u64::MAX, 0); NEAR]) }
+    }
+    /// 덩어리 bk 의 bricks 자리(없으면 만들고, 큰 표에 있던 덩어리면 칸을 제자리로 펼침). 이 장면에 봤다고 표시
+    #[inline(never)]
+    fn brick_slot(&mut self, bk: u64, kf: u32) -> u32 {
+        let (cold, bricks, free) = (&mut self.cells, &mut self.bricks, &mut self.free);
+        let bi = *self.hot.entry(bk).or_insert_with(|| {
+            let mut b = Brick { occ: 0, last: 0, v: [SV::EMPTY; 64] };
+            if let Some(cb) = cold.remove(&bk) {
+                b.occ = cb.occ;
+                let mut m = cb.occ;
+                for v in cb.v.iter() {
+                    b.v[m.trailing_zeros() as usize] = *v;
+                    m &= m - 1;
+                }
+            }
+            match free.pop() {
+                Some(i) => {
+                    bricks[i as usize] = b;
+                    i
+                }
+                None => {
+                    bricks.push(b);
+                    (bricks.len() - 1) as u32
+                }
+            }
+        });
+        bricks[bi as usize].last = kf as u16;
+        bi
+    }
+    /// 점 하나 넣기. last_b: 마지막 덩어리(이웃 점은 대개 같은 덩어리), near: 이 장면에서 찾은 덩어리 — 둘 다 맞으면 해시를 찾지 않음
+    #[inline(always)]
+    fn put(&mut self, last_b: &mut (u64, usize), near: &mut [(u64, u32); NEAR], kf: u32, p: V3, c: [u8; 3], d: f32) {
+        // 칸 좌표·칸 안 위치를 한 번에(key() 와 같은 식)
         let vox = self.vox;
-        let (hot, cold) = (&mut self.hot, &mut self.cells);
-        for (p, c, d) in pts {
-            // 칸 좌표·칸 안 위치를 한 번에(key() 와 같은 식)
-            let f = [p[0] / vox, p[1] / vox, p[2] / vox];
-            let fl = f.map(|v| v.floor());
-            let g = |v: f64| ((v as i64 + (1 << 20)) as u64) & 0x1F_FFFF;
-            let k = (g(fl[0]) << 42) | (g(fl[1]) << 21) | g(fl[2]);
-            let dmm = (d * 1000.0).clamp(0.0, 65535.0) as u16;
-            let q = |i: usize| (((f[i] - fl[i]) * 255.0).round() as i32).clamp(0, 255);
-            let e = hot.entry(k).or_insert_with(|| cold.remove(&k).unwrap_or(SV { off: [0; 3], col: *c, n: 0, nc: 0, nf: 0, last: u16::MAX, best: u16::MAX }));
-            // 칸 안 평균: 이어 더하는 평균(16 번 넘으면 최근 쪽 무게를 둔 평균)
-            let n = (e.n as i32 + 1).min(16);
-            for i in 0..3 {
-                let m = e.off[i] as i32;
-                e.off[i] = (m + div(q(i) - m, n)).clamp(0, 255) as u8;
+        let f = [p[0] / vox, p[1] / vox, p[2] / vox];
+        let fl = f.map(|v| v.floor());
+        let g = |v: f64| ((v as i64 + (1 << 20)) as u64) & 0x1F_FFFF;
+        let k = (g(fl[0]) << 42) | (g(fl[1]) << 21) | g(fl[2]);
+        let dmm = (d * 1000.0).clamp(0.0, 65535.0) as u16;
+        let q = |i: usize| (((f[i] - fl[i]) * 255.0).round() as i32).clamp(0, 255);
+        let (bk, slot) = brick_of(k);
+        if bk != last_b.0 {
+            let ni = ((bk & 7) | ((bk >> 19) & 7) << 3 | ((bk >> 38) & 7) << 6) as usize;
+            if near[ni].0 != bk {
+                near[ni] = (bk, self.brick_slot(bk, kf));
             }
-            e.n = n as u8;
-            if e.last != kf as u16 {
-                e.last = kf as u16;
-                e.nf = e.nf.saturating_add(1);
-                if e.nf == self.min_obs {
-                    self.pending.push(k);
-                }
-            }
-            // 색: 가장 가까운 거리의 2 배 안에서 본 관측의 평균(가까운 쪽 사진이 선명하고, 비슷한 거리 여러 장의 평균이 노출·잡음을 고름).
-            // 훨씬 가까운 관측이 오면 그 색에서 다시 시작
-            if (dmm as u32) * 2 < e.best as u32 || e.best == u16::MAX {
-                e.best = dmm;
-                e.col = *c;
-                e.nc = 1;
-            } else if dmm as u32 <= (e.best as u32) * 2 {
-                e.nc = e.nc.saturating_add(1).min(16);
-                for i in 0..3 {
-                    let m = e.col[i] as i32;
-                    e.col[i] = (m + div(c[i] as i32 - m, e.nc as i32)) as u8;
-                }
-                e.best = e.best.min(dmm);
+            *last_b = (bk, near[ni].1 as usize);
+        }
+        let b = &mut self.bricks[last_b.1];
+        let bit = 1u64 << slot;
+        if b.occ & bit == 0 {
+            b.occ |= bit;
+            b.v[slot] = SV { off: [0; 3], col: c, n: 0, nc: 0, nf: 0, last: u16::MAX, best: u16::MAX };
+        }
+        let e = &mut b.v[slot];
+        // 칸 안 평균: 이어 더하는 평균(16 번 넘으면 최근 쪽 무게를 둔 평균)
+        let n = (e.n as i32 + 1).min(16);
+        for i in 0..3 {
+            let m = e.off[i] as i32;
+            e.off[i] = (m + div(q(i) - m, n)).clamp(0, 255) as u8;
+        }
+        e.n = n as u8;
+        if e.last != kf as u16 {
+            e.last = kf as u16;
+            e.nf = e.nf.saturating_add(1);
+            if e.nf == self.min_obs {
+                self.pending.push(k);
             }
         }
-        // HOT_AGE 장 넘게 안 본 칸은 큰 표로(장면마다가 아니라 칸이 시야를 떠날 때 한 번만 큰 표를 건드림)
+        // 색: 가장 가까운 거리의 2 배 안에서 본 관측의 평균(가까운 쪽 사진이 선명하고, 비슷한 거리 여러 장의 평균이 노출·잡음을 고름).
+        // 훨씬 가까운 관측이 오면 그 색에서 다시 시작
+        if (dmm as u32) * 2 < e.best as u32 || e.best == u16::MAX {
+            e.best = dmm;
+            e.col = c;
+            e.nc = 1;
+        } else if dmm as u32 <= (e.best as u32) * 2 {
+            e.nc = e.nc.saturating_add(1).min(16);
+            for i in 0..3 {
+                let m = e.col[i] as i32;
+                e.col[i] = (m + div(c[i] as i32 - m, e.nc as i32)) as u8;
+            }
+            e.best = e.best.min(dmm);
+        }
+    }
+    /// HOT_AGE 장 넘게 안 본 덩어리는 큰 표로(장면마다가 아니라 덩어리가 시야를 떠날 때 한 번만 큰 표를 건드림).
+    /// 칸 값은 어느 표에 있든 같다 — 옮기는 때는 빠르기만 바꾼다
+    fn settle(&mut self, kf: u32) {
+        let (cold, bricks, free) = (&mut self.cells, &mut self.bricks, &mut self.free);
         if kf.wrapping_sub(self.hot_kf) >= HOT_AGE / 2 || kf < self.hot_kf {
             self.hot_kf = kf;
             let now = kf as u16;
-            self.hot.retain(|k, v| {
-                let keep = now.wrapping_sub(v.last) < HOT_AGE as u16;
+            self.hot.retain(|bk, bi| {
+                let b = &bricks[*bi as usize];
+                let keep = now.wrapping_sub(b.last) < HOT_AGE as u16;
                 if !keep {
-                    cold.insert(*k, *v);
+                    let mut m = b.occ;
+                    let v: Box<[SV]> = (0..b.occ.count_ones()).map(|_| {
+                        let s = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        b.v[s]
+                    }).collect();
+                    cold.insert(*bk, ColdBrick { occ: b.occ, v });
+                    free.push(*bi);
                 }
                 keep
             });
         }
     }
     fn cell(&self, k: &u64) -> &SV {
-        self.hot.get(k).unwrap_or_else(|| &self.cells[k])
+        let (bk, s) = brick_of(*k);
+        match self.hot.get(&bk) {
+            Some(&bi) => &self.bricks[bi as usize].v[s],
+            None => {
+                let cb = &self.cells[&bk];
+                &cb.v[(cb.occ & ((1u64 << s) - 1)).count_ones() as usize]
+            }
+        }
     }
     fn pos(&self, k: u64, v: &SV) -> [f32; 3] {
         let f = |s: u32, i: usize| ((((k >> s) & 0x1F_FFFF) as i64 - (1 << 20)) as f64 + v.off[i] as f64 / 255.0) * self.vox;
@@ -227,7 +341,8 @@ impl SceneMap {
         self.n_placed
     }
     pub fn bytes(&self) -> usize {
-        (self.cells.capacity() + self.hot.capacity()) * 24 + self.occ.iter().map(|s| s.capacity() * 9).sum::<usize>()
+        self.cells.capacity() * 33 + self.cells.values().map(|c| c.v.len() * std::mem::size_of::<SV>() + 16).sum::<usize>()
+            + self.hot.capacity() * 13 + self.bricks.capacity() * std::mem::size_of::<Brick>() + self.occ.iter().map(|s| s.capacity() * 9).sum::<usize>()
             + self.nodes.values().map(|n| n.keys.capacity() * 8 + 48).sum::<usize>() + self.pending.capacity() * 8
     }
 }
@@ -239,9 +354,14 @@ pub fn node_coord(k: u64) -> [i64; 3] {
 
 // ------------------------------------------------------------------ 2D 점유 격자
 
+/// 격자 조각 한 변(칸): 칸 값을 조각마다 한 덩어리로(칸마다 해시를 찾지 않음)
+const GT: i32 = 64;
+/// 칸 값: (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수, 그중 가구보다 높은 막힘을 본 수). 셋 다 0 = 아직 안 본 칸
+type GCell = (u32, u32, u32);
+
 pub struct Grid {
     pub res: f64,
-    cells: FastMap<(i32, i32), (u32, u32, u32)>, // (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수, 그중 가구보다 높은 막힘을 본 수)
+    tiles: FastMap<(i32, i32), Box<[GCell]>>, // 조각 (x>>6, y>>6) → 64×64 칸(줄 = y)
 }
 
 pub struct GridImg {
@@ -255,10 +375,71 @@ pub struct GridImg {
 
 impl Grid {
     pub fn new(res: f64) -> Grid {
-        Grid { res, cells: FastMap::default() }
+        Grid { res, tiles: FastMap::default() }
     }
-    /// occ: (x, y, 가구보다 높은 점인지)
+    #[inline]
+    fn cell_mut(&mut self, x: i32, y: i32) -> &mut GCell {
+        let t = self.tiles.entry((x >> 6, y >> 6)).or_insert_with(|| vec![(0, 0, 0); (GT * GT) as usize].into_boxed_slice());
+        &mut t[((y & (GT - 1)) * GT + (x & (GT - 1))) as usize]
+    }
+    /// occ: (x, y, 가구보다 높은 점인지). 이 장면이 닿는 칸을 작은 판(장면 범위)에 표시한 뒤 표시한 칸만 더한다 —
+    /// 칸 집합(해시) 셋과 시선 칸마다의 해시 넣기를 배열 표시로(더하는 값은 칸 집합 때와 같음)
     pub fn add(&mut self, cam: (f64, f64), occ: &[(f64, f64, bool)], floor: &[(f64, f64)]) {
+        let c = |x: f64, y: f64| ((x / self.res).floor() as i32, (y / self.res).floor() as i32);
+        let (cx, cy) = c(cam.0, cam.1);
+        let oc: Vec<(i32, i32, bool)> = occ.iter().map(|p| { let (x, y) = c(p.0, p.1); (x, y, p.2) }).collect();
+        let fc: Vec<(i32, i32)> = floor.iter().map(|p| c(p.0, p.1)).collect();
+        let (mut x0, mut y0, mut x1, mut y1) = (cx, cy, cx, cy);
+        for (x, y) in oc.iter().map(|p| (p.0, p.1)).chain(fc.iter().copied()) {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        let (bw, bh) = ((x1 as i64 - x0 as i64 + 1) as usize, (y1 as i64 - y0 as i64 + 1) as usize);
+        if bw * bh > 1 << 24 {
+            return self.add_sets(cam, occ, floor); // 장면 범위가 터무니없이 크면(위치가 튐) 칸 집합으로
+        }
+        const O: u8 = 1;
+        const T: u8 = 2;
+        const F: u8 = 4;
+        let mut fl = vec![0u8; bw * bh];
+        let at = |x: i32, y: i32| (y - y0) as usize * bw + (x - x0) as usize;
+        for &(x, y, t) in &oc {
+            fl[at(x, y)] |= O | if t { T } else { 0 };
+        }
+        for &(x, y) in &fc {
+            fl[at(x, y)] |= F;
+        }
+        // 막힌 칸까지의 시선(같은 칸은 한 번만)
+        for &(x, y, _) in &oc {
+            let i = at(x, y);
+            if fl[i] & 8 != 0 {
+                continue;
+            }
+            fl[i] |= 8;
+            let n = (x - cx).abs().max((y - cy).abs());
+            for k in 0..(n - 1).max(0) {
+                fl[at(cx + (x - cx) * k / n, cy + (y - cy) * k / n)] |= F;
+            }
+        }
+        for yy in 0..bh {
+            for xx in 0..bw {
+                let f = fl[yy * bw + xx];
+                if f & (O | F) == 0 {
+                    continue;
+                }
+                let e = self.cell_mut(x0 + xx as i32, y0 + yy as i32);
+                if f & O != 0 {
+                    e.0 += 1;
+                    if f & T != 0 {
+                        e.2 += 1;
+                    }
+                } else {
+                    e.1 += 1;
+                }
+            }
+        }
+    }
+    /// add 와 같은 값을 칸 집합으로(장면 범위가 너무 클 때만)
+    fn add_sets(&mut self, cam: (f64, f64), occ: &[(f64, f64, bool)], floor: &[(f64, f64)]) {
         let c = |x: f64, y: f64| ((x / self.res).floor() as i32, (y / self.res).floor() as i32);
         let o: FastSet<(i32, i32)> = occ.iter().map(|p| c(p.0, p.1)).collect();
         let tall: FastSet<(i32, i32)> = occ.iter().filter(|p| p.2).map(|p| c(p.0, p.1)).collect();
@@ -271,21 +452,27 @@ impl Grid {
             }
         }
         for k in &o {
-            self.cells.entry(*k).or_insert((0, 0, 0)).0 += 1;
+            self.cell_mut(k.0, k.1).0 += 1;
         }
         for k in &tall {
-            self.cells.entry(*k).or_insert((0, 0, 0)).2 += 1;
+            self.cell_mut(k.0, k.1).2 += 1;
         }
         for k in f.difference(&o) {
-            self.cells.entry(*k).or_insert((0, 0, 0)).1 += 1;
+            self.cell_mut(k.0, k.1).1 += 1;
         }
     }
+    /// 본 칸 모두: ((x, y), 값)
+    fn cells(&self) -> impl Iterator<Item = ((i32, i32), GCell)> + '_ {
+        self.tiles.iter().flat_map(|(&(tx, ty), t)| {
+            t.iter().enumerate().filter(|(_, v)| **v != (0, 0, 0)).map(move |(i, &v)| ((tx * GT + i as i32 % GT, ty * GT + i as i32 / GT), v))
+        })
+    }
     pub fn image(&self) -> Option<GridImg> {
-        if self.cells.is_empty() {
+        if self.tiles.is_empty() {
             return None;
         }
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        for &(x, y) in self.cells.keys() {
+        for ((x, y), _) in self.cells() {
             x0 = x0.min(x);
             y0 = y0.min(y);
             x1 = x1.max(x);
@@ -295,7 +482,7 @@ impl Grid {
         let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
         let mut px = vec![205u8; w * h];
         let mut wall = vec![false; w * h];
-        for (&(x, y), &(hit, free, tall)) in &self.cells {
+        for ((x, y), (hit, free, tall)) in self.cells() {
             let i = (h - 1 - (y - y0) as usize) * w + (x - x0) as usize;
             if hit >= 2 && hit >= free {
                 px[i] = 0;
@@ -428,7 +615,16 @@ impl Memory {
             }
         }
         let ext = [0, 1, 2].map(|k| (hi[k] - lo[k]).max(0.05));
-        let ckeys: FastSet<u64> = pts.iter().map(|(p, _)| key(p, self.sup)).collect();
+        // 이웃 점은 대개 같은 굵은 칸: 바로 앞과 같은 키는 다시 넣지 않음(이미 든 키 넣기는 표를 바꾸지 않으니 같은 집합·같은 차례)
+        let mut ckeys: FastSet<u64> = FastSet::default();
+        let mut last = None;
+        for (p, _) in pts {
+            let k = key(p, self.sup);
+            if last != Some(k) {
+                ckeys.insert(k);
+                last = Some(k);
+            }
+        }
         let i = match self.find(name, &c, &ext, &ckeys, cam.as_ref()) {
             Some(i) => i,
             None => {
@@ -446,8 +642,14 @@ impl Memory {
         for k in &ckeys {
             *o.support.entry(*k).or_insert(0) += 1;
         }
+        // 바로 앞 점과 같은 칸이면 표를 다시 찾지 않고 그 칸에 더함
+        let mut cur: Option<(u64, &mut OV)> = None;
         for (p, col) in pts {
-            let e = o.cells.entry(key(p, self.vox)).or_insert(OV { sum: [0.0; 3], n: 0, col: *col, best: f32::MAX });
+            let k = key(p, self.vox);
+            if !matches!(&cur, Some((ck, _)) if *ck == k) {
+                cur = Some((k, o.cells.entry(k).or_insert(OV { sum: [0.0; 3], n: 0, col: *col, best: f32::MAX })));
+            }
+            let e = &mut *cur.as_mut().unwrap().1;
             e.sum[0] += p[0] as f32;
             e.sum[1] += p[1] as f32;
             e.sum[2] += p[2] as f32;

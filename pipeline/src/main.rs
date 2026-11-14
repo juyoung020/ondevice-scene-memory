@@ -566,11 +566,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     std::fs::create_dir_all(a.out.join("objects")).unwrap();
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
-    // 점 지도는 점 작업 스레드가(스트림은 밀리면 건너뛰고, TUM 입력은 기다려 결과가 늘 같게)
+    // 점 지도는 점 작업 스레드가(스트림은 밀리면 건너뛰고, TUM 입력·--no-drop 은 기다려 결과가 늘 같게)
     let mut pw = Some({
         let mut s = SceneMap::new(a.scene_vox, 0.04);
         s.min_obs = a.pts_obs;
-        PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none())
+        PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none() || a.no_drop) // --no-drop: 스트림도 기다림
     });
     let mut mem = Memory::new(0.012, 0.04);
     let mut room_tr = rooms::Tracker::default(); // 방 번호를 실행 내내 잇는다
@@ -1169,7 +1169,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
-    while let Ok(Frame { t, mut p, mut r, rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, held, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, mut rgb, w, h, mut depth, dets, load, seg: seg_s, scale, feat, track_only, lost, held, anchor, graph }) = rx.recv() {
         *taken.n.lock().unwrap() += 1;
         taken.cv.notify_all();
         let c_top = Instant::now();
@@ -1247,7 +1247,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             if leveled && a.rebuild_every >= 0.0 && kfs.holds(anchor) {
                 let keep = kfs.push(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, &rgb, &depth, &dets, true);
                 match (pw.as_mut(), keep) {
-                    (Some(pw), Some(kf)) => pw.hold(&depth, &rgb, w, h, kf),
+                    (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut depth), std::mem::take(&mut rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김
                     (None, Some(kf)) => { let _ = kf.pts.set(None); }
                     _ => {}
                 }
@@ -1699,7 +1699,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             .then(|| kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, true))
             .flatten();
         if let (Some(p), true) = (pw.as_mut(), map_ok) {
-            p.frame(nkf, r, pwc, &depth, &rgb, w, h, keep, behind);
+            // 깊이·사진은 이 뒤 본 스레드가 쓰지 않으므로 복사 없이 넘김(스냅샷 장면만 사진을 남김: 아래 nkf += 1 뒤에 봄)
+            let rgb_pts = if a.snaps.contains(&(nkf + 1)) { rgb.clone() } else { std::mem::take(&mut rgb) };
+            p.frame(nkf, r, pwc, std::mem::take(&mut depth), rgb_pts, w, h, keep, behind);
         }
         clock.add(P::Pts, c_pt);
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
@@ -1974,7 +1976,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
             let cp = Instant::now();
             let zz = kf.pts.wait();
             if let Some(g) = zz.as_ref().map(PtsGrid::from_z) {
-                scene.add(i as u32, &grid_points(k, &g, r, pwc));
+                grid_points(k, &g, r, pwc, &mut scene, i as u32);
             }
             t_pts += cp.elapsed().as_secs_f64();
         }
@@ -2072,6 +2074,8 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
     let (gw, gh) = ((w - off[0]).div_ceil(step), (h - off[1]).div_ceil(step));
     let mut d = vec![0f32; gw * gh];
     let mut c = vec![0u8; gw * gh * 3];
+    let ax: Vec<f64> = (0..w).map(|x| (x as f64 - cx) / fx).collect();
+    let ay: Vec<f64> = (0..h).map(|y| (y as f64 - cy) / fy).collect();
     out::par(|| d.par_chunks_mut(gw).zip(c.par_chunks_mut(gw * 3)).enumerate().for_each(|(gy, (dr, cr))| {
         let v = off[1] + gy * step;
         for gx in 0..gw {
@@ -2080,8 +2084,12 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
             if !(z > 0.2 && z < 6.0) {
                 continue;
             }
-            let pc = [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z];
-            if pc[2] < maxd && !depth_edge(depth, w, h, u, v) && facing(depth, w, h, k, u, v, &pc) {
+            // 가장자리 2 화소 안은 facing 이 늘 거짓 → 이웃 창(5×5)을 범위 검사 없이 읽는 안쪽 판만 부름
+            if u < 2 || v < 2 || u + 2 >= w || v + 2 >= h {
+                continue;
+            }
+            let pc = [ax[u] * z, ay[v] * z, z];
+            if pc[2] < maxd && !depth_edge_in(depth, w, u, v) && facing(depth, w, h, &ax, &ay, u, v, &pc) {
                 dr[gx] = smooth_depth(depth, w, u, v);
                 let o = (v * w + u) * 3;
                 cr[gx * 3..gx * 3 + 3].copy_from_slice(&rgb[o..o + 3]);
@@ -2095,35 +2103,37 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &[f32], rgb: &[u8], w: usize, h: usize
 fn smooth_depth(d: &[f32], w: usize, u: usize, v: usize) -> f32 {
     let z0 = d[v * w + u];
     let tol = 0.003 + 0.004 * z0 * z0;
-    let (mut s, mut n) = (0f32, 0f32);
+    // 분기 없이: 빠지는 이웃은 +0 을 더함(s 는 늘 +0 이상이라 s + 0 = s, 더하는 차례 그대로 → 같은 값)
+    let (mut s, mut n) = (0f32, 0u32);
     for y in v - 2..=v + 2 {
-        for &z in &d[y * w + u - 2..=y * w + u + 2] {
-            if (z - z0).abs() < tol {
-                s += z;
-                n += 1.0;
-            }
+        let r: &[f32; 5] = d[y * w + u - 2..y * w + u + 3].try_into().unwrap();
+        for &z in r {
+            let ok = (z - z0).abs() < tol;
+            s += if ok { z } else { 0.0 };
+            n += ok as u32;
         }
     }
-    s / n
+    s / n as f32
 }
 
-/// 점 격자 → (세계 점, 색, 카메라 거리)
-fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3) -> Vec<(V3, [u8; 3], f32)> {
+/// 점 격자 → 지도: (세계 점, 색, 카메라 거리)를 하나씩 바로 넣는다(점 벡터를 만들지 않음)
+fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, scene: &mut SceneMap, kf: u32) {
     let [fx, fy, cx, cy] = k;
-    let mut out = Vec::with_capacity(g.d.len() / 2);
+    let mut ad = scene.adder(kf);
+    let ax: Vec<f64> = (0..g.gw).map(|gx| ((g.off[0] + gx * g.step) as f64 - cx) / fx).collect(); // 열마다 한 번만 나눔(같은 값)
     for gy in 0..g.gh {
         let v = (g.off[1] + gy * g.step) as f64;
+        let ay = (v - cy) / fy;
         for gx in 0..g.gw {
             let i = gy * g.gw + gx;
             let z = g.d[i] as f64;
             if z <= 0.0 {
                 continue;
             }
-            let pc = [((g.off[0] + gx * g.step) as f64 - cx) / fx * z, (v - cy) / fy * z, z];
-            out.push((add(&mv(r, &pc), pwc), [g.rgb[i * 3], g.rgb[i * 3 + 1], g.rgb[i * 3 + 2]], z as f32));
+            let pc = [ax[gx] * z, ay * z, z];
+            ad.put(add(&mv(r, &pc), pwc), [g.rgb[i * 3], g.rgb[i * 3 + 1], g.rgb[i * 3 + 2]], z as f32);
         }
     }
-    out
 }
 
 enum PtsMsg {
@@ -2177,7 +2187,7 @@ impl PtsWorker {
                             let _ = s.pts.set(Some(g.pack()));
                         }
                         let c1 = Instant::now();
-                        scene.add(kf, &grid_points(k, &g, &r, &pwc));
+                        grid_points(k, &g, &r, &pwc, &mut scene, kf);
                         (t_grid, t_add, nf) = (t_grid + (c1 - c0).as_secs_f64(), t_add + c1.elapsed().as_secs_f64(), nf + 1);
                         out::slow(c0);
                         q2.fetch_sub(1, Relaxed);
@@ -2190,7 +2200,7 @@ impl PtsWorker {
                     }
                     PtsMsg::Stored { kf, r, pwc, store } => {
                         if let Some(g) = store.pts.wait().as_ref().map(PtsGrid::from_z) {
-                            scene.add(kf, &grid_points(k, &g, &r, &pwc));
+                            grid_points(k, &g, &r, &pwc, &mut scene, kf);
                         }
                     }
                     PtsMsg::Write(budget, ack) => {
@@ -2224,7 +2234,7 @@ impl PtsWorker {
     /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게.
     /// 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면은 점 격자 일부만(어긋남을 돌려 가며) 넣음: 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
     #[allow(clippy::too_many_arguments)]
-    fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: &[f32], rgb: &[u8], w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, thin: bool) {
+    fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, thin: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
@@ -2242,10 +2252,10 @@ impl PtsWorker {
             self.last = Some((r, pwc));
             None
         };
-        self.send(PtsMsg::Frame { kf, r, pwc, depth: depth.to_vec(), rgb: rgb.to_vec(), w, h, keep, part });
+        self.send(PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep, part });
     }
     /// 맡아 둘 장면: 점 격자만 만들어 붙이게 넘김(밀렸으면 빈 점 격자로 표시)
-    fn hold(&mut self, depth: &[f32], rgb: &[u8], w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
+    fn hold(&mut self, depth: Vec<f32>, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
@@ -2253,7 +2263,7 @@ impl PtsWorker {
             return;
         }
         self.queued.fetch_add(1, Relaxed);
-        self.send(PtsMsg::Hold { depth: depth.to_vec(), rgb: rgb.to_vec(), w, h, keep });
+        self.send(PtsMsg::Hold { depth, rgb, w, h, keep });
     }
     fn stored(&self, kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf>) {
         self.send(PtsMsg::Stored { kf, r, pwc, store });
@@ -2391,6 +2401,7 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
     if dets.is_some() && map_ok {
         mem.n_seg += 1;
     }
+    let mut valid: Vec<u32> = vec![];
     for d in dets.iter().flatten().filter(|_| map_ok) {
         let name = seg::name(d.cls);
         if name == "person" {
@@ -2400,25 +2411,25 @@ fn map_frame(a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, de
         let (bw, bh) = (x2 - x1, y2 - y1);
         let m = erode(&d.mask, bw, bh, 3);
         // 마스크 안 깊이 있는 화소: 먼저 세어 간격을 정하고, 그 간격으로 최대 약 2,500 개만 모은다
-        let valid = |yy: usize, xx: usize| m[yy * bw + xx] && depth[(y1 + yy) * w + x1 + xx] as f64 > 0.2;
-        let cnt = (0..bh).map(|yy| (0..bw).filter(|&xx| valid(yy, xx)).count()).sum::<usize>();
+        // 한 번 훑어 깊이 있는 화소 자리를 모아 두고(마스크·깊이를 두 번 읽지 않게) 그 간격으로 고름
+        valid.clear();
+        for yy in 0..bh {
+            let (mr, dr) = (&m[yy * bw..(yy + 1) * bw], &depth[(y1 + yy) * w + x1..(y1 + yy) * w + x1 + bw]);
+            for xx in 0..bw {
+                if mr[xx] && dr[xx] as f64 > 0.2 {
+                    valid.push(((y1 + yy) * w + x1 + xx) as u32);
+                }
+            }
+        }
+        let cnt = valid.len();
         if cnt < 80 {
             continue;
         }
         let step = (cnt / 2500).max(1);
-        let mut pix: Vec<(usize, usize, f64)> = Vec::with_capacity(cnt / step + 1);
-        let mut k = 0usize;
-        for yy in 0..bh {
-            for xx in 0..bw {
-                if valid(yy, xx) {
-                    if k % step == 0 {
-                        let (u, v) = (x1 + xx, y1 + yy);
-                        pix.push((u, v, depth[v * w + u] as f64));
-                    }
-                    k += 1;
-                }
-            }
-        }
+        let pix: Vec<(usize, usize, f64)> = valid.iter().step_by(step).map(|&o| {
+            let o = o as usize;
+            (o % w, o / w, depth[o] as f64)
+        }).collect();
         let mut zs: Vec<f64> = pix.iter().map(|q| q.2).collect();
         let mid = zs.len() / 2;
         let med = *zs.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
@@ -2556,14 +2567,14 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
 
 /// 표면이 시선과 이루는 각: 이웃 화소(±2)로 만든 법선과 시선의 코사인이 0.3(약 73°) 이상인 점만 — 비스듬히 본 면은 깊이 잡음이
 /// 시선 방향으로 길게 번져 줄무늬 껍질이 됨
-fn facing(d: &[f32], w: usize, h: usize, k: [f64; 4], u: usize, v: usize, pc: &V3) -> bool {
+/// ax[x] = (x − cx)/fx, ay[y] = (y − cy)/fy: 화소마다 나누지 않게 미리(곱하는 차례는 그대로 → 같은 값)
+fn facing(d: &[f32], w: usize, h: usize, ax: &[f64], ay: &[f64], u: usize, v: usize, pc: &V3) -> bool {
     if u < 2 || v < 2 || u + 2 >= w || v + 2 >= h {
         return false;
     }
-    let [fx, fy, cx, cy] = k;
     let b = |x: usize, y: usize| {
         let z = d[y * w + x] as f64;
-        [(x as f64 - cx) / fx * z, (y as f64 - cy) / fy * z, z]
+        [ax[x] * z, ay[y] * z, z]
     };
     let (du, dv) = (sub(&b(u + 2, v), &b(u - 2, v)), sub(&b(u, v + 2), &b(u, v - 2)));
     let n = cross(&du, &dv);
@@ -2579,6 +2590,21 @@ fn depth_edge(d: &[f32], w: usize, h: usize, u: usize, v: usize) -> bool {
             let z = d[y * w + x];
             lo = lo.min(z);
             hi = hi.max(z);
+        }
+    }
+    lo <= 0.0 || hi / lo > 1.08
+}
+
+/// depth_edge 의 안쪽 판(2 ≤ u < w−2, 2 ≤ v < h−2): 줄마다 5 칸 조각을 한 번에(같은 최솟값·최댓값)
+#[inline]
+fn depth_edge_in(d: &[f32], w: usize, u: usize, v: usize) -> bool {
+    let (mut lo, mut hi) = (f32::MAX, 0f32);
+    for y in v - 2..=v + 2 {
+        let r: &[f32; 5] = d[y * w + u - 2..y * w + u + 3].try_into().unwrap();
+        for &z in r {
+            // f32::min/max 와 같은 결과(NaN 은 건너뜀)를 비교 한 번으로
+            lo = if z < lo { z } else { lo };
+            hi = if z > hi { z } else { hi };
         }
     }
     lo <= 0.0 || hi / lo > 1.08

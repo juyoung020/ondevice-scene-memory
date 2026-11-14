@@ -8,6 +8,7 @@
 //         --db <파일>(RTAB-Map 데이터베이스로 남김)  --max-frames N  --Param/Name 값(RTAB-Map 파라미터 덮어쓰기)
 #include "frame_source.h"
 #include "stream_writer.h"
+#include "prefetch_source.h"
 #include "tum_source.h"
 #ifdef BRIDGE_HAVE_REALSENSE
 #include "realsense_source.h"
@@ -151,8 +152,11 @@ static int run(int argc, char** argv) {
     ULogger::setLevel(ULogger::kWarning);
 
     std::unique_ptr<FrameSource> src;
+    TumSource* tum_src = nullptr;
     if (!tum.empty()) {
-        src = std::make_unique<TumSource>(tum, rate);
+        auto ts = std::make_unique<TumSource>(tum, rate);
+        tum_src = ts.get();
+        src = std::move(ts);
     } else {
 #ifdef BRIDGE_HAVE_REALSENSE
         src = std::make_unique<RealSenseSource>(w, h, fps, align, serial, exposure_ms, gain);
@@ -162,6 +166,9 @@ static int run(int argc, char** argv) {
 #endif
     }
     if (block < 0) block = (!tum.empty() && rate == 0) ? 1 : 0;
+    // 장면 읽기는 따로 도는 스레드에서(최대 속도 재생만 장면을 버리지 않음)
+    auto* pre = new PrefetchSource(std::move(src), !(!tum.empty() && rate == 0));
+    src.reset(pre);
 
     // RTAB-Map 파라미터: 기본값 ← ini([Core]) ← 명령줄
     ParametersMap params;
@@ -499,7 +506,8 @@ static int run(int argc, char** argv) {
                  n_loop, n_corr);
     std::fprintf(stderr, "놓침 가운데 새 지도에서 맡긴 장면 %ld(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 %ld)\n", n_held, n_joined);
     std::fprintf(stderr, "같은 지도에서 다시 잡음 %ld 번, ms/회 %s\n", n_reloc, s_reloc.str().c_str());
-    if (auto* ts = dynamic_cast<TumSource*>(src.get())) std::fprintf(stderr, "재생에서 밀려 건너뛴 장면 %zu\n", ts->skipped());
+    if (tum_src) std::fprintf(stderr, "재생에서 밀려 건너뛴 장면 %zu\n", tum_src->skipped());
+    std::fprintf(stderr, "위치 추적이 밀려 버린 장면 %zu\n", pre->dropped());
     std::fprintf(stderr, "보냄 %zu, 밀려 버림 %zu, 그래프 블록 %ld 개(노드 %ld 개)\n", writer.written(), writer.dropped(), n_graph, n_graph_nodes);
     std::fprintf(stderr, "ms/장  읽기    %s\n", s_read.str().c_str());
     std::fprintf(stderr, "ms/장  위치추적 %s\n", s_odom.str().c_str());

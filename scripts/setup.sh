@@ -43,3 +43,13 @@ if [ $BUILD = 1 ]; then
   fi
   ls -la target/release/ondevice
 fi
+
+if [ $BOARD = 1 ]; then
+  # 보드 분할 모델은 DEEPX 배포 파일이라 릴리스에 없다: DEEPX dx-all-suite(dx_app)의 모델 받기로 받는다.
+  seg=$(ls "$HOME"/models/yolo26-s-seg_640x640.dxnn "$HOME"/dx-all-suite*/workspace/res/models/yolo26-s-seg_640x640.dxnn 2>/dev/null | head -1 || true)
+  if [ -n "$seg" ]; then
+    echo "보드 분할 모델: $seg"
+  else
+    echo "보드 분할 모델 yolo26-s-seg_640x640.dxnn 이 없음: DEEPX dx_app(https://github.com/DEEPX-AI/dx_app)의 모델 받기로 받아 ~/models/ 에 두세요." >&2
+  fi
+fi

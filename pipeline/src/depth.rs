@@ -1,5 +1,5 @@
 //! 장면 깊이(미터). 스트림 입력은 받은 u16 을 그대로 들고 쓸 때 값 / 단위로 바꾼다(장면 전체를 f32 로 바꾼 1.2 MB 버퍼를 만들지 않음).
-//! 값은 전에 한꺼번에 바꾸던 것(`v as f32 / depth_per_m`)과 같은 식이라 비트까지 같다.
+//! 값 = `v as f32 × (1 / depth_per_m)`(역수 곱: 나눗셈과 끝자리 1 비트까지 다를 수 있고, 지도·물체 품질은 같음 — docs/performance_log.md).
 
 pub enum Depth {
     /// 미터 f32(TUM 읽기 · 딥러닝 깊이 · 보관 장면 풀기)
@@ -19,7 +19,7 @@ impl Depth {
     pub fn at(&self, i: usize) -> f32 {
         match self {
             Depth::M(v) => v[i],
-            Depth::Raw { d, per_m } => d[i] as f32 / *per_m,
+            Depth::Raw { d, per_m } => d[i] as f32 * (1.0 / *per_m), // 역수 곱(나눗셈보다 빠름, 값은 끝자리 1 비트까지 다를 수 있음)
         }
     }
 
@@ -30,7 +30,8 @@ impl Depth {
             Depth::M(v) => &v[y0 * w..(y0 + n) * w],
             Depth::Raw { d, per_m } => {
                 buf.clear();
-                buf.extend(d[y0 * w..(y0 + n) * w].iter().map(|&v| v as f32 / *per_m));
+                let inv = 1.0 / *per_m;
+                buf.extend(d[y0 * w..(y0 + n) * w].iter().map(|&v| v as f32 * inv));
                 buf
             }
         }
@@ -64,7 +65,7 @@ impl Depth {
                 let (mut lo, mut hi) = (0u32, 65536u32); // 65536 = 없음
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    if (mid as f32 / *per_m) as f64 > m { hi = mid } else { lo = mid + 1 }
+                    if (mid as f32 * (1.0 / *per_m)) as f64 > m { hi = mid } else { lo = mid + 1 }
                 }
                 Some(lo)
             }
@@ -89,14 +90,14 @@ impl Depth {
     }
 }
 
-/// 원래 값 → `(v / per_m × 1000)` 버림 표. 미터당 값마다 한 번(보통 하나)
+/// 원래 값 → `(v × (1/per_m) × 1000)` 버림 표. 미터당 값마다 한 번(보통 하나)
 fn trunc_lut(per_m: f32) -> &'static [u16] {
     static T: std::sync::Mutex<Vec<(u32, &'static [u16])>> = std::sync::Mutex::new(Vec::new());
     let mut t = T.lock().unwrap();
     if let Some(e) = t.iter().find(|e| e.0 == per_m.to_bits()) {
         return e.1;
     }
-    let v: &'static [u16] = Box::leak((0..=65535u32).map(|v| ((v as f32 / per_m) * 1000.0).clamp(0.0, 65535.0) as u16).collect::<Box<[u16]>>());
+    let v: &'static [u16] = Box::leak((0..=65535u32).map(|v| ((v as f32 * (1.0 / per_m)) * 1000.0).clamp(0.0, 65535.0) as u16).collect::<Box<[u16]>>());
     t.push((per_m.to_bits(), v));
     v
 }
@@ -120,7 +121,7 @@ mod tests {
     fn same_values() {
         let d: Vec<u16> = (0..=65535u16).step_by(7).collect();
         for per_m in [1000.0f32, 5000.0, 999.87] {
-            let full: Vec<f32> = d.iter().map(|&v| v as f32 / per_m).collect();
+            let full: Vec<f32> = d.iter().map(|&v| v as f32 * (1.0 / per_m)).collect();
             let r = Depth::Raw { d: d.clone().into(), per_m };
             for (i, &x) in full.iter().enumerate() {
                 assert_eq!(r.at(i).to_bits(), x.to_bits());
@@ -149,6 +150,17 @@ mod raw_tests {
                 assert_eq!(got[i], (r.at(i) * 1000.0).clamp(0.0, 65535.0) as u16);
                 assert_eq!(i as u32 >= th, r.at(i) as f64 > 0.2);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod recip_tests {
+    /// 1000/m 원래 값: 역수 곱으로 미터로 바꿨다 mm 로 반올림해도 모든 u16 에서 원래 값(보관 장면의 빠른 길과 같은 값)
+    #[test]
+    fn recip_mm_round_identity() {
+        for v in 0..=65535u16 {
+            assert_eq!(((v as f32 * (1.0 / 1000.0f32)) * 1000.0).round().clamp(0.0, 65535.0) as u16, v);
         }
     }
 }

@@ -71,6 +71,8 @@ slam_bridge --realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file
 | `Slam/FeatureBoxF32` | `--Slam/FeatureBoxF32 true` | 특징점 상자 합을 f32 로: 특징점 13 – 17 % 빠름, 점 순서가 바뀜(점 집합은 거의 같음) |
 | `fast_solver` | 코드 안 `OptimizerParams` 칸 | 그래프 최적화를 원본과 다른 근사 풀이(`graph/solve`)로 1.5 – 2.5 배 빠르게, 값은 마지막 몇 ulp 다름 |
 | `Vis/BundleAdjustment` | `--Vis/BundleAdjustment 0`(기본 1, 원본 기본값) | 위치 추적의 두 장면 묶음 조정을 끔: 1.0 · 1.5 ms/장(책상 · 복도), ATE 0.0792 → 0.0506 m · 0.386 → 0.351 m |
+| `Slam/BAEarlyStop` | `--Slam/BAEarlyStop 1e-3`(기본 0 = 끔) | 번들 조정 반복의 상대 chi2 감소가 이 값보다 작으면 멈춤: BA 0.5 → 0.2 ms/장, ATE desk 0.0792 → 0.0784 · 복도 0.386 → 0.280 · 긴 사무실 0.0434 → 0.0405 m |
+| `Slam/BAAnalyticJacobian` | `--Slam/BAAnalyticJacobian true` | 두 카메라 사이 변의 야코비안을 해석식으로: 시간 · ATE 같음, 비트만 다름(쓸 이유 없음) |
 | `Vis/CorNNType` | `--Vis/CorNNType 3`(기본 1, kd-나무) | 정확한 kNN 짝짓기: 시간 · ATE 같음, 원본 같은 설정과도 바이트 동일 |
 
 ## 출처와 라이선스

@@ -11,54 +11,41 @@
 use super::rtf::Tf;
 
 // ---- 더하기 순서 ----
-#[inline]
-fn d_seq(a: &[f64], b: &[f64]) -> f64 {
+// 길이는 모두 컴파일 때 정해지는 상수(2·3·4·6)라 되부름·조각 없이 펼쳐진다. 더하기 순서는 예전 되부름 판과 같다.
+#[inline(always)]
+fn d_seq<const N: usize>(a: &[f64; N], b: &[f64; N]) -> f64 {
     let mut s = a[0] * b[0];
-    for k in 1..a.len() {
+    for k in 1..N {
         s = s + a[k] * b[k];
     }
     s
 }
-#[inline]
-fn d_tree(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len();
-    if n == 1 {
-        return a[0] * b[0];
+/// 반씩 나눠 나무로 더함(왼쪽 반 = N/2 칸)
+#[inline(always)]
+fn d_tree<const N: usize>(a: &[f64; N], b: &[f64; N]) -> f64 {
+    match N {
+        1 => a[0] * b[0],
+        2 => a[0] * b[0] + a[1] * b[1],
+        3 => a[0] * b[0] + (a[1] * b[1] + a[2] * b[2]),
+        4 => (a[0] * b[0] + a[1] * b[1]) + (a[2] * b[2] + a[3] * b[3]),
+        _ => unreachable!(),
     }
-    let h = n / 2;
-    d_tree(&a[..h], &b[..h]) + d_tree(&a[h..], &b[h..])
 }
-fn tree_sum(v: &[f64]) -> f64 {
-    if v.len() == 1 {
-        return v[0];
+/// 패킷(2 칸) 나무 축약: 짝수 칸·홀수 칸 묶음을 각각 나무로 더하고 합친 뒤, 남는 한 칸
+#[inline(always)]
+fn d_ptree<const N: usize>(a: &[f64; N], b: &[f64; N]) -> f64 {
+    match N {
+        1 => a[0] * b[0],
+        2 => a[0] * b[0] + a[1] * b[1],
+        3 => (a[0] * b[0] + a[1] * b[1]) + a[2] * b[2],
+        6 => (a[0] * b[0] + (a[2] * b[2] + a[4] * b[4])) + (a[1] * b[1] + (a[3] * b[3] + a[5] * b[5])),
+        _ => unreachable!(),
     }
-    let h = v.len() / 2;
-    tree_sum(&v[..h]) + tree_sum(&v[h..])
-}
-/// 패킷(2 칸) 나무 축약
-#[inline]
-fn d_ptree(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len();
-    if n < 2 {
-        return a[0] * b[0];
-    }
-    let np = n / 2;
-    let mut l0 = [0f64; 8];
-    let mut l1 = [0f64; 8];
-    for p in 0..np {
-        l0[p] = a[2 * p] * b[2 * p];
-        l1[p] = a[2 * p + 1] * b[2 * p + 1];
-    }
-    let mut r = tree_sum(&l0[..np]) + tree_sum(&l1[..np]);
-    if n % 2 == 1 {
-        r = r + a[n - 1] * b[n - 1];
-    }
-    r
 }
 
 /// 열 우선 A(R×K)·B(K×C) 한 칸: 3 행이면 2 행만 나무
-#[inline]
-fn mm_elem(rows: usize, i: usize, a: &[f64], b: &[f64]) -> f64 {
+#[inline(always)]
+fn mm_elem<const N: usize>(rows: usize, i: usize, a: &[f64; N], b: &[f64; N]) -> f64 {
     if rows == 3 && i == 2 { d_tree(a, b) } else { d_seq(a, b) }
 }
 
@@ -247,14 +234,21 @@ impl Cam {
         self.drdz = m3_m3(&DRIDZ, &r3);
     }
     /// SBACam::update
-    fn oplus(&mut self, u: &[f64]) {
-        self.se3.t = [self.se3.t[0] + u[0], self.se3.t[1] + u[1], self.se3.t[2] + u[2]];
-        let sq = (u[3] * u[3] + u[4] * u[4]) + u[5] * u[5];
-        let qr = [u[3], u[4], u[5], (1.0 - sq).sqrt()];
-        self.se3.r = q_mul(&self.se3.r, &qr);
-        q_normalize(&mut self.se3.r);
+    fn oplus(&mut self, u: &[f64; 6]) {
+        self.se3 = se3_oplus(&self.se3, u);
         self.refresh();
     }
+}
+
+/// SBACam::update 의 위치 부분(캐시 갱신 없이). 두 카메라 사이 변의 수치 야코비안은 위치만 쓴다
+#[inline]
+fn se3_oplus(s: &Se3, u: &[f64; 6]) -> Se3 {
+    let t = [s.t[0] + u[0], s.t[1] + u[1], s.t[2] + u[2]];
+    let sq = (u[3] * u[3] + u[4] * u[4]) + u[5] * u[5];
+    let qr = [u[3], u[4], u[5], (1.0 - sq).sqrt()];
+    let mut r = q_mul(&s.r, &qr);
+    q_normalize(&mut r);
+    Se3 { r, t }
 }
 
 /// 한 관측(점 → 카메라). dim 2(단안) 또는 3(스테레오 흉내)
@@ -288,6 +282,8 @@ pub struct BaInput<'a> {
     pub baseline: f64,
     /// 정보 행렬은 Optimizer/PixelVariance = DisparityVariance = 1(기본) 의 단위 행렬로 둔다
     pub robust_delta: f64,
+    /// 원본에 없는 선택(기본 끔)
+    pub opt: BaOptions,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -312,6 +308,8 @@ struct Graph {
     obs: Vec<Obs>,
     // 두 카메라 사이 변
     meas_inv: Se3,
+    /// cams[0].se3.inverse()(카메라 1 은 고정)
+    c0_inv: Se3,
     info6: [[f64; 6]; 6],
     link_err: [f64; 6],
 }
@@ -339,7 +337,12 @@ impl Graph {
     }
 
     fn link_error(&self) -> [f64; 6] {
-        let d = self.meas_inv.mul(&self.cams[0].se3.inverse().mul(&self.cams[1].se3));
+        self.link_error_at(&self.cams[1].se3)
+    }
+    /// 카메라 2 위치가 c1 일 때의 두 카메라 사이 변 오차(카메라 1 은 고정이라 역은 미리 구해 둠)
+    #[inline]
+    fn link_error_at(&self, c1: &Se3) -> [f64; 6] {
+        let d = self.meas_inv.mul(&self.c0_inv.mul(c1));
         [d.t[0], d.t[1], d.t[2], d.r[0], d.r[1], d.r[2]]
     }
 
@@ -521,38 +524,37 @@ struct System {
     hll: Vec<M3>,
     bl: Vec<[f64; 3]>,
     /// 점마다 Hpl(6×3), 카메라 2 관측이 활성일 때만
-    hpl: Vec<Option<[[f64; 3]; 6]>>,
+    hpl: Vec<[[f64; 3]; 6]>,
+    has_hpl: Vec<bool>,
 }
 
-fn build_system(g: &Graph, active_pts: &[bool], sys: &mut System) {
+fn build_system(g: &Graph, active_pts: &[bool], sys: &mut System, analytic_link: bool) {
     sys.hpp = [[0.0; 6]; 6];
     sys.bp = [0.0; 6];
-    for i in 0..g.pts.len() {
-        sys.hll[i] = [[0.0; 3]; 3];
-        sys.bl[i] = [0.0; 3];
-        sys.hpl[i] = None;
-    }
+    sys.hll.fill([[0.0; 3]; 3]);
+    sys.bl.fill([0.0; 3]);
+    sys.has_hpl.fill(false);
     // 1) 두 카메라 사이 변(수치 야코비안, 카메라 2 만)
     {
         let delta = 1e-9f64;
         let scalar = 1.0 / (2.0 * delta);
-        let mut jac = [[0f64; 6]; 6]; // jac[row][col]
-        let mut g2 = Graph { cams: g.cams, pts: Vec::new(), obs: Vec::new(), meas_inv: g.meas_inv, info6: g.info6, link_err: [0.0; 6] };
-        for d in 0..6 {
-            let saved = g2.cams[1];
-            let mut add = [0f64; 6];
-            add[d] = delta;
-            g2.cams[1].oplus(&add);
-            let e1 = g2.link_error();
-            g2.cams[1] = saved;
-            add[d] = -delta;
-            g2.cams[1].oplus(&add);
-            let e2 = g2.link_error();
-            g2.cams[1] = saved;
-            for r in 0..6 {
-                jac[r][d] = scalar * (e1[r] - e2[r]);
+        let jac = if analytic_link {
+            link_jacobian_analytic(g)
+        } else {
+            let mut jac = [[0f64; 6]; 6]; // jac[row][col]
+            let c1 = g.cams[1].se3;
+            for d in 0..6 {
+                let mut add = [0f64; 6];
+                add[d] = delta;
+                let e1 = g.link_error_at(&se3_oplus(&c1, &add));
+                add[d] = -delta;
+                let e2 = g.link_error_at(&se3_oplus(&c1, &add));
+                for r in 0..6 {
+                    jac[r][d] = scalar * (e1[r] - e2[r]);
+                }
             }
-        }
+            jac
+        };
         let e = &g.link_err;
         // omega = Ω, 가중 오차 = -(Ω e)
         let mut we = [0f64; 6];
@@ -584,72 +586,60 @@ fn build_system(g: &Graph, active_pts: &[bool], sys: &mut System) {
         if o.level != 0 || !active_pts[o.point] {
             continue;
         }
-        let dd = if o.stereo { 3 } else { 2 };
-        let cam = &g.cams[o.cam];
-        let (jp, jc) = obs_jacobian(cam, &g.pts[o.point], o.stereo);
-        let chi = Graph::obs_chi2(o);
-        let rho = huber(chi, HUBER);
-        let ie = obs_info_mul(&o.err, dd);
-        // omega_r = (-(Ω e)) * rho1, 강건 정보 = rho1 * Ω
-        let mut we = [0f64; 3];
-        for i in 0..dd {
-            we[i] = -ie[i] * rho[1];
+        if o.stereo {
+            add_obs::<3>(g, o, sys);
+        } else {
+            add_obs::<2>(g, o, sys);
         }
-        let mut om = [[0f64; 3]; 3];
-        for i in 0..dd {
-            for j in 0..dd {
-                om[i][j] = rho[1] * if i == j { 1.0 } else { 0.0 };
+    }
+}
+
+/// 재투영 변 하나를 정규 방정식에 더함(D = 오차 차원 2·3, 컴파일 때 정해 펼침)
+#[inline(always)]
+fn add_obs<const D: usize>(g: &Graph, o: &Obs, sys: &mut System) {
+    let cam = &g.cams[o.cam];
+    let (jp, jc) = obs_jacobian(cam, &g.pts[o.point], D == 3);
+    let chi = Graph::obs_chi2(o);
+    let rho = huber(chi, HUBER);
+    let ie = obs_info_mul(&o.err, D);
+    // omega_r = (-(Ω e)) * rho1, 강건 정보 = rho1 * Ω
+    let we: [f64; D] = std::array::from_fn(|i| -ie[i] * rho[1]);
+    // om 의 열 j (대각만 rho1, 나머지 rho1*0)
+    let omc: [[f64; D]; D] = std::array::from_fn(|j| std::array::from_fn(|i| rho[1] * if i == j { 1.0 } else { 0.0 }));
+    // 야코비안의 열(D 칸)
+    let jpc: [[f64; D]; 3] = std::array::from_fn(|i| std::array::from_fn(|r| jp[r][i]));
+    let jcc: [[f64; D]; 6] = std::array::from_fn(|i| std::array::from_fn(|r| jc[r][i]));
+    // 점(꼭짓점 0)
+    let ato_p: [[f64; D]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| d_ptree(&jpc[i], &omc[j])));
+    let p = o.point;
+    for i in 0..3 {
+        sys.bl[p][i] = sys.bl[p][i] + d_ptree(&jpc[i], &we);
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            sys.hll[p][i][j] = sys.hll[p][i][j] + mm_elem(3, i, &ato_p[i], &jpc[j]);
+        }
+    }
+    if o.cam == 1 {
+        // 비대각(점-카메라 2): Hpl(6×3) += Jcᵀ · AtO_pᵀ
+        if !sys.has_hpl[p] {
+            sys.has_hpl[p] = true;
+            sys.hpl[p] = [[0.0; 3]; 6];
+        }
+        let blk = &mut sys.hpl[p];
+        for r in 0..6 {
+            for c in 0..3 {
+                blk[r][c] = blk[r][c] + d_tree(&jcc[r], &ato_p[c]); // 시험: 이 식은 나무 순서
             }
         }
-        // 점(꼭짓점 0)
-        let mut ato_p = [[0f64; 3]; 3]; // 3×D
-        for i in 0..3 {
-            let a = [jp[0][i], jp[1][i], jp[2][i]];
-            for j in 0..dd {
-                let oc = [om[0][j], om[1][j], om[2][j]];
-                ato_p[i][j] = d_ptree(&a[..dd], &oc[..dd]);
-            }
+        // 카메라 2(꼭짓점 1)
+        let ato_c: [[f64; D]; 6] = std::array::from_fn(|i| std::array::from_fn(|j| d_ptree(&jcc[i], &omc[j])));
+        for i in 0..6 {
+            sys.bp[i] = sys.bp[i] + d_ptree(&jcc[i], &we);
         }
-        let p = o.point;
-        for i in 0..3 {
-            let a = [jp[0][i], jp[1][i], jp[2][i]];
-            sys.bl[p][i] = sys.bl[p][i] + d_ptree(&a[..dd], &we[..dd]);
-        }
-        for i in 0..3 {
-            for j in 0..3 {
-                let bc = [jp[0][j], jp[1][j], jp[2][j]];
-                sys.hll[p][i][j] = sys.hll[p][i][j] + mm_elem(3, i, &ato_p[i][..dd], &bc[..dd]);
-            }
-        }
-        if o.cam == 1 {
-            // 비대각(점-카메라 2): Hpl(6×3) += Jcᵀ · AtO_pᵀ
-            let mut blk = sys.hpl[p].unwrap_or([[0.0; 3]; 6]);
-            for r in 0..6 {
-                let bcol = [jc[0][r], jc[1][r], jc[2][r]];
-                for c in 0..3 {
-                    let arow = [ato_p[c][0], ato_p[c][1], ato_p[c][2]];
-                    blk[r][c] = blk[r][c] + d_tree(&bcol[..dd], &arow[..dd]); // 시험: 이 식은 나무 순서
-                }
-            }
-            sys.hpl[p] = Some(blk);
-            // 카메라 2(꼭짓점 1)
-            let mut ato_c = [[0f64; 3]; 6];
-            for i in 0..6 {
-                let a = [jc[0][i], jc[1][i], jc[2][i]];
-                for j in 0..dd {
-                    let oc = [om[0][j], om[1][j], om[2][j]];
-                    ato_c[i][j] = d_ptree(&a[..dd], &oc[..dd]);
-                }
-            }
-            for i in 0..6 {
-                let a = [jc[0][i], jc[1][i], jc[2][i]];
-                sys.bp[i] = sys.bp[i] + d_ptree(&a[..dd], &we[..dd]);
-            }
-            for i in 0..6 {
-                for j in 0..6 {
-                    let bc = [jc[0][j], jc[1][j], jc[2][j]];
-                    sys.hpp[i][j] = sys.hpp[i][j] + d_seq(&ato_c[i][..dd], &bc[..dd]);
-                }
+        for i in 0..6 {
+            for j in 0..6 {
+                sys.hpp[i][j] = sys.hpp[i][j] + d_seq(&ato_c[i], &jcc[j]);
             }
         }
     }
@@ -672,7 +662,8 @@ fn solve_schur(sys: &System, active: &[usize], lambda: f64, dinv: &mut Vec<M3>, 
         let di = inv3(&d);
         let db0 = sys.bl[p];
         let db = m3_v3(&di, &db0);
-        if let Some(bi) = &sys.hpl[p] {
+        if sys.has_hpl[p] {
+            let bi = &sys.hpl[p];
             // BDinv = Bi·Dinv(6 행: 앞에서부터)
             let mut bd = [[0f64; 3]; 6];
             for r in 0..6 {
@@ -704,7 +695,8 @@ fn solve_schur(sys: &System, active: &[usize], lambda: f64, dinv: &mut Vec<M3>, 
     let cp = [-xp[0], -xp[1], -xp[2], -xp[3], -xp[4], -xp[5]];
     for (k, &p) in active.iter().enumerate() {
         let mut cl = sys.bl[p];
-        if let Some(bi) = &sys.hpl[p] {
+        if sys.has_hpl[p] {
+            let bi = &sys.hpl[p];
             for c in 0..3 {
                 let col = [bi[0][c], bi[1][c], bi[2][c], bi[3][c], bi[4][c], bi[5][c]];
                 cl[c] = cl[c] + d_ptree(&col, &cp);
@@ -719,7 +711,7 @@ fn solve_schur(sys: &System, active: &[usize], lambda: f64, dinv: &mut Vec<M3>, 
 }
 
 /// optimize(iterations): LM. 반환: 끝까지 성공했는지(실패 = Fail)
-fn levenberg(g: &mut Graph, iterations: i32) {
+fn levenberg(g: &mut Graph, iterations: i32, opt: &BaOptions) {
     // 활성 점: 레벨 0 관측이 하나라도 있는 점(번호 순)
     let npts = g.pts.len();
     let mut active_pts = vec![false; npts];
@@ -730,7 +722,7 @@ fn levenberg(g: &mut Graph, iterations: i32) {
     }
     let active: Vec<usize> = (0..npts).filter(|&p| active_pts[p]).collect();
     let dim = 6 + 3 * active.len();
-    let mut sys = System { hpp: [[0.0; 6]; 6], bp: [0.0; 6], hll: vec![[[0.0; 3]; 3]; npts], bl: vec![[0.0; 3]; npts], hpl: vec![None; npts] };
+    let mut sys = System { hpp: [[0.0; 6]; 6], bp: [0.0; 6], hll: vec![[[0.0; 3]; 3]; npts], bl: vec![[0.0; 3]; npts], hpl: vec![[[0.0; 3]; 6]; npts], has_hpl: vec![false; npts] };
     let mut x = vec![0f64; dim];
     let mut b = vec![0f64; dim];
     let mut backup_pts: Vec<[f64; 3]> = Vec::with_capacity(active.len());
@@ -741,7 +733,8 @@ fn levenberg(g: &mut Graph, iterations: i32) {
     for it in 0..iterations {
         g.compute_errors();
         let mut current_chi = g.active_robust_chi2();
-        build_system(g, &active_pts, &mut sys);
+        let chi_start = current_chi;
+        build_system(g, &active_pts, &mut sys, opt.analytic_jacobian);
         b[..6].copy_from_slice(&sys.bp);
         for (k, &p) in active.iter().enumerate() {
             b[6 + 3 * k..6 + 3 * k + 3].copy_from_slice(&sys.bl[p]);
@@ -822,7 +815,43 @@ fn levenberg(g: &mut Graph, iterations: i32) {
         if qmax == 10 || rho == 0.0 || !lambda.is_finite() {
             break;
         }
+        // 선택(기본 끔): 받아들인 걸음의 상대 chi2 감소가 작으면 일찍 멈춤
+        if opt.early_stop > 0.0 && rho > 0.0 && chi_start > 0.0 && (chi_start - current_chi) / chi_start < opt.early_stop {
+            break;
+        }
     }
+}
+
+/// 원본에 없는 선택(모두 기본 끔 = 원본과 비트 단위로 같음)
+#[derive(Clone, Copy, Default)]
+pub struct BaOptions {
+    /// Slam/BAAnalyticJacobian: 두 카메라 사이 변의 야코비안을 수치 미분 대신 해석식으로
+    pub analytic_jacobian: bool,
+    /// Slam/BAEarlyStop: 반복의 상대 chi2 감소가 이 값보다 작으면 멈춤(0 = 끔)
+    pub early_stop: f64,
+}
+
+/// 두 카메라 사이 변 오차 e = (meas⁻¹·c0⁻¹·(c1 ⊕ u)) 의 u=0 에서의 해석 야코비안.
+/// 위치: c1.t + u_t 가 A=meas⁻¹·c0⁻¹ 의 회전 R_A 로 돌아감 → ∂e_t/∂u_t = R_A, ∂e_t/∂u_r = 0.
+/// 회전: d ⊗ (u_r, √(1-|u_r|²)) 의 벡터부 → ∂e_r/∂u_r = d_w·I + [d_v]×(d 는 정규화·부호 맞춘 현재 오차 쿼터니언)
+fn link_jacobian_analytic(g: &Graph) -> [[f64; 6]; 6] {
+    let a = g.meas_inv.mul(&g.c0_inv);
+    let ra = q_to_mat(&a.r);
+    let d = g.meas_inv.mul(&g.c0_inv.mul(&g.cams[1].se3));
+    let (x, y, z, w) = (d.r[0], d.r[1], d.r[2], d.r[3]);
+    let mut j = [[0f64; 6]; 6];
+    for r in 0..3 {
+        for c in 0..3 {
+            j[r][c] = ra[r][c];
+        }
+    }
+    let jr = [[w, -z, y], [z, w, -x], [-y, x, w]];
+    for r in 0..3 {
+        for c in 0..3 {
+            j[3 + r][3 + c] = jr[r][c];
+        }
+    }
+    j
 }
 
 thread_local! {
@@ -855,7 +884,7 @@ pub fn optimize_ba(inp: &BaInput) -> BaOutput {
     for i in 0..6 {
         info6[i][i] = 1.0 * (1.0 / inp.cov_diag[i]);
     }
-    let mut g = Graph { cams: [c1, c2], pts: Vec::with_capacity(n), obs: Vec::with_capacity(2 * n), meas_inv: meas.inverse(), info6, link_err: [0.0; 6] };
+    let mut g = Graph { cams: [c1, c2], pts: Vec::with_capacity(n), obs: Vec::with_capacity(2 * n), meas_inv: meas.inverse(), c0_inv: c1.se3.inverse(), info6, link_err: [0.0; 6] };
     for (k, p) in inp.points.iter().enumerate() {
         g.pts.push([p.p3[0] as f64, p.p3[1] as f64, p.p3[2] as f64]);
         for cam in 0..2 {
@@ -873,7 +902,7 @@ pub fn optimize_ba(inp: &BaInput) -> BaOutput {
     let passes = if inp.robust_delta > 0.0 { 2 } else { 1 };
     for i in 0..passes {
         let iters = if i == 0 && inp.robust_delta > 0.0 { 5.min(inp.iterations) } else { inp.iterations };
-        levenberg(&mut g, iters);
+        levenberg(&mut g, iters, &inp.opt);
         g.compute_errors();
         let chi2 = g.active_robust_chi2();
         if chi2.is_nan() {

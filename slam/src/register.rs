@@ -123,6 +123,7 @@ pub struct RegistrationVis {
     ba_iterations: i32,
     ba_baseline: f64,
     ba_robust_delta: f64,
+    ba_opt: ba::BaOptions,
 }
 
 /// 해밍 거리용으로 미리 64 비트 넷으로 바꾼 설명자
@@ -204,6 +205,7 @@ impl RegistrationVis {
             ba_iterations: p.get("Optimizer/Iterations", 20i32),
             ba_baseline: p.get("Optimizer/Baseline", 0.075f64),
             ba_robust_delta: p.get("Optimizer/RobustKernelDelta", 8.0f64),
+            ba_opt: ba::BaOptions { analytic_jacobian: p.get_bool("Slam/BAAnalyticJacobian", false), early_stop: p.get("Slam/BAEarlyStop", 0.0f64) },
         }
     }
 
@@ -373,6 +375,7 @@ impl RegistrationVis {
                 iterations: self.ba_iterations,
                 baseline: self.ba_baseline,
                 robust_delta: self.ba_robust_delta,
+                opt: self.ba_opt,
             });
             PROF.with(|p| p.borrow_mut()[3] += _p2.elapsed().as_secs_f64());
             match out.transform {

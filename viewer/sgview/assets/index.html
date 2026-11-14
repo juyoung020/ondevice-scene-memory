@@ -1440,7 +1440,8 @@ function applyView(v) {
   if (!LIVE) { const sPose = JSON.stringify(view.pose); if (sPose !== prev.pose) drawRobot(); prev.pose = sPose; }
   status(); if (objChanged) renderInfo();
   Object.assign(prev, { obj:sObj, graph:sGraph, rooms:sRooms, grid:sGrid });
-  if (!viewSeen) { viewSeen = true; fitView(false); const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
+  if (!viewSeen) { viewSeen = true; fitView(QS.get("top") === "1");   // ?top=1: start in the Top view
+    const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
 }
 
 // Memory folder (not --ingest): the server watches view.json / pose.json and pushes over /stream (SSE) — `vv` = new view.json

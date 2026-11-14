@@ -42,7 +42,7 @@ D435(컬러 + 깊이) → rtab_bridge(C++, RTAB-Map 위치 추적·루프 클로
 | 물체 분할 | 받은 장면의 90 % 이상(초당 약 10 번) |
 | 카메라 위치 오차 | 책상 4 cm, 사무실 3 cm, 58 m 복도 24 cm |
 
-측정 방법과 기록은 [docs/performance_log.md](docs/performance_log.md)에 있습니다.
+측정 방법과 기록은 [docs/performance_log.md](docs/performance_log.md)에, 최적화별 전·후 요약은 [docs/optimization.md](docs/optimization.md)에 있습니다.
 
 ## 빠른 시작 — PC(Windows·WSL)
 

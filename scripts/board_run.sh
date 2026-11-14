@@ -25,7 +25,7 @@ EMB_NPU=${EMB_NPU:-all}
 # 분할을 NPU 에 함께 올릴 장 수. 2026-11-15 fr1_desk: 1 · 2 · 4 장에서 분할 지연 41 · 53 · 62 ms, 장면 처리 속도는 같음
 NPU_JOBS=${NPU_JOBS:-1}
 rm -rf "$OUT"; mkdir -p "$OUT"
-exec target/release/ondevice --slam "$SRC" \
+exec "${BIN:-target/release/ondevice}" --slam "$SRC" \
     --every 1 --live 1 --seg "$SEG" --embed "$EMB" --vocab "$VOCAB" \
     --max-depth 3.5 --out "$OUT" --rt "$RT" --mlock --seg-npu "$SEG_NPU" --embed-npu "$EMB_NPU" --npu-jobs "$NPU_JOBS" \
     --serve "8091 --bind 0.0.0.0 --search-model $M/siglip2 --vocab vocab/names.voc" "$@"

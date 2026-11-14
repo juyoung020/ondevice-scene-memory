@@ -378,6 +378,9 @@ pub struct OdometryKlt {
     pub recovered: usize,
     /// 깊이 ICP 로 이어 간 장면 수
     pub by_icp: usize,
+    /// 다시 시작한 첫 장면이 마지막 성공 장면 깊이와 ICP 로 맞았는지(이어 붙인 자리가 확인됨)
+    pub bridge_verified: bool,
+    pub bridges_verified: usize,
     /// 시험용: 광류 없이 깊이 ICP 만(OdomKlt/DepthOnly)
     depth_only: bool,
     /// 마지막 성공 장면의 깊이 격자(깊이 ICP)
@@ -408,6 +411,8 @@ impl OdometryKlt {
             keep_err: p.get("OdomKlt/KeepError", 3.0f32),
             recovered: 0,
             by_icp: 0,
+            bridge_verified: false,
+            bridges_verified: 0,
             depth_only: p.get_bool("OdomKlt/DepthOnly", false),
             prev_sub: Vec::new(),
             cur_sub: Vec::new(),
@@ -421,11 +426,15 @@ impl OdometryKlt {
 
     /// 이 위치에서 처음부터(다음 장면이 첫 장면)
     pub fn reset_tf(&mut self, pose: Tf) {
+        // 같은 자리에서 다시 시작(이어 붙이기)이면 마지막 성공 장면 깊이를 남겨, 첫 장면에서 그 깊이와 ICP 로 실제 움직임을 잡는다
+        let same_place = pose == self.pose;
         self.pose = pose;
         self.prev = None;
         self.tracks.clear();
         self.kf = None;
-        self.prev_sub.clear();
+        if !same_place {
+            self.prev_sub.clear();
+        }
         self.velocity = Tf::NULL;
         self.prev_t = 0.0;
     }
@@ -566,6 +575,15 @@ impl OdometryKlt {
         let Some(prev) = self.prev.take() else {
             // 첫 장면: 점만 만들고 '새로 시작'(공분산 9999)
             self.tracks.clear();
+            // 이어 붙이기: 마지막 성공 장면 깊이가 남아 있으면 움직임 없음에서 시작하는 ICP 로 그사이 움직임을 바로잡음
+            self.bridge_verified = false;
+            if !self.prev_sub.is_empty() && !f.depth_mm.is_empty() && sub_depth(&f.depth_mm, w, h, &mut self.cur_sub) > 1000 {
+                if let Some(tpo) = icp(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &Tf::IDENTITY) {
+                    self.pose = self.pose.mul(&local.mul(&tpo).mul(&local.inverse()));
+                    self.bridge_verified = true;
+                    self.bridges_verified += 1;
+                }
+            }
             self.top_up(f);
             let nd = if f.depth_mm.is_empty() { 0 } else { sub_depth(&f.depth_mm, w, h, &mut self.prev_sub) };
             // 어두워 점이 모자라도 깊이가 있으면 시작(깊이 ICP 로 이어 감)
@@ -581,7 +599,8 @@ impl OdometryKlt {
         };
         let dt = f.t - self.prev_t;
         // 1) 등속 예측 시작점
-        let pred = if !self.velocity.is_null() && dt > 0.0 {
+        // 0.2 초 넘게 비면(녹화 빈틈·놓친 뒤) 등속 예측은 틀리기 쉬워 쓰지 않음(움직임 없음에서 시작)
+        let pred = if !self.velocity.is_null() && dt > 0.0 && dt < 0.2 {
             let v = self.velocity.xyz_rpy();
             let m = |x: f32| (x as f64 * dt) as f32;
             Some(self.pose.mul(&Tf::from_xyz_rpy(m(v[0]), m(v[1]), m(v[2]), m(v[3]), m(v[4]), m(v[5]))))

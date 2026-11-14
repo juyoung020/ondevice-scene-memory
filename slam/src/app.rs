@@ -208,6 +208,8 @@ mod engine {
         pub loop_unique_ids: Arc<AtomicU32>,
         pub ref_reuse: u32,
         pub ref_unknown: u32,
+        /// 지도 노드마다 특징(기술자·3D)과 그때 위치 추적 위치: 놓쳤을 때 지도 전체에서 다시 잡기(global_reloc)
+        kf_db: Vec<(Features, Tf)>,
     }
 
     impl Engine {
@@ -244,6 +246,7 @@ mod engine {
                 loop_unique_ids: unique,
                 ref_reuse: 0,
                 ref_unknown: 0,
+                kf_db: Vec::new(),
             }
         }
 
@@ -294,6 +297,56 @@ mod engine {
             }
         }
 
+
+        /// 지도 전체에서 다시 잡기: 모든 지도 노드와 기술자 닮음(해밍 < 40 인 짝 수, 이번 특징 100 개 표본)으로 순위를 매기고
+        /// 위 3 개만 PnP 로 맞춰 본다(최근 기준 장면만 보는 reloc 와 달리 오래전 노드도). 성공하면 (위치, 맞은 점, 공분산)
+        /// 광류 경로: 방금 다시 시작한 장면이 마지막 성공 장면 깊이와 ICP 로 맞았는지
+        pub fn bridge_verified(&self) -> bool {
+            matches!(&self.odom, Odom::Klt(o) if o.bridge_verified)
+        }
+
+        pub fn global_reloc(&mut self, f: &Frame, min_inliers: usize) -> Option<(Tf, i32, [f64; 36])> {
+            self.ensure_cur(f);
+            if self.cur.desc.is_empty() || self.kf_db.is_empty() {
+                return None;
+            }
+            let words = |d: &[u8; 32]| -> [u64; 4] { std::array::from_fn(|i| u64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap())) };
+            let step = (self.cur.desc.len() / 100).max(1);
+            let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
+            let mut scores: Vec<(usize, usize)> = self
+                .kf_db
+                .iter()
+                .enumerate()
+                .map(|(i, (kf, _))| {
+                    let kw: Vec<[u64; 4]> = kf.desc.iter().map(words).collect();
+                    let hits = q
+                        .iter()
+                        .filter(|a| kw.iter().any(|b| (0..4).map(|j| (a[j] ^ b[j]).count_ones()).sum::<u32>() < 40))
+                        .count();
+                    (hits, i)
+                })
+                .collect();
+            scores.sort_by(|a, b| b.cmp(a));
+            let prof = std::env::var("KLT_PROF").is_ok();
+            if prof {
+                eprintln!("global db {} q {} top {:?}", self.kf_db.len(), q.len(), &scores[..scores.len().min(3)]);
+            }
+            let cam = f.cam.clone();
+            for &(hits, i) in scores.iter().take(2) {
+                if hits < 10 {
+                    break;
+                }
+                let (kf, kp) = &self.kf_db[i];
+                let info = self.reloc.compute_tf(kf, &self.cur, &cam, Tf::NULL);
+                if prof {
+                    eprintln!("global try {i} inliers {} null {}", info.inliers, info.tf.is_null());
+                }
+                if !info.tf.is_null() && info.inliers >= min_inliers {
+                    return Some((kp.mul(&info.tf), info.inliers as i32, cov36(&info.covariance)));
+                }
+            }
+            None
+        }
 
         pub fn cur_features(&self) -> Features {
             self.cur.clone()
@@ -363,6 +416,11 @@ mod engine {
         pub fn slam_process(&mut self, f: &Frame, node: bool, pose: Option<Tf>, cov: &[f64; 36], velocity: Vec<f32>) {
             if node {
                 self.ensure_cur(f);
+                if let Some(p) = pose {
+                    if !self.cur.desc.is_empty() {
+                        self.kf_db.push((self.cur.clone(), p));
+                    }
+                }
             }
             let features = if node {
                 // 이 장면 특징은 노드로 넘기면 더 쓰지 않음: 설명자는 복사 없이 옮김
@@ -396,6 +454,7 @@ mod engine {
             self.slam.trigger_new_map()
         }
         pub fn reset(&mut self) {
+            self.kf_db.clear();
             self.slam.reset();
         }
 
@@ -691,6 +750,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let reloc_wait = if a.reloc_wait >= 0.0 { a.reloc_wait } else if klt_path { 0.0 } else { 1.0 };
     let bridge = a.bridge && klt_path;
     let mut n_bridge = 0i64;
+    let mut n_global = 0i64;
+    let mut last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
+    let mut n_bridge_ok = 0i64;
 
     let mut refs: VecDeque<Ref> = VecDeque::new();
     let mut ref_next = 0usize;
@@ -808,6 +870,23 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 common::info!("장면 {n}: 같은 지도에서 다시 잡음({:.2} 초 전 장면, 맞은 점 {})", fr.t - rt, ri.inliers);
                 break;
             }
+            // 최근 기준 장면으로 못 잡으면 지도 전체에서(광류 경로, 놓친 동안 장면마다)
+            if !relocalized && klt_path && fr.t - last_good_t > 0.2 {
+                if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize) {
+                    eng.odom_reset(p);
+                    let info2 = eng.odom_process(&fr, None);
+                    if info2.pose.is_some() {
+                        pose = info2.pose;
+                        info = info2;
+                        info.cov = cov;
+                        info.inliers = inl;
+                        relocalized = true;
+                        n_reloc += 1;
+                        n_global += 1;
+                        common::info!("장면 {n}: 지도 전체에서 다시 잡음(맞은 점 {inl})");
+                    }
+                }
+            }
             s_reloc.add(ms_since(cr));
             // 기다려도 못 잡으면 마지막 위치에서 다시 시작 → 새 지도(이전 지도와 이어질 때까지 보내지 않음)
             if !relocalized && (!anchored || fr.t - lost_since > reloc_wait) {
@@ -823,6 +902,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         }
         if pose.is_some() {
             lost_since = -1.0;
+            last_good_t = fr.t;
         }
         // 위치 추적 자체가 위치를 못 낸 장면(지도 잇기 여부와 별개)
         let no_pose = pose.is_none();
@@ -838,6 +918,13 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 info.cov[i * 7] = 0.5;
             }
             n_bridge += 1;
+            if eng.bridge_verified() {
+                // 깊이 ICP 로 그사이 움직임을 잡았다: 보통 위치 추적처럼 작은 불확실성
+                for i in 0..6 {
+                    info.cov[i * 7] = 1e-3;
+                }
+                n_bridge_ok += 1;
+            }
         }
         if !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
             common::info!("장면 {n}: 위치 추적 다시 시작 → 새 지도");
@@ -1048,7 +1135,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     drop(stats_f);
 
     if bridge {
-        common::info!("놓친 뒤 같은 지도로 이어 붙임 {n_bridge} 번");
+        common::info!("놓친 뒤 같은 지도로 이어 붙임 {n_bridge} 번(깊이 ICP 로 자리 확인 {n_bridge_ok} 번), 지도 전체에서 다시 잡음 {n_global} 번");
     }
     common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
     common::info!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");

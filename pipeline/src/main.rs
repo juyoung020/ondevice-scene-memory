@@ -1298,14 +1298,16 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 32 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음)
-    const DEC_CHUNK: usize = 32;
+    // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 몇 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음).
+    // 한 번에 푸는 장 수 = 풀의 스레드 수(최대 8): 푼 장면 하나가 약 2.1 MB(깊이 f32 + 컬러)라 32 장씩이면 최대 메모리가 67 MB 늘었다.
+    // 쌓기가 차례대로라 8 장 넘게 미리 풀어도 빨라지지 않는다
+    let dec_chunk = rayon::current_num_threads().clamp(1, 8);
     let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>, Option<PtsGrid>)> = Default::default();
     for (i, (kf, r, pwc)) in snap.iter().enumerate() {
         let cd = Instant::now();
         if dec.is_empty() {
             use rayon::prelude::*;
-            let end = (i + DEC_CHUNK).min(snap.len());
+            let end = (i + dec_chunk).min(snap.len());
             dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets(), kf.pts.wait().as_ref().map(PtsGrid::from_z))).collect::<Vec<_>>().into();
         }
         let (kd, kr, kdets, kpts) = dec.pop_front().unwrap();

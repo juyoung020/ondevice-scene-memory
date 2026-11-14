@@ -20,6 +20,38 @@
 | ⑪ **비동기·캐시, NPU 는 차례대로**(짝 한 번만·특징점 400·위치표·기록 스레드) | **Pi 5** | ~160 ms | **6.2 kf/s** | ⑨ 대비 1.8 배, 재부팅 뒤 링크 다운 없음 |
 | ⑪ 같은 구성(동시 실행 시 측정), TUM fr1/desk | Pi 5 | 101 ms | 9.9 kf/s | 포즈 오차 0.71 m / 9.4 m(Kinect 0.12 m) — 차례대로면 다시 잴 것 |
 
+## 보드 경로 성능: NEON · 실시간 배치 · 복사 줄이기 (PC WSL, 2026-11-15)
+
+비교: `198ac5d`(옛 main) ↔ `opt/perf`. 분할은 녹화마다 한 번 돌려 `--seg-cache` 로 두 판이 같은 결과를 읽는다(지도 · 물체 · 넣기 코드만 비교). 공통 인자 `--no-drop --surface --max-depth 3.5`, 위치 `--slam "--tum … --rate 0 --block --config docs/rtabmap_pi.ini"`.
+
+**바이트 비교(값이 같은 커밋들)**
+
+| 입력 | 기억 폴더 |
+|---|---|
+| fr1_desk `--rebuild-every 0` | 318 파일 같음 |
+| fr1_desk 기본(다시 쌓기 5 초) | 318 파일 같음 |
+| digiteo2 `--rebuild-every 0` | 1,591 파일 같음 |
+| long_office `--every 2` | 748 파일 같음 |
+| 위치 프로그램만(`ondevice slam` ↔ `slam_bridge`) | 스트림 md5 a58d15911c0a · 위치 f0bccbdfb973 같음 |
+| `--serve` 응답 93 종(fr1_desk) | 실행 번호(`run`)만 다르고 같음 |
+
+**NEON(aarch64)**: `scripts/cross_check.sh`(교차 빌드 + `qemu-aarch64 -cpu max`, `cortex-a76`) — YUYV→RGB+회색조 NEON 판이 스칼라 식과 모든 Y·U·V 조합에서 비트 동일, 해밍 NEON 판 20 만 쌍 동일, common · slam · rsdriver · tools 시험 전부 통과.
+
+**값이 바뀌는 커밋(깊이 역수 곱)**: 원래 깊이 값 → 미터를 `v / per_m` 대신 `v × (1/per_m)`.
+
+| 입력 | 지도 위치 오차(poses_map) | 물체 수 · 이름별 | 점 지도 점 수 | 바뀐 파일 |
+|---|---|---|---|---|
+| fr1_desk `--rebuild-every 0` | 0.0264 m → 0.0264 m | 15 → 15, 이름별 같음 | 167,593 → 167,588 | 169 / 318 |
+| fr1_desk 기본 | 0.0264 → 0.0264 | 15 → 15, 같음 | 167,593 → 167,588 | 169 / 318 |
+| digiteo2 | (정답 없음) | 2 → 2, 같음 | 162,043 → 162,037 | 683 / 1,591 |
+| long_office `--every 2` | 0.0291 → 0.0291 | 41 → 41, 같음 | 1,341,194 → 1,341,201 | 564 / 748 |
+
+표면 비교 도구 `surfcmp` 는 표면 지도를 점 지도로 바꿀 때 함께 빠져 점 수로 견줬다(차이 0.001 % 안).
+
+**PC 시간**(long_office `--every 2`, 번갈아 두 번): 옛 판 29.4 · 29.6 초(CPU 46.7 · 46.8 초) ↔ 새 판 29.9 · 30.8 초(CPU 47.2 · 47.4 초). PC(x86)에는 NEON 판이 들어가지 않고 실시간 배치는 기본 꺼짐이라 같은 범위. **보드 숫자는 보드 실측 예정**(`--rt auto --mlock`, `scripts/board_tune.sh`, `scripts/pgo.sh`).
+
+시험: `cargo test --workspace --release` 윈도우 · WSL 모두 통과, `--no-default-features --features dxrt` · `slam-realsense` · `mimalloc` 빌드 확인.
+
 ## 무엇을 바꿨나
 
 ### ①→② 같은 일을 묶어서 (파이썬)

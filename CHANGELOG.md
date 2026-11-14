@@ -7,6 +7,8 @@
 ## [Unreleased]
 
 ### Added
+- 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.
+- 보드(aarch64) YUYV→RGB · 회색조와 설명자 해밍 거리를 NEON 으로 계산한다(결과 비트 동일).
 - Rust 로 다시 짠 위치 프로그램 `slam/`(`ondevice --slam` · `ondevice slam`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 한 프로그램 `ondevice`: 위치 추적(`--slam`) → 지도·물체 → 뷰어 서버(`--serve`)를 한 프로세스에서 복사 없이 돌린다(기억 폴더는 장면 스트림 방식과 바이트 동일). 뷰어는 이 프로세스가 쓴 기억 파일을 디스크에서 다시 읽지 않고 메모리에서 보낸다.
 - D435 입력을 librealsense2 없이 `rsdriver` 로 받는 `--driver rsdriver`(리눅스 기본, librealsense 판은 `--driver librealsense`).
@@ -16,6 +18,8 @@
 - 분할 모델의 클래스 이름 `ondevice --seg-names <이름,…>`: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `--seg-names object` 로 쓰고 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
 
 ### Changed
+- 기준 장면 · 스트림이 깊이 버퍼를 나눠 들고, 물체 사진 깊이 · 지도 그림 · 침식 · 레터박스의 복사와 할당을 줄였다(출력 바이트 동일).
+- 원래 깊이 값을 미터로 바꿀 때 역수 곱을 쓴다(끝자리 차이, 위치 오차 · 물체 수 같음).
 - **호환 변경:** 실행 파일을 `ondevice` 하나로 합쳤다(`memmap` → `ondevice`, `slam_bridge` → `ondevice slam`, `sgview` → `ondevice view`). 보드 실시간도 `ondevice --slam "--realsense …" --serve …` 한 명령이다.
 - 명령줄을 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 위치 프로그램 풀을 `--threads` 의 `slam` 역할로 코어에 묶을 수 있다.
 - 장면 스트림 형식 · TUM 목록 · 사원수 · PNG/PLY 쓰기 · ONNX Runtime 환경 · RealSense C API 선언을 한 곳씩으로 합쳤다(공통 크레이트 `common`, 출력 바이트 동일).

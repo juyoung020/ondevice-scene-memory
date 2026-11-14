@@ -382,8 +382,8 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         (s.pre, s.infer, s.post, s.n) = (s.pre + j.t[0], s.infer + j.t[1], s.post + j.t[2], s.n + 1);
         d
     });
-    let sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: sf.rgb, w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, anchor: sf.anchor, graph: j.graph };
+    let mut sf = j.sf;
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
 
@@ -823,7 +823,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
-    while let Ok(Frame { t, mut p, mut r, mut rgb, w, h, mut depth, dets, load, seg: seg_s, lost, held, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, anchor, graph }) = rx.recv() {
+        // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
+        let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
         *taken.n.lock().unwrap() += 1;
         taken.cv.notify_all();
         let c_top = Instant::now();
@@ -904,9 +906,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             // 기준 노드가 믿는 노드로 바뀌면(루프 클로저로 이어짐) 다시 쌓기가 고친 위치로 넣는다
             stream_held += 1;
             if leveled && a.rebuild_every >= 0.0 && kfs.holds(anchor) {
-                let keep = kfs.push(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, &rgb, &depth, &dets, true);
+                let keep = kfs.push(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, &rgb, &depth, dets, true);
                 match (pw.as_mut(), keep) {
-                    (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut depth), std::mem::take(&mut rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김
+                    (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut *depth), std::mem::take(&mut *rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김
                     (None, Some(kf)) => { let _ = kf.pts.set(None); }
                     _ => {}
                 }
@@ -1005,12 +1007,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let c_pt = Instant::now();
         // 보관(줄인 보관이어도 점 지도는 점 작업 스레드가 붙이는 점 격자로 다시 쌓음)
         let keep = (map_ok && a.stream.is_some() && a.rebuild_every >= 0.0)
-            .then(|| kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, &dets, true))
+            .then(|| kfs.push(t, anchor, raw.0, raw.1, h_now, w, h, &rgb, &depth, dets, true))
             .flatten();
         if let (Some(p), true) = (pw.as_mut(), map_ok) {
             // 깊이·사진은 이 뒤 본 스레드가 쓰지 않으므로 복사 없이 넘김
-            let rgb_pts = std::mem::take(&mut rgb);
-            p.frame(nkf, r, pwc, std::mem::take(&mut depth), rgb_pts, w, h, keep, behind);
+            let rgb_pts = std::mem::take(&mut *rgb);
+            p.frame(nkf, r, pwc, std::mem::take(&mut *depth), rgb_pts, w, h, keep, behind);
         }
         clock.add(P::Pts, c_pt);
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
@@ -1269,16 +1271,23 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 32 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음)
+    const DEC_CHUNK: usize = 32;
+    let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>, Option<PtsGrid>)> = Default::default();
     for (i, (kf, r, pwc)) in snap.iter().enumerate() {
         let cd = Instant::now();
-        let (kd, kr) = (Depth::M(kf.depth()), kf.rgb());
+        if dec.is_empty() {
+            use rayon::prelude::*;
+            let end = (i + DEC_CHUNK).min(snap.len());
+            dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets(), kf.pts.wait().as_ref().map(PtsGrid::from_z))).collect::<Vec<_>>().into();
+        }
+        let (kd, kr, kdets, kpts) = dec.pop_front().unwrap();
         t_dec += cd.elapsed().as_secs_f64();
-        let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kf.dets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
+        let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kdets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
         {
             // 점 지도: 점 작업 스레드가 보관해 둔 점 격자(온 장면을 풀지 않음)
             let cp = Instant::now();
-            let zz = kf.pts.wait();
-            if let Some(g) = zz.as_ref().map(PtsGrid::from_z) {
+            if let Some(g) = kpts {
                 grid_points(k, &g, r, pwc, &mut scene, i as u32);
             }
             t_pts += cp.elapsed().as_secs_f64();
@@ -1317,7 +1326,7 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
         }
     }
     for (kf, r, pwc) in newer.iter() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets, true, grid, mem, traj, map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets(), true, grid, mem, traj, map_traj);
     }
     eprintln!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
               rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
@@ -1460,6 +1469,42 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, scene: &mut SceneMap,
     }
 }
 
+/// 장면 버퍼를 쥔 채 쓰다가 버려질 때 카메라 입력에 돌려줌(Deref 로 안의 값을 그대로 씀)
+struct Recycle<T: Give + Default>(T);
+trait Give {
+    fn give(self);
+}
+impl Give for Vec<u8> {
+    fn give(self) {
+        slam::bufpool::give_rgb(self);
+    }
+}
+impl Give for Depth {
+    fn give(self) {
+        if let Some(d) = self.into_raw() {
+            slam::bufpool::give_depth(d);
+        }
+    }
+}
+impl<T: Give + Default> Drop for Recycle<T> {
+    fn drop(&mut self) {
+        if slam::bufpool::enabled() {
+            std::mem::take(&mut self.0).give();
+        }
+    }
+}
+impl<T: Give + Default> std::ops::Deref for Recycle<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<T: Give + Default> std::ops::DerefMut for Recycle<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// 다 쓴 장면 컬러·깊이 버퍼를 카메라 입력(rsdriver)에 돌려줌(카메라 입력이 아니면 그냥 버림)
 fn give_back(rgb: Vec<u8>, depth: Depth) {
     if slam::bufpool::enabled() {
@@ -1574,6 +1619,7 @@ impl PtsWorker {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
+            give_back(rgb, depth);
             if let Some(s) = keep {
                 let _ = s.pts.set(None);
             }
@@ -1595,6 +1641,7 @@ impl PtsWorker {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
             self.dropped += 1;
+            give_back(rgb, depth);
             let _ = keep.pts.set(None);
             return;
         }
@@ -2060,7 +2107,7 @@ const CATCH_UP_MAX: usize = 3;
 fn catch_up(a: &Args, k: [f64; 4], rb: &mut Rebuilt, newer: Snap) {
     let c0 = Instant::now();
     for (kf, r, pwc) in newer.iter() {
-        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets, true, &mut rb.grid, &mut rb.mem, &mut rb.traj, &mut rb.map_traj);
+        map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &Depth::M(kf.depth()), &kf.rgb(), kf.w, kf.h, &kf.dets(), true, &mut rb.grid, &mut rb.mem, &mut rb.traj, &mut rb.map_traj);
         rb.last_seq = kf.seq;
     }
     rb.secs += c0.elapsed().as_secs_f64();

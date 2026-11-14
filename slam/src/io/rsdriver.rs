@@ -2,7 +2,7 @@
 //! (컬러 RGB8, 컬러 격자에 정렬한 깊이, 보정값 = 컬러 카메라).
 //! 시각: rsdriver 는 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한다(librealsense 의 global time 처럼
 //! 장치·시스템 시계 차이를 계속 따라가지 않음). 장면끼리의 간격은 장치 시각 그대로다.
-use super::{optical_rotation, split_depth, to_gray, FrameSource};
+use super::{optical_rotation, split_depth, FrameSource};
 use crate::{Camera, Frame};
 use rsdriver::camera::{Camera as RsCamera, Config, Output};
 use std::time::Instant;
@@ -20,7 +20,7 @@ impl RsDriverSource {
         let cam = RsCamera::open(Config { width: w, height: h, fps, serial: serial.to_string(), exposure_ms, gain, ..Default::default() })?;
         let desc = cam.describe();
         crate::bufpool::enable();
-        Ok(RsDriverSource { cam, out: Output::default(), id: 0, read_ms: 0.0, desc })
+        Ok(RsDriverSource { cam, out: Output { want_gray: true, ..Default::default() }, id: 0, read_ms: 0.0, desc })
     }
 }
 
@@ -35,13 +35,16 @@ impl FrameSource for RsDriverSource {
         if self.out.aligned.capacity() == 0 {
             self.out.aligned = crate::bufpool::take_depth(n);
         }
+        if self.out.gray.capacity() == 0 {
+            self.out.gray = crate::bufpool::take_gray(n);
+        }
         let info = self.cam.next_into(&mut self.out)?;
         // 장치 버퍼에서 한 번 채운 컬러·깊이를 그대로 장면으로 넘김(다음 장면은 돌려받은 버퍼나 새 버퍼에: 앞 장면은 memmap 이 들고 있음)
         let color = std::mem::take(&mut self.out.rgb);
         let depth_raw = std::mem::take(&mut self.out.aligned);
         let k = &self.cam.calib.color;
         let dpm = self.cam.depth_per_m();
-        let gray = to_gray(&color, true);
+        let gray = std::mem::take(&mut self.out.gray); // YUYV→RGB 와 같은 훑기에서 채운 회색조(to_gray(&color, true) 와 같은 값)
         let (depth_mm, depth_raw) = split_depth(depth_raw, dpm); // 1000/m 이면 복사 없이 한 버퍼
         self.id += 1;
         self.read_ms = c0.elapsed().as_secs_f64() * 1e3;

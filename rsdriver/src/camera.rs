@@ -197,6 +197,9 @@ pub struct Output {
     /// true 면 컬러 원본 YUYV 도 채움(빽빽하게 w*2)
     pub want_yuyv: bool,
     pub yuyv: Vec<u8>,
+    /// true 면 회색조(OpenCV BGR2GRAY 식)도 YUYV→RGB 와 같은 훑기에서 채움(w*h)
+    pub want_gray: bool,
+    pub gray: Vec<u8>,
 }
 
 struct Side {
@@ -406,15 +409,21 @@ impl Camera {
                 self.depth.release()?;
                 return self.next_into(out);
             }
-            out.rgb.resize(w * h * 3, 0);
-            format::yuyv_to_rgb8(cdata, self.color.stride, w, &mut out.rgb, self.cfg.yuy2);
+            // 화소를 모두 덮어쓰므로 길이만 맞춤(새로 잡을 때는 0 페이지 할당: 따로 0 을 쓰지 않음)
+            fit(&mut out.rgb, w * h * 3);
+            if out.want_gray {
+                fit(&mut out.gray, w * h);
+                format::yuyv_to_rgb8_gray(cdata, self.color.stride, w, &mut out.rgb, &mut out.gray, self.cfg.yuy2);
+            } else {
+                format::yuyv_to_rgb8(cdata, self.color.stride, w, &mut out.rgb, self.cfg.yuy2);
+            }
             if out.want_yuyv {
                 out.yuyv.resize(w * h * 2, 0);
                 for r in 0..h {
                     out.yuyv[r * w * 2..(r + 1) * w * 2].copy_from_slice(&cdata[r * self.color.stride..r * self.color.stride + w * 2]);
                 }
             }
-            out.aligned.resize(w * h, 0);
+            fit(&mut out.aligned, w * h); // fast_align 이 처음에 0 으로 채움
             let packed = self.depth.stride == w * 2 && (ddata.as_ptr() as usize) % 2 == 0;
             if packed && !out.want_raw {
                 // mmap 깊이를 복사 없이 정렬 입력으로
@@ -460,5 +469,17 @@ impl Camera {
             k.ppx,
             k.ppy
         )
+    }
+}
+
+/// 버퍼 길이를 n 으로: 이미 n 이면 그대로(내용은 부르는 쪽이 모두 덮어씀), 담을 자리가 모자라면 0 페이지로 새로 잡음(memset 없음)
+fn fit<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
+    if v.len() == n {
+        return;
+    }
+    if v.capacity() >= n {
+        v.resize(n, T::default());
+    } else {
+        *v = vec![T::default(); n];
     }
 }

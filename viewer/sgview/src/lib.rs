@@ -162,15 +162,24 @@ struct Live {
 }
 
 /// 파일 바이트: memmap 이 같은 프로세스에서 걸어 둔 것(memfs)이 있으면 그것, 아니면 디스크
-fn read_file(p: &Path) -> Option<Vec<u8>> {
+/// (메모리 바이트는 복사 없이 나눠 씀)
+fn read_file(p: &Path) -> Option<Arc<Vec<u8>>> {
     match memfs::get(p) {
-        Some((_, b)) => Some(b.as_ref().clone()),
-        None => fs::read(p).ok(),
+        Some((_, b)) => Some(b),
+        None => fs::read(p).ok().map(Arc::new),
+    }
+}
+
+/// 나눠 쓰는 파일 바이트(응답 몸)
+struct Shared(Arc<Vec<u8>>);
+impl AsRef<[u8]> for Shared {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
 fn read_text(p: &Path) -> Option<String> {
-    String::from_utf8(read_file(p)?).ok()
+    String::from_utf8(Arc::try_unwrap(read_file(p)?).unwrap_or_else(|a| (*a).clone())).ok()
 }
 
 fn file_ver(p: &Path) -> Option<String> {
@@ -492,13 +501,13 @@ fn respond(s: &mut TcpStream, code: u16, ctype: &str, extra: &str, body: &[u8]) 
 }
 
 /// 200 with an ETag, or 304 when the browser already has this version
-fn respond_tagged(s: &mut TcpStream, ctype: &str, etag: &str, body: impl FnOnce() -> Option<std::borrow::Cow<'static, [u8]>>) {
+fn respond_tagged<B: AsRef<[u8]>>(s: &mut TcpStream, ctype: &str, etag: &str, body: impl FnOnce() -> Option<B>) {
     let tag = format!("\"{}\"", etag);
     if REQ.with(|r| r.borrow().if_none_match.as_deref() == Some(tag.as_str())) {
         return respond(s, 304, ctype, &format!("ETag: {}\r\n", tag), b"");
     }
     match body() {
-        Some(b) => respond(s, 200, ctype, &format!("ETag: {}\r\n", tag), &b),
+        Some(b) => respond(s, 200, ctype, &format!("ETag: {}\r\n", tag), b.as_ref()),
         None => respond(s, 404, "text/plain", "", b"not found"),
     }
 }
@@ -733,7 +742,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
             let vers: Vec<String> = rels.iter().map(|r| safe_join(&st.dir, r).and_then(|p| file_ver(&p)).unwrap_or_default()).collect();
             let tag = format!("b{:x}", fnv(format!("{:?}{:?}", rels, vers).as_bytes()));
             let dir = st.dir.clone();
-            respond_tagged(&mut s, "application/octet-stream", &tag, || Some(std::borrow::Cow::Owned(pack_files(&dir, &rels))))
+            respond_tagged(&mut s, "application/octet-stream", &tag, || Some(std::borrow::Cow::<[u8]>::Owned(pack_files(&dir, &rels))))
         }
         "/api/walls" => match walls_json(&st, &q) {
             Some(j) => respond(&mut s, 200, "application/json", "", j.as_bytes()),
@@ -743,7 +752,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
             let rel = &path["/file/".len()..];
             // ETag = mtime + size: a page reload (or a second viewer) revalidates the map/objects it already has with 304
             match safe_join(&st.dir, rel).and_then(|p| file_ver(&p).map(|v| (p, v))) {
-                Some((p, ver)) => respond_tagged(&mut s, content_type(rel), &ver, || read_file(&p).map(std::borrow::Cow::Owned)),
+                Some((p, ver)) => respond_tagged(&mut s, content_type(rel), &ver, || read_file(&p).map(Shared)),
                 None => respond(&mut s, 404, "text/plain", "", b"not found"),
             }
         }

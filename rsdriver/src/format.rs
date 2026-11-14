@@ -69,6 +69,30 @@ pub fn yuyv_to_rgb8(src: &[u8], stride: usize, w: usize, out: &mut [u8], rule: Y
     }
 }
 
+/// RGB 화소 하나의 회색조: OpenCV cvtColor(BGR2GRAY) 15 비트 계수(slam `io::to_gray` 의 RGB 차례와 같은 식)
+#[inline(always)]
+pub fn gray_of(p: &[u8; 3]) -> u8 {
+    ((p[2] as u32 * 3735 + p[1] as u32 * 19235 + p[0] as u32 * 9798 + (1 << 14)) >> 15) as u8
+}
+
+/// `yuyv_to_rgb8` + 회색조를 한 번 훑기로(값은 RGB 를 만든 뒤 `gray_of` 를 따로 돌린 것과 같음). gray 길이 = out.len() / 3
+pub fn yuyv_to_rgb8_gray(src: &[u8], stride: usize, w: usize, out: &mut [u8], gray: &mut [u8], rule: Yuy2Rule) {
+    let h = out.len() / (w * 3);
+    for r in 0..h {
+        let s = &src[r * stride..r * stride + w * 2];
+        let o = &mut out[r * w * 3..(r + 1) * w * 3];
+        let g = &mut gray[r * w..(r + 1) * w];
+        for ((q, os), gs) in s.chunks_exact(4).zip(o.chunks_exact_mut(6)).zip(g.chunks_exact_mut(2)) {
+            let a = px(q[0], q[1], q[3], rule);
+            let b = px(q[2], q[1], q[3], rule);
+            os[..3].copy_from_slice(&a);
+            os[3..].copy_from_slice(&b);
+            gs[0] = gray_of(&a);
+            gs[1] = gray_of(&b);
+        }
+    }
+}
+
 /// Z16(줄 간격 stride 바이트) → u16 빽빽하게
 pub fn z16_copy(src: &[u8], stride: usize, w: usize, out: &mut [u16]) {
     let h = out.len() / w;
@@ -77,5 +101,33 @@ pub fn z16_copy(src: &[u8], stride: usize, w: usize, out: &mut [u16]) {
         for (o, b) in out[r * w..(r + 1) * w].iter_mut().zip(s.chunks_exact(2)) {
             *o = u16::from_le_bytes([b[0], b[1]]);
         }
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+
+    #[test]
+    fn rgb_gray_fused_same() {
+        let (w, h, stride) = (64usize, 9usize, 64 * 2 + 6);
+        let mut s = 7u64;
+        let src: Vec<u8> = (0..stride * h).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s >> 56) as u8 }).collect();
+        for rule in [Yuy2Rule::Sse, Yuy2Rule::Neon, Yuy2Rule::Generic] {
+            let mut a = vec![0u8; w * h * 3];
+            yuyv_to_rgb8(&src, stride, w, &mut a, rule);
+            let ga: Vec<u8> = a.chunks_exact(3).map(|p| gray_of(&[p[0], p[1], p[2]])).collect();
+            let (mut b, mut gb) = (vec![1u8; w * h * 3], vec![1u8; w * h]);
+            yuyv_to_rgb8_gray(&src, stride, w, &mut b, &mut gb, rule);
+            assert_eq!(a, b);
+            assert_eq!(ga, gb);
+        }
+        // 모든 Y·U·V 조합의 화소
+        for y in 0..=255u8 { for u in (0..=255u8).step_by(3) { for v in (0..=255u8).step_by(5) {
+            let src = [y, u, y, v];
+            let (mut o, mut g) = ([0u8; 6], [0u8; 2]);
+            yuyv_to_rgb8_gray(&src, 4, 2, &mut o, &mut g, Yuy2Rule::NATIVE);
+            assert_eq!(g[0], gray_of(&[o[0], o[1], o[2]]));
+        }}}
     }
 }

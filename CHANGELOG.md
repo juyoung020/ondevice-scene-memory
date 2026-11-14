@@ -19,6 +19,8 @@
 - **호환 변경:** 실행 파일을 `ondevice` 하나로 합쳤다(`memmap` → `ondevice`, `slam_bridge` → `ondevice slam`, `sgview` → `ondevice view`). 보드 실시간도 `ondevice --slam "--realsense …" --serve …` 한 명령이다.
 - 명령줄을 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 위치 프로그램 풀을 `--threads` 의 `slam` 역할로 코어에 묶을 수 있다.
 - 장면 스트림 형식 · TUM 목록 · 사원수 · PNG/PLY 쓰기 · ONNX Runtime 환경 · RealSense C API 선언을 한 곳씩으로 합쳤다(공통 크레이트 `common`, 출력 바이트 동일).
+- 카메라 입력에서 버려지는 장면(밀림 · 건너뜀 · 놓침 · 지도 밖)의 컬러 · 깊이 · 회색조 버퍼도 드라이버로 돌려 다시 쓰고, 회색조를 YUYV→RGB 와 한 번에 만든다.
+- 분할 입력 레터박스의 회색 띠를 한 번만 칠하고, 1000/m 깊이 보관과 기준 장면 · 검출 마스크 · 뷰어 응답의 복사를 없앴다.
 - 한 프로세스에서 깊이를 u16 그대로 넘기고 D435 깊이 복사 · 카메라 버퍼 0 채우기를 없앴다. 재생 입력의 다시 쌓기는 장면 시각으로 정해 실행마다 같은 결과를 낸다.
 - 저장소 맨 위를 Cargo 작업 공간 하나로 묶었다(Cargo.lock · 빌드 폴더 하나, 릴리스 빌드는 LTO fat). 실행 파일은 `target/release/` 에 생긴다.
 - 깊이 정렬 `fast_align` 과 정렬 확인·IMU 도구(`rs_align_check`·`align_sdk_check`·`bench_align`·`imu_probe`·`check_tum`)를 Rust 크레이트 `tools/` 로 옮겼다(결과 비트 동일, PC 정렬 1.65 배 빠름).

@@ -33,6 +33,16 @@ pub struct StreamFrame {
     pub graph: Vec<Node>,
 }
 
+/// 카메라 입력이면 버려지는 장면(건너뜀·밀림 등)의 버퍼를 드라이버에 돌려줌
+impl Drop for StreamFrame {
+    fn drop(&mut self) {
+        if slam::bufpool::enabled() {
+            slam::bufpool::give_rgb(std::mem::take(&mut self.rgb));
+            slam::bufpool::give_depth(std::mem::take(&mut self.depth));
+        }
+    }
+}
+
 impl StreamFrame {
     /// 위치가 없는 장면(맡아 둘 장면은 위치가 있으니 아님)
     pub fn lost(&self) -> bool {

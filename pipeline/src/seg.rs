@@ -55,21 +55,32 @@ pub struct LbGeom {
 
 /// 레터박스: RGB(w×h) → buf(u8 NHWC s×s×3, 가까운 화소, 여백 회색 114). buf 는 다시 쓰는 버퍼(크기만 맞춤).
 /// 배율이 1(640×480 → 640)이면 줄 단위 복사.
+#[allow(dead_code)]
 pub fn letterbox(rgb: &[u8], w: usize, h: usize, s: usize, buf: &mut Vec<u8>) -> LbGeom {
+    letterbox_keep(rgb, w, h, s, buf, false)
+}
+
+/// `letterbox` 와 같고, bands_ok 이면(이 버퍼에 같은 w·h·s 로 이미 레터박스한 적이 있음) 회색 띠를 다시 칠하지 않는다(띠는 늘 같은 자리·같은 값)
+pub fn letterbox_keep(rgb: &[u8], w: usize, h: usize, s: usize, buf: &mut Vec<u8>, bands_ok: bool) -> LbGeom {
     let r = (s as f32 / w as f32).min(s as f32 / h as f32);
     let (nw, nh) = ((w as f32 * r).round() as usize, (h as f32 * r).round() as usize);
     let (px, py) = ((s - nw) / 2, (s - nh) / 2);
+    let bands_ok = bands_ok && buf.len() == s * s * 3;
     buf.resize(s * s * 3, 114);
     // 여백: 위·아래 띠, 줄마다 왼쪽·오른쪽
-    buf[..py * s * 3].fill(114);
-    buf[(py + nh) * s * 3..].fill(114);
+    if !bands_ok {
+        buf[..py * s * 3].fill(114);
+        buf[(py + nh) * s * 3..].fill(114);
+    }
     let same = r == 1.0;
     // 가로 원본 위치는 줄마다 같으니 한 번만 계산
     let xs: Vec<usize> = if same { vec![] } else { (0..nw).map(|x| (((x as f32 + 0.5) / r) as usize).min(w - 1) * 3).collect() };
     for y in 0..nh {
         let row = &mut buf[(py + y) * s * 3..(py + y + 1) * s * 3];
-        row[..px * 3].fill(114);
-        row[(px + nw) * 3..].fill(114);
+        if !bands_ok {
+            row[..px * 3].fill(114);
+            row[(px + nw) * 3..].fill(114);
+        }
         let dst = &mut row[px * 3..(px + nw) * 3];
         if same {
             dst.copy_from_slice(&rgb[y * w * 3..(y + 1) * w * 3]);
@@ -308,6 +319,8 @@ pub mod reference {
 pub struct SegIn {
     pub geom: LbGeom,
     pub u8: Vec<u8>,
+    /// u8 에 마지막으로 레터박스한 영상 크기(같으면 회색 띠를 다시 칠하지 않음)
+    pub lb_wh: Option<(usize, usize)>,
 }
 
 /// 추론 결과(후처리 입력): 검출 [300, 6 + pc] 와 원형 [pc, ph, pw] 를 버퍼 하나에. 버퍼는 장면마다 다시 쓴다.
@@ -323,7 +336,8 @@ pub struct SegRaw {
 
 /// 전처리 단계: 레터박스. 추론과 다른 스레드에서 돌려도 된다.
 pub fn seg_pre(rgb: &[u8], w: usize, h: usize, inp: &mut SegIn) {
-    inp.geom = letterbox(rgb, w, h, SEG_S, &mut inp.u8);
+    inp.geom = letterbox_keep(rgb, w, h, SEG_S, &mut inp.u8, inp.lb_wh == Some((w, h)));
+    inp.lb_wh = Some((w, h));
 }
 
 /// 후처리 단계: 마스크 해독. 추론과 다른 스레드에서 돌려도 된다.
@@ -610,6 +624,12 @@ mod tests {
             let g1 = letterbox(&rgb, w, h, SEG_S, &mut buf);
             assert_eq!(g0, g1, "{w}x{h}");
             assert!(want == buf, "{w}x{h}");
+            // 같은 크기로 두 번째(띠를 다시 칠하지 않음): 다른 화소로 덮어도 같아야 함
+            let rgb2: Vec<u8> = rgb.iter().map(|v| v ^ 0x5a).collect();
+            let (want2, _) = reference::letterbox(&rgb2, w, h, SEG_S);
+            letterbox_keep(&rgb2, w, h, SEG_S, &mut buf, true);
+            assert!(want2 == buf, "{w}x{h} 두 번째");
+            letterbox(&rgb, w, h, SEG_S, &mut buf);
             #[cfg(feature = "onnx")]
             {
                 let mut f = vec![];

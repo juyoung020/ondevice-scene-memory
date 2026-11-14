@@ -2085,8 +2085,11 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args(&argv);
-    if let Some(n) = &a.seg_names {
-        seg::set_names(n);
+    // 물체만 자르는 1 클래스 모델(파일 이름에 objectsam)은 --seg-names 가 없으면 object
+    match &a.seg_names {
+        Some(n) => seg::set_names(n),
+        None if a.seg.to_ascii_lowercase().contains("objectsam") => seg::set_names("object"),
+        None => {}
     }
     if let Some(m) = &a.embed {
         embed::start(m);

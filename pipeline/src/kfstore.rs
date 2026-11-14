@@ -597,6 +597,7 @@ pub fn unpack_rgb(z: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// 한 줄: 면마다 왼쪽부터 누적 합(u8 감싸기) → RGB 섞어 담기. aarch64 는 16 칸씩 NEON 누적 합(정수라 값이 같음)
 #[inline]
+#[allow(unused_assignments)]
 fn unpack_rgb_row(p: [&[u8]; 3], out: &mut [u8]) {
     let w = p[0].len();
     #[allow(unused_mut)]
@@ -639,6 +640,7 @@ fn unpack_rgb_row(p: [&[u8]; 3], out: &mut [u8]) {
 
 /// 한 줄: (아래 바이트 | 위 바이트 << 8) 의 왼쪽부터 누적 합(u16 감싸기). aarch64 는 16 칸씩 NEON(정수라 값이 같음)
 #[inline]
+#[allow(unused_assignments)]
 fn unpack_depth_row(lo: &[u8], hi: &[u8], out: &mut [u16]) {
     let w = out.len();
     #[allow(unused_mut)]

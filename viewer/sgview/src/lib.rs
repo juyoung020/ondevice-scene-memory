@@ -674,7 +674,8 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         }
         // ?metrics=1 page: frames drawn and pose → screen latency every 2 s, logged here (measuring on the board screen)
         "/api/metric" => {
-            eprintln!("viewer: {} fps, pose→screen p50 {} p95 {} ms (n {})", q.get("fps").map_or("-", |v| v), q.get("lat50").map_or("-", |v| v), q.get("lat95").map_or("-", |v| v), q.get("n").map_or("-", |v| v));
+            let g = |k: &str| q.get(k).map_or("-", |v| v.as_str());
+            eprintln!("viewer: {} fps (render {} ms), pose→screen p50 {} p95 {} ms (n {}), map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB", g("fps"), g("rms"), g("lat50"), g("lat95"), g("n"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"));
             respond(&mut s, 204, "text/plain", "", b"")
         }
         "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),
@@ -697,7 +698,12 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 return respond(&mut s, 200, "application/json", "", b"{\"unchanged\":true}");
             }
             let map_v = file_ver(&st.dir.join("map.pgm")).unwrap_or_default();
-            respond(&mut s, 200, "application/json", "", &v.api_body(&map_v))
+            // tr/tf: the page already has the first tf trajectory points of log tr → only the appended ones
+            let delta = q.get("tr").and_then(|t| t.parse().ok()).zip(q.get("tf").and_then(|t| t.parse().ok())).and_then(|(tr, tf)| v.api_delta(&map_v, tr, tf));
+            match delta {
+                Some(b) => respond(&mut s, 200, "application/json", "", &b),
+                None => respond(&mut s, 200, "application/json", "", &v.api_body(&map_v)),
+            }
         }
         // full map, or with ?since=<map_v> only the rows changed since that version (X-Y0..X-Y1, PGM row order; X-Full: 0)
         "/api/map" => match current_map(&st) {

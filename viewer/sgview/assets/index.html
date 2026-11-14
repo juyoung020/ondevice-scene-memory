@@ -201,7 +201,7 @@ const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShade
 const renderer = new THREE.WebGLRenderer({ antialias:!WEAK_GPU, alpha:true });   // transparent clear: the page gradient is the background
 renderer.setClearColor(0x000000, 0);
 host.appendChild(renderer.domElement);
-let quality = QS.get("quality") || localStorage.getItem("sg_quality") || "high";
+let quality = QS.get("quality") || "high";   // normal quality by default on every screen; ?quality=low only when asked (a saved choice never forces Low)
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }
@@ -1338,8 +1338,9 @@ renderer.domElement.addEventListener("pointerleave", () => { if (hoverId != null
 function contentBox() {
   const b = new THREE.Box3();
   if (oct.box && opt("c_scene")) b.union(oct.box);
-  if (b.isEmpty() && view && view.grid) {
-    const g = view.grid; b.set(new THREE.Vector3(g.origin[0], g.origin[1], 0), new THREE.Vector3(g.origin[0] + g.width * g.resolution, g.origin[1] + g.height * g.resolution, 2));
+  // the occupancy grid covers the whole map at once (the point map arrives node by node after a rebuild): fit to both
+  if (view && view.grid) {
+    const g = view.grid; b.union(new THREE.Box3(new THREE.Vector3(g.origin[0], g.origin[1], 0), new THREE.Vector3(g.origin[0] + g.width * g.resolution, g.origin[1] + g.height * g.resolution, 2)));
   }
   return b.isEmpty() ? null : b;
 }
@@ -1354,7 +1355,7 @@ function fitView(top, instant = true) {
   const b = contentBox(); if (!b) return;
   stageFor(b);
   const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
-  const r = 0.5 * Math.hypot(s.x, s.y, s.z * 0.6), fov = camera.fov * Math.PI / 180, fit = r / Math.sin(Math.min(fov, fov * camera.aspect) / 2) * 0.66;
+  const r = 0.5 * (top ? Math.hypot(s.x, s.y) : Math.hypot(s.x, s.y, s.z * 0.6)), fov = camera.fov * Math.PI / 180, fit = r / Math.sin(Math.min(fov, fov * camera.aspect) / 2) * 0.66;
   const tgt = new THREE.Vector3(c.x, c.y, top ? b.min.z : b.min.z + s.z * 0.3);
   const az = -2.25, el = top ? 1.5697 : 0.66;
   const pos = new THREE.Vector3(tgt.x + fit * Math.cos(el) * Math.cos(az), tgt.y + fit * Math.cos(el) * Math.sin(az), tgt.z + fit * Math.sin(el));
@@ -1369,7 +1370,7 @@ $("b_demo").onclick = () => setDemo(!controls.autoRotate);
 $("b_level").onclick = () => { const b = $("b_level"); b.disabled = true; fetch("/api/level").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_reset").onclick = () => { const b = $("b_reset"); b.disabled = true; fetch("/api/reset").finally(() => setTimeout(() => { b.disabled = false; }, 3000)); };
 $("b_panel").onclick = () => togglePanel();
-$("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; localStorage.setItem("sg_quality", quality); applyQuality(); };
+$("b_q").onclick = () => { quality = quality === "high" ? "low" : "high"; applyQuality(); };
 if (QS.get("ui") === "0") document.body.classList.add("ui-off");
 if (QS.get("panel") === "1") togglePanel(true);
 if (QS.get("demo") === "1") setTimeout(() => setDemo(true), 0);
@@ -1428,34 +1429,54 @@ function applyView(v) {
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
   let sObj = ""; for (const o of view.objects) sObj += o.id + "|" + o.state + "|" + o.pos[0] + "," + o.pos[1] + "," + o.pos[2] + "|" + o.extent[0] + "," + o.extent[1] + "," + o.extent[2] + "|" + (o.points ? o.points.stamp : "") + "|" + (o.rgbd ? 1 : 0) + "|" + (o.room ?? "") + ";";
   if (view.scene_points) sObj += "scene|" + (view.scene_points.octree ? "o" + view.scene_points.octree.run + ":" + view.scene_points.octree.ver : (view.scene_points.chunks ?? view.scene_points.stamp)) + "|" + view.scene_points.run + "|" + (view.scene_points.surface ? view.scene_points.surface.regions.map(r => r[3] * 1000 + (r[4] || 0)).reduce((a, b) => a + b, 0) : "");
-  const sGraph = JSON.stringify(view.graph), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
-  const objChanged = sObj !== prev.obj, graphChanged = objChanged || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
+  // graph: edges compared as text; the trajectory (grows every keyframe in a live run) only by its length, redrawn at most once a second
+  const sGraph = JSON.stringify(view.graph.edges || []), sRooms = JSON.stringify(view.rooms), sGrid = JSON.stringify(view.grid);
+  const nTraj = (view.graph.nodes || []).length, nowT = performance.now();
+  const trajDue = nTraj !== prev.nTraj && nowT - (prev.trajT || 0) > 1000;
+  const objChanged = sObj !== prev.obj, graphChanged = objChanged || trajDue || sGraph !== prev.graph || sRooms !== prev.rooms || sGrid !== prev.grid;
+  if (graphChanged) { prev.nTraj = nTraj; prev.trajT = nowT; }
   if (objChanged) { fillSelect(); drawObjects(); findRefresh(); }
   if (graphChanged) drawGraph();
   if (!objChanged && selected != null) renderInfoSoon();
   if (!LIVE) { const sPose = JSON.stringify(view.pose); if (sPose !== prev.pose) drawRobot(); prev.pose = sPose; }
   status(); if (objChanged) renderInfo();
   Object.assign(prev, { obj:sObj, graph:sGraph, rooms:sRooms, grid:sGrid });
-  if (!viewSeen) { viewSeen = true; fitView(false); const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
+  // the pipeline re-stacked the map (leveling correction, loop closure): new run → refit once if the user has not moved the camera
+  const run = view.scene_points && view.scene_points.run;
+  if (viewSeen && run !== prev.run && !userMoved) setTimeout(() => fitView(QS.get("top") === "1", false), 1500);   // after the new map's first nodes arrive
+  prev.run = run;
+  if (!viewSeen) { viewSeen = true; fitView(QS.get("top") === "1");   // ?top=1: start in the Top view
+    const qs = QS.get("sel"); if (qs && objs.has(+qs)) select(+qs); }   // ?sel=<id>: open with an object selected (demos, screenshots)
 }
 
 // Memory folder (not --ingest): the server watches view.json / pose.json and pushes over /stream (SSE) — `vv` = new view.json
 // version (fetched once), `fpose` = the fast camera pose. An idle viewer sends no requests. If the event stream is down, a slow
 // poll (every 2 s) keeps the page current until it reconnects.
 let viewBusy = false, viewAgain = false;
+let trajLog = null;   // {id, nodes}: trajectory points held here, the server sends only the appended ones
 async function fetchView() {
   if (viewBusy) { viewAgain = true; return; }
   viewBusy = true;
   try {
-    const r = await fetch("/api/view?v=" + encodeURIComponent(viewVer));
-    const j = await r.json();
+    const t0 = performance.now();
+    // trajectory: send what we have (log id + count) so the server sends only the appended points
+    const r = await fetch("/api/view?v=" + encodeURIComponent(viewVer) + (trajLog ? `&tr=${trajLog.id}&tf=${trajLog.nodes.length}` : ""));
+    const txt = await r.text(), j = JSON.parse(txt);
+    met.kb += txt.length / 1024;
     if (j.view) {
+      const g = j.view.graph || (j.view.graph = {});
+      if (j.traj && j.traj.from > 0 && trajLog && trajLog.id === j.traj.id) { trajLog.nodes.push(...(g.nodes || [])); g.nodes = trajLog.nodes; }
+      trajLog = j.traj ? { id: j.traj.id, nodes: (g.nodes || []).slice() } : null;
+      if (trajLog) g.nodes = trajLog.nodes.slice();
       const first = !view;
       viewVer = j.v;
       if (first || j.map_v !== mapVer) { mapVer = j.map_v; view = j.view; await loadMap(); }
+      const t1 = performance.now(); met.fms += t1 - t0; met.nv++;
+      if (j.view.wall) viewWall = j.view.wall;   // ?metrics=1: 지도 판을 낸 장면 → 화면
       applyView(j.view);
       if (latestPose && latestPose.t >= (view.stamp ?? 0)) { view.cam = latestPose.cam; view.pose = latestPose.pose; drawRobot(); }   // keep the newer fast pose
       updateWalls();
+      met.ams += performance.now() - t1;
     }
   } catch (e) {}
   viewBusy = false;
@@ -1465,12 +1486,12 @@ async function fetchView() {
 // fast camera pose (pose.json, a few hundred bytes, written every keyframe): the handheld camera moves without waiting for view.json
 let latestPose = null;
 // ?metrics=1: 2 초마다 그린 프레임 수 · 위치(pose.json wall) → 화면 지연을 서버 로그로(/api/metric)
-let poseWall = 0;
-const met = { frames: 0, lat: [], t0: performance.now() };
+let poseWall = 0, viewWall = 0;
+const met = { frames: 0, lat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0 };
 if (QS.get("metrics") === "1") setInterval(() => {
-  const dt = (performance.now() - met.t0) / 1000, l = met.lat.sort((a, b) => a - b), q = p => l.length ? l[Math.min(l.length - 1, Math.floor(l.length * p))].toFixed(0) : "-";
-  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${q(0.5)}&lat95=${q(0.95)}&n=${l.length}`).catch(() => {});
-  met.frames = 0; met.lat = []; met.t0 = performance.now();
+  const dt = (performance.now() - met.t0) / 1000, qq = (a, p) => { a.sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(0) : "-"; };
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}`).catch(() => {});
+  met.frames = 0; met.lat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = 0; met.t0 = performance.now();
 }, 2000);
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
@@ -1637,6 +1658,8 @@ function stepChase(dt) {
 }
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
 $("c_blend").onchange = invalidate; $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
+// weak GPU (Pi 5 V3D): one direct pass — the splat-blend pass (point map drawn twice + float accumulate) and EDL (full-screen depth pass) cost 30–95 ms a frame there. Points keep their size; ?c_blend=1 / ?c_edl=1 turn them back on
+if (WEAK_GPU) { $("c_blend").checked = false; $("c_edl").checked = false; }
 $("n_octk").onchange = () => { octUni.sizeK.value = opt("n_octk"); invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
   if (!$("c_follow").checked || !robotGrp) return false;
@@ -1924,8 +1947,9 @@ function frame() {
   { const d = camera.position.distanceTo(controls.target); scene.fog.near = d * 0.6; scene.fog.far = d * 2.2; }   // fog follows the viewing distance: the focus stays clear at any zoom
   updatePointScale(); octUpdate(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
-  met.frames++;
+  met.frames++; met.rms += performance.now() - tr;
   if (poseWall) { met.lat.push(Date.now() - poseWall); poseWall = 0; }
+  if (viewWall) { met.vlat.push(Date.now() - viewWall); viewWall = 0; }
 }
 (function loop() { requestAnimationFrame(loop); frame(); })();
 loadRobotModel();

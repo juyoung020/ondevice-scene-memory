@@ -259,7 +259,8 @@ impl Clock {
 
 /// 한 장면의 '대략 수평'인 가장 큰 면(바닥·책상)을 RANSAC 으로 찾아 그 위쪽 법선을 세계 좌표로(IMU 없이 중력 방향 단서).
 /// 여러 장면의 법선을 모아 다수결로 수평을 정한다(gravity 합의).
-fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V3> {
+/// floor_only: 카메라보다 0.3 m 넘게 아래인 면만(실시간: 천장 · 책상 위를 바닥으로 잡지 않게)
+fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3, floor_only: bool) -> Option<V3> {
     let [fx, fy, cx, cy] = k;
     let mut pts: Vec<V3> = vec![];
     for v in (0..h).step_by(8) {
@@ -297,6 +298,9 @@ fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V
             continue; // 가정한 위에서 50° 넘게 기운 면(벽)은 제외
         }
         let d = dot(&n, &a);
+        if floor_only && d > -0.3 {
+            continue; // 위쪽(가정한 위 기준) 면 = 천장 · 높은 면
+        }
         let cnt = pts.iter().filter(|q| (dot(&n, q) - d).abs() < 0.02 + 0.01 * q[2]).count();
         if cnt > best_c {
             (best_n, best_c) = (n, cnt);
@@ -551,7 +555,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none() || a.no_drop) // --no-drop: 스트림도 기다림
     });
     let mut mem = Memory::new(0.012, 0.04);
-    let mut view = ViewWorker::spawn(a.out.clone()); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
+    let mut view = ViewWorker::spawn(a.out.clone(), a.live > 0.0); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
     let mut z0: Option<f64> = None;
@@ -880,6 +884,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut grav_obs: Vec<V3> = vec![];
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
     let mut leveled = a.stream.is_none() || a.no_level;
+    // 실시간: 첫 장면 카메라가 똑바로 서 있다고 보고(위 = 첫 장면 카메라의 −y) 처음부터 수평으로 보여 주고, 바닥 합의가 나오면 한 번 고쳐 다시 쌓는다
+    let (mut upright, mut refine) = (a.stream.is_some() && a.live > 0.0 && !a.no_level, false);
     let mut force_rb = false; // 수평 버튼: 기다리지 않고 바로 다시 쌓기
     let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
     let mut stream_held = 0u32; // 맡아 둘 장면으로 받은 수
@@ -1018,14 +1024,19 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             force_rb = true;
             common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
         }
+        if std::mem::take(&mut upright) && !leveled {
+            stream_fix = rot_between(&[-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]], &[0.0, 0.0, 1.0]);
+            (leveled, refine) = (true, true);
+            common::info!("수평: 첫 장면 카메라를 똑바로 선 것으로 보고 시작(바닥 합의가 나오면 고침)");
+        }
         if a.stream.is_some() {
             r = mm(&stream_fix, &r);
             p = mv(&stream_fix, &p);
         }
         let c_vo = Instant::now();
         // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
-        if !leveled && a.stream.is_some() {
-            if let Some(n) = up_normal(&depth, w, h, seq.k, &r) {
+        if (!leveled || refine) && a.stream.is_some() {
+            if let Some(n) = up_normal(&depth, w, h, seq.k, &r, refine) {
                 grav_obs.push(n);
             }
             if grav_obs.len() >= 15 {
@@ -1037,13 +1048,32 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let m0 = mean(&grav_obs);
                 let inl: Vec<V3> = grav_obs.iter().copied().filter(|n| dot(n, &m0) > 10f64.to_radians().cos()).collect();
                 if inl.len() * 10 >= grav_obs.len() * 6 {
+                    'lv: {
                     let up = mean(&inl);
                     let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
+                    let tilt = up[2].clamp(-1.0, 1.0).acos().to_degrees();
+                    if refine && tilt > 70.0 {
+                        // 첫 장면이 똑바르다는 가정과 70° 넘게 다르면 믿지 않음(세계를 뒤집지 않음, 천장은 floor_only 로 이미 빠짐 · 녹화 첫 장면은 46° 숙여 있기도 함): 모은 것을 버리고 계속
+                        common::info!("수평 맞춤: 바닥 합의가 처음 가정과 {tilt:.1}° 달라 버림");
+                        grav_obs.clear();
+                        break 'lv;
+                    }
+                    if std::mem::take(&mut refine) {
+                        // 처음 가정(첫 장면이 똑바름)을 바닥 합의로 고침: 지난 위치 · 바닥 높이 원점도 새 좌표로, 지도는 다시 쌓음
+                        for e in est_traj.iter_mut() {
+                            (e.1, e.2) = (mv(&fix, &e.1), mm(&fix, &e.2));
+                        }
+                        // 바닥 높이는 기울어진 채 잰 값이라 버리고, 이 장면에서 새 좌표로 다시 잰다(바닥 = z 0)
+                        hist_h.clear();
+                        z0 = None;
+                        (kfs.dirty, force_rb) = (true, true);
+                    }
                     r = mm(&fix, &r);
                     p = mv(&fix, &p);
                     stream_fix = mm(&fix, &stream_fix);
                     leveled = true;
                     common::info!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
+                    }
                 } else if grav_obs.len() > 60 {
                     grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
                 }
@@ -1149,7 +1179,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             clock.add(P::Scene, c_sc);
             let c_v = Instant::now();
             // 점 노드를 쓴 장면은 view.json 을 다음 장면으로 미룸(한 장면에 몰리지 않게). 병합은 제때(결과가 같게)
-            if scene_done && nkf > 1 {
+            if scene_done && nkf > 1 && !(out::memory_only() && a.live > 0.0) { // 메모리 기억 폴더는 같은 장면에서(미루면 실시간에선 장면마다 다시 미뤄져 판이 안 나감)
                 if merge {
                     mem.prune(t);
                     mem.merge_pass();
@@ -2043,7 +2073,8 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
     let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).collect();
     let traj = view.traj_update(traj);
-    view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone() });
+    let wall = if view.live { wall_ms() } else { 0.0 };
+    view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });
 }
 
 /// 지나온 길 바뀐 몫: 덧붙인 점, 또는 다시 쌓기로 새로 만든 길 전체
@@ -2063,6 +2094,7 @@ struct ViewJob {
     pose: [f64; 3],
     cam: serde_json::Value,
     scene: serde_json::Value,
+    wall: f64, // 실시간: 이 판을 낸 장면의 벽시계(ms) — 뷰어(?metrics=1)가 지도 → 화면 지연을 잼. 재생은 0(view.json 에 안 실음)
 }
 
 enum ViewMsg {
@@ -2077,10 +2109,11 @@ struct ViewWorker {
     handle: Option<std::thread::JoinHandle<()>>,
     sent: usize,   // 넘긴 길 점 수
     fresh: bool,   // 길이 새로 만들어짐(다시 쌓기 갈아 끼우기)
+    live: bool,    // 실시간 입력(판에 벽시계를 실음)
 }
 
 impl ViewWorker {
-    fn spawn(dir: PathBuf) -> ViewWorker {
+    fn spawn(dir: PathBuf, live: bool) -> ViewWorker {
         let (tx, rx) = std::sync::mpsc::channel::<ViewMsg>();
         let handle = std::thread::Builder::new().name("view".into()).spawn(move || {
             out::thread_role(out::Role::Writer);
@@ -2146,6 +2179,9 @@ impl ViewWorker {
                 if !j.scene.is_null() {
                     head["scene_points"] = j.scene;
                 }
+                if j.wall > 0.0 {
+                    head["wall"] = json!(j.wall);
+                }
                 n += 1;
                 let len = log.len();
                 if out::memory_only() {
@@ -2155,7 +2191,7 @@ impl ViewWorker {
                 }
             }
         }).unwrap();
-        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true }
+        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true, live }
     }
     fn traj_update(&mut self, traj: &[(f64, [f64; 3])]) -> TrajUpd {
         let u = if std::mem::take(&mut self.fresh) || traj.len() < self.sent { TrajUpd::Reset(traj.to_vec()) } else { TrajUpd::Append(traj[self.sent..].to_vec()) };

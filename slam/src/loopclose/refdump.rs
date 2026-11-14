@@ -351,12 +351,16 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
     let mism = Arc::new(Mutex::new(Vec::new()));
     let regq = Arc::new(Mutex::new(VecDeque::new()));
     let regbad: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let params = crate::params::Params::read_ini("/mnt/c/ondevice/docs/rtabmap_pi.ini").unwrap();
+    let mut params = crate::params::Params::read_ini("/mnt/c/ondevice/docs/rtabmap_pi.ini").unwrap();
+    if let Ok(c) = std::env::var("DICT_CHECKS") {
+        params.set("Rust/DictChecks", &c);
+    }
     let sync = Arc::new(Mutex::new((0u32, 0u64)));
     let index: Box<dyn WordIndex> = if real { Box::new(SyncedIndex { inner: flann::KdTreeIndex::from_params(&params), sync: sync.clone() }) } else { Box::new(ReplayIndex { log: flog.clone(), built: false }) };
     let opt: Box<dyn PoseGraphOptimizer> = if real { Box::new(TimedOpt(GtsamOptimizer(crate::graph::OptimizerParams::from_params(&params)))) } else { Box::new(ReplayOpt { calls, mismatch: mism.clone(), n: 0 }) };
     let rng = parse_rng(&format!("{dir}/flann.txt"));
     let mut slam_ms = 0.0f64;
+    let (mut my_loops, mut my_prox) = (0usize, 0usize);
     let mut slam = Slam::new(
         &params,
         index,
@@ -375,6 +379,8 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
         let c0 = std::time::Instant::now();
         slam.process(&st.input);
         slam_ms += c0.elapsed().as_secs_f64() * 1e3;
+        my_loops += (slam.loop_closure_id() > 0) as usize;
+        my_prox += (slam.info.proximity_id > 0) as usize;
         let mut d = Vec::new();
         if let Some(b) = regbad.lock().unwrap().take() {
             d.push(b);
@@ -442,6 +448,8 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
             diffs.push(format!("단계 {n}: {}", d.join(", ")));
         }
     }
+    let gd = check_graphs(&mut slam, &dir);
+    diffs.extend(gd);
     diffs.extend(mism.lock().unwrap().iter().cloned());
     {
         let l = flog.lock().unwrap();
@@ -453,6 +461,7 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
     let proxs = steps.iter().filter(|s| s.prox > 0).count();
     let posts = steps.iter().filter(|s| !s.post.is_empty()).count();
     eprintln!("{seq}: getConnectedGraph {} 번", slam.connected_graph_calls);
+    eprintln!("{seq}: Rust 루프 {my_loops} 근접 {my_prox}");
     eprintln!("{seq}: 루프 {loops} 근접 {proxs} 사후 확률 있는 단계 {posts}");
     let orig: f64 = std::fs::read_to_string(format!("{dir}/time.txt")).unwrap_or_default().lines().filter_map(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()).sum();
     let ap = APPLY_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
@@ -653,4 +662,40 @@ impl PoseGraphOptimizer for TimedOpt {
     fn iterations(&self) -> i32 {
         self.0.iterations()
     }
+}
+
+/// main.txt 끝의 GRAPH 블록: (optimized, global) → (위치, 링크)
+fn parse_graphs(path: &str) -> Vec<((bool, bool), BTreeMap<i32, [u32; 12]>, Vec<(i32, i32, i32, [u32; 12], [u64; 36])>)> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut v: Vec<((bool, bool), BTreeMap<i32, [u32; 12]>, Vec<(i32, i32, i32, [u32; 12], [u64; 36])>)> = Vec::new();
+    for line in text.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        match t.first().copied() {
+            Some("GRAPH") => v.push(((t[1] == "1", t[2] == "1"), BTreeMap::new(), Vec::new())),
+            Some("gp") => {
+                v.last_mut().unwrap().1.insert(t[1].parse().unwrap(), tf(&t[2..]).0 .0.map(f32::to_bits));
+            }
+            Some("gl") => {
+                let (tt, n) = tf(&t[4..]);
+                let (m, _) = mat(&t[4 + n..]);
+                v.last_mut().unwrap().2.push((t[1].parse().unwrap(), t[2].parse().unwrap(), t[3].parse().unwrap(), tt.0.map(f32::to_bits), m.map(f64::to_bits)));
+            }
+            _ => {}
+        }
+    }
+    v
+}
+
+/// 끝난 뒤 get_graph 네 가지를 원본 getGraph 와 비교
+fn check_graphs(slam: &mut Slam, dir: &str) -> Vec<String> {
+    let mut d = Vec::new();
+    for ((opt, glob), poses, links) in parse_graphs(&format!("{dir}/main.txt")) {
+        let (p, l) = slam.get_graph(opt, glob);
+        let p: BTreeMap<i32, [u32; 12]> = p.iter().map(|(k, v)| (*k, v.0.map(f32::to_bits))).collect();
+        let l: Vec<_> = l.iter().map(|(_, x)| (x.from, x.to, x.ty as i32, x.t.0.map(f32::to_bits), x.inf.map(f64::to_bits))).collect();
+        if p != poses || l != links {
+            d.push(format!("getGraph({opt},{glob}): 위치 {}/{} 링크 {}/{}", p.len(), poses.len(), l.len(), links.len()));
+        }
+    }
+    d
 }

@@ -208,9 +208,11 @@ impl Slam {
             .cloned()
             .unwrap_or_else(|| "0.1 0.36 0.30 0.16 0.062 0.0151 0.00255 0.000324 2.5e-05 1e-06 4.8e-08 1.2e-09 1.9e-11 2.2e-13 1.7e-15 8.5e-18 2.9e-20 6.9e-23".into());
         let model = PredictionModel::new(&lc, params.get("Bayes/VirtualPlacePriorThr", 0.9f32));
+        let mut mem = Memory::new(mp, index);
+        mem.dict.checks = params.get("Rust/DictChecks", 32);
         Slam {
             p,
-            mem: Memory::new(mp, index),
+            mem,
             bayes: BayesFilter::new(model),
             opt,
             reg,
@@ -292,7 +294,6 @@ impl Slam {
                 self.trigger_new_map();
             }
         }
-        // ---- 기억 갱신 ----
         self.mem.update(&inp.features, inp.stamp, odom_pose, &inp.cov, &inp.velocity, inp.image_size);
         let sid = self.mem.last_signature.unwrap();
         let rehearsed = self.mem.rehearsal.0;
@@ -345,7 +346,6 @@ impl Slam {
             }
             self.odom_cache_poses.insert(sid, s.pose);
         }
-        // ---- 가능도·사후 확률·가설 ----
         let loc_prev = s.links.iter().next().map(|(k, _)| *k != sid && self.mem.has_loop_closure_links(*k)).unwrap_or(false);
         let mut rejected = false;
         let mut likelihood = BTreeMap::new();
@@ -397,7 +397,6 @@ impl Slam {
             self.highest = last_highest;
         }
         self.info.highest = self.highest;
-        // ---- 공간 근접 찾기(RGBD/ProximityBySpace) ----
         let mut added: Vec<(i32, i32)> = Vec::new();
         let mut last_prox = 0;
         let mut suppressed = 0;
@@ -504,7 +503,6 @@ impl Slam {
                 }
             }
         }
-        // ---- 전역 루프 클로저 검증 ----
         if self.loop_hyp.0 > 0 {
             if suppressed == 0 {
                 let r = self.compute_transform(self.loop_hyp.0, sid, Tf::NULL);
@@ -523,7 +521,6 @@ impl Slam {
                 self.loop_hyp.0 = 0;
             }
         }
-        // ---- 그래프 최적화 · RGBD/OptimizeMaxError · 지도 보정 ----
         let s_weight = self.mem.sig(sid).map(|s| s.weight).unwrap_or(-9);
         if s_weight != -1 && (self.loop_hyp.0 > 0 || last_prox > 0) {
             let mut poses = self.optimized.clone();
@@ -555,7 +552,6 @@ impl Slam {
         self.info.posterior = self.bayes.posterior_ids.iter().copied().zip(self.bayes.posterior_values.iter().copied()).collect();
         self.info.proximity_id = last_prox;
         self.info.rejected = rejected;
-        // ---- 정리: 거의 안 움직인 노드는 지움(RGBD/LinearUpdate·AngularUpdate) ----
         let w = self.mem.sig(sid).map(|s| s.weight).unwrap_or(-9);
         if w >= 0 && small && self.loop_hyp.0 == 0 && last_prox == 0 {
             self.mem.move_to_trash(sid, false);

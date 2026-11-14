@@ -313,17 +313,10 @@ pub struct Dictionary {
     pub map_id_index: BTreeMap<i32, i32>,
     pub index: Box<dyn WordIndex>,
     pub nndr: f32,
+    /// 사전 찾기 checks(원본 KNN_CHECKS = 32). 줄이면 빠르지만 단어가 달라짐(기본 32, Rust/DictChecks)
+    pub checks: i32,
 }
 
-/// VWDictionary::convertBinTo32F(byteToFloat=false) 뒤 L1 거리 = 서로 다른 비트 수
-#[inline]
-fn hamming(a: &[u8; 32], b: &[u8; 32]) -> f32 {
-    let mut s = 0u32;
-    for i in 0..32 {
-        s += (a[i] ^ b[i]).count_ones();
-    }
-    s as f32
-}
 
 impl Dictionary {
     pub fn new(index: Box<dyn WordIndex>, nndr: f32) -> Dictionary {
@@ -337,6 +330,7 @@ impl Dictionary {
             map_id_index: BTreeMap::new(),
             index,
             nndr,
+            checks: 32,
         }
     }
 
@@ -431,9 +425,11 @@ impl Dictionary {
             return ids;
         }
         let k = 2usize;
-        let (res, dists) = if self.index.is_built() { self.index.knn_search(desc, k, 32) } else { (Vec::new(), Vec::new()) };
+        let (res, dists) = if self.index.is_built() { self.index.knn_search(desc, k, self.checks) } else { (Vec::new(), Vec::new()) };
         let searched = self.index.is_built();
-        let mut new_words: Vec<[u8; 32]> = Vec::new();
+        let mut new_words: Vec<[u64; 4]> = Vec::new();
+        let mut dist_buf: Vec<f32> = Vec::new();
+        let pack = |x: &[u8; 32]| -> [u64; 4] { std::array::from_fn(|i| u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap())) };
         let mut new_ids: Vec<i32> = Vec::new();
         for i in 0..desc.len() {
             // multimap<float,int>: 같은 거리는 넣은 순서
@@ -461,8 +457,10 @@ impl Dictionary {
                 // cv::BFMatcher(NORM_L1) knnMatch k = 2(새 단어가 1 개면 1): 같은 거리는 앞 순번
                 let kk = if new_words.len() > 1 { 2 } else { 1 };
                 let mut best: [(f32, i32); 2] = [(f32::MAX, -1), (f32::MAX, -1)];
-                for (j, w) in new_words.iter().enumerate() {
-                    let d = hamming(&desc[i], w);
+                let qi = pack(&desc[i]);
+                dist_buf.clear();
+                hamming_all(&qi, &new_words, &mut dist_buf);
+                for (j, &d) in dist_buf.iter().enumerate() {
                     if d < best[kk - 1].0 {
                         let mut p = kk - 1;
                         while p > 0 && best[p - 1].0 > d {
@@ -492,7 +490,7 @@ impl Dictionary {
                 refs.insert(sig, 1);
                 self.words.insert(id, VisualWord { id, desc: desc[i], refs });
                 self.not_indexed.insert(id);
-                new_words.push(desc[i]);
+                new_words.push(pack(&desc[i]));
                 new_ids.push(id);
                 ids.push(id);
             } else {
@@ -1133,4 +1131,28 @@ mod tests {
         let kps = vec![k(1.0), k(3.0), k(3.0), k(2.0)];
         assert_eq!(response_order(&kps), vec![2, 1, 3, 0]);
     }
+}
+
+/// 새 단어들과의 거리(서로 다른 비트 수). x86 은 popcnt 명령이 있으면 그 판으로(같은 정수 결과)
+fn hamming_all(q: &[u64; 4], ws: &[[u64; 4]], out: &mut Vec<f32>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("popcnt") {
+            // SAFETY: popcnt 지원을 방금 확인함
+            unsafe { hamming_all_popcnt(q, ws, out) };
+            return;
+        }
+    }
+    hamming_all_plain(q, ws, out)
+}
+
+#[inline(always)]
+fn hamming_all_plain(q: &[u64; 4], ws: &[[u64; 4]], out: &mut Vec<f32>) {
+    out.extend(ws.iter().map(|w| ((q[0] ^ w[0]).count_ones() + (q[1] ^ w[1]).count_ones() + (q[2] ^ w[2]).count_ones() + (q[3] ^ w[3]).count_ones()) as f32));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn hamming_all_popcnt(q: &[u64; 4], ws: &[[u64; 4]], out: &mut Vec<f32>) {
+    hamming_all_plain(q, ws, out)
 }

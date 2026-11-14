@@ -331,6 +331,10 @@ pub fn optimize(root: i32, poses: &BTreeMap<i32, Tf>, links: &[Link], p: &Optimi
         return Err("우리 설정(3D·배치·가우스-뉴턴·PriorsIgnored) 밖의 최적화 설정".into());
     }
     if links.is_empty() || poses.len() < 2 || p.iterations <= 0 {
+        // 원본 OptimizerGTSAM.cpp 1140 행: 위치가 하나뿐이거나 반복 0 이면 받은 위치를 그대로, 그 밖(링크 없음)은 빈 결과
+        if poses.len() == 1 || p.iterations <= 0 {
+            return Ok(Optimized { poses: poses.clone(), ..Optimized::default() });
+        }
         return Ok(Optimized::default());
     }
     if poses.keys().any(|&id| id <= 0) {

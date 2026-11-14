@@ -32,11 +32,11 @@ ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
 
 # TUM 재생(카메라 없이): --rate 1 이면 찍은 시각대로(밀리면 건너뜀), 생략하면 최대 속도로 빠짐없이
 ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
-  --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+  --every 2 --max-depth 3.5 --out data/memory/office_stream
 
 # 같은 것을 장면 스트림 파일로(위치만 한 번, 물체 기억은 몇 번이고)
 ondevice slam --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini --out data/office.mmf
-ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office_stream
+ondevice --stream data/office.mmf --every 2 --max-depth 3.5 --out data/memory/office_stream
 ```
 
 `--slam` · `--serve` 의 인자는 공백으로 나눈다(경로에 공백이 없어야 함). 명령줄은 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 잘못된 위치 인자는 스레드를 띄우기 전에 멈춘다. `ondevice view <기억 폴더> …` 는 뷰어만 띄운다.

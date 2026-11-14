@@ -52,7 +52,10 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
 
 | 파일 | 하는 일 | 받는 곳 |
 |---|---|---|
-| `yolo26s-seg.onnx` | 물체 찾기(분할) | Hugging Face `prithivMLmods/YOLO26-ONNX` |
+| `ObjectSAM-416_640.onnx` | 물체 자르기(분할, 이름 없는 물체 1 클래스) | `train/ObjectSAM` 에서 내보냄 |
+| `siglip2-base-patch32-256/` | 물체 사진 → 이름 · 검색 벡터(SigLIP2) | Hugging Face `google/siglip2-base-patch32-256` 을 ONNX 로 |
+
+물체는 ObjectSAM 으로 자르고, 이름은 SigLIP2 사진 벡터가 가장 닮은 실내 낱말(`vocab/indoor.voc`, 104 개)로 붙습니다. 이 셋이 `--seg` · `--embed` · `--vocab` 의 기본값이라 따로 주지 않아도 됩니다(모델 폴더는 `ONDEVICE_MODELS`, 기본 PC `models/` · 보드 `~/models`, `--embed off` 로 이름 붙이기 끔). COCO 80 이름의 YOLO 분할은 `--seg models/yolo26s-seg.onnx` 처럼 직접 줄 때만 씁니다.
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).
 
@@ -61,9 +64,9 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
 ```bash
 cargo build --release --features directml        # target/release/ondevice
 
-# TUM 영상 → 위치 추적 → 점 지도 + 물체 → 뷰어(http://127.0.0.1:8091), 한 명령
+# TUM 영상 → 위치 추적 → 점 지도 + 물체(ObjectSAM + SigLIP2 이름) → 뷰어(http://127.0.0.1:8091), 한 명령
 target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
-    --every 2 --seg models/yolo26s-seg.onnx --embed models/siglip2-base-patch32-256/vision_model.onnx --vocab vocab/names.voc \
+    --every 2 \
     --max-depth 3.5 --out data/memory/office \
     --serve "8091 --bind 127.0.0.1 --search-model models/siglip2-base-patch32-256 --vocab vocab/names.voc"
 ```
@@ -74,7 +77,7 @@ target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sy
 
 검색 모델은 Hugging Face 의 SigLIP2 base patch32-256 을 ONNX 로 내보낸 것으로, `models/siglip2-base-patch32-256/` 에 `vision_model.onnx`(물체 기억이 물체 사진에), `text_model_fp16.onnx`·`tokenizer.json`(뷰어가 검색어에) 을 둡니다. `--embed`·`--search-model` 을 빼면 검색창은 저장된 이름의 글자만 비교합니다.
 
-`vocab/names.voc` 는 이름 1,225 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 · 바닥 · 벽 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. 물체 기억은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 물체 이름으로 쓰고(tv → monitor, 몫 0.3 이상일 때), 뷰어는 같은 파일로 이름들의 글 벡터 계산을 건너뜁니다. 목록을 바꾸면 `ondevice view --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
+`vocab/names.voc` 는 이름 1,225 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 · 바닥 · 벽 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. 물체 기억은 기본으로 더 작은 실내 표 `vocab/indoor.voc` 를 쓰고, `--vocab vocab/names.voc` 로 이 큰 표를 줄 수 있습니다. 물체 기억은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 물체 이름으로 쓰고(tv → monitor, 몫 0.3 이상일 때), 뷰어는 같은 파일로 이름들의 글 벡터 계산을 건너뜁니다. 목록을 바꾸면 `ondevice view --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 
@@ -82,16 +85,15 @@ target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sy
 
 ```bash
 cargo build --release --no-default-features --features dxrt   # target/release/ondevice (D435 입력은 rsdriver: V4L2 직접)
-M=~/dx-all-suite_my/workspace/res/models
-
+# 모델 기본값: ~/models/objectsam-416_640.dxnn(분할) · siglip2-vision_npu.dxnn(이름), 이름 표 vocab/indoor.voc
 target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2 --reset-file data/memory/live/reset.req" \
-    --every 1 --live 1 --seg $M/yolo26-s-seg_640x640.dxnn --max-depth 3.5 --out data/memory/live \
+    --every 1 --live 1 --rt auto --mlock --npu-jobs 1 --max-depth 3.5 --out data/memory/live \
     --serve "8091 --bind 0.0.0.0"     # 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
 ```
 
 - **D435 입력 고르기:** 리눅스 빌드의 기본은 `rsdriver`(librealsense2 없이 V4L2·UVC 직접)입니다. librealsense2 판은 `--features slam-realsense` 로 빌드하고 `--slam "--realsense --driver librealsense …"` 로 고릅니다. rsdriver 의 장면 시각은 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한 값이라(librealsense 의 global time 처럼 시계 차이를 계속 따라가지 않음) 두 판의 절대 시각은 다를 수 있고, 장면 간격은 같습니다. rsdriver 입력은 실제 카메라 확인이 남아 있습니다.
 
-- **아무 말로 찾기(보드):** 물체 기억에 `--embed <SigLIP2 영상 인코더>.dxnn`(NPU), 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
+- **아무 말로 찾기(보드):** 물체 기억은 기본으로 `~/models/siglip2-vision_npu.dxnn`(NPU) 사진 벡터를 남기고, 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
 - **움직일 때 번지면:** `--slam "… --exposure 8 --gain 110"` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
 
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.

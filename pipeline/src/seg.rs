@@ -1,7 +1,7 @@
 //! YOLO26-seg, end-to-end 출력: [1,300,38] = x1 y1 x2 y2 점수 클래스 + 계수 32, 원형 [1,32,160,160].
 //! 실행기 두 개가 같은 전처리(레터박스 RGB, 회색 114)·후처리(상자 안 화소만 계수·원형 내적)를 쓴다.
-//!   - PC: ONNX Runtime (feature "onnx", models/yolo26s-seg.onnx, 입력 f32 NCHW /255)
-//!   - Pi5 + DX-M1: DXRT C API (feature "dxrt", yolo26-s-seg_640x640.dxnn, 입력 u8 NHWC)
+//!   - PC: ONNX Runtime (feature "onnx", 기본 models/ObjectSAM-416_640.onnx, --seg 로 YOLO COCO 모델도, 입력 f32 NCHW /255)
+//!   - Pi5 + DX-M1: DXRT C API (feature "dxrt", 기본 ~/models/objectsam-416_640.dxnn, 입력 u8 NHWC)
 
 pub const COCO: [&str; 80] = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant",
@@ -22,7 +22,7 @@ pub struct Det {
 }
 
 /// 분할 모델 입력 한 변
-/// 분할 모델이 내는 이름(`--seg-names`). 정하지 않으면 COCO 80 개
+/// 분할 모델이 내는 이름(`--seg-names`). 기본 object(ObjectSAM), YOLO 모델이면 COCO 80 개
 static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// 클래스 이름 목록을 바꾼다: 이름 없이 물체만 자르는 1 클래스 모델(ObjectSAM)은 `object`

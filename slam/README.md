@@ -52,11 +52,11 @@ cargo build --release --features slam-realsense
 
 # 한 프로세스: 물체 기억과 같은 프로세스에서 위치 루프를 돌림(라이브러리 `slam::app::spawn`, 장면은 메모리 큐 `stream::Writer::channel`)
 target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
-  --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
+  --every 2 --max-depth 3.5 --out data/memory/office
 
 # 위치만: 장면 스트림을 파일로 남기고 물체 기억은 나중에 그 파일로
 target/release/ondevice slam --tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini --out data/office.mmf
-target/release/ondevice --stream data/office.mmf --every 2 --seg models/yolo26s-seg.onnx --max-depth 3.5 --out data/memory/office
+target/release/ondevice --stream data/office.mmf --every 2 --max-depth 3.5 --out data/memory/office
 ```
 
 시험용 `--reset-at N` 은 N 번째 장면에서 리셋 파일이 생긴 것처럼 처음부터 다시 시작한다. `--db` 는 받아서 넘어간다(데이터베이스 저장은 `rtab_bridge` 에만 있음).

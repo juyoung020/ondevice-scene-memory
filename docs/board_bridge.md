@@ -18,6 +18,20 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 - NPU 는 한 번에 한 프로세스만: 새로 돌리기 전에 `pkill -f ondevice`(다른 NPU 프로그램도 멈춤).
 - 코어 묶기: `--threads` 로 역할마다(예 `--threads auto` 기본, 위치 프로그램 풀을 따로 묶을 때 `slam=0:2-3`).
 
+## PC 에서 교차 빌드해 보드로 보내기
+
+보드에서 빌드(약 4 – 5 분) 대신 PC(우분투 · WSL)에서 aarch64 로 빌드해 `scp` 로 보낸다. 처음 한 번 보드의 `/usr/local/lib/libdxrt.so.3.4.0` 을 `~/board-sysroot/lib` 로 받아 링크에 쓴다(스크립트가 알아서 받음, 저장소 밖). libdxrt 가 부르는 onnxruntime 은 보드에서 실행할 때 찾는다. PC 교차 glibc 2.39 ≤ 보드 2.41.
+
+```bash
+sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold   # mold · sccache 는 있으면 씀
+rustup target add aarch64-unknown-linux-gnu
+bash scripts/cross_board.sh                         # release(fat LTO) → kau@192.168.219.101:~/ondevice-cross
+PROFILE=dev-fast bash scripts/cross_board.sh        # 빠른 확인용: LTO 끔 · 나눠 컴파일 · 증분
+bash scripts/cross_board.sh kau@192.168.219.101 ondevice-cross -- --help   # 보내고 바로 실행
+```
+
+`dev-fast` 는 확인용이고, 측정 · 배포는 `release` 빌드로 한다.
+
 ## 위치 프로그램을 C++ 원본과 견주기(보드 ARM)
 
 위치 프로그램은 PC(x86)에서 C++ 원본 `rtab_bridge` 와 스트림 · 위치 파일 · 판단 바이트가 같다(시험 입력 18 개 × 설정 2 개). 보드 원본은 OpenCV · Eigen 이 ARM NEON 곱셈-덧셈 합침을 써서, 같은 비교를 보드에서 따로 한다(남은 일). 견주는 법: 같은 녹화를 `rtab_bridge --tum <폴더> --rate 0 --block --config docs/rtabmap_pi.ini --out a.mmf --poses a.txt` 와 `ondevice slam` (같은 인자, `--out b.mmf --poses b.txt`)로 돌려 두 파일의 md5 를 본다. `bridge/` 의 C++ 원본은 이 비교에만 쓰고, 아래는 그 빌드 순서다. 필요한 것: RTAB-Map 0.24.2 라이브러리(GTSAM 4.2, OpenCV 4.10.0 + contrib), librealsense2, CMake.

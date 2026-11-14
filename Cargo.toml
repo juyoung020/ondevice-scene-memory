@@ -13,3 +13,10 @@ codegen-units = 1
 lto = "fat"
 # 스레드 패닉을 잡아 이어 가는 곳이 없어 풀기 코드를 뺀다
 panic = "abort"
+
+# 빠른 확인용(교차 빌드 반복): release 를 이어받되 LTO 끄고 나눠 컴파일 · 증분. 측정 · 배포는 release(fat LTO)
+[profile.dev-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

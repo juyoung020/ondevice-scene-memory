@@ -324,6 +324,32 @@ impl KfStore {
 mod tests {
     use super::*;
 
+    /// 줄 풀기(aarch64 는 NEON 누적 합)가 한 칸씩 더하는 스칼라 식과 같은지(폭 여럿, 감싸기 포함)
+    #[test]
+    fn unpack_rows_same_as_scalar() {
+        let mut s = 3u64;
+        let mut r = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s >> 33) as u8 };
+        for w in [1usize, 15, 16, 17, 31, 32, 33, 100, 640] {
+            let p: Vec<Vec<u8>> = (0..3).map(|_| (0..w).map(|_| r()).collect()).collect();
+            let mut out = vec![0u8; 3 * w];
+            unpack_rgb_row([&p[0], &p[1], &p[2]], &mut out);
+            for c in 0..3 {
+                let mut pv = 0u8;
+                for x in 0..w {
+                    pv = pv.wrapping_add(p[c][x]);
+                    assert_eq!(out[x * 3 + c], pv, "rgb w {w} c {c} x {x}");
+                }
+            }
+            let mut d = vec![0u16; w];
+            unpack_depth_row(&p[0], &p[1], &mut d);
+            let mut pv = 0u16;
+            for x in 0..w {
+                pv = pv.wrapping_add(p[0][x] as u16 | (p[1][x] as u16) << 8);
+                assert_eq!(d[x], pv, "depth w {w} x {x}");
+            }
+        }
+    }
+
     /// 묶기 함수가 풀어 쓴 기준 계산과 같은 바이트를 내는지(크기 여럿, 값은 고정 난수)
     #[test]
     fn pack_matches_reference() {
@@ -562,16 +588,92 @@ pub fn unpack_rgb(z: &[u8], w: usize, h: usize) -> Vec<u8> {
     let b = lz4_flex::decompress_size_prepended(z).expect("보관 컬러 풀기");
     let n = w * h;
     let mut rgb = vec![0u8; n * 3];
-    for c in 0..3 {
-        for y in 0..h {
-            let mut prev = 0u8;
-            for x in 0..w {
-                prev = prev.wrapping_add(b[c * n + y * w + x]);
-                rgb[(y * w + x) * 3 + c] = prev;
-            }
-        }
+    for y in 0..h {
+        let r = y * w;
+        unpack_rgb_row([&b[r..r + w], &b[n + r..n + r + w], &b[2 * n + r..2 * n + r + w]], &mut rgb[r * 3..(r + w) * 3]);
     }
     rgb
+}
+
+/// 한 줄: 면마다 왼쪽부터 누적 합(u8 감싸기) → RGB 섞어 담기. aarch64 는 16 칸씩 NEON 누적 합(정수라 값이 같음)
+#[inline]
+#[allow(unused_assignments)]
+fn unpack_rgb_row(p: [&[u8]; 3], out: &mut [u8]) {
+    let w = p[0].len();
+    #[allow(unused_mut)]
+    let mut prev = [0u8; 3];
+    #[allow(unused_mut)]
+    let mut x = 0;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: x + 16 ≤ w 인 동안 세 면과 out[3x .. 3x+48] 은 범위 안
+    unsafe {
+        use core::arch::aarch64::*;
+        let z = vdupq_n_u8(0);
+        let scan = |v: uint8x16_t, c: uint8x16_t| {
+            let v = vaddq_u8(v, vextq_u8::<15>(z, v));
+            let v = vaddq_u8(v, vextq_u8::<14>(z, v));
+            let v = vaddq_u8(v, vextq_u8::<12>(z, v));
+            let v = vaddq_u8(v, vextq_u8::<8>(z, v));
+            vaddq_u8(v, c)
+        };
+        let (mut c0, mut c1, mut c2) = (z, z, z);
+        while x + 16 <= w {
+            let r = scan(vld1q_u8(p[0].as_ptr().add(x)), c0);
+            let g = scan(vld1q_u8(p[1].as_ptr().add(x)), c1);
+            let bb = scan(vld1q_u8(p[2].as_ptr().add(x)), c2);
+            vst3q_u8(out.as_mut_ptr().add(3 * x), uint8x16x3_t(r, g, bb));
+            c0 = vdupq_laneq_u8::<15>(r);
+            c1 = vdupq_laneq_u8::<15>(g);
+            c2 = vdupq_laneq_u8::<15>(bb);
+            x += 16;
+        }
+        prev = [vgetq_lane_u8::<0>(c0), vgetq_lane_u8::<0>(c1), vgetq_lane_u8::<0>(c2)];
+    }
+    for c in 0..3 {
+        let mut pv = prev[c];
+        for xx in x..w {
+            pv = pv.wrapping_add(p[c][xx]);
+            out[xx * 3 + c] = pv;
+        }
+    }
+}
+
+/// 한 줄: (아래 바이트 | 위 바이트 << 8) 의 왼쪽부터 누적 합(u16 감싸기). aarch64 는 16 칸씩 NEON(정수라 값이 같음)
+#[inline]
+#[allow(unused_assignments)]
+fn unpack_depth_row(lo: &[u8], hi: &[u8], out: &mut [u16]) {
+    let w = out.len();
+    #[allow(unused_mut)]
+    let mut prev = 0u16;
+    #[allow(unused_mut)]
+    let mut x = 0;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: x + 16 ≤ w 인 동안 읽기·쓰기 범위 안
+    unsafe {
+        use core::arch::aarch64::*;
+        let z = vdupq_n_u16(0);
+        let scan = |v: uint16x8_t, c: uint16x8_t| {
+            let v = vaddq_u16(v, vextq_u16::<7>(z, v));
+            let v = vaddq_u16(v, vextq_u16::<6>(z, v));
+            let v = vaddq_u16(v, vextq_u16::<4>(z, v));
+            vaddq_u16(v, c)
+        };
+        let mut c = z;
+        while x + 16 <= w {
+            let (l, h) = (vld1q_u8(lo.as_ptr().add(x)), vld1q_u8(hi.as_ptr().add(x)));
+            let a = scan(vreinterpretq_u16_u8(vzip1q_u8(l, h)), c);
+            let b = scan(vreinterpretq_u16_u8(vzip2q_u8(l, h)), vdupq_laneq_u16::<7>(a));
+            vst1q_u16(out.as_mut_ptr().add(x), a);
+            vst1q_u16(out.as_mut_ptr().add(x + 8), b);
+            c = vdupq_laneq_u16::<7>(b);
+            x += 16;
+        }
+        prev = vgetq_lane_u16::<0>(c);
+    }
+    for xx in x..w {
+        prev = prev.wrapping_add(lo[xx] as u16 | (hi[xx] as u16) << 8);
+        out[xx] = prev;
+    }
 }
 
 
@@ -619,12 +721,8 @@ pub fn unpack_depth(z: &[u8], w: usize, h: usize) -> Vec<u16> {
     let n = w * h;
     let mut d = vec![0u16; n];
     for y in 0..h {
-        let mut prev = 0u16;
-        for x in 0..w {
-            let i = y * w + x;
-            prev = prev.wrapping_add(b[i] as u16 | (b[n + i] as u16) << 8);
-            d[i] = prev;
-        }
+        let r = y * w;
+        unpack_depth_row(&b[r..r + w], &b[n + r..n + r + w], &mut d[r..r + w]);
     }
     d
 }

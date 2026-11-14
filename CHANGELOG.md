@@ -8,7 +8,8 @@
 
 ### Added
 - 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.
-- 보드(aarch64) YUYV→RGB · 회색조와 설명자 해밍 거리를 NEON 으로 계산한다(결과 비트 동일).
+- 보드(aarch64) YUYV→RGB · 회색조, 설명자 해밍 거리, BRIEF 9×9 상자 합, 깊이 → 컬러 정렬 사각형 채우기, 보관 장면 풀기를 NEON 으로 계산한다(결과 비트 동일).
+- PC 에서 보드 실행 파일을 교차 빌드해 보내는 `scripts/cross_board.sh` 와 빠른 확인용 빌드 설정 `--profile dev-fast`.
 - Rust 로 다시 짠 위치 프로그램 `slam/`(`ondevice --slam` · `ondevice slam`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 한 프로그램 `ondevice`: 위치 추적(`--slam`) → 지도·물체 → 뷰어 서버(`--serve`)를 한 프로세스에서 복사 없이 돌린다(기억 폴더는 장면 스트림 방식과 바이트 동일). 뷰어는 이 프로세스가 쓴 기억 파일을 디스크에서 다시 읽지 않고 메모리에서 보낸다.
 - D435 입력을 librealsense2 없이 `rsdriver` 로 받는 `--driver rsdriver`(리눅스 기본, librealsense 판은 `--driver librealsense`).

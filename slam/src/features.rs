@@ -326,20 +326,26 @@ struct ColIdx {
 /// Dx 세로 = fma(위+아래, s, fma(가운데, 2s, 0)) (SymmColumnSmallVec_32f 대칭·일반 계수), Dy 세로 = (아래 - 위) + 0 (반대칭 ±1)
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn cov_row_sum<A: BoxAcc>(du: &[f32], dm: &[f32], dd: &[f32], su: &[f32], sd: &[f32], cov: &mut [[f32; 3]], ra: &mut [A], rb: &mut [A], rc: &mut [A]) {
+fn cov_row_sum<A: BoxAcc>(du: &[f32], dm: &[f32], dd: &[f32], su: &[f32], sd: &[f32], cov: &mut [Vec<f32>; 3], ra: &mut [A], rb: &mut [A], rc: &mut [A]) {
     let (s, s2) = (SOBEL_S, SOBEL_S * 2.0);
-    for (((((c, &du), &dm), &dd), &su), &sd) in cov.iter_mut().zip(du).zip(dm).zip(dd).zip(su).zip(sd) {
+    // cov 는 채널마다 따로 연속 배열(세 칸 묶음이면 aarch64 에서 ld3 로 풀어 읽느라 느림)
+    let [xx, xy, yy] = cov;
+    let n = du.len();
+    for (((((((cx, cxy), cy), &du), &dm), &dd), &su), &sd) in
+        xx[..n].iter_mut().zip(xy[..n].iter_mut()).zip(yy[..n].iter_mut()).zip(du).zip(dm).zip(dd).zip(su).zip(sd)
+    {
         let dx = (du + dd).mul_add(s, dm.mul_add(s2, 0.0));
         let dy = (sd - su) + 0.0;
-        *c = [dx * dx, dx * dy, dy * dy];
+        *cx = dx * dx;
+        *cxy = dx * dy;
+        *cy = dy * dy;
     }
-    // 세 채널을 한 번에 돌되 결과는 채널마다 따로 둠(세로 누적이 채널별 연속 배열이라 SIMD 로 잘 바뀜)
+    // 채널마다 가로 3 칸 합 ((a + b) + c)
     let cw = ra.len();
-    let (c0, c1, c2) = (&cov[..cw], &cov[1..cw + 1], &cov[2..cw + 2]);
-    for (((((a, b), c), p), q), r) in ra.iter_mut().zip(rb.iter_mut()).zip(rc.iter_mut()).zip(c0).zip(c1).zip(c2) {
-        *a = A::from_f32(p[0]) + A::from_f32(q[0]) + A::from_f32(r[0]);
-        *b = A::from_f32(p[1]) + A::from_f32(q[1]) + A::from_f32(r[1]);
-        *c = A::from_f32(p[2]) + A::from_f32(q[2]) + A::from_f32(r[2]);
+    for (o, c) in [(ra, &xx[..]), (rb, &xy[..]), (rc, &yy[..])] {
+        for (((o, &p), &q), &r) in o.iter_mut().zip(&c[..cw]).zip(&c[1..cw + 1]).zip(&c[2..cw + 2]) {
+            *o = A::from_f32(p) + A::from_f32(q) + A::from_f32(r);
+        }
     }
 }
 
@@ -369,7 +375,7 @@ fn eig_strip_impl<A: BoxAcc>(gray: &[u8], w: usize, h: usize, xa: usize, xb: usi
     let mut ra = vec![A::default(); 3 * cw];
     let mut rb = vec![A::default(); 3 * cw];
     let mut rc = vec![A::default(); 3 * cw];
-    let mut cov = vec![[0f32; 3]; n];
+    let mut cov = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
     // 클로저 대신 매크로: 클로저는 target_feature(fma) 를 물려받지 않아 mul_add 가 느린 함수 호출이 됨
     macro_rules! filt {
         ($g:expr) => {{
@@ -745,13 +751,8 @@ fn box9_with(gray: &[u8], w: usize, h: usize, out: &mut [i32], col: &mut Vec<i32
         }
         let o = &mut out[y * w + 4..y * w + w - 4];
         let n = w - 8;
-        // 가로 9 칸 합: 앞 9 칸을 한 번 더하고 한 칸씩 밀며 더하고 뺌(정수라 값이 같음)
-        let mut s: i32 = col[..9].iter().sum();
-        o[0] = s;
-        for k in 1..n {
-            s += col[k + 8] - col[k - 1];
-            o[k] = s;
-        }
+        // 가로 9 칸 합(정수라 더하는 순서와 무관하게 값이 같음)
+        crate::simd::hsum9(&col[..n + 8], o);
     }
 }
 

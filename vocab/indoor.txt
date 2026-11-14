@@ -1,0 +1,104 @@
+monitor
+laptop computer
+keyboard
+mouse
+desk
+table
+chair
+stool
+shelf
+bookshelf
+cabinet
+drawer
+book
+notebook
+paper
+cardboard
+box
+bag
+backpack
+plastic bag
+cable
+charger
+phone
+headphones
+speaker
+light
+desk lamp
+fan
+air conditioner
+heater
+radiator
+printer
+router
+camera
+webcam
+tripod
+clock
+wall clock
+cup
+bottle
+can
+bowl
+plate
+glass
+kettle
+refrigerator
+microwave oven
+oven
+sink
+faucet
+trash can
+basket
+bucket
+pen
+pencil
+marker
+scissors
+tape
+stapler
+calculator
+remote control
+toy
+teddy bear
+pillow
+cushion
+blanket
+towel
+paper towel
+curtain
+window blind
+window
+door
+wall
+floor
+ceiling
+whiteboard
+bulletin board
+poster
+picture
+mirror
+plant
+sofa
+bed
+cart
+ladder
+toolbox
+screwdriver
+pliers
+hammer
+drill
+soldering iron
+circuit board
+robot
+fire extinguisher
+umbrella
+jacket
+coat
+shoe
+hat
+glove
+envelope
+folder
+ruler
+battery

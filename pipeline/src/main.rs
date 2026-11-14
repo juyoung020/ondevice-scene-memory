@@ -1179,7 +1179,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             clock.add(P::Scene, c_sc);
             let c_v = Instant::now();
             // 점 노드를 쓴 장면은 view.json 을 다음 장면으로 미룸(한 장면에 몰리지 않게). 병합은 제때(결과가 같게)
-            if scene_done && nkf > 1 {
+            if scene_done && nkf > 1 && !(out::memory_only() && a.live > 0.0) { // 메모리 기억 폴더는 같은 장면에서(미루면 실시간에선 장면마다 다시 미뤄져 판이 안 나감)
                 if merge {
                     mem.prune(t);
                     mem.merge_pass();

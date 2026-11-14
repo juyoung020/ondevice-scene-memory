@@ -1457,9 +1457,11 @@ async function fetchView() {
   if (viewBusy) { viewAgain = true; return; }
   viewBusy = true;
   try {
+    const t0 = performance.now();
     // trajectory: send what we have (log id + count) so the server sends only the appended points
     const r = await fetch("/api/view?v=" + encodeURIComponent(viewVer) + (trajLog ? `&tr=${trajLog.id}&tf=${trajLog.nodes.length}` : ""));
-    const j = await r.json();
+    const txt = await r.text(), j = JSON.parse(txt);
+    met.kb += txt.length / 1024;
     if (j.view) {
       const g = j.view.graph || (j.view.graph = {});
       if (j.traj && j.traj.from > 0 && trajLog && trajLog.id === j.traj.id) { trajLog.nodes.push(...(g.nodes || [])); g.nodes = trajLog.nodes; }
@@ -1468,10 +1470,12 @@ async function fetchView() {
       const first = !view;
       viewVer = j.v;
       if (first || j.map_v !== mapVer) { mapVer = j.map_v; view = j.view; await loadMap(); }
+      const t1 = performance.now(); met.fms += t1 - t0; met.nv++;
       if (j.view.wall) viewWall = j.view.wall;   // ?metrics=1: 지도 판을 낸 장면 → 화면
       applyView(j.view);
       if (latestPose && latestPose.t >= (view.stamp ?? 0)) { view.cam = latestPose.cam; view.pose = latestPose.pose; drawRobot(); }   // keep the newer fast pose
       updateWalls();
+      met.ams += performance.now() - t1;
     }
   } catch (e) {}
   viewBusy = false;
@@ -1482,11 +1486,11 @@ async function fetchView() {
 let latestPose = null;
 // ?metrics=1: 2 초마다 그린 프레임 수 · 위치(pose.json wall) → 화면 지연을 서버 로그로(/api/metric)
 let poseWall = 0, viewWall = 0;
-const met = { frames: 0, lat: [], vlat: [], t0: performance.now() };
+const met = { frames: 0, lat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0 };
 if (QS.get("metrics") === "1") setInterval(() => {
   const dt = (performance.now() - met.t0) / 1000, qq = (a, p) => { a.sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(0) : "-"; };
-  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}`).catch(() => {});
-  met.frames = 0; met.lat = []; met.vlat = []; met.t0 = performance.now();
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}`).catch(() => {});
+  met.frames = 0; met.lat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = 0; met.t0 = performance.now();
 }, 2000);
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
@@ -1940,7 +1944,7 @@ function frame() {
   { const d = camera.position.distanceTo(controls.target); scene.fog.near = d * 0.6; scene.fog.far = d * 2.2; }   // fog follows the viewing distance: the focus stays clear at any zoom
   updatePointScale(); octUpdate(); renderFrame(); updateLabels();
   perf.frames++; perf.renderMs += performance.now() - tr;
-  met.frames++;
+  met.frames++; met.rms += performance.now() - tr;
   if (poseWall) { met.lat.push(Date.now() - poseWall); poseWall = 0; }
   if (viewWall) { met.vlat.push(Date.now() - viewWall); viewWall = 0; }
 }

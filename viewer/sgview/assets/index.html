@@ -193,7 +193,7 @@ const EDGE_COL = { place:0x5a5a5a, door:0xe67814, agent:0x286ee6, inter:0x969696
 const host = $("view");
 const QS = new URLSearchParams(location.search);
 // Quality: "high" = device pixel ratio up to 2 and a 3 M point budget for the octree point map; "low" = pixel ratio 1 and 0.8 M points.
-// Weak GPUs (Raspberry Pi V3D, mobile, software rasterisers) start at low. EDL depth shading stays on in both (one light full-screen pass).
+// Every GPU starts at high (?quality=low or the button picks low; the choice is remembered). EDL depth shading stays on in both (one light full-screen pass).
 // The GPU is read from a throwaway context first: weak GPUs get a canvas without multisampling (the scene is drawn into the EDL target,
 // which has none, so canvas MSAA only cost a resolve per frame there, and with EDL off it doubled the point fill cost).
 const GPU_NAME = (() => { try { const gl = document.createElement("canvas").getContext("webgl"), x = gl.getExtension("WEBGL_debug_renderer_info"), n = String(gl.getParameter(x ? x.UNMASKED_RENDERER_WEBGL : gl.RENDERER)); const l = gl.getExtension("WEBGL_lose_context"); if (l) l.loseContext(); return n; } catch (e) { return ""; } })();
@@ -201,7 +201,7 @@ const WEAK_GPU = /V3D|VideoCore|Broadcom|Mali|Adreno|PowerVR|llvmpipe|SwiftShade
 const renderer = new THREE.WebGLRenderer({ antialias:!WEAK_GPU, alpha:true });   // transparent clear: the page gradient is the background
 renderer.setClearColor(0x000000, 0);
 host.appendChild(renderer.domElement);
-let quality = QS.get("quality") || localStorage.getItem("sg_quality") || (WEAK_GPU ? "low" : "high");
+let quality = QS.get("quality") || localStorage.getItem("sg_quality") || "high";
 function applyQuality() {
   renderer.setPixelRatio(quality === "high" ? Math.min(devicePixelRatio, 2) : 1);
   const b = $("b_q"); if (b) { b.textContent = quality === "high" ? "High" : "Low"; b.title = "Rendering quality (GPU: " + (GPU_NAME || "unknown") + ")"; }

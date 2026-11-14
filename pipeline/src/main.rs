@@ -1888,7 +1888,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             }
             Crop { w: bw as u32, h: bh as u32, rgb: crgb.into(), mask: std::sync::Arc::new(m.iter().map(|&b| if b { 255 } else { 0 }).collect()), depth: cdep.into() }
         };
-        let id = mem.update(name, d.score, &pts, med as f32, t, (bw * bh) as u32, crop, None);
+        let id = mem.update(name, d.score, &pts, med as f32, t, crop_score(rgb, w, h, x1, y1, bw, bh, m), crop, None);
         seen.insert(id);
     }
     EB.with(|c| c.set(eb));
@@ -1996,6 +1996,34 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, room_tr: &mut rooms::Tr
 
 /// 표면이 시선과 이루는 각: 이웃 화소(±2)로 만든 법선과 시선의 코사인이 0.3(약 73°) 이상인 점만 — 비스듬히 본 면은 깊이 잡음이
 /// 시선 방향으로 길게 번져 줄무늬 껍질이 됨
+/// 물체 사진 점수(클수록 이름 붙이기에 좋은 사진): 넓이 × 밝기 × 선명함 × 잘림. 마스크 안 화소를 4 칸마다 본다.
+/// 어두운 사진(밝기 평균 60 아래), 흐린 사진(이웃 밝기 차 평균이 작음), 영상 가장자리에 닿아 잘린 사진은 깎는다
+#[allow(clippy::too_many_arguments)]
+fn crop_score(rgb: &[u8], w: usize, h: usize, x1: usize, y1: usize, bw: usize, bh: usize, m: &[bool]) -> u32 {
+    let luma = |o: usize| (rgb[o * 3] as u32 * 77 + rgb[o * 3 + 1] as u32 * 150 + rgb[o * 3 + 2] as u32 * 29) >> 8;
+    let (mut n, mut sum, mut grad) = (0u32, 0u32, 0u32);
+    for yy in (0..bh).step_by(4) {
+        for xx in (0..bw.saturating_sub(1)).step_by(4) {
+            if !m[yy * bw + xx] {
+                continue;
+            }
+            let o = (y1 + yy) * w + x1 + xx;
+            let (a, b) = (luma(o), luma(o + 1));
+            n += 1;
+            sum += a;
+            grad += a.abs_diff(b);
+        }
+    }
+    if n == 0 {
+        return 0;
+    }
+    let (mean, sharp) = (sum as f32 / n as f32, grad as f32 / n as f32);
+    let bright = (mean / 60.0).clamp(0.2, 1.0);
+    let crisp = (sharp / 6.0).clamp(0.3, 1.0);
+    let edge = if x1 == 0 || y1 == 0 || x1 + bw >= w || y1 + bh >= h { 0.6 } else { 1.0 };
+    ((bw * bh) as f32 * bright * crisp * edge) as u32
+}
+
 /// ax[x] = (x − cx)/fx, ay[y] = (y − cy)/fy: 화소마다 나누지 않게 미리(곱하는 차례는 그대로 → 같은 값)
 fn facing(d: &[f32], w: usize, h: usize, ax: &[f64], ay: &[f64], u: usize, v: usize, pc: &V3) -> bool {
     if u < 2 || v < 2 || u + 2 >= w || v + 2 >= h {
@@ -2085,8 +2113,18 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args(&argv);
-    if let Some(n) = &a.seg_names {
-        seg::set_names(n);
+    #[cfg(feature = "dxrt")]
+    {
+        // --seg-npu · --embed-npu: 두 NPU 모델을 다른 NPU 코어에 묶음(기본 all)
+        use std::sync::atomic::Ordering::Relaxed;
+        seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
+        seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
+    }
+    // 물체만 자르는 1 클래스 모델(파일 이름에 objectsam)은 --seg-names 가 없으면 object
+    match &a.seg_names {
+        Some(n) => seg::set_names(n),
+        None if a.seg.to_ascii_lowercase().contains("objectsam") => seg::set_names("object"),
+        None => {}
     }
     if let Some(m) = &a.embed {
         embed::start(m);

@@ -692,7 +692,7 @@ const VIS_W = 4096;
 const octVis = { data:new Uint8Array(VIS_W * 4), tex:null };
 octVis.tex = new THREE.DataTexture(octVis.data, VIS_W, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
 octVis.tex.magFilter = octVis.tex.minFilter = THREE.NearestFilter; octVis.tex.generateMipmaps = false;
-const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:50 }, vis:{ value:octVis.tex },
+const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:14 }, vis:{ value:octVis.tex },
                  pass:{ value:0 }, depth:{ value:null }, res:{ value:new THREE.Vector2(1, 1) }, near:{ value:0.05 }, far:{ value:500 }, band:{ value:1.5 } };
 function octMaterial() {
   // round splats sized by the local point spacing: neighbouring points overlap into a closed surface and EDL shades its edges;

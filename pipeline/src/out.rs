@@ -84,7 +84,9 @@ fn write_lazy(dst: &Path, job: Job) {
 fn run_job(dst: &Path, job: Job) {
     let c0 = std::time::Instant::now();
     let b = job();
-    write_now(dst, &b);
+    if !memory_only() {
+        write_now(dst, &b);
+    }
     let n = b.len();
     publish(dst, b);
     slow(c0);
@@ -101,21 +103,96 @@ pub fn publish(dst: &Path, bytes: Vec<u8>) {
 
 /// 기록 스레드를 거치지 않고 바로 씀(그 자리에서 읽힐 작은 파일) + 서버에 걸어 둠
 pub fn write_direct(dst: &Path, bytes: Vec<u8>) {
-    if std::fs::write(dst, &bytes).is_ok() {
+    if memory_only() || std::fs::write(dst, &bytes).is_ok() {
         publish(dst, bytes);
     }
 }
 
 /// 파일 지우기(서버에 걸어 둔 것도 함께)
 pub fn remove_file(p: &Path) {
-    let _ = std::fs::remove_file(p);
+    if !memory_only() {
+        let _ = std::fs::remove_file(p);
+    }
     sgview::memfs::remove(p);
 }
 
 /// 폴더 지우기(서버에 걸어 둔 그 아래 파일도 함께)
 pub fn remove_dir_all(p: &Path) {
-    let _ = std::fs::remove_dir_all(p);
+    if !memory_only() {
+        let _ = std::fs::remove_dir_all(p);
+    }
     sgview::memfs::remove_dir(p);
+}
+
+/// `--serve`: 기억 폴더를 메모리(memfs)에만 둔다. 장면마다 디스크(보드 SD 카드)에 쓰지 않고, 끝에
+/// (또는 `--save-every` 초마다 · 뷰어 저장 버튼) [`save`] 로 한 번에 쓴다
+static MEMORY_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_memory_only() {
+    MEMORY_ONLY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn memory_only() -> bool {
+    MEMORY_ONLY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn norm_path(p: &Path) -> std::path::PathBuf {
+    p.components().collect()
+}
+
+/// 폴더 바로 아래 항목(이름, 폴더인지): 메모리 기억 폴더면 걸린 파일 경로에서, 아니면 디스크에서
+pub fn list_dir(p: &Path) -> Vec<(String, bool)> {
+    if memory_only() {
+        let base = norm_path(p);
+        let mut v: Vec<(String, bool)> = vec![];
+        for f in sgview::memfs::list(p) {
+            let Ok(rest) = f.strip_prefix(&base) else { continue };
+            let mut c = rest.components();
+            let Some(first) = c.next() else { continue };
+            let (name, is_dir) = (first.as_os_str().to_string_lossy().into_owned(), c.next().is_some());
+            if !v.iter().any(|e| e.0 == name) {
+                v.push((name, is_dir));
+            }
+        }
+        return v;
+    }
+    std::fs::read_dir(p).map_or_else(|_| vec![], |rd| rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path().is_dir())).collect())
+}
+
+static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 메모리 기억 폴더를 디스크에: 걸린 파일을 모두(임시 파일 → 바꾸기) 쓰고, 같은 프로세스 뷰가 있으면 view.json 도.
+/// 디스크의 scene/ · objects/ 아래 메모리에 없는 파일(지운 판 · 사라진 물체)은 지운다. 돌려줌: 쓴 파일 수
+pub fn save(dir: &Path) -> usize {
+    let _g = SAVING.lock().unwrap();
+    let base = norm_path(dir);
+    let files: Vec<_> = sgview::memfs::all().into_iter().filter(|(p, _)| p.starts_with(&base)).collect();
+    let keep: std::collections::HashSet<std::path::PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+    for sub in ["scene", "objects"] {
+        prune_disk(&dir.join(sub), &keep);
+    }
+    for (p, b) in &files {
+        write_now(p, b);
+    }
+    let mut n = files.len();
+    if let Some(v) = sgview::live::current() {
+        write_now(&dir.join("view.json"), &v.bytes());
+        n += 1;
+    }
+    n
+}
+
+fn prune_disk(d: &Path, keep: &std::collections::HashSet<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(d) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            prune_disk(&p, keep);
+            let _ = std::fs::remove_dir(&p); // 빈 폴더만 지워짐
+        } else if !keep.contains(&norm_path(&p)) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 fn write_now(dst: &Path, bytes: &[u8]) {

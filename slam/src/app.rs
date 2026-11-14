@@ -739,9 +739,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let c0 = Instant::now();
         let Some(mut fr) = src.next()? else { break };
         fr.id = n + 1;
-        // 리셋 요청(뷰어의 Reset 버튼이 이 파일을 만듦): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
+        // 리셋 요청(뷰어의 Reset 버튼: 한 프로그램이면 common::control 신호, 따로 띄운 뷰어면 --reset-file 파일): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
         // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다
-        let reset_req = n == a.reset_at || (!a.reset_file.is_empty() && std::path::Path::new(&a.reset_file).exists());
+        let reset_req = n == a.reset_at || common::control::take_reset() || (!a.reset_file.is_empty() && std::path::Path::new(&a.reset_file).exists());
         if reset_req {
             let _ = std::fs::remove_file(&a.reset_file);
         }

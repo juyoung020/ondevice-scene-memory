@@ -436,6 +436,11 @@ mod engine {
             self.slam.process(&inp);
         }
 
+        /// 이번 단계 루프 보정 크기(m, rad)와 크기 때문에 버린 루프 수
+        pub fn correction_info(&self) -> ((f32, f32), u32) {
+            (self.slam.info.max_correction, self.slam.info.rejected_by_correction)
+        }
+
         pub fn loop_closure_id(&self) -> i32 {
             self.slam.loop_closure_id()
         }
@@ -751,6 +756,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let bridge = a.bridge && klt_path;
     let mut n_bridge = 0i64;
     let mut n_global = 0i64;
+    let mut n_loop_rejected = 0i64;
+    let mut max_corr = (0f32, 0f32);
     let mut last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
     let mut n_bridge_ok = 0i64;
 
@@ -900,6 +907,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 lost_since = -1.0;
             }
         }
+        let gap_since_good = fr.t - last_good_t; // 마지막으로 위치를 낸 뒤 흐른 시간(녹화·USB 빈틈 포함)
         if pose.is_some() {
             lost_since = -1.0;
             last_good_t = fr.t;
@@ -910,7 +918,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
 
         // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다
         let mut new_map = false;
-        if bridge && anchored && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
+        // 이어 붙이기는 그사이 움직임을 아는 경우만: 깊이 ICP 로 자리를 확인했거나 빈틈이 1 초 이하.
+        // 그보다 길면(사람이 그사이 걸었을 수 있음) 새 지도를 열고 루프 클로저가 옛 지도와 잇게 둔다(틀린 이어 붙이기를 거대한 보정으로 끌어오지 않게)
+        if bridge && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 && (eng.bridge_verified() || gap_since_good <= 1.0) {
             // 이어 붙이기: 위치 추적은 마지막 위치에서 다시 시작했다. 같은 지도에 큰 불확실성(0.5 m², 0.5 rad²)으로 이어
             // 지도가 끊기지 않게 하고, 실제로 어긋났으면 뒤의 루프 클로저가 그래프 최적화로 바로잡는다
             info.cov = [0.0; 36];
@@ -960,6 +970,13 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             slam_ms = ms_since(c2);
             loop_ = eng.loop_closure_id() > 0;
             n_loop += loop_ as i64;
+            let (mc, rj) = eng.correction_info();
+            n_loop_rejected += rj as i64;
+            if loop_ || rj > 0 {
+                max_corr.0 = max_corr.0.max(mc.0);
+                max_corr.1 = max_corr.1.max(mc.1);
+                common::info!("장면 {n}: 루프 클로저 {} (기존 노드 최대 보정 {:.2} m · {:.1}°)", if rj > 0 { "버림" } else { "받음" }, mc.0, mc.1.to_degrees());
+            }
             lp = eng.local_optimized().clone();
             let last = eng.last_location_id();
             if !anchored && lp.contains_key(&good_id) {
@@ -1136,6 +1153,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
 
     if bridge {
         common::info!("놓친 뒤 같은 지도로 이어 붙임 {n_bridge} 번(깊이 ICP 로 자리 확인 {n_bridge_ok} 번), 지도 전체에서 다시 잡음 {n_global} 번");
+    }
+    {
+        common::info!("루프 클로저 받음 {n_loop} · 보정이 커서 버림 {n_loop_rejected}, 살펴본 보정 최대 {:.2} m · {:.1}°", max_corr.0, max_corr.1.to_degrees());
     }
     common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
     common::info!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");

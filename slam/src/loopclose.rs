@@ -135,6 +135,9 @@ pub struct StepInfo {
     pub proximity_id: i32,
     pub small_displacement: bool,
     pub rejected: bool,
+    /// 루프 클로저 최적화가 옮긴 기존 노드 최대(m, rad)와, 그 크기 때문에 버렸는지
+    pub max_correction: (f32, f32),
+    pub rejected_by_correction: u32,
 }
 
 /// 설정(우리 ini 와 Parameters.h 기본값)
@@ -148,6 +151,9 @@ pub struct SlamParams {
     pub proximity_filtering_radius: f32,
     pub proximity_angle: f32,
     pub optimize_max_error: f32,
+    /// 루프 클로저를 넣은 최적화가 이미 있던 노드를 이보다 많이 옮기면 거짓 루프로 보고 버림(m, rad). 0 = 끔(원본 동작)
+    pub max_correction_lin: f32,
+    pub max_correction_ang: f32,
     pub linear_update: f32,
     pub angular_update: f32,
     pub max_odom_cache: usize,
@@ -165,6 +171,8 @@ impl SlamParams {
             // _proximityAngle *= M_PI/180.0f (float 변수)
             proximity_angle: (p.get("RGBD/ProximityAngle", 45.0f32) as f64 * (std::f64::consts::PI / 180.0f32 as f64)) as f32,
             optimize_max_error: p.get("RGBD/OptimizeMaxError", 3.0f32),
+            max_correction_lin: p.get("RGBD/MaxCorrectionLinear", 0.0f32),
+            max_correction_ang: p.get("RGBD/MaxCorrectionAngular", 0.0f32),
             linear_update: p.get("RGBD/LinearUpdate", 0.1f32),
             angular_update: p.get("RGBD/AngularUpdate", 0.1f32),
             max_odom_cache: p.get("RGBD/MaxOdomCacheSize", 10usize),
@@ -531,6 +539,27 @@ impl Slam {
                 let e = compute_max_graph_errors(&poses, &cons);
                 let max = self.p.optimize_max_error;
                 reject = (e.linear_valid && max > 0.0 && e.linear_ratio > max) || (e.angular_valid && max > 0.0 && e.angular_ratio > max);
+                // 그럴듯한 보정 크기: 이미 있던 노드가 옮겨진 최대 거리·각도
+                if !reject && (self.p.max_correction_lin > 0.0 || self.p.max_correction_ang > 0.0) {
+                    let (mut ml, mut ma) = (0f32, 0f32);
+                    // 루프 상대 노드가 속한 지도의 노드만 본다: 다른 지도와 이어 붙일 때(새 지도 → 옛 지도) 새 지도 쪽이 크게 옮겨지는 건 정상
+                    let tgt_map = added.first().and_then(|(_, b)| self.mem.sig(*b)).map(|s| s.map_id);
+                    for (id, np) in poses.iter() {
+                        if tgt_map.is_some() && self.mem.sig(*id).map(|s| s.map_id) != tgt_map {
+                            continue;
+                        }
+                        if let Some(op) = self.optimized.get(id) {
+                            let v = op.inverse().mul(np).xyz_rpy();
+                            ml = ml.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+                            ma = ma.max(v[3].abs().max(v[4].abs()).max(v[5].abs()));
+                        }
+                    }
+                    reject = (self.p.max_correction_lin > 0.0 && ml > self.p.max_correction_lin) || (self.p.max_correction_ang > 0.0 && ma > self.p.max_correction_ang);
+                    self.info.max_correction = (ml, ma);
+                    if reject {
+                        self.info.rejected_by_correction += 1;
+                    }
+                }
             }
             if reject {
                 for (a, b) in &added {

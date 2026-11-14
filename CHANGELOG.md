@@ -14,7 +14,7 @@
 - 실시간 지도가 첫 장면부터 수평으로 보이고(첫 장면 카메라를 똑바로 선 것으로 봄), 바닥 합의가 나오면 한 번 고친다.
 - 뷰어가 지나온 길을 덧붙인 몫만 받는다.
 - 빠른 움직임에도 끊기지 않는 광류 위치 추적 `Odom/Strategy=9`(기본): 등속 예측 · 광류 · PnP, 끊기면 깊이 ICP · 키프레임 기술자로 같은 장면에서 되찾음. 사용자 손카메라 녹화에서 위치 못 낸 장면 21.5 % → 1.7 %, 새 지도 192 → 0.
-- 위치 프로그램 `--stride N`(TUM 재생에서 N 장마다 한 장), rsd_rec 녹화 폴더(calib.json) 재생, 통계 CSV 의 `no_pose` 칸, D435 컬러 노출 상한 `--ae-cap ms`.
+- 위치 프로그램 `--stride N`(TUM 재생에서 N 장마다 한 장), rsd_rec 녹화 폴더(calib.json) 재생, 통계 CSV 의 `no_pose` 칸, D435 컬러 노출 상한 `--ae-cap ms` 와 제어 묶음 `--camera-profile librealsense|tracking`.
 - 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.
 - 보드(aarch64) YUYV→RGB · 회색조, 설명자 해밍 거리, BRIEF 9×9 상자 합, 깊이 → 컬러 정렬 사각형 채우기, 보관 장면 풀기를 NEON 으로 계산한다(결과 비트 동일).
 - PC 에서 보드 실행 파일을 교차 빌드해 보내는 `scripts/cross_board.sh` 와 빠른 확인용 빌드 설정 `--profile dev-fast`.
@@ -30,7 +30,7 @@
 - 실시간 뷰어는 받은 장면마다 새 판을 받고, 서버는 바뀔 때만 밀어 준다(연결 스레드는 고정 8 개).
 - view 판 짜기 · 방 나누기 · 장면 보관 압축이 본 스레드 밖에서 돌고, 깊이는 장면마다 한 번만 미터로 바꾼다(출력 바이트 동일).
 - 놓친 뒤 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙인다(광류 경로, `--no-bridge` 로 예전 동작). 광류 경로에서는 다시 잡기 대기가 0 초다.
-- D435 컬러를 60 Hz 깜빡임 맞춤 · 자동 화이트 밸런스 · 역광 보정 끔으로 연다.
+- rsdriver 가 열 때 컬러 제어를 모두 장치 기본값으로 되돌려 librealsense 와 값마다 같은 상태로 연다(앞 실행이 바꿔 둔 값이 남지 않음). 위치 추적용 묶음 `--camera-profile tracking`(60 Hz · 노출 상한 · 감도 보충)은 선택.
 - 기준 장면 · 스트림이 깊이 버퍼를 나눠 들고, 물체 사진 깊이 · 지도 그림 · 침식 · 레터박스의 복사와 할당을 줄였다(출력 바이트 동일).
 - 원래 깊이 값을 미터로 바꿀 때 역수 곱을 쓴다(끝자리 차이, 위치 오차 · 물체 수 같음).
 - **호환 변경:** 실행 파일을 `ondevice` 하나로 합쳤다(`memmap` → `ondevice`, `slam_bridge` → `ondevice slam`, `sgview` → `ondevice view`). 보드 실시간도 `ondevice --slam "--realsense …" --serve …` 한 명령이다.

@@ -386,13 +386,13 @@ pub struct Diag {
     pub jump: f32,
 }
 
-/// 영상이 낸 장면 사이 움직임(transform, 몸체)의 회전이 IMU 자이로 회전과 5° + 회전량의 10 % 넘게 다른지. IMU 회전이 없으면 false
+/// 영상이 낸 장면 사이 움직임(transform, 몸체)의 회전이 IMU 자이로 회전과 1° + 회전량의 15 % 넘게 다른지(가만히 둔 장면의 차이는 0.03°/장 안). IMU 회전이 없으면 false
 fn imu_disagree(imu_rot: &Option<crate::simd::M34>, transform: &Tf) -> bool {
     let Some(r) = imu_rot else { return false };
     let e = crate::imu::so3_log(&crate::simd::m34_mul(&crate::simd::m34_t(r), &crate::imu::m34_of_tf(transform)));
     let w = crate::imu::so3_log(r);
     let n = |v: [f32; 4]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().to_degrees();
-    n(e) > 5.0 + 0.1 * n(w)
+    n(e) > 1.0 + 0.15 * n(w)
 }
 
 fn jump_of(pred: &Option<Tf>, pose: &Tf) -> f32 {

@@ -551,7 +551,23 @@ pub struct OV {
 
 /// 썸네일: w×h RGB, 마스크(0/255), 깊이(mm)
 /// 사진 벡터로 합치는 문턱(fr1_room 실측, docs/performance_log.md): 같은 물체의 두 이름 0.92, 의자와 그 위 인형 0.85, 겹친 다른 물체 0.74–0.82
+/// 약한 물체: 이보다 적게 보였고 분할 점수가 이보다 낮으면 3 초 안 보일 때 지움
+pub const WEAK_OBS: u32 = 6;
+pub const WEAK_SCORE: f32 = 0.6;
 pub const LOOK_COS: f32 = 0.88;
+/// 상자 겹침으로 합칠 때의 사진 코사인
+pub const BOX_COS: f32 = 0.9;
+/// 두 물체 상자(중심 ± 크기/2)의 겹친 부피 / 작은 상자 부피
+fn box_overlap(a: &Obj, b: &Obj) -> f64 {
+    let mut inter = 1.0;
+    for k in 0..3 {
+        let lo = (a.pos[k] - a.extent[k] / 2.0).max(b.pos[k] - b.extent[k] / 2.0);
+        let hi = (a.pos[k] + a.extent[k] / 2.0).min(b.pos[k] + b.extent[k] / 2.0);
+        inter *= (hi - lo).max(0.0);
+    }
+    let vol = |o: &Obj| o.extent.iter().map(|x| x.max(0.01)).product::<f64>();
+    inter / vol(a).min(vol(b)).max(1e-9)
+}
 /// 작은 쪽 굳은 칸 중 큰 쪽 굳은 칸과 겹쳐야 하는 비율(같은 물체 0.33, 나란한 모니터 둘 0.14)
 pub const LOOK_OVL: f32 = 0.25;
 
@@ -767,7 +783,9 @@ impl Memory {
         let n0 = self.objs.len();
         // 두 번 이하로 본 물체는 3 초가 지나고 분할한 장면 8 장에서도 안 보였을 때 지움(분할을 건너뛴 장면은 못 본 것으로 세지 않음)
         let ns = self.n_seg;
-        self.objs.retain(|o| !(o.n_obs <= 2 && now - o.last_seen > 3.0 && ns.saturating_sub(o.last_seg) >= 8));
+        // 몇 번 안 보였고 분할 점수도 낮은 물체(책상 모서리 · 뭉개진 조각: 이름을 붙여도 대개 틀림)도 같은 때 지움
+        let weak = |o: &Obj| o.n_obs <= 2 || (o.n_obs < WEAK_OBS && o.score < WEAK_SCORE);
+        self.objs.retain(|o| !(weak(o) && now - o.last_seen > 3.0 && ns.saturating_sub(o.last_seg) >= 8));
         n0 - self.objs.len()
     }
 
@@ -872,8 +890,13 @@ impl Memory {
                     let (sa, sb) = if a.support.len() <= b.support.len() { (&a.support, &b.support) } else { (&b.support, &a.support) };
                     let inter = sa.keys().filter(|k| sb.contains_key(k)).count() as f32;
                     let touch = || votes_cos(a, b) >= 0.5 && touching(a, b, &solid(a), &solid(b));
+                    // 칸은 안 겹쳐도 상자가 크게 겹치고 사진이 아주 닮으면 같은 물체(다른 조각으로 잡힘)
+                    let boxed = || {
+                        let (Some(ea), Some(eb)) = (emb(a.id), emb(b.id)) else { return false };
+                        ea.len() == eb.len() && ea.iter().zip(&eb).map(|(x, y)| x * y).sum::<f32>() >= BOX_COS && box_overlap(a, b) >= 0.6
+                    };
                     if inter == 0.0 {
-                        if touch() {
+                        if touch() || boxed() {
                             pair = Some((i, j));
                             break 'outer;
                         }
@@ -896,6 +919,11 @@ impl Memory {
                         let cos = ea.iter().zip(&eb).map(|(x, y)| x * y).sum::<f32>();
                         if ea.len() != eb.len() || cos < LOOK_COS {
                             return false;
+                        }
+                        // 상자가 크게 겹치고 사진이 아주 닮음(같은 물체를 다른 조각으로 두 번 잡음): 작은 상자의 60 % 이상이 겹침
+                        if cos >= BOX_COS && box_overlap(a, b) >= 0.6 {
+                            common::info!("merge(box): {}#{} + {}#{} cos {cos:.2}", a.name, a.id, b.name, b.id);
+                            return true;
                         }
                         let (ca, cb) = (solid(a), solid(b));
                         let (s, l) = if ca.len() <= cb.len() { (ca, cb) } else { (cb, ca) };

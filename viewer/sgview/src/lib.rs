@@ -680,7 +680,13 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         // ?metrics=1 page: frames drawn and pose → screen latency every 2 s, logged here (measuring on the board screen)
         "/api/metric" => {
             let g = |k: &str| q.get(k).map_or("-", |v| v.as_str());
-            eprintln!("viewer: {} fps (render {} ms), pose→screen p50 {} p95 {} ms (n {}), map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms)", g("fps"), g("rms"), g("lat50"), g("lat95"), g("n"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"));
+            // MemAvailable of this machine (board): run boundaries are logged with it to tell memory pressure from viewer work
+            let avail = fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).map_or("-".to_string(), |kb| (kb / 1024).to_string());
+            if let Some(e) = q.get("event") {
+                eprintln!("viewer event: {e}, js heap {} MB, MemAvailable {avail} MB", g("jsmb"));
+                return respond(&mut s, 204, "text/plain", "", b"");
+            }
+            eprintln!("viewer: {} fps (render {} ms), pose→screen p50 {} p95 {} ms (n {}), map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms), js heap {} MB, MemAvailable {} MB", g("fps"), g("rms"), g("lat50"), g("lat95"), g("n"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"), g("jsmb"), avail);
             respond(&mut s, 204, "text/plain", "", b"")
         }
         "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),

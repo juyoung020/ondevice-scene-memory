@@ -754,7 +754,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--bridge-gap 초(1)] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -793,6 +793,8 @@ pub struct Args {
     queue: usize,
     w: u32,
     h: u32,
+    /// --color-size: 컬러 크기(0 = --size 와 같음)
+    color: (u32, u32),
     fps: u32,
     max_frames: i64,
     overrides: Vec<(String, String)>,
@@ -827,6 +829,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         gain: -1,
         send_every: 1,
         queue: 4,
+        color: (0, 0),
         w: 640,
         h: 480,
         fps: 30,
@@ -867,6 +870,12 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
                 if let Some((w, h)) = s.split_once('x') {
                     a.w = w.parse().unwrap_or(a.w);
                     a.h = h.parse().unwrap_or(a.h);
+                }
+            }
+            "--color-size" => {
+                let s = val()?;
+                if let Some((w, h)) = s.split_once('x') {
+                    a.color = (w.parse().unwrap_or(0), h.parse().unwrap_or(0));
                 }
             }
             "--fps" => a.fps = num(&val()?)? as u32,
@@ -1490,13 +1499,13 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
 
 /// D435 입력: --driver rsdriver(V4L2 직접, 기본) | librealsense(--align 로 정렬 방식). 빌드에 든 것만 고를 수 있다
 fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
-    let _ = (&a.align, &a.serial, a.exposure_ms, a.gain, a.w, a.h, a.fps);
-    let want = if a.driver.is_empty() { if cfg!(feature = "rsdriver") { "rsdriver" } else { "librealsense" } } else { a.driver.as_str() };
-    match want {
-        #[cfg(feature = "rsdriver")]
-        "rsdriver" => Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, &a.camera_profile)?)),
-        #[cfg(feature = "realsense")]
-        "librealsense" => Ok(Box::new(crate::io::RealSenseSource::new(a.w, a.h, a.fps, &a.align, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms)?)),
-        d => Err(format!("카메라 입력 {d} 이 이 빌드에 없음(--features rsdriver 또는 realsense 로 빌드)")),
+    #[cfg(feature = "rsdriver")]
+    {
+        Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.color, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, &a.camera_profile)?))
+    }
+    #[cfg(not(feature = "rsdriver"))]
+    {
+        let _ = (&a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, a.w, a.h, a.color, a.fps, &a.camera_profile);
+        Err("D435 입력은 리눅스 빌드(rsdriver 기능)에만 있음".into())
     }
 }

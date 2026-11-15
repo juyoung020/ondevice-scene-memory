@@ -146,8 +146,11 @@ struct State {
     streams: Mutex<Vec<StreamClient>>,    // open /stream pages (one thread pushes to all of them)
     parts: Mutex<Option<Arc<delta::Parts>>>, // the current view split into objects + head (once per version, shared by every /bstream page)
     octidx: Mutex<Option<Arc<delta::OctIdx>>>, // octree node list of the current view (read once per version)
+    // --search-model (dir, --vocab): the encoder and tokenizer are loaded on the first search, so a viewer nobody searches holds neither
     #[cfg(feature = "search")]
-    text_enc: std::sync::OnceLock<search::TextEnc>, // --search-model: set once the model is loaded (search is by the letters of the name until then)
+    text_src: Option<(String, Option<String>)>,
+    #[cfg(feature = "search")]
+    text_enc: std::sync::OnceLock<Option<search::TextEnc>>,
 }
 
 /// An open /stream page and the versions it was last sent
@@ -671,7 +674,9 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
             let Some(v) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") };
             let Some(view) = v.doc() else { return respond(&mut s, 500, "text/plain", "", b"view.json") };
             #[cfg(feature = "search")]
-            let enc = |t: &str| st.text_enc.get().and_then(|e| e.encode(t).map_err(|e| eprintln!("search: {e}")).ok());
+            let te = st.text_enc.get_or_init(|| st.text_src.as_ref().and_then(|(m, vocab)| search::load_encoder(m, vocab.as_deref())));
+            #[cfg(feature = "search")]
+            let enc = |t: &str| te.as_ref().and_then(|e| e.encode(t).map_err(|e| eprintln!("search: {e}")).ok());
             #[cfg(not(feature = "search"))]
             let enc = |_: &str| None;
             let k = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(20);
@@ -951,6 +956,8 @@ pub fn run(args: Vec<String>) {
 /// 서버 실행(막힘): 읽어 둔 설정으로. `ondevice --serve` 는 이것을 스레드로 부른다
 pub fn serve(c: Config) {
     let Config { dir, port, bind, search_model, vocab, encode_vocab } = c;
+    #[cfg(not(feature = "search"))]
+    let _ = &vocab;
     // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
     if let Some((list, out)) = &encode_vocab {
         #[cfg(feature = "search")]
@@ -977,33 +984,13 @@ pub fn serve(c: Config) {
     let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()),
         parts: Mutex::new(None), octidx: Mutex::new(None),
         #[cfg(feature = "search")]
+        text_src: search_model.clone().map(|m| (m, vocab.clone())),
+        #[cfg(feature = "search")]
         text_enc: std::sync::OnceLock::new() });
     let l = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {
         eprintln!("cannot listen on {}:{}: {}", bind, port, e);
         std::process::exit(1);
     });
-    #[cfg(feature = "search")]
-    if let Some(m) = search_model {
-        // the model takes seconds to load: the page is served meanwhile
-        let st2 = st.clone();
-        std::thread::spawn(move || match search::TextEnc::load(Path::new(&m)) {
-            Ok(e) => {
-                // class names and the null texts are asked on every query: take their vectors from the file, or encode them once now
-                match vocab.as_deref().map(|f| search::read_vocab(Path::new(f))) {
-                    Some(Ok(v)) => e.know(v),
-                    Some(Err(err)) => eprintln!("search: {err}"),
-                    None => {}
-                }
-                let names: Vec<String> = memfs::read(&st2.dir.join("vocab.json")).and_then(|t| serde_json::from_slice(&t).ok()).unwrap_or_default();
-                for n in names.iter().map(String::as_str).chain(search::NULLS) {
-                    let _ = e.encode(n);
-                }
-                let _ = st2.text_enc.set(e);
-                eprintln!("search: text encoder ready ({m})");
-            }
-            Err(e) => eprintln!("search: {e} — searching by name only"),
-        });
-    }
     #[cfg(not(feature = "search"))]
     if search_model.is_some() {
         eprintln!("search: built without the search feature — searching by name only");

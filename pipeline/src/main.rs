@@ -2586,6 +2586,11 @@ const CATCH_UP_MAX: usize = 3;
 /// 보관 장면 여럿을 코어마다 나눠 풂(깊이 · 컬러 · 검출). 쌓기는 부른 쪽이 차례대로(같은 결과)
 fn unpack_all(snap: &[(std::sync::Arc<kfstore::Kf>, M3, V3)]) -> Vec<(Depth, Vec<u8>, Option<Vec<seg::Det>>)> {
     use rayon::prelude::*;
+    // 압축은 점 작업 스레드가 채우는데 그 스레드도 같은 뒤쪽 풀을 쓴다: 풀에 들어가기 전에 여기서 다 기다려야
+    // 풀 일꾼이 아직 안 채운 장면을 기다리며 풀을 막는 교착이 없다(--block 재생에서 멈춤)
+    for (kf, _, _) in snap {
+        kf.wait_ready();
+    }
     out::par(|| snap.par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets())).collect())
 }
 

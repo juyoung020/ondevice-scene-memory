@@ -151,6 +151,10 @@ impl Kf {
     fn z(&self) -> &KfZ {
         self.z.wait()
     }
+    /// 압축이 끝날 때까지 기다림(점 작업 스레드가 채움)
+    pub fn wait_ready(&self) {
+        let _ = self.z();
+    }
     /// 보관 바이트: 아직 압축 전이면 None
     fn bytes(&self) -> Option<usize> {
         Some(self.z.get()?.bytes() + self.dets.iter().flatten().map(|d| d.bits.len()).sum::<usize>()

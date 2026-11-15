@@ -179,7 +179,9 @@ pub fn mlock_all() -> bool {
         unsafe extern "C" {
             fn mlockall(flags: i32) -> i32;
         }
-        return mlockall(1 | 2) == 0; // MCL_CURRENT | MCL_FUTURE
+        // MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT: 닿은 쪽만 묶는다. ONFAULT 가 없으면 새로 잡는 영역(스레드 스택 8 MB 씩,
+        // DXRT 버퍼, 크게 잡아 둔 Vec)이 통째로 채워져 상주 메모리가 2 GB 까지 불었다(2026-11-15 walk1, 다른 실행과 겹쳐 OOM)
+        return mlockall(1 | 2 | 4) == 0;
     }
     #[allow(unreachable_code)]
     false

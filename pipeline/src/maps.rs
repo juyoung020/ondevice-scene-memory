@@ -62,6 +62,7 @@ pub const OCT_G: i64 = 32;
 /// 최근 칸 표(hot)에 남기는 키프레임 수
 const HOT_AGE: u32 = 24;
 
+#[derive(Clone)]
 pub struct Node {
     keys: Vec<u64>, // 고운 칸 키
     pub ver: u32,
@@ -77,6 +78,7 @@ struct Brick {
 }
 
 /// 한동안 안 본 덩어리: 든 칸만 차례로(자리 = occ 에서 그 칸 아래 비트 수)
+#[derive(Clone)]
 struct ColdBrick {
     occ: u64,
     v: Box<[SV]>,
@@ -89,6 +91,7 @@ fn brick_of(k: u64) -> (u64, usize) {
     (((x >> 2) << 38) | ((y >> 2) << 19) | (z >> 2), ((x & 3) | ((y & 3) << 2) | ((z & 3) << 4)) as usize)
 }
 
+#[derive(Clone)]
 pub struct SceneMap {
     pub vox: f64,
     cells: FastMap<u64, ColdBrick>, // 한동안 안 본 덩어리(큰 표: 덩어리마다 캐시·TLB 를 놓침)
@@ -131,6 +134,12 @@ impl Drop for Adder<'_> {
 static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SceneMap {
+    /// 새 지도 번호(다시 쌓은 지도를 이어 쓸 때도 뷰어가 받은 노드를 비우게)
+    pub fn new_run() -> u64 {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16
+    }
+
     pub fn new(vox: f64, _sup: f64) -> SceneMap {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let run = t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16;
@@ -359,6 +368,7 @@ const GT: i32 = 64;
 /// 칸 값: (막힘으로 본 키프레임 수, 빔으로 본 키프레임 수, 그중 가구보다 높은 막힘을 본 수). 셋 다 0 = 아직 안 본 칸
 type GCell = (u32, u32, u32);
 
+#[derive(Clone)]
 pub struct Grid {
     pub res: f64,
     tiles: FastMap<(i32, i32), Box<[GCell]>>, // 조각 (x>>6, y>>6) → 64×64 칸(줄 = y)
@@ -524,6 +534,7 @@ pub const LOOK_COS: f32 = 0.88;
 /// 작은 쪽 굳은 칸 중 큰 쪽 굳은 칸과 겹쳐야 하는 비율(같은 물체 0.33, 나란한 모니터 둘 0.14)
 pub const LOOK_OVL: f32 = 0.25;
 
+#[derive(Clone)]
 pub struct Crop {
     pub w: u32,
     pub h: u32,
@@ -532,6 +543,7 @@ pub struct Crop {
     pub depth: std::sync::Arc<Vec<u16>>, // 기록 스레드·사진 벡터와 복사 없이 나눠 씀
 }
 
+#[derive(Clone)]
 pub struct Obj {
     pub id: u32,
     pub name: String,
@@ -557,6 +569,7 @@ pub struct Obj {
     pub last_seg: u32, // 마지막으로 본 때의 Memory::n_seg
 }
 
+#[derive(Clone)]
 pub struct Memory {
     pub objs: Vec<Obj>,
     pub next: u32, // 다음 물체 id(다시 쌓을 때 이어서 써 뷰어가 옛 물체 파일과 헷갈리지 않게)

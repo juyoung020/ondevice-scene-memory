@@ -1673,7 +1673,7 @@ function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
   if (j.wall) poseWall = j.wall;   // ?metrics=1: 손카메라 위치 → 화면 시간(같은 보드 시계)
   if (j.cam && j.cam.pos && j.cam.pos[2] > camTop) { camTop = j.cam.pos[2]; invalidate(); }
-  if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
+  if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; hhUnsure = j.ok !== false && j.uncertain === true; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
 }
 function startFileEvents() {
   let up = false;
@@ -2151,7 +2151,7 @@ function buildHandheld() {
 // so the camera glides at 60 fps instead of jumping. Only transforms change — no geometry is rebuilt per pose.
 const hhTgt = { p: new THREE.Vector3(), q: new THREE.Quaternion(), yaw: 0, has: false };
 const hhCur = { p: new THREE.Vector3(), q: new THREE.Quaternion(), yaw: 0, init: false };
-let hhLost = false;
+let hhLost = false, hhUnsure = false;   // tracking lost (red) / pose uncertain (orange)
 function camQuat(R) {   // OpenCV camera -> world rotation as the phone's orientation (x forward, y left, z up)
   const f = [R[0][2], R[1][2], R[2][2]], l = [-R[0][0], -R[1][0], -R[2][0]], u = [-R[0][1], -R[1][1], -R[2][1]];
   return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().set(f[0], l[0], u[0], 0, f[1], l[1], u[1], 0, f[2], l[2], u[2], 0, 0, 0, 0, 1));
@@ -2162,7 +2162,8 @@ function setHandheldTarget(vc) {
 }
 function applyHandheld() {
   const P = robotGrp && robotGrp.userData.hh; if (!P || !hhCur.init) return;
-  if (P.lost !== hhLost) { P.lost = hhLost; for (const m of P.mats) m.color.setHex(hhLost ? 0xe5484d : 0x2f81f7); }   // red while tracking is lost (pose is only predicted)
+  const q = hhLost ? 2 : hhUnsure ? 1 : 0;
+  if (P.q !== q) { P.q = q; for (const m of P.mats) m.color.setHex([0x2f81f7, 0xf59e0b, 0xe5484d][q]); }   // blue good · orange uncertain · red lost (pose only predicted)
   robotGrp.position.set(hhCur.p.x, hhCur.p.y, 0); robotGrp.rotation.z = 0;
   P.cam.position.z = hhCur.p.z; P.cam.quaternion.copy(hhCur.q); P.floorMark.rotation.z = hhCur.yaw;
   const a = P.drop.geometry.attributes.position; a.setXYZ(0, 0, 0, hhCur.p.z - 0.09); a.needsUpdate = true; P.drop.computeLineDistances();

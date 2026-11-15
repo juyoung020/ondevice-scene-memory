@@ -416,6 +416,9 @@ fn make_seg(path: &str) -> Box<dyn seg::Segmenter + Send> {
     }
 }
 
+/// 스트림 장면 표시: 위치가 불확실(위치 프로그램이 약한 추적으로 낸 위치). 표시 값은 slam::stream 과 같음
+const UNCERTAIN: u32 = 32;
+
 struct Frame {
     t: f64,
     p: V3,
@@ -429,6 +432,7 @@ struct Frame {
     seg: f64,
     lost: bool,       // 스트림 입력에서 위치를 놓친 장면(지도·물체에 넣지 않음)
     held: bool,       // 스트림: 맡아 둘 장면(믿는 지도와 이어지면 다시 쌓기 때 지도에 들어감)
+    uncertain: bool,  // 스트림: 위치가 불확실(약한 광류 · 임시 위치) — 뷰어 손카메라 주황
     anchor: u32,      // 스트림: 기준 지도 노드 id(0 = 없음)
     graph: Vec<stream::Node>, // 스트림: 이 장면 앞에 온 그래프 블록 노드
 }
@@ -503,7 +507,7 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         d
     });
     let mut sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, anchor: sf.anchor, graph: j.graph };
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, uncertain: sf.flags & (UNCERTAIN | stream::PROVISIONAL) != 0, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
 
@@ -865,7 +869,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
                 graph.append(&mut rd.take_graph());
                 if !graph.is_empty() {
-                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, anchor: 0, graph };
+                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, uncertain: false, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
                 common::info!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
@@ -909,7 +913,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let c1 = Instant::now();
                 let dets = Some(seg.run(&rgb, w, h, conf));
                 let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, anchor: 0, graph: vec![] };
+                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, uncertain: false, anchor: 0, graph: vec![] };
                 if tx.send(f).is_err() {
                     break;
                 }
@@ -949,7 +953,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
     let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
-    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, uncertain, anchor, graph }) = rx.recv() {
         // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
         let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
         *taken.n.lock().unwrap() += 1;
@@ -1197,7 +1201,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(뷰어가 0.1 초마다 받아 손카메라를 바로 움직임),
         // 지도·물체·그래프(view.json)는 0.4 초마다
         if a.live > 0.0 {
-            out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true, "wall": wall_ms()})));
+            out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true, "uncertain": uncertain, "wall": wall_ms()})));
         }
         // 메모리 기억 폴더(--serve): 받은 장면마다 바로 뷰어에(view 판은 뷰 스레드가 짜고 밀리면 마지막 것만, 점 노드는 점 작업 스레드가 한가할 때마다). 디스크 기록이면 0.4 · 1 초 간격
         let write_now = write_late || if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= view_gap || nkf == 1 } else { nkf % (if behind { 15 } else { 5 }) == 0 || nkf == 1 };

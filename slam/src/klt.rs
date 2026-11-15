@@ -357,6 +357,17 @@ fn icp_q(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: 
     Some(tf_from_rt(&r, &t))
 }
 
+/// 일꾼 스레드에 넘기는 키프레임 기술자 일
+struct DescJob {
+    gray: Vec<u8>,
+    depth: crate::DepthBuf,
+    cam: crate::Camera,
+    kps: Vec<KeyPoint>,
+    pose: Tf,
+    min_depth: f32,
+    max_depth: f32,
+}
+
 pub struct OdometryKlt {
     pose: Tf,
     /// 마지막 성공 장면의 회색조 피라미드·시각
@@ -364,6 +375,8 @@ pub struct OdometryKlt {
     /// 마지막 키프레임 특징과 그때 위치(광류가 끊겼을 때 되찾기)
     kf: Option<(Features, Tf)>,
     kf_t: f64,
+    desc_tx: Option<std::sync::mpsc::Sender<DescJob>>,
+    desc_rx: Option<std::sync::mpsc::Receiver<(Features, Tf)>>,
     /// 되찾기용 기술자를 새로 뽑는 최소 간격(초)
     desc_every: f64,
     desc_every_kf: u32,
@@ -409,6 +422,8 @@ impl OdometryKlt {
             prev: None,
             kf: None,
             kf_t: 0.0,
+            desc_tx: None,
+            desc_rx: None,
             desc_every: p.get("OdomKlt/DescEvery", 0.0f64),
             desc_every_kf: p.get("OdomKlt/DescEveryKf", 1u32),
             kf_count: 0,
@@ -471,7 +486,22 @@ impl OdometryKlt {
         if full {
             self.kf_count = 0;
         }
-        let feats = if full {
+        let feats = if full && self.desc_tx.is_some() {
+            // 기술자는 일꾼 스레드에서(되찾기에만 쓰여 한두 장 늦어도 됨): 여기선 GFTT·3D 점만, 회색조 사본과 깊이(나눠 듦)를 넘김
+            let kps = self.ext.detect(f);
+            let pts3d = self.ext.keypoints_3d(f, &kps);
+            let _ = self.desc_tx.as_ref().unwrap().send(DescJob {
+                gray: f.gray.clone(),
+                depth: f.depth_mm.clone(),
+                cam: f.cam.clone(),
+                kps: kps.clone(),
+                pose: self.pose,
+                min_depth: self.min_depth,
+                max_depth: self.max_depth,
+            });
+            self.kf_t = f.t;
+            Features { kps, pts3d, desc: Vec::new() }
+        } else if full {
             self.ext.extract(f)
         } else {
             let kps = self.ext.detect(f);
@@ -500,10 +530,36 @@ impl OdometryKlt {
             let wp = self.pose.transform_point([p.x, p.y, p.z]);
             self.tracks.push(Track { w: wp, uv: [k.x, k.y] });
         }
-        if full {
+        if full && self.desc_tx.is_none() {
             self.kf = Some((feats, self.pose));
             self.kf_t = f.t;
         }
+    }
+
+    /// 실시간 입력: 키프레임 기술자를 일꾼 스레드에서 뽑음(재생은 결정적이게 그 자리에서)
+    pub fn set_async_desc(&mut self) {
+        if self.desc_tx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<DescJob>();
+        let (rtx, rrx) = std::sync::mpsc::channel::<(Features, Tf)>();
+        std::thread::spawn(move || {
+            while let Ok(mut j) = rx.recv() {
+                // 쌓였으면 가장 최근 것만
+                while let Ok(n) = rx.try_recv() {
+                    j = n;
+                }
+                let (w, h) = (j.cam.width as usize, j.cam.height as usize);
+                let mut kps = j.kps;
+                let desc = crate::features::describe(&j.gray, w, h, &mut kps);
+                let pts3d = keypoints_3d(&j.depth, &j.cam, &kps, j.min_depth, j.max_depth);
+                if rtx.send((Features { kps, pts3d, desc }, j.pose)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.desc_tx = Some(tx);
+        self.desc_rx = Some(rrx);
     }
 
     /// 광류가 모두 실패했을 때: 마지막 키프레임 특징과 이번 장면 특징을 기술자로 맞춤(RTAB-Map 맞추기 그대로). 성공하면 점을 이 장면에서 새로
@@ -603,6 +659,11 @@ impl OdometryKlt {
     pub fn process(&mut self, f: &Frame) -> OdomResult {
         let (w, h) = (f.cam.width as usize, f.cam.height as usize);
         let t0 = std::time::Instant::now();
+        if let Some(rx) = &self.desc_rx {
+            while let Ok(kf) = rx.try_recv() {
+                self.kf = Some(kf);
+            }
+        }
         let mut cur = self.spare.take().unwrap_or(Pyr { lv: Vec::new() });
         cur.fill(&f.gray, w, h);
         let t_pyr = t0.elapsed().as_secs_f64();

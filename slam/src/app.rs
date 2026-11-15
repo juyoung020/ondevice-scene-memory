@@ -216,8 +216,19 @@ mod engine {
         }
     }
 
+    /// 지도 스레드에서 노드 특징을 뽑을 장면
+    pub struct RawNode {
+        gray: Vec<u8>,
+        depth: crate::DepthBuf,
+        cam: Camera,
+        pose: Option<Tf>,
+        trusted: bool,
+    }
+
+    type KfOut = (Features, Tf, bool, i32);
+
     pub enum Cmd {
-        Proc(Box<NodeInput>, i32, u64, bool),
+        Proc(Box<NodeInput>, i32, u64, bool, Option<Box<RawNode>>),
         NewMap(std::sync::mpsc::SyncSender<i32>),
         Reset(std::sync::mpsc::SyncSender<()>),
     }
@@ -229,7 +240,7 @@ mod engine {
             tx: Option<std::sync::mpsc::Sender<Cmd>>,
             h: Option<std::thread::JoinHandle<Box<Slam>>>,
             /// 끝난 단계 결과 + 그 단계에서 정해진 (일 번호, 노드 id)
-            done: Arc<Mutex<(Vec<MapSt>, Vec<(u64, i32)>)>>,
+            done: Arc<Mutex<(Vec<MapSt>, Vec<(u64, i32)>, Vec<KfOut>)>>,
             st: MapSt,
             jobs: u64,
         },
@@ -237,6 +248,9 @@ mod engine {
     }
 
     impl MapHost {
+        fn is_thread(&self) -> bool {
+            matches!(self, MapHost::Thread { .. })
+        }
         fn jobs(&self) -> u64 {
             match self {
                 MapHost::Thread { jobs, .. } => *jobs,
@@ -253,20 +267,20 @@ mod engine {
             }
         }
         /// 노드 넣기. 돌려줌: 이번에 id 가 정해진 (일 번호, 노드 id)
-        fn process(&mut self, inp: NodeInput, forced: i32, node: bool, job: u64) -> Vec<(u64, i32)> {
+        fn process(&mut self, inp: NodeInput, forced: i32, node: bool, job: u64, raw: Option<Box<RawNode>>) -> (Vec<(u64, i32)>, Vec<KfOut>) {
             match self {
                 MapHost::Inline(s, st) => {
                     s.forced_hyp = forced;
                     s.process(&inp);
                     *st = snap_of(s);
                     st.jobs = job;
-                    if node { vec![(job, s.last_location_id())] } else { vec![] }
+                    (if node { vec![(job, s.last_location_id())] } else { vec![] }, vec![])
                 }
                 MapHost::Thread { tx, done, st, jobs, .. } => {
                     *jobs = job;
-                    let _ = tx.as_ref().unwrap().send(Cmd::Proc(Box::new(inp), forced, job, node));
+                    let _ = tx.as_ref().unwrap().send(Cmd::Proc(Box::new(inp), forced, job, node, raw));
                     // 끝난 단계가 있으면 가장 최근 결과로(루프 클로저는 그 단계들 가운데 있었으면 알림)
-                    let (sts, ids) = std::mem::take(&mut *done.lock().unwrap());
+                    let (sts, ids, kfs) = std::mem::take(&mut *done.lock().unwrap());
                     if let Some(last) = sts.last() {
                         let lp_loop = sts.iter().rev().find(|x| x.loop_id > 0).map(|x| x.loop_id).unwrap_or(0);
                         let rej: u32 = sts.iter().map(|x| x.corr.1).sum();
@@ -278,7 +292,7 @@ mod engine {
                         st.loop_id = 0;
                         st.corr = ((0.0, 0.0), 0);
                     }
-                    ids
+                    (ids, kfs)
                 }
                 MapHost::Empty => unreachable!(),
             }
@@ -310,17 +324,30 @@ mod engine {
                 MapHost::Empty => {}
             }
         }
-        fn start_thread(&mut self) {
+        fn start_thread(&mut self, ext: Extractor) {
             let MapHost::Inline(..) = self else { return };
             let MapHost::Inline(mut slam, st0) = std::mem::replace(self, MapHost::Empty) else { unreachable!() };
             let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
-            let done: Arc<Mutex<(Vec<MapSt>, Vec<(u64, i32)>)>> = Default::default();
+            let done: Arc<Mutex<(Vec<MapSt>, Vec<(u64, i32)>, Vec<KfOut>)>> = Default::default();
             let d2 = done.clone();
             let h = std::thread::spawn(move || {
                 common::threads::rt("slam"); // 지도 스레드도 위치 프로그램 역할 코어에
                 while let Ok(c) = rx.recv() {
                     match c {
-                        Cmd::Proc(inp, forced, job, node) => {
+                        Cmd::Proc(mut inp, forced, job, node, raw) => {
+                            let mut kf = None;
+                            if let Some(r) = raw {
+                                let fr = Frame { id: 0, t: inp.stamp, gray: r.gray, color: Vec::new(), color_is_rgb: true, depth_mm: r.depth, depth_raw: Default::default(), depth_per_m: 1000.0, cam: r.cam };
+                                let feats = ext.extract(&fr);
+                                inp.features = NodeFeatures {
+                                    kps: feats.kps.iter().map(|k| Kp { x: k.x, y: k.y, size: k.size, angle: k.angle, response: k.response, octave: k.octave, class_id: -1 }).collect(),
+                                    pts3d: feats.pts3d.iter().map(|p| [p.x, p.y, p.z]).collect(),
+                                    desc: feats.desc.clone(),
+                                };
+                                if let Some(p) = r.pose {
+                                    kf = Some((feats, p, r.trusted));
+                                }
+                            }
                             slam.forced_hyp = forced;
                             slam.process(&inp);
                             let st = snap_of(&slam);
@@ -328,6 +355,9 @@ mod engine {
                             d.0.push(st);
                             if node {
                                 d.1.push((job, slam.last_location_id()));
+                            }
+                            if let Some((f, p, t)) = kf {
+                                d.2.push((f, p, t, slam.last_location_id()));
                             }
                         }
                         Cmd::NewMap(r) => {
@@ -590,7 +620,13 @@ mod engine {
 
         /// Rtabmap::process(data, odomPose, covariance, velocity). node = false 면 중간 장면(특징 없음)
         pub fn slam_process(&mut self, f: &Frame, node: bool, pose: Option<Tf>, cov: &[f64; 36], velocity: Vec<f32>) {
-            if node {
+            // 지도 스레드 + 광류 경로: 노드 특징(GFTT·BRIEF)도 지도 스레드에서 뽑음(회색조 사본·깊이 나눠 듦만 넘김)
+            let raw = if node && self.cur.kps.is_empty() && matches!(self.odom, Odom::Klt(_)) && self.slam.is_thread() {
+                Some(Box::new(RawNode { gray: f.gray.clone(), depth: f.depth_mm.clone(), cam: f.cam.clone(), pose, trusted: self.trusted }))
+            } else {
+                None
+            };
+            if node && raw.is_none() {
                 self.ensure_cur(f);
                 if let Some(p) = pose {
                     if !self.cur.desc.is_empty() {
@@ -618,7 +654,14 @@ mod engine {
                 }
             }
             let forced = std::mem::take(&mut self.forced_hyp);
-            for (k, id) in self.slam.process(inp, forced, had, job) {
+            let (ids, kfs) = self.slam.process(inp, forced, had, job, raw);
+            for (feats, p, trusted, id) in kfs {
+                if !feats.desc.is_empty() {
+                    self.kf_db.push((feats, p));
+                    self.kf_ids.push((id, trusted, 0));
+                }
+            }
+            for (k, id) in ids {
                 // 지도 노드 id 가 정해진 kf_db 칸을 채움(지도 스레드면 한 단계 늦게 옴)
                 if let Some(e) = self.kf_ids.iter_mut().find(|e| e.0 == 0 && e.2 == k) {
                     e.0 = id;
@@ -708,7 +751,10 @@ mod engine {
         /// 지도 갱신(노드 넣기·루프 클로저·그래프 최적화)을 따로 도는 스레드로: 위치 추적 스레드는 기다리지 않고
         /// 지난 단계 결과(지도 보정·최적화 위치)를 쓴다(한 노드 늦음). 실시간 입력에서만 켠다(재생 결과는 그대로 결정적)
         pub fn start_map_thread(&mut self) {
-            self.slam.start_thread();
+            self.slam.start_thread(self.ext.clone());
+            if let Odom::Klt(o) = &mut self.odom {
+                o.set_async_desc();
+            }
         }
 
         /// Rtabmap::getGraph(optimized=true, global=true): (id, 시각, 위치). 노드가 없으면 빔

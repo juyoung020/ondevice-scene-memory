@@ -1187,9 +1187,10 @@ $("wsave").onclick = () => {
 function ensureLabel(key, text, cls) {
   let e = labelEls.get(key);
   if (!e) { e = document.createElement("div"); e.className = "lbl" + (cls ? " " + cls : ""); $("labels").appendChild(e); labelEls.set(key, e); }
-  if (e.textContent !== text) e.textContent = text;
+  if (e.textContent !== text) { e.textContent = text; e._sz = null; }
   return e;
 }
+function labelSize(e) { if (!e._sz) e._sz = [e.offsetWidth, e.offsetHeight]; return e._sz; }
 const _v = new THREE.Vector3();
 function updateLabels() {
   const want = new Set();
@@ -1202,10 +1203,12 @@ function updateLabels() {
       const e = ensureLabel(key, text, cls);
       const x = (_v.x + 1) / 2 * w, y = (1 - _v.y) / 2 * h; e.style.left = x + "px";
       const hit = r => boxes.some(b => r.left < b.right + 2 && r.right > b.left - 2 && r.top < b.bottom + 1 && r.bottom > b.top - 1);
+      // label boxes from the cached size (measured once per text): no layout read per label per frame (that forced a layout each time)
+      const [lw, lh] = labelSize(e);
       let r;
       for (const dy of avoid ? [0, -1, 1] : [0]) {   // spot taken: try one label height above, then below
-        e.style.top = y + dy * e.offsetHeight + "px"; r = e.getBoundingClientRect();
-        if (!avoid || !hit(r)) break; r = null;
+        const ty = y + dy * lh; r = { left:x - lw / 2, right:x + lw / 2, top:ty - lh, bottom:ty };
+        if (!avoid || !hit(r)) { e.style.top = ty + "px"; break; } r = null;
       }
       if (!r) return;
       boxes.push(r); want.add(key);
@@ -1215,8 +1218,9 @@ function updateLabels() {
       for (const p of pts) { _v.set(...p).project(camera); if (_v.z > 1) continue; if (!best || _v.x < best[0]) best = [_v.x, _v.y]; }
       if (!best || Math.abs(best[1]) > 1) return;
       const e = ensureLabel(key, text, "layer"); want.add(key);
-      e.style.left = Math.max((best[0] + 1) / 2 * w - 14, e.offsetWidth + 8) + "px"; e.style.top = ((1 - best[1]) / 2 * h) + "px";
-      boxes.push(e.getBoundingClientRect());
+      const [lw, lh] = labelSize(e), L = Math.max((best[0] + 1) / 2 * w - 14, lw + 8), T = (1 - best[1]) / 2 * h;
+      e.style.left = L + "px"; e.style.top = T + "px";
+      boxes.push({ left:L - lw, right:L, top:T - lh / 2, bottom:T + lh / 2 });
     };
     for (const id of new Set([selected, hoverId])) {   // hovered / selected object: one pill with the state dot
       const o = id != null && objs.get(id); if (!o) continue;
@@ -1355,8 +1359,11 @@ async function renderCropsNow(o, v) {
   }
 }
 function fillSelect() {
+  // rebuilt only when the list text changes (positions move every view; a new option list re-lays out the panel)
   const s = $("s_obj"), cur = s.value;
-  s.innerHTML = '<option value="">(none)</option>' + [...objs.values()].sort((a, b) => a.id - b.id).map(o => `<option value="${o.id}">${o.name}#${o.id}</option>`).join("");
+  const html = '<option value="">(none)</option>' + [...objs.values()].sort((a, b) => a.id - b.id).map(o => `<option value="${o.id}">${o.name}#${o.id}</option>`).join("");
+  if (html === s._html) return;
+  s._html = html; s.innerHTML = html;
   s.value = cur;
 }
 $("s_obj").onchange = e => select(e.target.value === "" ? null : +e.target.value);
@@ -1866,13 +1873,14 @@ function styleRobot(root) {
 }
 const robotEdge = { todo:null, cache:new Map(), mat:new THREE.LineBasicMaterial({ color:0x15171d }), busy:false };
 function robotEdges() {
-  if (!robotModel || !gRobot.visible || robotEdge.busy) return;
+  // only for a model that is drawn (handheld runs never attach it; an edge pass on its big meshes took 0.3–0.7 s per mesh at Pi speed)
+  if (!robotModel || !robotModel.root.parent || !gRobot.visible || robotEdge.busy) return;
   if (!robotEdge.todo) { robotEdge.todo = []; robotModel.root.traverse(o => { if (o.isMesh) robotEdge.todo.push(o); }); }
   if (!robotEdge.todo.length) return;
   robotEdge.busy = true;
   const idle = window.requestIdleCallback || (f => setTimeout(f, 16));
   idle(function step() {
-    if (!gRobot.visible) { robotEdge.busy = false; return; }   // hidden again: continue when shown
+    if (!gRobot.visible || !robotModel.root.parent) { robotEdge.busy = false; return; }   // hidden again: continue when shown
     const o = robotEdge.todo.shift();
     if (o) {
       if (!robotEdge.cache.has(o.geometry)) robotEdge.cache.set(o.geometry, new THREE.EdgesGeometry(o.geometry, 38));
@@ -1971,6 +1979,7 @@ function attachRobotModel() {
   robotGrp.remove(...robotGrp.children.filter(c => c.userData.fallback));   // the box/cone stand-in goes away
   if (!robotModel.root.parent) robotGrp.add(robotModel.root);
   robotModel.root.scale.setScalar(opt("n_rscale"));
+  robotEdges();
 }
 function setJoints(vals) {
   if (!robotModel) return;
@@ -2208,7 +2217,7 @@ const upQ = [], UP_BYTES = WEAK_GPU ? 1.5e6 : 16e6, UP_MS = WEAK_GPU ? 4 : 8;
 let upKick = 0;
 function queueUpload(bytes, fn) { upQ.push({ bytes, fn }); if (!upKick) upKick = setTimeout(kickUploads, 100); }
 // no animation frames (hidden tab, headless virtual-time screenshot): nothing to keep smooth, drain from a timer instead
-function kickUploads() { upKick = 0; if (performance.now() - lastCamT > 90) { while (upQ.length) upQ.shift().fn(); invalidate(); frame(); } if (upQ.length || oct.loading) upKick = setTimeout(kickUploads, 100); }
+function kickUploads() { upKick = 0; if (performance.now() - lastCamT > 90) { if (document.hidden) while (upQ.length) upQ.shift().fn(); else drainUploads(performance.now()); invalidate(); frame(); } if (upQ.length || oct.loading) upKick = setTimeout(kickUploads, 100); }
 function drainUploads(t0) {
   let b = 0, n = 0;
   while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); n++; }

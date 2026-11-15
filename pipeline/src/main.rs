@@ -203,7 +203,7 @@ fn is_wall(p: &[(V3, [u8; 3])]) -> bool {
 /// 물체가 아닌 조각(이름을 붙여도 틀리는 검출): 바닥·천장 면(넓고 평평한 수평 면이 바닥 근처 또는 2 m 위),
 /// 선처럼 가는 조각(책상 모서리 · 문틀: 한 축만 길고 나머지 두 축이 3 cm 안), 아주 작은 조각(가장 긴 축 6 cm 안),
 /// 화면 가장자리 셋 이상에 잘린 마스크(장면 대부분을 덮는 배경 조각). 그러면 Some(까닭)
-fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, border_sides: usize) -> Option<&'static str> {
+fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, cam_z: f64, border_sides: usize) -> Option<&'static str> {
     if border_sides >= 3 {
         return Some("border");
     }
@@ -231,6 +231,10 @@ fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, border_sides: usize) -> Option<&'
     let horizontal = v[2][0].abs() > 0.9;
     if flat && horizontal && (m[2] < floor_z + 0.15 || m[2] > floor_z + 2.0) {
         return Some("floor/ceiling");
+    }
+    // 천장 조각: 카메라보다 30 cm 넘게 위의 평평한 수평 면(넓이 50 cm 넘음)
+    if span[0] < 0.05 && span[1] > 0.5 && horizontal && m[2] > cam_z + 0.3 {
+        return Some("ceiling");
     }
     None
 }
@@ -1357,7 +1361,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     // 물체 이름별 수: 화면에 쓰는 이름(사진으로 붙인 이름, 없으면 분할 이름 object)
     let mut by: std::collections::BTreeMap<String, u32> = Default::default();
     for o in &mem.objs {
-        *by.entry(embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0)).or_default() += 1;
+        let n = embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0);
+        if n != "ceiling" {
+            *by.entry(n).or_default() += 1;
+        }
     }
     let mut summary = json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
         "scene_points": n_pts, "scene_mb": scene_mb, "pts_dropped": pts_dropped.0, "pts_near_skipped": pts_dropped.1, "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
@@ -2147,7 +2154,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             continue;
         }
         let border = [x1 <= 1, y1 <= 1, x2 + 1 >= w, y2 + 1 >= h].iter().filter(|b| **b).count();
-        if let Some(why) = fragment(&pts, floor_z, border) {
+        if let Some(why) = fragment(&pts, floor_z, pwc[2], border) {
             if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() {
                 println!("fragdbg {why}");
             }
@@ -2233,6 +2240,10 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");
+        // 사진이 천장인 물체는 기억에 넣지 않음(위에서 볼 때 지도를 가림)
+        if look.as_ref().is_some_and(|l| l.0 == "ceiling") {
+            continue;
+        }
         // 이름 없는 분할 모델이 자른 벽·바닥·천장 면: 사진 이름이 구조물이면 구조물로 표시(뷰어가 따로 끄고 켬)
         let structural = o.name == "object" && look.as_ref().is_some_and(|l| embed::STRUCTURAL.contains(&l.0.as_str()));
         let mut e = json!({"id": o.id, "name": look.as_ref().map_or(&o.name, |l| &l.0), "seg_name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
@@ -2250,7 +2261,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
         objs.push(e);
     }
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
-    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).collect();
+    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).filter(|o| o.4 != "ceiling").collect();
     let traj = view.traj_update(traj);
     let wall = if view.live { wall_ms() } else { 0.0 };
     view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });

@@ -1518,6 +1518,10 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
             if dec.is_empty() {
                 use rayon::prelude::*;
                 let end = (i + dec_chunk).min(snap.len());
+                // 압축이 다 채워진 뒤 풀에 들어감(점 작업 스레드와 풀을 서로 기다리는 교착 막기, unpack_all 과 같음)
+                for (kf, _, _) in &snap[i..end] {
+                    kf.wait_ready();
+                }
                 dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets())).collect::<Vec<_>>().into();
             }
             let (kd, kr, kdets) = dec.pop_front().unwrap();

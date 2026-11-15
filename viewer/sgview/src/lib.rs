@@ -693,7 +693,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 eprintln!("viewer event: {e}, js heap {} MB, MemAvailable {avail} MB", g("jsmb"));
                 return respond(&mut s, 204, "text/plain", "", b"");
             }
-            eprintln!("viewer: {} fps (render {} ms), pose updates {}/s, pose→screen p50 {} p95 {} ms (n {}), camera→screen p50 {} p95 {} ms, map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms), js heap {} MB, MemAvailable {} MB", g("fps"), g("rms"), g("np"), g("lat50"), g("lat95"), g("n"), g("clat50"), g("clat95"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"), g("jsmb"), avail);
+            eprintln!("viewer: {} fps (render {} ms), pose updates {}/s, pose→screen p50 {} p95 {} ms (n {}), camera→screen p50 {} p95 {} ms, map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms), points drawn {} k / loaded {} k, js heap {} MB, MemAvailable {} MB", g("fps"), g("rms"), g("np"), g("lat50"), g("lat95"), g("n"), g("clat50"), g("clat95"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"), g("pts"), g("mapk"), g("jsmb"), avail);
             respond(&mut s, 204, "text/plain", "", b"")
         }
         "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),

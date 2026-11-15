@@ -55,6 +55,10 @@ impl StreamFrame {
     pub fn held(&self) -> bool {
         self.flags & HELD != 0
     }
+    /// 맡아 둘 장면이지만 위치는 바로 보이는 장면(IMU 모드 · 이어지지 않은 새 지도의 임시 위치)
+    pub fn held_live(&self) -> bool {
+        self.held() && self.flags & LOST == 0
+    }
     /// 위치만(IMU 로 이어 붙였거나 영상이 IMU 와 어긋난 뒤): 카메라만 옮기고 지도 · 물체에 넣지 않음
     pub fn no_map(&self) -> bool {
         self.flags & NO_MAP != 0

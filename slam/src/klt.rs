@@ -468,6 +468,8 @@ pub struct OdometryKlt {
     pub grav_deg: f64,
     /// 이번 장면에서 영상 결과를 IMU 회전과 어긋나 버렸는지 · 그런 장면 수
     pub imu_rejected: bool,
+    /// IMU: 이번 장면 앞 구간의 자이로 회전 속도(°/s, IMU 회전이 없으면 0)
+    pub imu_rate: f32,
     /// 영상 결과를 IMU 와 어긋나 연달아 버린 장면 수(IMU_TRUST_MAX 에 닿으면 IMU 쪽을 의심: 치우침 되돌리고 영상을 받음)
     imu_streak: u32,
 }
@@ -516,6 +518,7 @@ impl OdometryKlt {
             n_grav: 0,
             grav_deg: 0.0,
             imu_rejected: false,
+            imu_rate: 0.0,
             imu_streak: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
@@ -783,6 +786,7 @@ impl OdometryKlt {
     pub fn process(&mut self, f: &Frame) -> OdomResult {
         self.imu_streak = if self.imu_rejected { self.imu_streak + 1 } else { 0 };
         self.imu_rejected = false;
+        self.imu_rate = 0.0;
         let (w, h) = (f.cam.width as usize, f.cam.height as usize);
         let t0 = std::time::Instant::now();
         if let Some(rx) = &self.desc_rx {
@@ -843,6 +847,13 @@ impl OdometryKlt {
                 if dt > 0.0 && dt <= u.bridge_max { u.rotation(self.prev_t, f.t) } else { None }
             }
             None => None,
+        };
+        self.imu_rate = match &imu_rot {
+            Some(r) if dt > 0.0 => {
+                let w = crate::imu::so3_log(r);
+                ((w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt().to_degrees() as f64 / dt) as f32
+            }
+            _ => 0.0,
         };
         let pred = if let Some(r) = &imu_rot {
             // 회전은 IMU, 이동은 등속(0.2 초 안일 때만)

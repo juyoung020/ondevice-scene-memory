@@ -139,6 +139,8 @@ pub struct StepInfo {
     pub rejected: bool,
     /// 루프 클로저 최적화가 옮긴 기존 노드 최대(m, rad)와, 그 크기 때문에 버렸는지
     pub max_correction: (f32, f32),
+    /// 같은 최적화에서 옮겨진 노드 최대(m, 다른 지도 노드 포함: 새 지도를 옛 지도에 이을 때 옮겨지는 쪽)
+    pub max_moved_all: f32,
     pub rejected_by_correction: u32,
 }
 
@@ -557,7 +559,12 @@ impl Slam {
                     let (mut ml, mut ma) = (0f32, 0f32);
                     // 루프 상대 노드가 속한 지도의 노드만 본다: 다른 지도와 이어 붙일 때(새 지도 → 옛 지도) 새 지도 쪽이 크게 옮겨지는 건 정상
                     let tgt_map = added.first().and_then(|(_, b)| self.mem.sig(*b)).map(|s| s.map_id);
+                    let mut mall = 0f32;
                     for (id, np) in poses.iter() {
+                        if let Some(op) = self.optimized.get(id) {
+                            let v = op.inverse().mul(np).xyz_rpy();
+                            mall = mall.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+                        }
                         if tgt_map.is_some() && self.mem.sig(*id).map(|s| s.map_id) != tgt_map {
                             continue;
                         }
@@ -572,6 +579,7 @@ impl Slam {
                     }
                     reject = (self.p.max_correction_lin > 0.0 && ml > self.p.max_correction_lin) || (self.p.max_correction_ang > 0.0 && ma > self.p.max_correction_ang);
                     self.info.max_correction = (ml, ma);
+                    self.info.max_moved_all = mall;
                     if reject {
                         self.info.rejected_by_correction += 1;
                     }

@@ -78,6 +78,25 @@ pub fn pool(name: &'static str, nice: i32, mask: u64) -> rayon::ThreadPool {
         .expect("스레드 풀")
 }
 
+/// 위치 추적 스레드를 다른 일(분할·memmap·뷰어)보다 먼저: nice -10, 권한이 없으면 낮은 SCHED_FIFO(10). 코어는 묶지 않음
+/// (FIFO 를 추론 코어에 묶으면 DXRT 런타임 스레드를 굶긴 적이 있어 묶지 않는다). 걸었으면 무엇을 걸었는지
+pub fn boost_tracking() -> &'static str {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+            fn gettid() -> i32;
+        }
+        if setpriority(0, gettid() as u32, -10) == 0 {
+            return "nice -10";
+        }
+    }
+    if fifo(10) {
+        return "SCHED_FIFO 10";
+    }
+    "그대로(권한 없음)"
+}
+
 /// 실시간 배치(`--rt`): 역할 이름마다 SCHED_FIFO 우선순위(1..99)와 코어 묶음(선택).
 /// 형식 `camera=50@1,infer=40,reader=30@0+1` (역할=우선순위[@코어 목록, `a-b`·`+` 로 잇기]), `auto` = camera=50, infer=40, reader=30, main=20, `none`/빈칸 = 끔.
 /// 권한(CAP_SYS_NICE·rtprio 한도)이 없으면 조용히 보통 스케줄로 남는다. 출력 값에는 영향 없음(순서·차례만)

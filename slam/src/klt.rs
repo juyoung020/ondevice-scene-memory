@@ -544,6 +544,7 @@ impl OdometryKlt {
         let (tx, rx) = std::sync::mpsc::channel::<DescJob>();
         let (rtx, rrx) = std::sync::mpsc::channel::<(Features, Tf)>();
         std::thread::spawn(move || {
+            common::threads::apply(5, 0); // 위치 추적보다 뒤
             while let Ok(mut j) = rx.recv() {
                 // 쌓였으면 가장 최근 것만
                 while let Ok(n) = rx.try_recv() {

@@ -724,9 +724,16 @@ function texSub(tex, x, y, w, h, type, data) {
   return true;
 }
 // once per frame before drawing: each segment's changed range (one bufferSubData per attribute), the changed table rows
+// GPU upload budget per frame (bytes of buffer sub-uploads): a big burst (a rebuilt map, a recycled pool's slots) goes up over several
+// frames instead of stalling one frame in the driver (frame gaps of 200+ ms with no script long task)
+const FLUSH_BYTES = WEAK_GPU ? 768 * 1024 : 8 * 1024 * 1024;
 function octFlush(R) {
+  let budget = FLUSH_BYTES;
   for (const b of R.blocks.values()) for (const s of b.segs) {
-    if ((s.hi < 0 && !s.zero) || !s.p.visible) continue;   // a hidden segment keeps its changed range until it is drawn (three keeps one range per upload)
+    if ((s.hi < 0 && !s.zero) || !s.p.visible) continue;
+    const cost = (s.hi >= 0 ? (s.hi - s.lo) * 11 : 0) + (s.zero ? s.n * 2 : 0);
+    if (cost > budget && budget < FLUSH_BYTES) continue;   // next frame (one oversize range still goes alone)
+    budget -= cost;   // a hidden segment keeps its changed range until it is drawn (three keeps one range per upload)
     const at = s.g.attributes, n = s.hi - s.lo;
     if (s.hi >= 0) {
       at.position.updateRange.offset = s.lo * 3; at.position.updateRange.count = n * 3; at.position.needsUpdate = true;
@@ -2276,7 +2283,8 @@ function frame() {
   if (viewWall) { met.vlat.push(Date.now() - viewWall); viewWall = 0; }
 }
 (function loop() { requestAnimationFrame(loop); const t = performance.now(); if (met.lastRaf && t - met.lastChange < 1000) met.gap = Math.max(met.gap, t - met.lastRaf); met.lastRaf = t; frame(); })();
-loadRobotModel();
+// the robot model (GLB meshes, joint panel) is not needed for the first frame: loaded when the page is idle after start-up
+(window.requestIdleCallback || (f => setTimeout(f, 1500)))(() => loadRobotModel(), { timeout:4000 });
 loadRobotKind().then(invalidate);
 // 주소 뒤 ?c_scene=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
 for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); else if (e && e.type === "number") { e.value = v; e.dispatchEvent(new Event("change")); } }

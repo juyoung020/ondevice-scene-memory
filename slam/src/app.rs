@@ -411,6 +411,9 @@ mod engine {
         forced_hyp: i32,
         /// 이어 붙인 구간 시작 노드 id(0 = 없음): 이 앞 노드들에서만 제자리 후보를 찾고, 루프가 이 구간을 옮기는 것은 허용
         pub prov_from: i32,
+        /// 지금(이어지지 않은) 새 지도의 첫 노드 id(0 = 믿는 지도 안)
+        pub map_start: i32,
+        rr: usize,
         /// 지금 지도가 믿는 지도인지(app 이 slam_process 앞에 알려 줌)
         pub trusted: bool,
     }
@@ -453,6 +456,8 @@ mod engine {
                 kf_ids: Vec::new(),
                 forced_hyp: 0,
                 prov_from: 0,
+                map_start: 0,
+                rr: 0,
                 trusted: true,
             }
         }
@@ -697,8 +702,16 @@ mod engine {
             let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
             let mut best: Vec<(usize, usize)> = Vec::new();
             // 믿는 지도의 노드 가운데 최근 40 개(새 지도 노드는 빼고 셈: 전에는 최근 40 칸이 모두 새 지도 노드라 후보가 0 이었음)
-            let below = if self.prov_from > 0 { self.prov_from } else { i32::MAX }; // 이어 붙인 구간이면 그 앞 노드만
-            let cand: Vec<usize> = (0..self.kf_db.len()).rev().filter(|&i| self.kf_ids[i].1 && self.kf_ids[i].0 > 0 && self.kf_ids[i].0 < below).take(40).collect();
+            // 후보: 이어 붙인 구간이면 그 앞 노드, 새 지도면 지금 지도보다 앞의 모든 노드(믿는 지도 · 다른 새 지도 모두).
+            // 노드 전체를 40 개씩 돌아가며 봄(장면당 시간 상한, 몇 장면이면 지도 전체를 한 바퀴)
+            let below = if self.prov_from > 0 { self.prov_from } else if self.map_start > 0 { self.map_start } else { i32::MAX };
+            let all: Vec<usize> = (0..self.kf_db.len()).filter(|&i| self.kf_ids[i].0 > 0 && self.kf_ids[i].0 < below && (self.map_start > 0 || self.kf_ids[i].1)).collect();
+            let cand: Vec<usize> = if all.len() <= 40 {
+                all
+            } else {
+                self.rr = (self.rr + 40) % all.len();
+                (0..40).map(|k| all[(self.rr + k) % all.len()]).collect()
+            };
             for &i in &cand {
                 let kf = &self.kf_db[i].0;
                 let id = self.kf_ids[i].0;
@@ -1318,6 +1331,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         }
         if !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 {
             common::info!("장면 {n}: 위치 추적 다시 시작 → 새 지도");
+            eng.map_start = eng.last_node() + 1;
             let id = eng.trigger_new_map();
             map_id = if id >= 0 { id as u32 } else { map_id + 1 };
             new_map = true;
@@ -1335,8 +1349,12 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if anchored && eng.prov_from > 0 && !fixing {
             eng.prov_from = 0; // 10 초 동안 못 찾음: 이어 붙인 그대로 둠
         }
+        if anchored {
+            eng.map_start = 0;
+        }
         let mut force_node = false;
-        if fixing && klt_path && pose.is_some() && fr.t - last_merge_try >= 0.2 && ms_since(c1) < 25.0 {
+        // 이어지지 않은 새 지도 · 이어 붙인 구간: 장면마다(0.2 초 간격, 장면 예산 안) 앞 지도들의 노드에서 이을 후보를 찾고, 찾으면 이 장면을 바로 노드로
+        if (fixing || !anchored) && klt_path && pose.is_some() && fr.t - last_merge_try >= 0.2 && ms_since(c1) < 25.0 {
             last_merge_try = fr.t;
             if eng.propose_merge(&fr, reloc_min as usize) {
                 n_merge_try += 1;
@@ -1363,9 +1381,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             eng.trusted = anchored;
             // 이어지지 않은 새 지도: 노드를 넣을 때마다 믿는 지도 노드 전체에서 이어 줄 후보를 찾아 루프 후보로 넘김
             // 잇기 후보 찾기는 1.5 초에 한 번, 이 장면 위치 추적이 가벼웠을 때만
-            if !anchored && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= 1.5 && ms_since(c1) < 30.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
-                n_merge_try += 1;
-            }
+
             eng.slam_process(&fr, data_id > 0, pose, &info.cov, info.velocity());
             slam_ms = ms_since(c2);
             loop_ = eng.loop_closure_id() > 0;

@@ -508,6 +508,14 @@ mod engine {
         /// 지도 전체에서 다시 잡기: 모든 지도 노드와 기술자 닮음(해밍 < 40 인 짝 수, 이번 특징 100 개 표본)으로 순위를 매기고
         /// 위 3 개만 PnP 로 맞춰 본다(최근 기준 장면만 보는 reloc 와 달리 오래전 노드도). 성공하면 (위치, 맞은 점, 공분산)
         /// 광류 경로: 방금 다시 시작한 장면이 마지막 성공 장면 깊이와 ICP 로 맞았는지
+        /// 광류 경로의 마지막 장면 진단
+        pub fn klt_diag(&self) -> Option<crate::klt::Diag> {
+            match &self.odom {
+                Odom::Klt(o) => Some(o.diag),
+                _ => None,
+            }
+        }
+
         pub fn bridge_verified(&self) -> bool {
             matches!(&self.odom, Odom::Klt(o) if o.bridge_verified)
         }
@@ -873,7 +881,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
         bridge: true,
         provisional: true,
-        bridge_gap: 5.0, // 빈틈 뒤 먼저 지도 전체에서 제자리를 찾고, 못 찾으면 5 초 이하 빈틈은 이어 붙임(한 지도 유지, 거짓 루프는 보정 크기 검사가 막음)
+        bridge_gap: 0.0, // 이어 붙이기는 깊이 ICP 로 자리가 확인될 때만(확인 안 된 이어 붙이기는 어긋난 위치를 감춤). 못 찾으면 새 지도(임시 위치, 불확실 표시) → 루프로 합침
         map_inline: false,
         no_boost: false,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
@@ -1095,6 +1103,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let mut global_tried = false;
     let mut n_loop_rejected = 0i64;
     let mut n_merge_try = 0i64;
+    let mut nq = [0i64; 3]; // 위치 질별 장면 수
     let mut bridge_t = f64::NEG_INFINITY; // 확인 안 된 이어 붙이기 시각
     let mut n_bridge_fix = 0i64;
     let mut last_merge_try = f64::MIN;
@@ -1124,7 +1133,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let _ = writeln!(f, "# timestamp x y z qx qy qz qw (OpenCV 카메라 → RTAB-Map 지도, 보낸 그대로)");
     }
     if let Some(f) = stats_f.as_mut() {
-        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose");
+        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose,quality,method,klt_inliers,klt_ratio,reproj_rms,spread,jump");
     }
     #[cfg(unix)]
     if !in_proc {
@@ -1268,6 +1277,18 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         }
         // 위치 추적 자체가 위치를 못 낸 장면(지도 잇기 여부와 별개)
         let no_pose = pose.is_none();
+        // 위치 질: 0 좋음(광류 · 다시 잡기), 1 불확실(ICP · 기술자 되찾기 · 첫 장면 · 이어 붙인 구간 · 이어지지 않은 새 지도), 2 놓침
+        let dg = eng.klt_diag().unwrap_or_default();
+        let quality = if pose.is_none() {
+            2u8
+        } else if relocalized {
+            0
+        } else if dg.method != 0 || !anchored || eng.prov_from > 0 {
+            1
+        } else {
+            0
+        };
+        nq[quality as usize] += 1;
         let odom_ms = ms_since(c1);
 
         // 새 지도는 위치 추적이 실제로 다시 시작한 장면(위치가 채워져 옴)에서만 연다
@@ -1483,6 +1504,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                     of.flags |= stream::PROVISIONAL;
                     n_prov += 1;
                 }
+                if quality == 1 {
+                    of.flags |= stream::UNCERTAIN;
+                }
             }
             let twc = body.mul(&optical);
             of.pose = twc.0.map(|v| v as f64);
@@ -1535,8 +1559,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if let Some(f) = stats_f.as_mut() {
             let _ = writeln!(
                 f,
-                "{n},{:.6},{read_ms:.3},{odom_ms:.3},{slam_ms:.3},{send_ms:.3},{},{},{},{},{},{},{},{}",
-                fr.t, lost as i32, new_map as i32, corrected as i32, loop_ as i32, info.features, info.inliers, held as i32, no_pose as i32
+                "{n},{:.6},{read_ms:.3},{odom_ms:.3},{slam_ms:.3},{send_ms:.3},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
+                fr.t, lost as i32, new_map as i32, corrected as i32, loop_ as i32, info.features, info.inliers, held as i32, no_pose as i32, quality, dg.method, dg.q.inliers, dg.q.ratio, dg.q.rms, dg.q.spread, dg.jump
             );
         }
         n += 1;
@@ -1567,6 +1591,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         common::info!("루프 클로저 받음 {n_loop} · 보정이 커서 버림 {n_loop_rejected}, 살펴본 보정 최대 {:.2} m · {:.1}°", max_corr.0, max_corr.1.to_degrees());
     }
     common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
+    common::info!("위치 질: 좋음 {} · 불확실 {} · 놓침 {}", nq[0], nq[1], nq[2]);
     if provisional {
         common::info!("이어지지 않은 새 지도에서 임시 위치로 바로 보낸 장면 {n_prov}, 지도 전체에서 찾은 잇기 후보 {n_merge_try} 번");
     }

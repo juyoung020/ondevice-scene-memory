@@ -368,6 +368,34 @@ struct DescJob {
     max_depth: f32,
 }
 
+/// 광류 한 장의 질(위치 질 표시·통계용)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Quality {
+    pub inliers: usize,
+    pub ratio: f32,
+    pub rms: f32,
+    pub spread: f32,
+}
+
+/// 이번 장면 위치를 어떻게 냈나: 0 광류, 1 깊이 ICP, 2 기술자 되찾기, 3 첫 장면, 4 놓침
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Diag {
+    pub method: u8,
+    pub q: Quality,
+    /// 등속 예측과 낸 위치 사이 거리(m), 예측 없으면 -1
+    pub jump: f32,
+}
+
+fn jump_of(pred: &Option<Tf>, pose: &Tf) -> f32 {
+    match pred {
+        Some(p) => {
+            let (a, b) = (p, pose);
+            ((a.x() - b.x()).powi(2) + (a.y() - b.y()).powi(2) + (a.z() - b.z()).powi(2)).sqrt()
+        }
+        None => -1.0,
+    }
+}
+
 pub struct OdometryKlt {
     pose: Tf,
     /// 마지막 성공 장면의 회색조 피라미드·시각
@@ -403,6 +431,11 @@ pub struct OdometryKlt {
     par: bool,
     /// 기술자 맞추기로 되찾은 장면 수
     pub recovered: usize,
+    /// 마지막 장면 진단
+    pub diag: Diag,
+    /// 약한 광류 결과는 받지 않음(OdomKlt/Strict, 기본 켬)
+    strict: bool,
+    min_good: usize,
     /// 깊이 ICP 로 이어 간 장면 수
     pub by_icp: usize,
     /// 다시 시작한 첫 장면이 마지막 성공 장면 깊이와 ICP 로 맞았는지(이어 붙인 자리가 확인됨)
@@ -443,6 +476,9 @@ impl OdometryKlt {
             redetect: p.get("OdomKlt/RedetectRatio", 0.6f32),
             keep_err: p.get("OdomKlt/KeepError", 3.0f32),
             recovered: 0,
+            diag: Diag::default(),
+            strict: p.get_bool("OdomKlt/Strict", true),
+            min_good: p.get("OdomKlt/MinGood", 30usize),
             by_icp: 0,
             bridge_verified: false,
             bridges_verified: 0,
@@ -613,7 +649,7 @@ impl OdometryKlt {
 
     /// 한 번 시도: 시작점들 → 광류 → PnP → 다듬기. (새 위치, 안쪽 번호, 이번 화소)
     /// need: 받아들일 최소 안쪽 점 수(빈틈 뒤엔 더 엄격하게)
-    fn attempt(&self, prev: &Pyr, cur: &Pyr, inits: &[[f32; 2]], k4: &[f64; 4], local: &Tf, need: usize) -> Option<(Tf, Vec<usize>, Vec<[f32; 2]>)> {
+    fn attempt(&self, prev: &Pyr, cur: &Pyr, inits: &[[f32; 2]], k4: &[f64; 4], local: &Tf, need: usize) -> Option<(Tf, Vec<usize>, Vec<[f32; 2]>, Quality)> {
         let ta = std::time::Instant::now();
         let res: Vec<Option<[f32; 2]>> = if self.par {
             self.tracks.par_iter().zip(inits.par_iter()).map(|(t, &i)| track_one(prev, cur, t.uv, i)).collect()
@@ -650,11 +686,30 @@ impl OdometryKlt {
             return None;
         }
         let tcw = refine(&tcw, k4, &op, &ip, &inl, self.reproj as f64);
+        // 질: 재투영 RMS, 안쪽 비율, 안쪽 점이 퍼진 넓이(화면 대비). 약하면 받지 않고 되찾기·놓침으로(어긋난 자리에 붙어 이어 가지 않게)
+        let mut se = 0.0f64;
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &i in &inl {
+            if let Some(p) = project(&tcw, k4, op[i]) {
+                se += ((p[0] - ip[i][0]).powi(2) + (p[1] - ip[i][1]).powi(2)) as f64;
+            }
+            x0 = x0.min(ip[i][0]);
+            y0 = y0.min(ip[i][1]);
+            x1 = x1.max(ip[i][0]);
+            y1 = y1.max(ip[i][1]);
+        }
+        let rms = (se / inl.len().max(1) as f64).sqrt() as f32;
+        let ratio = inl.len() as f32 / op.len().max(1) as f32;
+        let spread = ((x1 - x0).max(0.0) * (y1 - y0).max(0.0)) / ((2.0 * k4[2]) * (2.0 * k4[3])) as f32;
+        let q = Quality { inliers: inl.len(), ratio, rms, spread };
+        if self.strict && (inl.len() < self.min_good || ratio < 0.3 || spread < 0.08 || rms > 2.0) {
+            return None;
+        }
         let pose = local.mul(&tcw).inverse();
         let uvs: Vec<[f32; 2]> = ip.clone();
         let ids_in: Vec<usize> = inl.iter().map(|&i| ids[i]).collect();
         let uv_in: Vec<[f32; 2]> = inl.iter().map(|&i| uvs[i]).collect();
-        Some((pose, ids_in, uv_in))
+        Some((pose, ids_in, uv_in, q))
     }
 
     pub fn process(&mut self, f: &Frame) -> OdomResult {
@@ -694,6 +749,7 @@ impl OdometryKlt {
             }
             self.prev = Some(cur);
             self.prev_t = f.t;
+            self.diag = Diag { method: 3, q: Quality::default(), jump: -1.0 };
             return self.result(Tf::IDENTITY, Self::eye(9999.0), 0, 0, true);
         };
         let dt = f.t - self.prev_t;
@@ -720,7 +776,7 @@ impl OdometryKlt {
         }
         let t_trk = t0.elapsed().as_secs_f64();
         let n_tracks = self.tracks.len();
-        let Some((pose, ids, uvs)) = out else {
+        let Some((pose, ids, uvs, q)) = out else {
             // 먼저 마지막 키프레임과 기술자 맞추기(밝기만 있으면 더 정확), 안 되면 깊이 ICP
             if let Some((pose, cov, inl)) = self.recover(f, pred) {
                 if !f.depth_mm.is_empty() {
@@ -737,6 +793,7 @@ impl OdometryKlt {
                 self.spare = Some(prev);
                 self.prev_t = f.t;
                 self.recovered += 1;
+                self.diag = Diag { method: 2, q: Quality { inliers: inl, ..Default::default() }, jump: jump_of(&pred, &pose) };
                 if std::env::var("KLT_PROF").is_ok() {
                     eprintln!("klt recover t {:.3} inliers {inl}", f.t);
                 }
@@ -766,6 +823,7 @@ impl OdometryKlt {
                     self.spare = Some(prev);
                     self.prev_t = f.t;
                     self.by_icp += 1;
+                    self.diag = Diag { method: 1, q: Quality::default(), jump: jump_of(&pred, &pose) };
                     if std::env::var("KLT_PROF").is_ok() {
                         eprintln!("klt icp t {:.3}", f.t);
                     }
@@ -775,6 +833,7 @@ impl OdometryKlt {
             // 놓침: 마지막 성공 장면 그대로 둠(다음 장면이 거기서 다시)
             self.prev = Some(prev);
             self.spare = Some(cur);
+            self.diag = Diag { method: 4, q: Quality::default(), jump: -1.0 };
             return self.result(Tf::NULL, Self::eye(9999.0), 0, n_tracks, false);
         };
         let transform = self.pose.inverse().mul(&pose);
@@ -832,6 +891,7 @@ impl OdometryKlt {
         self.spare = Some(prev);
         self.prev = Some(cur);
         self.prev_t = f.t;
+        self.diag = Diag { method: 0, q, jump: jump_of(&pred, &pose) };
         self.result(transform, cov, inliers, n_tracks, kf)
     }
 }

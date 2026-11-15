@@ -87,6 +87,24 @@ impl View {
         b.push(b'}');
         Some(b)
     }
+    /// 지나온 길: (로그 id, 전체 길이, from 뒤 점들). 파일 판은 view.json 의 graph.nodes(로그 id 0, 판마다 통째로)
+    pub fn traj_from(&self, from: usize) -> (u64, usize, Vec<(f64, [f64; 3])>) {
+        match &self.src {
+            Src::Live { traj, n } => {
+                let g = traj.0.read().unwrap();
+                let f = from.min(*n);
+                (traj.id(), *n, g[f..*n].to_vec())
+            }
+            Src::File(_) => {
+                let nodes = self.doc().and_then(|d| d["graph"]["nodes"].as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
+                let v: Vec<_> = nodes.iter().filter(|n| n["kind"] == "agent").map(|n| {
+                    let p = |i: usize| n["pos"][i].as_f64().unwrap_or(0.0);
+                    (n["t"].as_f64().unwrap_or(0.0), [p(0), p(1), p(2)])
+                }).collect();
+                (0, v.len(), v)
+            }
+        }
+    }
     /// 이 판의 길 로그 id(같은 프로세스 판만)
     pub fn traj_id(&self) -> Option<u64> {
         match &self.src {
@@ -152,16 +170,27 @@ pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])], from: usize) -> Vec<u8
     b
 }
 
+/// 뷰 스레드 → 서버 넘김 칸: 가장 새 판만(넣기는 기다리지 않고, 서버가 아직 안 꺼낸 옛 판은 덮어씀)
+static HANDOFF: OnceLock<common::slot::Latest<Arc<View>>> = OnceLock::new();
+/// 서버가 꺼내 들고 있는 지금 판(HTTP · 밀어 보내기 · 저장이 함께 읽음)
 static CUR: Mutex<Option<Arc<View>>> = Mutex::new(None);
 
-/// 같은 프로세스의 물체 기억이 새 판을 건다(뷰어는 파일 대신 이것을 씀)
+fn handoff() -> &'static common::slot::Latest<Arc<View>> {
+    HANDOFF.get_or_init(|| common::slot::Latest::new(false))
+}
+
+/// 같은 프로세스의 물체 기억이 새 판을 건다(뷰어는 파일 대신 이것을 씀). 막히지 않음
 pub fn publish(v: View) {
-    *CUR.lock().unwrap() = Some(Arc::new(v));
+    let _ = handoff().put(0, Arc::new(v));
     crate::memfs::bump();
 }
 
 pub fn current() -> Option<Arc<View>> {
-    CUR.lock().unwrap().clone()
+    let mut c = CUR.lock().unwrap();
+    if let Some((_, v)) = handoff().try_take() {
+        *c = Some(v);
+    }
+    c.clone()
 }
 
 #[cfg(test)]

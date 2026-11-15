@@ -2104,8 +2104,10 @@ enum ViewMsg {
 
 /// 뷰 스레드: 방 나누기 · 엣지(graph::build), map.pgm, view.json(디스크) 또는 같은 프로세스 뷰어에 구조 그대로 건 판(--serve).
 /// 받은 차례대로 하므로 방 번호 잇기 · 파일 차례는 본 스레드에서 하던 것과 같다
+/// 지도 → 뷰 넘김은 common::slot::Latest 한 칸: 실시간(메모리 기억 폴더)은 덮어써 가장 새 판만(본 스레드는 기다리지 않음,
+/// 덮어쓴 판의 길 점은 새 판 앞에 이어 붙여 하나도 잃지 않음), 디스크 기록 · 재생은 exact(하나도 건너뛰지 않음 — 결과가 늘 같게)
 struct ViewWorker {
-    tx: std::sync::mpsc::Sender<ViewMsg>,
+    slot: std::sync::Arc<common::slot::Latest<ViewMsg>>,
     handle: Option<std::thread::JoinHandle<()>>,
     sent: usize,   // 넘긴 길 점 수
     fresh: bool,   // 길이 새로 만들어짐(다시 쌓기 갈아 끼우기)
@@ -2114,7 +2116,8 @@ struct ViewWorker {
 
 impl ViewWorker {
     fn spawn(dir: PathBuf, live: bool) -> ViewWorker {
-        let (tx, rx) = std::sync::mpsc::channel::<ViewMsg>();
+        let slot = std::sync::Arc::new(common::slot::Latest::<ViewMsg>::new(!out::memory_only()));
+        let rx = slot.clone();
         let handle = std::thread::Builder::new().name("view".into()).spawn(move || {
             out::thread_role(out::Role::Writer);
             let mut tr = rooms::Tracker::default();
@@ -2127,16 +2130,8 @@ impl ViewWorker {
                     log.extend(v);
                 }
             };
-            let mut back: Option<ViewMsg> = None;
-            loop {
-                let m = match back.take() {
-                    Some(m) => m,
-                    None => match rx.recv() {
-                        Ok(m) => m,
-                        Err(_) => break,
-                    },
-                };
-                let mut j = match m {
+            while let Some((_, m)) = rx.take() {
+                let j = match m {
                     ViewMsg::Flush(t) => {
                         let _ = t.send(());
                         continue;
@@ -2144,21 +2139,6 @@ impl ViewWorker {
                     ViewMsg::Job(j) => *j,
                 };
                 apply(&mut log, &j.traj);
-                // 실시간(메모리 기억 폴더): 밀린 판은 건너뛰고 마지막 것만(길은 모두 이어 붙임). 디스크 기록은 하나도 건너뛰지 않음(결과가 늘 같게)
-                if out::memory_only() {
-                    while let Ok(m2) = rx.try_recv() {
-                        match m2 {
-                            ViewMsg::Job(j2) => {
-                                apply(&mut log, &j2.traj);
-                                j = *j2;
-                            }
-                            other => {
-                                back = Some(other);
-                                break;
-                            }
-                        }
-                    }
-                }
                 let (grid_j, rooms, doors, edges) = match j.gi {
                     Some(mut g) => {
                         let ol: Vec<_> = j.ol.iter().map(|o| (o.0, o.1, o.2, o.3, o.4.as_str())).collect();
@@ -2191,7 +2171,7 @@ impl ViewWorker {
                 }
             }
         }).unwrap();
-        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true, live }
+        ViewWorker { slot, handle: Some(handle), sent: 0, fresh: true, live }
     }
     fn traj_update(&mut self, traj: &[(f64, [f64; 3])]) -> TrajUpd {
         let u = if std::mem::take(&mut self.fresh) || traj.len() < self.sent { TrajUpd::Reset(traj.to_vec()) } else { TrajUpd::Append(traj[self.sent..].to_vec()) };
@@ -2202,21 +2182,39 @@ impl ViewWorker {
     fn traj_replaced(&mut self) {
         self.fresh = true;
     }
-    fn send(&self, j: ViewJob) {
-        self.tx.send(ViewMsg::Job(Box::new(j))).expect("뷰 스레드");
+    fn send(&self, mut j: ViewJob) {
+        // 실시간: 뷰 스레드가 아직 안 꺼낸 판은 이 판으로 바꾸되 그 판의 길 점을 앞에 붙임(넣는 쪽은 이 스레드 하나라 put 은 덮어쓰지 않음)
+        if !out::memory_only() {
+            self.slot.put(0, ViewMsg::Job(Box::new(j)));
+            return;
+        }
+        if let Some((_, ViewMsg::Job(old))) = self.slot.try_take() {
+            j.traj = match (old.traj, j.traj) {
+                (_, TrajUpd::Reset(v)) => TrajUpd::Reset(v),
+                (TrajUpd::Reset(mut a), TrajUpd::Append(b)) => {
+                    a.extend(b);
+                    TrajUpd::Reset(a)
+                }
+                (TrajUpd::Append(mut a), TrajUpd::Append(b)) => {
+                    a.extend(b);
+                    TrajUpd::Append(a)
+                }
+            };
+        }
+        self.slot.put(0, ViewMsg::Job(Box::new(j)));
     }
     /// 넘긴 판을 모두 짤 때까지 기다림
     fn flush(&self) {
         let (t, r) = std::sync::mpsc::channel();
-        self.tx.send(ViewMsg::Flush(t)).expect("뷰 스레드");
+        self.slot.wait_empty(); // 덮어쓰는 칸: 남은 판이 꺼내진 뒤 끝 표시(판을 덮어쓰지 않게)
+        self.slot.put(0, ViewMsg::Flush(t));
         let _ = r.recv();
     }
 }
 
 impl Drop for ViewWorker {
     fn drop(&mut self) {
-        let (tx, _) = std::sync::mpsc::channel();
-        drop(std::mem::replace(&mut self.tx, tx));
+        self.slot.close();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

@@ -56,6 +56,13 @@ impl<T> Latest<T> {
         }
         v
     }
+    /// 칸이 빌 때까지(뒤 단계가 꺼낼 때까지) 기다림: 덮어쓰는 칸에서 남은 것을 잃지 않고 다음 것을 넣을 때
+    pub fn wait_empty(&self) {
+        let mut s = self.m.lock().unwrap();
+        while s.v.is_some() && !s.closed {
+            s = self.cv.wait(s).unwrap();
+        }
+    }
     /// 앞 단계 끝: 남은 것은 꺼낼 수 있고 그 뒤 take 는 None
     pub fn close(&self) {
         self.m.lock().unwrap().closed = true;

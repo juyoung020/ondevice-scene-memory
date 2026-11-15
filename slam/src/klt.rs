@@ -110,7 +110,7 @@ fn track_one(prev: &Pyr, cur: &Pyr, p0: [f32; 2], init: [f32; 2]) -> Option<[f32
         let mn = (M * M) as f32;
         // 최소 고윳값 / 화소 수 가 너무 작으면(밋밋한 곳) 못 따라감
         let min_eig = (a11 + a22 - ((a11 - a22) * (a11 - a22) + 4.0 * a12 * a12).sqrt()) * 0.5 / mn;
-        if det.abs() < 1e-6 || min_eig < 2e-3 {
+        if det.abs() < 1e-6 || min_eig < 1e-2 {
             return None;
         }
         let inv = 1.0 / det;
@@ -260,6 +260,11 @@ fn vtx(d: &[u16], ws: usize, i: usize, j: usize, k: &[f64; 4]) -> Option<Vector3
 
 /// 점-평면 ICP(투영 짝짓기): 이번 깊이 격자 cur 를 앞 깊이 격자 prev 에 맞춤. t_init·결과 = 이번 광학 → 앞 광학
 fn icp(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: &Tf) -> Option<Tf> {
+    icp_q(prev, cur, ws, hs, k, t_init, 0.25, 1e-3)
+}
+
+/// min_ratio: 짝이 된 점 비율 하한, min_eig: 6 방향 구속(정규화 최소 고윳값) 하한
+fn icp_q(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: &Tf, min_ratio: f64, min_eig: f64) -> Option<Tf> {
     let (mut r, mut t) = rt_from_tf(t_init);
     // 앞 장면 법선(이웃 격자 차의 외적)
     let normal = |i: usize, j: usize| -> Option<(Vector3<f64>, Vector3<f64>)> {
@@ -287,6 +292,10 @@ fn icp(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: &T
     if pts.len() < 200 {
         return None;
     }
+    // 잔차 상한: 스테레오 깊이 잡음 ≈ 0.0042·z²(D435, 기준선 5 cm·초점 383 px·부화소 0.08)의 2.5 배, 1–4 cm
+    let mut zs: Vec<f64> = pts.iter().map(|p| p[2]).collect();
+    let zm = *zs.select_nth_unstable_by(pts.len() / 2, |a, b| a.total_cmp(b)).1;
+    let rms_max = (2.5 * 0.0042 * zm * zm).clamp(0.01, 0.04);
     let mut good = 0usize;
     let mut rms = 0.0;
     let mut h = Matrix6::<f64>::zeros();
@@ -342,7 +351,7 @@ fn icp(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: &T
     if std::env::var("KLT_PROF").is_ok() {
         eprintln!("icp good {good}/{} rms {rms:.4} min_e {min_e:.2e}", pts.len());
     }
-    if (good as f64) < 0.25 * pts.len() as f64 || rms > 0.03 || min_e < 1e-4 {
+    if (good as f64) < min_ratio * pts.len() as f64 || rms > rms_max || min_e < min_eig {
         return None;
     }
     Some(tf_from_rt(&r, &t))
@@ -378,6 +387,9 @@ pub struct OdometryKlt {
     pub recovered: usize,
     /// 깊이 ICP 로 이어 간 장면 수
     pub by_icp: usize,
+    /// 다시 시작한 첫 장면이 마지막 성공 장면 깊이와 ICP 로 맞았는지(이어 붙인 자리가 확인됨)
+    pub bridge_verified: bool,
+    pub bridges_verified: usize,
     /// 시험용: 광류 없이 깊이 ICP 만(OdomKlt/DepthOnly)
     depth_only: bool,
     /// 마지막 성공 장면의 깊이 격자(깊이 ICP)
@@ -408,6 +420,8 @@ impl OdometryKlt {
             keep_err: p.get("OdomKlt/KeepError", 3.0f32),
             recovered: 0,
             by_icp: 0,
+            bridge_verified: false,
+            bridges_verified: 0,
             depth_only: p.get_bool("OdomKlt/DepthOnly", false),
             prev_sub: Vec::new(),
             cur_sub: Vec::new(),
@@ -421,11 +435,15 @@ impl OdometryKlt {
 
     /// 이 위치에서 처음부터(다음 장면이 첫 장면)
     pub fn reset_tf(&mut self, pose: Tf) {
+        // 같은 자리에서 다시 시작(이어 붙이기)이면 마지막 성공 장면 깊이를 남겨, 첫 장면에서 그 깊이와 ICP 로 실제 움직임을 잡는다
+        let same_place = pose == self.pose;
         self.pose = pose;
         self.prev = None;
         self.tracks.clear();
         self.kf = None;
-        self.prev_sub.clear();
+        if !same_place {
+            self.prev_sub.clear();
+        }
         self.velocity = Tf::NULL;
         self.prev_t = 0.0;
     }
@@ -511,7 +529,8 @@ impl OdometryKlt {
     }
 
     /// 한 번 시도: 시작점들 → 광류 → PnP → 다듬기. (새 위치, 안쪽 번호, 이번 화소)
-    fn attempt(&self, prev: &Pyr, cur: &Pyr, inits: &[[f32; 2]], k4: &[f64; 4], local: &Tf) -> Option<(Tf, Vec<usize>, Vec<[f32; 2]>)> {
+    /// need: 받아들일 최소 안쪽 점 수(빈틈 뒤엔 더 엄격하게)
+    fn attempt(&self, prev: &Pyr, cur: &Pyr, inits: &[[f32; 2]], k4: &[f64; 4], local: &Tf, need: usize) -> Option<(Tf, Vec<usize>, Vec<[f32; 2]>)> {
         let ta = std::time::Instant::now();
         let res: Vec<Option<[f32; 2]>> = if self.par {
             self.tracks.par_iter().zip(inits.par_iter()).map(|(t, &i)| track_one(prev, cur, t.uv, i)).collect()
@@ -544,7 +563,7 @@ impl OdometryKlt {
         let inl: Vec<usize> = (0..op.len())
             .filter(|&i| project(&tcw, k4, op[i]).map(|p| (p[0] - ip[i][0]).powi(2) + (p[1] - ip[i][1]).powi(2) <= thr).unwrap_or(false))
             .collect();
-        if inl.len() < self.min_inliers {
+        if inl.len() < need {
             return None;
         }
         let tcw = refine(&tcw, k4, &op, &ip, &inl, self.reproj as f64);
@@ -566,6 +585,16 @@ impl OdometryKlt {
         let Some(prev) = self.prev.take() else {
             // 첫 장면: 점만 만들고 '새로 시작'(공분산 9999)
             self.tracks.clear();
+            // 이어 붙이기: 마지막 성공 장면 깊이가 남아 있으면 움직임 없음에서 시작하는 ICP 로 그사이 움직임을 바로잡음
+            self.bridge_verified = false;
+            if !self.prev_sub.is_empty() && !f.depth_mm.is_empty() && sub_depth(&f.depth_mm, w, h, &mut self.cur_sub) > 1000 {
+                // 확인용이라 엄격하게: 점 절반 이상이 짝, 바닥·벽 하나처럼 미끄러지는 장면은 확인 안 된 것으로
+                if let Some(tpo) = icp_q(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &Tf::IDENTITY, 0.5, 1e-2) {
+                    self.pose = self.pose.mul(&local.mul(&tpo).mul(&local.inverse()));
+                    self.bridge_verified = true;
+                    self.bridges_verified += 1;
+                }
+            }
             self.top_up(f);
             let nd = if f.depth_mm.is_empty() { 0 } else { sub_depth(&f.depth_mm, w, h, &mut self.prev_sub) };
             // 어두워 점이 모자라도 깊이가 있으면 시작(깊이 ICP 로 이어 감)
@@ -581,29 +610,54 @@ impl OdometryKlt {
         };
         let dt = f.t - self.prev_t;
         // 1) 등속 예측 시작점
-        let pred = if !self.velocity.is_null() && dt > 0.0 {
+        // 0.2 초 넘게 비면(녹화 빈틈·놓친 뒤) 등속 예측은 틀리기 쉬워 쓰지 않음(움직임 없음에서 시작)
+        let pred = if !self.velocity.is_null() && dt > 0.0 && dt < 0.2 {
             let v = self.velocity.xyz_rpy();
             let m = |x: f32| (x as f64 * dt) as f32;
             Some(self.pose.mul(&Tf::from_xyz_rpy(m(v[0]), m(v[1]), m(v[2]), m(v[3]), m(v[4]), m(v[5]))))
         } else {
             None
         };
+        // 0.5 초 넘는 빈틈 뒤: 비슷해 보이는 다른 자리에 잘못 붙지 않게 따라가던 점의 절반 이상이 맞아야 받아들임
+        let need = if dt > 0.5 { self.min_inliers.max(self.tracks.len() / 2) } else { self.min_inliers };
         let still: Vec<[f32; 2]> = self.tracks.iter().map(|t| t.uv).collect();
         let mut out = None;
         if let Some(pp) = pred.filter(|_| !self.depth_only) {
             let tcw = pp.mul(&local).inverse();
             let inits: Vec<[f32; 2]> = self.tracks.iter().map(|t| project(&tcw, &k4, t.w).unwrap_or(t.uv)).collect();
-            out = self.attempt(&prev, &cur, &inits, &k4, &local);
+            out = self.attempt(&prev, &cur, &inits, &k4, &local, need);
         }
         if out.is_none() && !self.depth_only {
-            out = self.attempt(&prev, &cur, &still, &k4, &local);
+            out = self.attempt(&prev, &cur, &still, &k4, &local, need);
         }
         let t_trk = t0.elapsed().as_secs_f64();
         let n_tracks = self.tracks.len();
         let Some((pose, ids, uvs)) = out else {
+            // 먼저 마지막 키프레임과 기술자 맞추기(밝기만 있으면 더 정확), 안 되면 깊이 ICP
+            if let Some((pose, cov, inl)) = self.recover(f, pred) {
+                if !f.depth_mm.is_empty() {
+                    sub_depth(&f.depth_mm, w, h, &mut self.prev_sub);
+                }
+                let transform = self.pose.inverse().mul(&pose);
+                if dt > 0.0 {
+                    let v = transform.xyz_rpy();
+                    let d = |x: f32| (x as f64 / dt) as f32;
+                    self.velocity = Tf::from_xyz_rpy(d(v[0]), d(v[1]), d(v[2]), d(v[3]), d(v[4]), d(v[5]));
+                }
+                self.pose = pose;
+                self.prev = Some(cur);
+                self.spare = Some(prev);
+                self.prev_t = f.t;
+                self.recovered += 1;
+                if std::env::var("KLT_PROF").is_ok() {
+                    eprintln!("klt recover t {:.3} inliers {inl}", f.t);
+                }
+                return self.result(transform, cov, inl, n_tracks, true);
+            }
             // 광류가 끊김(어둡거나 번짐): 깊이는 적외선이라 보통 멀쩡하다 -> 앞 장면 깊이와 점-평면 ICP
             let nd = if f.depth_mm.is_empty() || self.prev_sub.is_empty() { 0 } else { sub_depth(&f.depth_mm, w, h, &mut self.cur_sub) };
-            if nd > 1000 {
+            // 빈틈(0.5 초 넘게) 뒤의 ICP 는 바닥·벽처럼 평평한 곳에서 엉뚱한 자리로 미끄러져도 잔차가 작아(fr1_floor 1.3 초 빈틈 0.4 m 어긋남) 쓰지 않음
+            if nd > 1000 && dt <= 0.5 {
                 let rel = pred.map(|p| self.pose.inverse().mul(&p)).unwrap_or(Tf::IDENTITY);
                 let linv = local.inverse();
                 let init = linv.mul(&rel).mul(&local);
@@ -624,25 +678,11 @@ impl OdometryKlt {
                     self.spare = Some(prev);
                     self.prev_t = f.t;
                     self.by_icp += 1;
+                    if std::env::var("KLT_PROF").is_ok() {
+                        eprintln!("klt icp t {:.3}", f.t);
+                    }
                     return self.result(transform, Self::eye(1e-3), 0, n_tracks, true);
                 }
-            }
-            if let Some((pose, cov, inl)) = self.recover(f, pred) {
-                if !f.depth_mm.is_empty() {
-                    sub_depth(&f.depth_mm, w, h, &mut self.prev_sub);
-                }
-                let transform = self.pose.inverse().mul(&pose);
-                if dt > 0.0 {
-                    let v = transform.xyz_rpy();
-                    let d = |x: f32| (x as f64 / dt) as f32;
-                    self.velocity = Tf::from_xyz_rpy(d(v[0]), d(v[1]), d(v[2]), d(v[3]), d(v[4]), d(v[5]));
-                }
-                self.pose = pose;
-                self.prev = Some(cur);
-                self.spare = Some(prev);
-                self.prev_t = f.t;
-                self.recovered += 1;
-                return self.result(transform, cov, inl, n_tracks, true);
             }
             // 놓침: 마지막 성공 장면 그대로 둠(다음 장면이 거기서 다시)
             self.prev = Some(prev);

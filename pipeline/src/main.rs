@@ -1505,11 +1505,13 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let mut start = 0usize;
     let mut old_keys: Vec<(u64, M3, V3)> = vec![];
     if let Some(c) = cache.filter(|_| std::env::var_os("MEMMAP_RB_FULL").is_none()) {
+        // MEMMAP_RB_TOL=1: 움직임 문턱 안의 흔들림은 같은 것으로(빠름, 처음부터 쌓은 것과 문턱만큼 다를 수 있음). 기본은 정확히 같은 위치만
+        let tol = std::env::var("MEMMAP_RB_TOL").is_ok_and(|v| v == "1");
         // 처음 달라진 장면: 순번이 다르거나 노드가 실제로 움직임(kfstore 의 움직임 문턱 2 cm · 1° — 최적화의 아주 작은 흔들림은 같은 것으로 봄)
         let d = snap
             .iter()
             .zip(c.keys.iter())
-            .position(|((kf, r, p), (s, r0, p0))| kf.seq != *s || norm(&sub(p, p0)) > kfstore::MOVE_T || kfstore::angle(r, r0) > kfstore::MOVE_R)
+            .position(|((kf, r, p), (s, r0, p0))| kf.seq != *s || if tol { norm(&sub(p, p0)) > kfstore::MOVE_T || kfstore::angle(r, r0) > kfstore::MOVE_R } else { r != r0 || p != p0 })
             .unwrap_or(snap.len().min(c.keys.len()));
         if std::env::var_os("MEMMAP_PARTS").is_some() {
             common::info!("다시 쌓기: 지난번과 처음 달라진 장면 {d} / {}", snap.len());
@@ -1561,6 +1563,10 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
             if dec.is_empty() {
                 use rayon::prelude::*;
                 let end = (i + dec_chunk).min(snap.len());
+                // 압축이 다 채워진 뒤 풀에 들어감(점 작업 스레드와 풀을 서로 기다리는 교착 막기, unpack_all 과 같음)
+                for (kf, _, _) in &snap[i..end] {
+                    kf.wait_ready();
+                }
                 dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets())).collect::<Vec<_>>().into();
             }
             let (kd, kr, kdets) = dec.pop_front().unwrap();

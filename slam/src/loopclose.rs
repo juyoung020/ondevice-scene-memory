@@ -123,6 +123,8 @@ pub struct NodeInput {
     pub cov: Mat6,
     pub velocity: Vec<f32>,
     pub image_size: (u32, u32),
+    /// 이 id 부터의 노드는 이어 붙인(임시) 구간: 루프 보정 크기 검사에서 빼서 루프가 그 구간을 제자리로 옮길 수 있게(0 = 없음)
+    pub prov_from: i32,
 }
 
 /// 한 번의 결과 요약(검증·통계용)
@@ -192,6 +194,8 @@ pub struct Slam {
     loop_hyp: (i32, f32),
     /// 밖에서 찾은 루프 후보(옛 지도 노드 id): 이번 단계에 베이즈 가설이 없으면 이것으로 정합해 본다(검증은 원래 루프와 같음)
     pub forced_hyp: i32,
+    /// 이어 붙인 구간 시작 노드 id(NodeInput::prov_from)
+    pub prov_from: i32,
     highest: (i32, f32),
     odom_cache_poses: BTreeMap<i32, Tf>,
     odom_cache_links: LinkMap,
@@ -231,6 +235,7 @@ impl Slam {
             map_correction: Tf::IDENTITY,
             loop_hyp: (0, 0.0),
             forced_hyp: 0,
+            prov_from: 0,
             highest: (0, 0.0),
             odom_cache_poses: BTreeMap::new(),
             odom_cache_links: LinkMap::default(),
@@ -292,6 +297,7 @@ impl Slam {
 
     /// Rtabmap::process(data, odomPose, covariance, velocity). false = 노드를 만들지 않음(위치 없음)
     pub fn process(&mut self, inp: &NodeInput) -> bool {
+        self.prov_from = inp.prov_from;
         self.loop_hyp = (0, 0.0);
         let last_highest = self.highest;
         self.highest = (0, 0.0);
@@ -554,6 +560,9 @@ impl Slam {
                     for (id, np) in poses.iter() {
                         if tgt_map.is_some() && self.mem.sig(*id).map(|s| s.map_id) != tgt_map {
                             continue;
+                        }
+                        if self.prov_from > 0 && *id >= self.prov_from {
+                            continue; // 이어 붙인 임시 구간은 옮겨져도 됨
                         }
                         if let Some(op) = self.optimized.get(id) {
                             let v = op.inverse().mul(np).xyz_rpy();
@@ -978,6 +987,6 @@ mod refdump;
 
 impl Default for NodeInput {
     fn default() -> Self {
-        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0) }
+        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0 }
     }
 }

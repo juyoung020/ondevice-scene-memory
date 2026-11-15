@@ -2,6 +2,14 @@
 
 목표: 라즈베리파이 5(A76 4 코어) + RealSense D435(IMU 없음, 시험 데이터는 같은 계열 D435i)에서 RTAB-Map 0.24.2 위치 추적을 30 장/초로. 설정 파일: [`rtabmap_pi.ini`](rtabmap_pi.ini).
 
+## 기본 위치 추적(광류, `Odom/Strategy=9`, `slam/src/klt.rs`)
+
+- 장면마다: 등속 예측 → 피라미드 광류 → PnP RANSAC → 가우스-뉴턴 다듬기. 광류가 끊기면 같은 장면에서 키프레임 기술자 맞추기, 그다음 깊이 ICP(0.5 초 넘는 빈틈 뒤엔 안 씀).
+- 놓치면 바로 다시 시작: 빈틈 뒤 첫 장면은 지도 전체에서 제자리를 찾고, 못 찾으면 5 초 이하 빈틈은 마지막 위치에서 같은 지도로 이어 붙인다(`--bridge-gap`). 기존 노드를 1 m · 57° 넘게 옮기는 루프는 버린다(`RGBD/MaxCorrectionLinear/Angular`).
+- 실시간 입력에서는 위치 추적 스레드가 우선(SCHED_FIFO 10 또는 nice -10)이고, 지도 갱신·키프레임 기술자·노드 특징은 다른 스레드에서 한다.
+- 알려진 한계: 빈틈 뒤 비슷한 바닥 무늬에서 광류가 어긋난 자리에 붙으면 그 구간이 어긋난 채 남는다(TUM fr1_floor 0.153 m, performance_log.md "빠른 움직임").
+- RTAB-Map 그대로의 F2F 는 `Odom/Strategy=1`(비교용). 아래 표들은 그 F2F 경로의 조정 기록이다.
+
 ## 측정 조건
 
 - PC: Ryzen 9 9950X, 프로세스를 논리 코어 하나에 묶고 우선순위 높음. RTAB-Map 0.24.2(Windows) `rtabmap-rgbd_dataset`, 모든 실행에 `Rtabmap/DetectionRate 1`(지도 갱신 1 초에 1 번).

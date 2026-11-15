@@ -637,13 +637,11 @@ mod engine {
             let step = (self.cur.desc.len() / 60).max(1);
             let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
             let mut best: Vec<(usize, usize)> = Vec::new();
-            // 최근 40 노드만(장면당 시간 상한)
-            let from = self.kf_db.len().saturating_sub(40);
-            for (i, (kf, _)) in self.kf_db.iter().enumerate().skip(from) {
-                let (id, trusted, _) = self.kf_ids[i];
-                if !trusted || id <= 0 {
-                    continue;
-                }
+            // 믿는 지도의 노드 가운데 최근 40 개(새 지도 노드는 빼고 셈: 전에는 최근 40 칸이 모두 새 지도 노드라 후보가 0 이었음)
+            let cand: Vec<usize> = (0..self.kf_db.len()).rev().filter(|&i| self.kf_ids[i].1 && self.kf_ids[i].0 > 0).take(40).collect();
+            for &i in &cand {
+                let kf = &self.kf_db[i].0;
+                let id = self.kf_ids[i].0;
                 // 짝 = 가장 가까운 것이 두 번째보다 충분히 가까움(비율 0.8) 이고 거리 < 50
                 let kw: Vec<[u64; 4]> = kf.desc.iter().map(words).collect();
                 let hits = q
@@ -819,7 +817,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
         bridge: true,
         provisional: true,
-        bridge_gap: 1.0,
+        bridge_gap: 5.0, // 빈틈 뒤 먼저 지도 전체에서 제자리를 찾고, 못 찾으면 5 초 이하 빈틈은 이어 붙임(한 지도 유지, 거짓 루프는 보정 크기 검사가 막음)
         map_inline: false,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
@@ -1032,6 +1030,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let bridge = a.bridge && klt_path;
     let mut n_bridge = 0i64;
     let mut n_global = 0i64;
+    let mut global_tried = false;
     let mut n_loop_rejected = 0i64;
     let mut n_merge_try = 0i64;
     let mut last_merge_try = f64::MIN;
@@ -1166,7 +1165,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             }
             // 최근 기준 장면으로 못 잡으면 지도 전체에서(광류 경로, 놓친 동안 장면마다)
             // 장면당 예산: 이 장면에서 위치 추적이 이미 20 ms 넘게 썼으면 다음 장면으로 미룸(추적 스레드가 40 ms 넘게 막히지 않게)
-            if !relocalized && klt_path && fr.t - last_good_t > 0.2 && ms_since(c1) < 20.0 {
+            // 빈틈 바로 뒤 첫 장면은 예산과 상관없이 한 번 꼭 해 봄(이어 붙이기 전에 제자리 찾기)
+            if !relocalized && klt_path && fr.t - last_good_t > 0.2 && (ms_since(c1) < 20.0 || !global_tried) {
+                global_tried = true;
                 if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize) {
                     eng.odom_reset(p);
                     let info2 = eng.odom_process(&fr, None);
@@ -1199,6 +1200,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if pose.is_some() {
             lost_since = -1.0;
             last_good_t = fr.t;
+            global_tried = false;
         }
         // 위치 추적 자체가 위치를 못 낸 장면(지도 잇기 여부와 별개)
         let no_pose = pose.is_none();
@@ -1257,7 +1259,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             eng.trusted = anchored;
             // 이어지지 않은 새 지도: 노드를 넣을 때마다 믿는 지도 노드 전체에서 이어 줄 후보를 찾아 루프 후보로 넘김
             // 잇기 후보 찾기는 1.5 초에 한 번, 이 장면 위치 추적이 가벼웠을 때만
-            if !anchored && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= 1.5 && ms_since(c1) < 15.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
+            if !anchored && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= 1.5 && ms_since(c1) < 30.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
                 n_merge_try += 1;
             }
             eng.slam_process(&fr, data_id > 0, pose, &info.cov, info.velocity());

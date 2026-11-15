@@ -1588,3 +1588,25 @@ walk1 녹화를 실시간(1 배)으로 보드 화면 루프(`~/restart_screen.sh
 다른 실행 2 개와 함께(MemAvailable 1.5–2.5 GB): 그리기 8–31 ms, 프레임 간격 최대 276 ms, 판 경계 72–109 ms.
 
 통합 판(opt/viewer-client = opt/rust-only + feat/objectsam-dxnn + opt/track-full + 뷰어) PC 품질(`--rate 0 --block --every 2`, ObjectSAM + SigLIP2, `vocab/indoor.voc`): fr1_desk 놓침 0, ATE(지도 위치) 2.87 cm, 물체 28; fr1_room 놓침 0, ATE 12.9 cm, 물체 91. `cargo test --workspace --release` 통과.
+
+### 통합 판 확인: walk1 이 510 장에서 끝난 까닭 · PC 품질 비교 (2026-11-15)
+
+- walk1 510 장은 멈춤이 아니라 녹화 끝까지 읽은 실시간(1 배) 재생에서 위치 추적이 밀린 장면을 버린 것이다(그 실행: 밀려 버린 장면 394, 다른 실행 2 개 동시). 같은 때 앞 판도 546 · 555 장(밀려 버림 479 · 434)이었다.
+- 보드에 다른 실행이 없을 때(화면 루프만, 통합 판은 끝 30 초에 다른 실행 1 개 겹침):
+
+| 판 | 받은 장면 | 위치 추적이 밀려 버린 장면 | 위치 추적 ms/장 중앙 · 95 % · 최대 |
+|---|---|---|---|
+| 앞 판(08:46, opt/integration) | 766 | 44 | 14.0 · 40.2 · 148 |
+| 뷰어만 바꾼 판(30c30de) | 753 | 70 – 71 | – |
+| 통합 판(be8a840) | 726 | 125 | 12.9 · 54.4 · 239 |
+
+통합 판은 중앙값은 빠르나 꼬리(95 %·최대)가 길어 밀려 버리는 장면이 늘었다(opt/track-full 의 위치 추적 쪽, 다음에 그쪽에서 볼 것).
+
+- PC 품질(`--rate 0 --block --every 2`, ObjectSAM + SigLIP2, `vocab/indoor.voc`):
+
+| 판 | fr1_desk 놓침 · ATE 추적 / 지도 · 물체 | fr1_room 놓침 · ATE 추적 / 지도 · 물체 | 많은 이름 |
+|---|---|---|---|
+| opt/all(b34b4e4) | 0 · 3.92 / 2.87 cm · 28 | 0 · 27.1 / 12.9 cm · 91 | webcam 13 · 21 개, object 4 · 12 |
+| 통합 판 | 0 · 3.92 / 2.87 cm · 28 | 0 · 27.1 / 12.9 cm · 91 | desk · monitor · cardboard, object 11 · 38 |
+
+위치 · 물체 수는 같고 이름만 바뀌었다(webcam 쏠림이 없어지는 대신 이름 없는 object 가 늘었다). main 은 아직 `ondevice` 크레이트 전 구조라 같은 명령으로 돌지 않아 opt/all 과 비교했다.

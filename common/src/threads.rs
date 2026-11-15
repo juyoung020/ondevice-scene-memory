@@ -172,14 +172,16 @@ pub fn fifo(prio: i32) -> bool {
     }
 }
 
-/// 프로세스 메모리를 RAM 에 묶음(`--mlock`: 지금 것 + 앞으로 할당할 것, 페이지 내보내기로 생기는 멈춤 없앰). 권한·한도가 모자라면 false
+/// 지금 있는 메모리만 RAM 에 묶음(`--mlock`, 준비가 끝난 뒤 부름: 실행 파일·라이브러리·모델·스레드 스택).
+/// 그 뒤에 늘어나는 메모리(장면 보관·지도)는 묶지 않는다 — 앞으로 할당할 것까지 묶으면(MCL_FUTURE) 다른 실행과 겹칠 때
+/// 커널이 내보낼 수 있는 페이지가 없어 OOM 으로 죽었다(2026-11-15 walk1, 묶인 메모리 2 GB). 권한·한도가 모자라면 false
 pub fn mlock_all() -> bool {
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
             fn mlockall(flags: i32) -> i32;
         }
-        return mlockall(1 | 2) == 0; // MCL_CURRENT | MCL_FUTURE
+        return mlockall(1) == 0; // MCL_CURRENT
     }
     #[allow(unreachable_code)]
     false

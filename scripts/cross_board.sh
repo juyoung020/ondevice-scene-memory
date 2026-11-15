@@ -26,9 +26,12 @@ export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 # 이 환경 변수는 .cargo/config.toml 의 rustflags 를 대신하므로 target-cpu 를 함께 적음
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=cortex-a76 -L $SYS/lib -C link-arg=-Wl,--allow-shlib-undefined"
 PROFILE=${PROFILE:-release}
+PGO_PROFILE=${PGO_PROFILE:-$HOME/board-pgo/merged.profdata}
 # PGO(프로필 기반 최적화, 계산 식은 그대로라 출력 값이 같다):
 #   PGO=gen  → 계측 빌드(보드에서 돌리면 ~/pgo/*.profraw 가 생김, 별도 target 폴더)
 #   PGO=use:<합친 .profdata> → 그 프로필로 최종 빌드
+#   기본: ~/board-pgo/merged.profdata(PGO_PROFILE)가 있으면 그 프로필로 빌드(PGO=off 로 끔). 코드가 바뀌어 프로필이 낡아도
+#   빌드는 되고(맞는 함수만 씀), 다시 만들려면 PGO=auto:<녹화> 를 한 번 돌린다(그 결과를 PGO_PROFILE 에 둠)
 #   PGO=auto:<보드의 TUM 녹화 폴더> → 한 번에(계측 빌드 → 보드에서 녹화 한 벌 → 프로필 받아 합침 → 최종 빌드·보냄)
 if [ "${PGO:-}" != "" ] && [ "${PGO%%:*}" = auto ]; then
   REC=${PGO#auto:}
@@ -39,8 +42,10 @@ if [ "${PGO:-}" != "" ] && [ "${PGO%%:*}" = auto ]; then
   ssh "$BOARD" "rm -rf ~/pgo && mkdir -p ~/pgo && chmod +x ~/ondevice-pgo-gen && cd ~/ondevice-scene-memory &&     ~/ondevice-pgo-gen --slam '--tum $REC --rate 0 --block --config docs/rtabmap_pi.ini --send-every 2' --no-drop --every 1       --seg ~/models/objectsam-416_640.dxnn --embed ~/models/siglip2-vision_npu.dxnn --vocab vocab/indoor.voc --max-depth 3.5 --out /tmp/pgo-out > /dev/null 2>&1;     rm -rf /tmp/pgo-out ~/ondevice-pgo-gen"
   rm -rf /tmp/ondevice-pgo && mkdir -p /tmp/ondevice-pgo && scp -q "$BOARD:pgo/*.profraw" /tmp/ondevice-pgo/
   "$PD" merge -o /tmp/ondevice-pgo/merged.profdata /tmp/ondevice-pgo/*.profraw
-  PGO=use:/tmp/ondevice-pgo/merged.profdata exec bash "$0" "$BOARD" "$DEST"
+  mkdir -p "$(dirname "$PGO_PROFILE")" && cp /tmp/ondevice-pgo/merged.profdata "$PGO_PROFILE"
+  PGO=use:$PGO_PROFILE exec bash "$0" "$BOARD" "$DEST"
 fi
+if [ -z "${PGO:-}" ] && [ -f "$PGO_PROFILE" ]; then PGO=use:$PGO_PROFILE; echo "PGO 프로필: $PGO_PROFILE"; fi
 case "${PGO:-}" in
   gen) CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS+=" -C profile-generate=/home/${BOARD%%@*}/pgo"; export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}/pgo-gen ;;
   use:*) CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS+=" -C profile-use=${PGO#use:} -C llvm-args=-pgo-warn-missing-function=false" ;;

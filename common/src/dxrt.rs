@@ -32,7 +32,8 @@ pub fn parse_bound(s: &str) -> u32 {
 pub struct Config {
     pub seg_bound: String,
     pub embed_bound: String,
-    /// 0 = 라이브러리 기본(6)
+    /// 모델마다 잡는 추론 버퍼 벌 수(0 = 라이브러리 기본 6). 기본 2: 분할(--npu-jobs 1)·사진 벡터 모두 한 장씩 올리고 받는 동안
+    /// 다음 장을 올릴 자리면 충분하다. 6 벌이면 분할 모델만 버퍼 130 MB 가 상주했다. --npu-jobs K 로 올리면 --npu-buffers K+1
     pub buffers: i32,
     /// NPU 형식 변환(NFH) 일꾼 스레드 수(입력, 출력). None = 라이브러리 기본(ARM 1, 2)
     pub nfh: Option<(u32, u32)>,
@@ -48,7 +49,7 @@ impl Config {
         Config {
             seg_bound: get("--seg-npu").unwrap_or_default(),
             embed_bound: get("--embed-npu").unwrap_or_default(),
-            buffers: get("--npu-buffers").and_then(|s| s.parse().ok()).unwrap_or(0),
+            buffers: get("--npu-buffers").and_then(|s| s.parse().ok()).unwrap_or(2),
             nfh: get("--npu-nfh").and_then(|s| {
                 let (a, b) = s.split_once(',')?;
                 Some((a.parse().ok()?, b.parse().ok()?))

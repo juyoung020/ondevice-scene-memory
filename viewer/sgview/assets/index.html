@@ -644,9 +644,14 @@ let octFitted = false;   // first octree framing done
 const NT_W = 4096, NT_H = 4, NT_N = NT_W * NT_H, SEG_PTS = 1 << 17, BLOCK_M = 2.5;
 const oct = { cur:null, next:null, old:[], loading:0, drawn:0, nDrawn:0, box:null, want:null, meta:null };
 function octBudget() { return OCT_BUDGET || (quality === "high" ? 3000000 : 800000); }
+// A new run (rebuild, or the replay started over) reuses the dropped run's pools: its segments and node table are recycled one per
+// frame (slots cleared, buffers kept on the GPU), so a run change allocates and frees almost nothing (no GC spike, no buffer storm)
+oct.spareSegs = []; oct.spareTabs = [];
 function octNewRun(run, meta) {
-  const table = new Float32Array(NT_N * 4), tex = new THREE.DataTexture(table, NT_W, NT_H, THREE.RGBAFormat, THREE.FloatType);
-  tex.magFilter = tex.minFilter = THREE.NearestFilter; tex.generateMipmaps = false; tex.needsUpdate = true;
+  let table, tex;
+  const sp = oct.spareTabs.pop();
+  if (sp) { ({ table, tex } = sp); table.fill(0); tex.needsUpdate = true; }
+  else { table = new Float32Array(NT_N * 4); tex = new THREE.DataTexture(table, NT_W, NT_H, THREE.RGBAFormat, THREE.FloatType); tex.magFilter = tex.minFilter = THREE.NearestFilter; tex.generateMipmaps = false; tex.needsUpdate = true; }
   let lb = 0; for (let l = meta.depth; l >= 0; l--) if (meta.vox * meta.g * 2 ** (meta.depth - l) >= BLOCK_M) { lb = l; break; }
   const grp = new THREE.Group(); gOct.add(grp);
   return { run, meta, lb, nodes:new Map(), roots:[], blocks:new Map(), table, tex, grp, free:[], nextSlot:1, tlo:NT_N, thi:-1, loadedPts:0, box:null, tick:0, want:[], sel:null, t0:performance.now() };
@@ -660,6 +665,7 @@ function octBlock(R, nd) {
   return b;
 }
 function octSeg(R, cap) {
+  if (cap <= SEG_PTS && oct.spareSegs.length) { const s = oct.spareSegs.pop(); R.grp.add(s.p); return s; }
   const n = Math.max(SEG_PTS, cap), g = new THREE.BufferGeometry();
   const pos = new THREE.BufferAttribute(new Uint16Array(n * 3), 3, true), col = new THREE.BufferAttribute(new Uint8Array(n * 3), 3, true), sl = new THREE.BufferAttribute(new Uint16Array(n), 1, false);
   for (const a of [pos, col, sl]) a.setUsage(THREE.DynamicDrawUsage);
@@ -669,7 +675,9 @@ function octSeg(R, cap) {
   // the GPU before it is swapped in)
   const p = new THREE.Points(g, octMat); p.frustumCulled = false; p.matrixAutoUpdate = false;
   R.grp.add(p);
-  return { g, p, n, top:0, free:[], lo:Infinity, hi:-1, nodes:new Set() };
+  const s = { g, p, n, top:0, free:[], lo:Infinity, hi:-1, nodes:new Set(), zero:false };
+  p.userData.seg = s;
+  return s;
 }
 function octAlloc(R, nd, N) {
   const b = octBlock(R, nd), cap = N > SEG_PTS / 2 ? N : Math.ceil(N * 1.25) + 32;   // room to grow in place (points are only added)
@@ -716,13 +724,24 @@ function texSub(tex, x, y, w, h, type, data) {
   return true;
 }
 // once per frame before drawing: each segment's changed range (one bufferSubData per attribute), the changed table rows
+// GPU upload budget per frame (bytes of buffer sub-uploads): a big burst (a rebuilt map, a recycled pool's slots) goes up over several
+// frames instead of stalling one frame in the driver (frame gaps of 200+ ms with no script long task)
+const FLUSH_BYTES = WEAK_GPU ? 768 * 1024 : 8 * 1024 * 1024;
 function octFlush(R) {
+  let budget = FLUSH_BYTES;
   for (const b of R.blocks.values()) for (const s of b.segs) {
-    if (s.hi < 0 || !s.p.visible) continue;   // a hidden segment keeps its changed range until it is drawn (three keeps one range per upload)
+    if ((s.hi < 0 && !s.zero) || !s.p.visible) continue;
+    const cost = (s.hi >= 0 ? (s.hi - s.lo) * 11 : 0) + (s.zero ? s.n * 2 : 0);
+    if (cost > budget && budget < FLUSH_BYTES) continue;   // next frame (one oversize range still goes alone)
+    budget -= cost;   // a hidden segment keeps its changed range until it is drawn (three keeps one range per upload)
     const at = s.g.attributes, n = s.hi - s.lo;
-    at.position.updateRange.offset = s.lo * 3; at.position.updateRange.count = n * 3; at.position.needsUpdate = true;
-    at.color.updateRange.offset = s.lo * 3; at.color.updateRange.count = n * 3; at.color.needsUpdate = true;
-    at.slot.updateRange.offset = s.lo; at.slot.updateRange.count = n; at.slot.needsUpdate = true;
+    if (s.hi >= 0) {
+      at.position.updateRange.offset = s.lo * 3; at.position.updateRange.count = n * 3; at.position.needsUpdate = true;
+      at.color.updateRange.offset = s.lo * 3; at.color.updateRange.count = n * 3; at.color.needsUpdate = true;
+    }
+    // a recycled segment: its whole slot attribute (cleared to the dead slot) goes up once
+    if (s.zero) { at.slot.updateRange.offset = 0; at.slot.updateRange.count = s.n; s.zero = false; } else { at.slot.updateRange.offset = s.lo; at.slot.updateRange.count = n; }
+    at.slot.needsUpdate = true;
     s.lo = Infinity; s.hi = -1;
   }
   if (R.thi < 0) return;
@@ -739,14 +758,24 @@ function octFreeStep() {
   const R = oct.old[0]; if (!R) return;
   R.grp.visible = false;
   const c = R.grp.children[0];
-  if (c) { R.grp.remove(c); c.geometry.dispose(); return; }
-  gOct.remove(R.grp); R.tex.dispose(); oct.old.shift();
+  if (c) {
+    R.grp.remove(c);
+    const s = c.userData.seg;
+    if (s && s.n === SEG_PTS && oct.spareSegs.length < 96) {   // kept for the next run: slots to the dead slot, nothing freed
+      s.g.attributes.slot.array.fill(0); Object.assign(s, { top:0, free:[], lo:Infinity, hi:-1, zero:true }); s.nodes.clear(); s.g.setDrawRange(0, 0);
+      oct.spareSegs.push(s);
+    } else c.geometry.dispose();
+    return;
+  }
+  gOct.remove(R.grp); R.nodes.clear(); R.blocks.clear();
+  if (oct.spareTabs.length < 2) oct.spareTabs.push({ table:R.table, tex:R.tex }); else R.tex.dispose();
+  oct.old.shift();
 }
 // node list of a run (all of it, or only the nodes that changed: binary stream): nodes are added or grow, never removed within a run
 function octIndex(run, meta, list, n) {
   let R = oct.cur && oct.cur.run === run ? oct.cur : oct.next && oct.next.run === run ? oct.next : null;
   if (!R) {
-    R = octNewRun(run, meta);
+    R = octNewRun(run, meta); if (oct.cur) metEvent("new map run " + run);
     if (!oct.cur) { oct.cur = R; R.grp.visible = true; } else { octFreeRun(oct.next); oct.next = R; }
   }
   const m = R.meta; let added = false;
@@ -1629,10 +1658,12 @@ let poseWall = 0, viewWall = 0;
 const met = { frames: 0, lat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0, gap: 0, lastRaf: 0, lastChange: -1e9, lt: 0, ltMax: 0 };
 // freezes: longest gap between animation frames while the scene is changing (data applied within the last second), and main-thread
 // long tasks (> 50 ms, count and longest)
+// ?metrics=1: run boundaries (a new trajectory / octree run) with the page's JS heap; the server adds the board's MemAvailable
+function metEvent(what) { if (QS.get("metrics") === "1") fetch(`/api/metric?event=${encodeURIComponent(what)}&jsmb=${performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) : "-"}`).catch(() => {}); }
 try { new PerformanceObserver(l => { for (const e of l.getEntries()) { met.lt++; met.ltMax = Math.max(met.ltMax, e.duration); } }).observe({ entryTypes:["longtask"] }); } catch (e) {}
 if (QS.get("metrics") === "1") setInterval(() => {
   const dt = (performance.now() - met.t0) / 1000, qq = (a, p) => { a.sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(0) : "-"; };
-  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}&gap=${met.gap.toFixed(0)}&lt=${met.lt}&ltmax=${met.ltMax.toFixed(0)}`).catch(() => {});
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}&gap=${met.gap.toFixed(0)}&lt=${met.lt}&ltmax=${met.ltMax.toFixed(0)}&jsmb=${performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) : "-"}`).catch(() => {});
   met.frames = 0; met.lat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = met.gap = met.lt = met.ltMax = 0; met.t0 = performance.now();
 }, 2000);
 function onFilePose(j) {
@@ -1780,7 +1811,7 @@ function applyDelta(m) {
   }
   if (m.traj) {
     const tj = m.traj, a = tj.data;
-    if (tj.from === 0 || tj.id !== dlt.traj.id || tj.from !== dlt.traj.nodes.length) dlt.traj = { id:tj.id, nodes:[] };
+    if (tj.from === 0 || tj.id !== dlt.traj.id || tj.from !== dlt.traj.nodes.length) { if (dlt.traj.nodes.length) metEvent("new trajectory"); dlt.traj = { id:tj.id, nodes:[] }; }
     const nodes = dlt.traj.nodes, base = nodes.length;
     for (let i = 0; i < a.length / 4; i++) nodes.push({ id:"A" + (base + i), kind:"agent", pos:[a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]], t:a[4 * i] });
   }
@@ -2252,7 +2283,8 @@ function frame() {
   if (viewWall) { met.vlat.push(Date.now() - viewWall); viewWall = 0; }
 }
 (function loop() { requestAnimationFrame(loop); const t = performance.now(); if (met.lastRaf && t - met.lastChange < 1000) met.gap = Math.max(met.gap, t - met.lastRaf); met.lastRaf = t; frame(); })();
-loadRobotModel();
+// the robot model (GLB meshes, joint panel) is not needed for the first frame: loaded when the page is idle after start-up
+(window.requestIdleCallback || (f => setTimeout(f, 1500)))(() => loadRobotModel(), { timeout:4000 });
 loadRobotKind().then(invalidate);
 // 주소 뒤 ?c_scene=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
 for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); else if (e && e.type === "number") { e.value = v; e.dispatchEvent(new Event("change")); } }

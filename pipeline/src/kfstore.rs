@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// 노드가 이만큼 넘게 움직이면 다시 쌓을 거리(m)·각도(°)
-const MOVE_T: f64 = 0.02;
-const MOVE_R: f64 = 1.0;
+pub const MOVE_T: f64 = 0.02;
+pub const MOVE_R: f64 = 1.0;
 
 pub struct Kf {
     pub seq: u64, // 보관한 순서(다시 쌓는 동안 들어온 장면을 가려냄)
@@ -219,7 +219,7 @@ fn mul(a: &(M3, V3), b: &(M3, V3)) -> (M3, V3) {
     (mm(&a.0, &b.0), add(&mv(&a.0, &b.1), &a.1))
 }
 
-fn angle(a: &M3, b: &M3) -> f64 {
+pub fn angle(a: &M3, b: &M3) -> f64 {
     // 두 회전 사이 각도: trace(aᵀb)
     let mut tr = 0.0;
     for i in 0..3 {

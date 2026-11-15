@@ -1308,8 +1308,22 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         }
         fresh = false;
         let mut process = true;
+        // 확인 안 된 이어 붙이기 뒤 10 초: 장면마다(0.2 초 간격, 장면 예산 안) 옛 노드에서 제자리를 찾고, 찾으면 이 장면을 바로 지도 노드로 넣어
+        // 그 옛 노드와 루프를 건다(그래프 최적화가 이어 붙인 구간 전체를 끌어옴)
+        let fixing = anchored && eng.prov_from > 0 && fr.t - bridge_t < 10.0;
+        if anchored && eng.prov_from > 0 && !fixing {
+            eng.prov_from = 0; // 10 초 동안 못 찾음: 이어 붙인 그대로 둠
+        }
+        let mut force_node = false;
+        if fixing && klt_path && pose.is_some() && fr.t - last_merge_try >= 0.2 && ms_since(c1) < 25.0 {
+            last_merge_try = fr.t;
+            if eng.propose_merge(&fr, reloc_min as usize) {
+                n_merge_try += 1;
+                force_node = true;
+            }
+        }
         let det_rate = if anchored || klt_path { detection_rate } else { detection_rate.max(4.0) }; // 이어지기를 기다리는 동안은 더 자주 찾아봄
-        if det_rate > 0.0 && prev_stamp > 0.0 && fr.t > prev_stamp && fr.t - prev_stamp < 1.0 / det_rate as f64 {
+        if !force_node && det_rate > 0.0 && prev_stamp > 0.0 && fr.t > prev_stamp && fr.t - prev_stamp < 1.0 / det_rate as f64 {
             process = false;
         }
         if process {
@@ -1328,11 +1342,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             eng.trusted = anchored;
             // 이어지지 않은 새 지도: 노드를 넣을 때마다 믿는 지도 노드 전체에서 이어 줄 후보를 찾아 루프 후보로 넘김
             // 잇기 후보 찾기는 1.5 초에 한 번, 이 장면 위치 추적이 가벼웠을 때만
-            let fixing = anchored && eng.prov_from > 0 && fr.t - bridge_t < 10.0;
-            if anchored && eng.prov_from > 0 && !fixing {
-                eng.prov_from = 0; // 10 초 동안 못 찾음: 이어 붙인 그대로 둠
-            }
-            if (!anchored || fixing) && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= if fixing { 0.5 } else { 1.5 } && ms_since(c1) < 30.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
+            if !anchored && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= 1.5 && ms_since(c1) < 30.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
                 n_merge_try += 1;
             }
             eng.slam_process(&fr, data_id > 0, pose, &info.cov, info.velocity());

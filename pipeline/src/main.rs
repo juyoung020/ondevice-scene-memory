@@ -507,7 +507,7 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         d
     });
     let mut sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, uncertain: sf.flags & (UNCERTAIN | stream::PROVISIONAL) != 0, anchor: sf.anchor, graph: j.graph };
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, uncertain: sf.flags & (UNCERTAIN | slam::stream::PROVISIONAL) != 0, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
 

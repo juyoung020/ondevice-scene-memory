@@ -7,6 +7,8 @@
 ## [Unreleased]
 
 ### Added
+- D435 컬러 1280×720(`--color-size 1280x720`, 깊이는 640×480 그대로, 정렬은 고른 컬러 모드의 보정값).
+- `scripts/board_tune.sh --no-remote`(원격 화면 멈춤) · NPU 인터럽트 코어 1 · `--revert`(처음 값으로 되돌림).
 - 모델 기본값: `--seg` ObjectSAM(PC `models/ObjectSAM-416_640.onnx`, 보드 `~/models/objectsam-416_640.dxnn`) · `--embed` SigLIP2 영상 인코더 · `--vocab vocab/indoor.voc`. 모델 폴더는 `ONDEVICE_MODELS`, `--embed off` 로 이름 붙이기 끔.
 - 빠른 움직임에도 끊기지 않는 광류 위치 추적 `Odom/Strategy=9`(기본): 등속 예측 · 광류 · PnP, 끊기면 깊이 ICP · 키프레임 기술자로 같은 장면에서 되찾음. 사용자 손카메라 녹화에서 위치 못 낸 장면 21.5 % → 1.7 %, 새 지도 192 → 0.
 - 위치 프로그램 `--stride N`(TUM 재생에서 N 장마다 한 장), rsd_rec 녹화 폴더(calib.json) 재생, 통계 CSV 의 `no_pose` 칸, D435 컬러 노출 상한 `--ae-cap ms`.
@@ -31,6 +33,7 @@
 - DXRT 설정을 한곳에서: `--seg-npu` · `--embed-npu` · `--npu-buffers` · `--npu-nfh` · `--npu-profile` · `--npu-ort`(모델은 기본으로 NPU 작업만).
 
 ### Changed
+- 뷰어 검색 글 인코더와 토크나이저는 첫 검색 때 올리고, 가중치는 f16 그대로 · 토큰 표는 파일에 둔 채 쓴다(검색 결과 같음, 인코더 최대 RSS 0.40 GB).
 - 보드 빌드는 ONNX Runtime 을 넣지 않고, 토크나이저는 순수 Rust 정규식(fancy-regex)으로 돈다(글 1,329 개에서 토큰이 같음).
 - **호환 변경:** 물체 분할은 클래스 없는 ObjectSAM 만 쓴다. COCO 이름 표 · `--seg-names` · YOLO26 공식 dxnn(모델 안 CPU 후처리) 출력 배치를 뺐고, 클래스를 내는 모델은 첫 검출에서 멈춘다. 이름은 늘 SigLIP2 사진 벡터로 붙인다.
 - 놓친 뒤 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙인다(광류 경로, `--no-bridge` 로 예전 동작). 광류 경로에서는 다시 잡기 대기가 0 초다.

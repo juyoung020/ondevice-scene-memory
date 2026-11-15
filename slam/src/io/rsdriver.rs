@@ -16,9 +16,9 @@ pub struct RsDriverSource {
 }
 
 impl RsDriverSource {
-    pub fn new(w: u32, h: u32, fps: u32, serial: &str, exposure_ms: f64, gain: i32, ae_cap_ms: f64, profile: &str) -> Result<RsDriverSource, String> {
+    pub fn new(w: u32, h: u32, color: (u32, u32), fps: u32, serial: &str, exposure_ms: f64, gain: i32, ae_cap_ms: f64, profile: &str) -> Result<RsDriverSource, String> {
         let profile = rsdriver::camera::Profile::parse(profile)?;
-        let cam = RsCamera::open(Config { width: w, height: h, fps, serial: serial.to_string(), exposure_ms, gain, ae_cap_ms, profile, ..Default::default() })?;
+        let cam = RsCamera::open(Config { width: w, height: h, color_width: color.0, color_height: color.1, fps, serial: serial.to_string(), exposure_ms, gain, ae_cap_ms, profile, ..Default::default() })?;
         let desc = cam.describe();
         crate::bufpool::enable();
         Ok(RsDriverSource { cam, out: Output { want_gray: true, ..Default::default() }, id: 0, read_ms: 0.0, desc })
@@ -29,7 +29,8 @@ impl FrameSource for RsDriverSource {
     fn next(&mut self) -> Result<Option<Frame>, String> {
         let c0 = Instant::now();
         // 받는 쪽이 다 쓰고 돌려준 버퍼가 있으면 그것에 채움(길이가 맞아 0 으로 채우지 않음, 화소는 모두 덮어씀)
-        let n = self.cam.cfg.width as usize * self.cam.cfg.height as usize;
+        let (cw, ch) = self.cam.cfg.color_size();
+        let n = cw as usize * ch as usize;
         if self.out.rgb.capacity() == 0 {
             self.out.rgb = crate::bufpool::take_rgb(n * 3);
         }
@@ -58,7 +59,7 @@ impl FrameSource for RsDriverSource {
             depth_mm,
             depth_raw,
             depth_per_m: dpm,
-            cam: Camera { fx: k.fx as f64, fy: k.fy as f64, cx: k.ppx as f64, cy: k.ppy as f64, width: self.cam.cfg.width, height: self.cam.cfg.height, local: optical_rotation() },
+            cam: Camera { fx: k.fx as f64, fy: k.fy as f64, cx: k.ppx as f64, cy: k.ppy as f64, width: cw, height: ch, local: optical_rotation() },
         }))
     }
     fn last_read_ms(&self) -> f64 {

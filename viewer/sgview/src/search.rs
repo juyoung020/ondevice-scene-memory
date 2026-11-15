@@ -433,3 +433,23 @@ mod tests {
     }
 }
 
+
+/// The viewer's encoder (first search): model dir + word vectors made ahead of time (`--vocab`) for the class names
+#[cfg(feature = "search")]
+pub fn load_encoder(dir: &str, vocab: Option<&str>) -> Option<TextEnc> {
+    match TextEnc::load(Path::new(dir)) {
+        Ok(e) => {
+            match vocab.map(|f| read_vocab(Path::new(f))) {
+                Some(Ok(v)) => e.know(v),
+                Some(Err(err)) => eprintln!("search: {err}"),
+                None => {}
+            }
+            eprintln!("search: text encoder ready ({dir})");
+            Some(e)
+        }
+        Err(e) => {
+            eprintln!("search: {e} — searching by name only");
+            None
+        }
+    }
+}

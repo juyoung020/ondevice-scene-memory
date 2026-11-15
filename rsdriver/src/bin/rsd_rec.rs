@@ -1,5 +1,5 @@
 //! rsdriver 로 녹화(D435 녹화 도구): rgb · depth(정렬) · depth_raw · calib.json · frames.tsv 폴더.
-//!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms] [--camera-profile librealsense|tracking] [--gain g] [--emitter on|off] [--skip 30] [--writers 3] [--queue 150]
+//!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--color-size 1280x720] [--fps 30] [--exposure ms | --ae-cap ms] [--camera-profile librealsense|tracking] [--gain g] [--emitter on|off] [--skip 30] [--writers 3] [--queue 150]
 //! 폴더: rgb/ depth/(rsdriver 정렬, depth_rs.txt 도 이것을 가리킴) depth_raw/ yuyv/<시각>.bin(원본 YUYV) calib.json frames.tsv(시각·순번·메타·해시)
 #[cfg(target_os = "linux")]
 fn main() {
@@ -8,16 +8,20 @@ fn main() {
     use tools::common::*;
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 2 {
-        eprintln!("rsd_rec <출력 폴더> [장면=60] [--size WxH] [--fps 30] [--exposure ms | --ae-cap ms] [--gain g] [--emitter on|off] [--skip 30]");
+        eprintln!("rsd_rec <출력 폴더> [장면=60] [--size WxH] [--color-size WxH] [--fps 30] [--exposure ms | --ae-cap ms] [--gain g] [--emitter on|off] [--skip 30]");
         std::process::exit(1);
     }
     let arg = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
     let out = a[1].clone();
     let n: usize = a.get(2).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let (w, h) = arg("--size").and_then(|s| parse_wh(&s)).unwrap_or((640, 480));
+    // (dw, dh) = 깊이 --size, (w, h) = 컬러 --color-size(없으면 깊이와 같음)
+    let (dw, dh) = arg("--size").and_then(|s| parse_wh(&s)).unwrap_or((640, 480));
+    let (w, h) = arg("--color-size").and_then(|s| parse_wh(&s)).unwrap_or((dw, dh));
     let cfg = Config {
-        width: w as u32,
-        height: h as u32,
+        width: dw as u32,
+        height: dh as u32,
+        color_width: w as u32,
+        color_height: h as u32,
         fps: arg("--fps").and_then(|s| s.parse().ok()).unwrap_or(30),
         exposure_ms: arg("--exposure").and_then(|s| s.parse().ok()).unwrap_or(0.0),
         gain: arg("--gain").and_then(|s| s.parse().ok()).unwrap_or(-1),
@@ -84,7 +88,7 @@ fn main() {
             let tc = &j.tc;
             let _ = write_png_rgb(&join(&out, &format!("rgb/{tc}.png")), &j.rgb, w, h);
             let _ = write_png16(&join(&out, &format!("depth/{tc}.png")), &j.aligned, w, h);
-            let _ = write_png16(&join(&out, &format!("depth_raw/{tc}.png")), &j.raw, w, h);
+            let _ = write_png16(&join(&out, &format!("depth_raw/{tc}.png")), &j.raw, dw, dh);
             let _ = std::fs::write(join(&out, &format!("yuyv/{tc}.bin")), &j.yuyv);
             let line = j.meta.replace("{H}", &format!("{:016x}\t{:016x}\t{:016x}\t{:016x}", fnv(&j.yuyv), b16(&j.raw), fnv(&j.rgb), b16(&j.aligned)));
             lines.lock().unwrap().insert(j.seq, line);

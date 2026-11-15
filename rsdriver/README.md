@@ -44,7 +44,7 @@ librealsense 값과의 대응: `rs2_get_frame_timestamp`×1e-3 → `info.t_ms ×
 ## 도구
 
 - `rsd_info [--size 640x480] [--serial S] [--dump 폴더]` — 보정값·깊이 단위를 JSON 으로(f32 는 16진 비트도). `--dump` 는 HWM 원래 바이트(`gvd`·`coeff`·`rgb`·`new`·`depth_table` .bin)를 저장. 카메라가 없으면 끝 코드 2.
-- `rsd_rec <폴더> [장면=60] [--size WxH] [--fps 30] [--exposure ms] [--gain g] [--emitter on|off] [--skip 30]` — 녹화 폴더(`rgb/` `depth/` `depth_raw/` `depth_rs/` + 목록, `calib.json`)에 원본 `yuyv/*.bin` 과 `frames.tsv`(장치 시각·순번·장면 번호·노출·감도·YUYV/Z16/RGB/정렬 FNV 해시·대기·정렬 시간)를 더 쓴다. `depth_rs/` 에는 rsdriver 정렬 결과가 들어간다.
+- `rsd_rec <폴더> [장면=60] [--size WxH] [--color-size WxH] [--fps 30] [--exposure ms] [--gain g] [--emitter on|off] [--skip 30]` — 녹화 폴더(`rgb/` `depth/` `depth_raw/` `depth_rs/` + 목록, `calib.json`)에 원본 `yuyv/*.bin` 과 `frames.tsv`(장치 시각·순번·장면 번호·노출·감도·YUYV/Z16/RGB/정렬 FNV 해시·대기·정렬 시간)를 더 쓴다. `depth_rs/` 에는 rsdriver 정렬 결과가 들어간다.
 
 ## 같은 결과 확인 (PC, 카메라 없이)
 

@@ -36,6 +36,13 @@ bash scripts/cross_board.sh kau@192.168.219.101 ondevice-cross -- --help   # 보
 3. 코어 묶기 예(코어 4 개): `--threads` 기본(auto)은 본 스레드·읽기를 앞 코어 둘에, 점 · 다시 쌓기 · 기록을 나머지에 두고 위치 프로그램 풀은 코어 전부. 숫자는 [bridge.md](bridge.md) "시간".
 4. 카메라 장치 권한: 일반 사용자가 `/dev/video*` 를 열 수 있게 `video` 묶음에 든다(`sudo usermod -aG video $USER`). D435 는 USB 3 포트(파란색)에 꽂는다.
 
+## 실행 전 설정(scripts/board_tune.sh)
+
+`sudo scripts/board_tune.sh --no-remote --user $USER`: CPU 주파수 관리자 performance, D435 USB 절전 끔, swappiness 10, 쓰지 않는 서비스(블루투스 · 프린터 · 모뎀 · avahi)와 원격 화면(rustdesk · wayvnc) 멈춤, 실시간 권한(다시 로그인 후), 인터럽트 USB(카메라) → 코어 0 · NPU(dx-dma) → 코어 1. 바꾸기 전 값은 `/run/ondevice-tune` 에 남는다.
+
+- 되돌리기: `sudo scripts/board_tune.sh --revert`(기록한 값으로 되쓰고 멈춘 서비스를 다시 켬, 규칙 파일 지움) 또는 재부팅.
+- 원격 화면이 필요하면 `--no-remote` 를 빼고 돌린다.
+
 ## RTAB-Map 설정 값
 
 `docs/rtabmap_pi.ini` 는 위치 프로그램의 특징 · 최적화기를 적는다: `Vis/FeatureType=6`, `Kp/DetectorStrategy=6`(GFTT/BRIEF), `Optimizer/Strategy=2`(GTSAM). RTAB-Map 0.24.2 로 잰 키프레임 위치 오차(한 번씩, Windows):

@@ -1420,9 +1420,14 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let (mut traj, mut map_traj) = (vec![], vec![]);
     let mut ckpts: Vec<std::sync::Arc<Ckpt>> = vec![];
     let mut start = 0usize;
+    let mut old_keys: Vec<(u64, M3, V3)> = vec![];
     if let Some(c) = cache.filter(|_| std::env::var_os("MEMMAP_RB_FULL").is_none()) {
-        // 처음 달라진 장면(순번이 다르거나 위치가 조금이라도 다름)
-        let d = snap.iter().zip(c.keys.iter()).position(|((kf, r, p), (s, r0, p0))| kf.seq != *s || r != r0 || p != p0).unwrap_or(snap.len().min(c.keys.len()));
+        // 처음 달라진 장면: 순번이 다르거나 노드가 실제로 움직임(kfstore 의 움직임 문턱 2 cm · 1° — 최적화의 아주 작은 흔들림은 같은 것으로 봄)
+        let d = snap
+            .iter()
+            .zip(c.keys.iter())
+            .position(|((kf, r, p), (s, r0, p0))| kf.seq != *s || norm(&sub(p, p0)) > kfstore::MOVE_T || kfstore::angle(r, r0) > kfstore::MOVE_R)
+            .unwrap_or(snap.len().min(c.keys.len()));
         if std::env::var_os("MEMMAP_PARTS").is_some() {
             common::info!("다시 쌓기: 지난번과 처음 달라진 장면 {d} / {}", snap.len());
         }
@@ -1431,6 +1436,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
             scene.run = SceneMap::new_run();
             start = ck.i;
             ckpts = c.ckpts.iter().filter(|x| x.i <= start).cloned().collect();
+            old_keys = c.keys[..start].to_vec(); // 이어 받은 앞부분은 그때 위치로 쌓은 것
         }
     }
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -1478,7 +1484,8 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
     common::info!("다시 쌓기 나눔: 장면 {start} 번부터 {} 개(앞은 저장해 둔 상태) · 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", snap.len() - start, t_map);
-    let cache = std::sync::Arc::new(RbCache { keys: snap.iter().map(|(kf, r, p)| (kf.seq, *r, *p)).collect(), ckpts });
+    old_keys.extend(snap[start..].iter().map(|(kf, r, p)| (kf.seq, *r, *p)));
+    let cache = std::sync::Arc::new(RbCache { keys: old_keys, ckpts });
     Rebuilt { pts, grid, scene, mem, traj, map_traj, last_seq, extra: vec![], n: snap.len(), secs, moved, cache, start }
 }
 

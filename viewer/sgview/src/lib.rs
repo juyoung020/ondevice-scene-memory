@@ -950,6 +950,8 @@ pub fn run(args: Vec<String>) {
 /// 서버 실행(막힘): 읽어 둔 설정으로. `ondevice --serve` 는 이것을 스레드로 부른다
 pub fn serve(c: Config) {
     let Config { dir, port, bind, search_model, vocab, encode_vocab } = c;
+    #[cfg(not(feature = "search"))]
+    let _ = &vocab;
     // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
     if let Some((list, out)) = &encode_vocab {
         #[cfg(feature = "search")]

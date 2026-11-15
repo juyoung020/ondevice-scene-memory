@@ -7,7 +7,9 @@
 //! The "vector DB" is those files read into one flat scan; a memory holds tens to hundreds of objects.
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "search")]
+use std::sync::Mutex;
 
 pub const DIM: usize = 768;
 /// SigLIP2 base patch32-256: logits = SCALE · cos (logit_scale = e^4.717 in the checkpoint)
@@ -190,6 +192,7 @@ pub fn read_vocab(p: &Path) -> Result<Vec<(String, Arc<Vec<f32>>)>, String> {
 /// A line may add descriptions after a colon, `monitor: a black computer screen; a turned-off monitor`. Each name's vector is the
 /// mean of the name in several sentences ("a photo of a {name}.", "a blurry photo of a {name}." …), plus the mean of its descriptions
 /// ("a photo of {description}.") when given — sentences match photos better than a bare word, and dark monitors stop looking like "webcam"
+#[cfg(feature = "search")]
 pub fn encode_vocab(model: &Path, list: &Path, out: &Path) -> Result<usize, String> {
     const TEMPLATES: [&str; 6] = ["a photo of a {}.", "a photo of the {}.", "a blurry photo of a {}.", "a dark photo of a {}.", "a close-up photo of a {}.", "a photo of a {} in an office."];
     let enc = TextEnc::load(model)?;

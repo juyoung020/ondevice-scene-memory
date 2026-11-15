@@ -932,7 +932,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             eng.ensure_cur(&fr);
             // 기준 장면을 최근 것부터 한 장면에 둘씩 돌아가며 맞춰 봄
             let mut k = 0;
-            while anchored && k < 2 && k < refs.len() {
+            // 광류 경로는 위치 추적 안에서 키프레임 기술자 맞추기를 이미 함: 최근 기준 장면 맞추기(장면당 수십 ms)는 F2F 에서만
+            while anchored && !klt_path && k < 2 && k < refs.len() {
                 k += 1;
                 let idx = refs.len() - 1 - (ref_next % refs.len());
                 ref_next += 1;
@@ -1027,7 +1028,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         }
         fresh = false;
         let mut process = true;
-        let det_rate = if anchored { detection_rate } else { detection_rate.max(4.0) }; // 이어지기를 기다리는 동안은 더 자주 찾아봄
+        let det_rate = if anchored || klt_path { detection_rate } else { detection_rate.max(4.0) }; // 이어지기를 기다리는 동안은 더 자주 찾아봄
         if det_rate > 0.0 && prev_stamp > 0.0 && fr.t > prev_stamp && fr.t - prev_stamp < 1.0 / det_rate as f64 {
             process = false;
         }
@@ -1186,7 +1187,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             let twc = body.mul(&optical);
             of.pose = twc.0.map(|v| v as f64);
             if !lost {
-                if let Some(f) = poses_f.as_mut() {
+                // 위치 파일엔 믿는 위치만(임시 위치는 화면·지도용)
+                if let (Some(f), true) = (poses_f.as_mut(), anchored) {
                     write_tum(f, fr.t, &twc);
                 }
                 // 기준 노드: 마지막 지도 노드(이 장면 위치 = 그 노드 위치 × 오도메트리 상대 위치)

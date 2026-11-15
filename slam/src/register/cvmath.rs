@@ -186,15 +186,17 @@ pub fn jacobi_svd(at: &mut [f64], astep: usize, w_out: &mut [f64], mut vt: Optio
 /// 반환: (w, ut, vt) — ut 의 행 i = 왼쪽 특이벡터 i(= OpenCV u 의 열 i), vt 의 행 i = 오른쪽 특이벡터 i
 pub fn svd_square<const N: usize>(a: &[[f64; N]; N]) -> ([f64; N], [[f64; N]; N], [[f64; N]; N]) {
     // temp_a = transpose(a): temp_a[i][k] = a[k][i]
-    let mut at = vec![0f64; N * N];
+    // 작은 고정 크기라 힙 대신 스택 배열(값·순서 같음)
+    let mut at2 = [[0f64; N]; N];
     for i in 0..N {
         for k in 0..N {
-            at[i * N + k] = a[k][i];
+            at2[i][k] = a[k][i];
         }
     }
     let mut w = [0f64; N];
-    let mut v = vec![0f64; N * N];
-    jacobi_svd(&mut at, N, &mut w, Some((&mut v, N)), N, N, N);
+    let mut v2 = [[0f64; N]; N];
+    let (at, v) = (at2.as_flattened_mut(), v2.as_flattened_mut());
+    jacobi_svd(at, N, &mut w, Some((&mut *v, N)), N, N, N);
     let mut ut = [[0f64; N]; N];
     let mut vt = [[0f64; N]; N];
     for i in 0..N {
@@ -254,13 +256,11 @@ pub fn solve_svd<const M: usize, const N: usize>(a: &[[f64; N]; M], b: &[f64; M]
             at[i][k] = a[k][i];
         }
     }
-    let mut flat = vec![0f64; N * M];
-    for i in 0..N {
-        flat[i * M..(i + 1) * M].copy_from_slice(&at[i]);
-    }
+    let flat = at.as_flattened_mut();
     let mut w = [0f64; N];
-    let mut v = vec![0f64; N * N];
-    jacobi_svd(&mut flat, M, &mut w, Some((&mut v, N)), M, N, N);
+    let mut v2 = [[0f64; N]; N];
+    let v = v2.as_flattened_mut();
+    jacobi_svd(flat, M, &mut w, Some((&mut *v, N)), M, N, N);
     // SVBkSb(m, n, w, u=a(uT), v(vT), b, nb=1)
     let eps = f64::EPSILON * 2.0;
     let nm = M.min(N);

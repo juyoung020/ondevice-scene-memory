@@ -1,10 +1,10 @@
-monitor
+monitor: a computer monitor; a black computer screen; a flat screen display on a desk; a turned-off monitor
 laptop computer
-keyboard
-mouse
+keyboard: a computer keyboard
+mouse: a computer mouse
 desk
 table
-chair
+chair: an office chair; a wooden chair
 stool
 shelf
 bookshelf
@@ -20,7 +20,7 @@ backpack
 plastic bag
 cable
 charger
-phone
+phone: a desk telephone; an office phone with buttons
 headphones
 speaker
 light
@@ -32,11 +32,10 @@ radiator
 printer
 router
 camera
-webcam
 tripod
 clock
 wall clock
-cup
+cup: a coffee mug
 bottle
 can
 bowl

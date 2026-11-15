@@ -1914,7 +1914,9 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     if dets.is_some() && map_ok {
         mem.n_seg += 1;
     }
-    let mut valid: Vec<u32> = vec![];
+    // 검출마다 쓰는 작업 칸(유효 화소 · 표본 · 깊이 · 세계 점)은 스레드에 하나 두고 다시 씀(장면마다 할당 없음)
+    thread_local! { static OS: std::cell::Cell<(Vec<u32>, Vec<(usize, usize, f64)>, Vec<f64>, Vec<(V3, [u8; 3])>)> = const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) }; }
+    let (mut valid, mut pix, mut zs, mut pts) = OS.with(|c| c.take());
     // 침식 작업 칸은 스레드에 하나(장면·검출마다 다시 씀)
     thread_local! { static EB: std::cell::Cell<ErodeBuf> = std::cell::Cell::new(ErodeBuf { a: vec![], b: vec![], run: vec![] }); }
     let mut eb = EB.with(|c| c.take());
@@ -1954,24 +1956,26 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             continue;
         }
         let step = (cnt / 2500).max(1);
-        let pix: Vec<(usize, usize, f64)> = valid.iter().step_by(step).map(|&o| {
+        pix.clear();
+        pix.extend(valid.iter().step_by(step).map(|&o| {
             let o = o as usize;
             (o % w, o / w, depth.at(o) as f64)
-        }).collect();
-        let mut zs: Vec<f64> = pix.iter().map(|q| q.2).collect();
+        }));
+        zs.clear();
+        zs.extend(pix.iter().map(|q| q.2));
         let mid = zs.len() / 2;
         let med = *zs.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
         if med > 5.0 {
             continue;
         }
-        let pts: Vec<(V3, [u8; 3])> = pix
+        pts.clear();
+        pts.extend(pix
             .iter()
             .filter(|q| (q.2 - med).abs() < 0.25 * med + 0.1)
             .map(|&(u, v, z)| {
                 let o = (v * w + u) * 3;
                 (to_w(&[(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]), [rgb[o], rgb[o + 1], rgb[o + 2]])
-            })
-            .collect();
+            }));
         if pts.len() < 50 || is_wall(&pts) {
             continue;
         }
@@ -1990,6 +1994,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
         seen.insert(id);
     }
     EB.with(|c| c.set(eb));
+    OS.with(|c| c.set((valid, pix, zs, pts)));
     if dets.is_some() && map_ok {
         mem.check_missing(&seen, k, &r, &pwc, &depth, w, h);
     }

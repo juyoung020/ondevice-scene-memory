@@ -26,18 +26,30 @@ pub fn preprocess_into(rgb: &[u8], w: u32, h: u32, patches: bool, out: &mut Vec<
         let a = (f as usize).min(src - 1);
         (a, (a + 1).min(src - 1), f - a as f32)
     };
-    let xs: Vec<(usize, usize, f32)> = (0..SIZE).map(|x| axis(x, w)).collect();
+    // 가로 위치·가중(열마다 한 번). 한 행의 가로 섞기를 먼저 채널별 배열로 만든 뒤 세로 섞기를 32 칸씩 이어서 쓴다
+    // (곱·더하기 순서는 화소마다 하던 식과 같아 값이 비트까지 같다. 세로 섞기 고리는 컴파일러가 NEON 으로 묶음)
+    let (mut ix0, mut ix1, mut wx0, mut wx1) = ([0usize; SIZE], [0usize; SIZE], [0f32; SIZE], [0f32; SIZE]);
+    for x in 0..SIZE {
+        let (a, b, f) = axis(x, w);
+        (ix0[x], ix1[x], wx0[x], wx1[x]) = (a * 3, b * 3, 1.0 - f, f);
+    }
     const K: f32 = 1.0 / 127.5;
+    let (mut top, mut bot) = ([0f32; SIZE], [0f32; SIZE]);
     for y in 0..SIZE {
         let (y0, y1, fy) = axis(y, h);
         let (r0, r1) = (&rgb[y0 * w * 3..(y0 + 1) * w * 3], &rgb[y1 * w * 3..(y1 + 1) * w * 3]);
-        for (x, &(x0, x1, fx)) in xs.iter().enumerate() {
-            for c in 0..3 {
-                let top = r0[x0 * 3 + c] as f32 * (1.0 - fx) + r0[x1 * 3 + c] as f32 * fx;
-                let bot = r1[x0 * 3 + c] as f32 * (1.0 - fx) + r1[x1 * 3 + c] as f32 * fx;
-                let v = (top * (1.0 - fy) + bot * fy) * K - 1.0;
-                let i = if patches { ((y / 32) * 8 + x / 32) * 3072 + c * 1024 + (y % 32) * 32 + x % 32 } else { c * n + y * SIZE + x };
-                out[i] = v;
+        let (wy0, wy1) = (1.0 - fy, fy);
+        for c in 0..3 {
+            for x in 0..SIZE {
+                top[x] = r0[ix0[x] + c] as f32 * wx0[x] + r0[ix1[x] + c] as f32 * wx1[x];
+                bot[x] = r1[ix0[x] + c] as f32 * wx0[x] + r1[ix1[x] + c] as f32 * wx1[x];
+            }
+            for px in 0..SIZE / 32 {
+                let o = if patches { ((y / 32) * 8 + px) * 3072 + c * 1024 + (y % 32) * 32 } else { c * n + y * SIZE + px * 32 };
+                let (d, t, b) = (&mut out[o..o + 32], &top[px * 32..px * 32 + 32], &bot[px * 32..px * 32 + 32]);
+                for k in 0..32 {
+                    d[k] = (t[k] * wy0 + b[k] * wy1) * K - 1.0;
+                }
             }
         }
     }
@@ -70,6 +82,9 @@ pub const NAME_MIN: f32 = 0.3;
 /// 이름 없는 물체(object)에 사진 이름을 쓰는 가장 낮은 몫. ObjectSAM v1.0 으로 돌린 사무실 녹화에서 0.15 아래는 대부분 틀렸다
 /// (breechcloth 0.06, ping-pong ball 0.08, vending machine 0.10), 0.2 대는 맞았다(chair 0.27, bottle 0.23, file cabinet 0.20)
 pub const NAME_MIN_UNNAMED: f32 = 0.15;
+/// 1 등 이름과 2 등 이름의 코사인 차가 이보다 작으면 이름을 붙이지 않는다. fr1_desk 물체 23 개(사람이 이름을 단 것)에서
+/// 몫 0.15 만 쓸 때 맞은 이름 비율 0.52, 차 0.003 을 더하면 0.67(이름 붙은 물체 15 개)
+pub const NAME_MARGIN: f32 = 0.003;
 
 /// 물체가 아닌 면의 이름(이름 목록에 함께 넣어 둠)
 pub const STRUCTURAL: [&str; 4] = ["floor", "wall", "ceiling", "baseboard"];
@@ -100,12 +115,15 @@ pub fn load_vocab(path: &str) -> Vec<String> {
     names
 }
 
-/// 사진 벡터(길이 1)가 가장 닮은 이름과 그 몫: 이름 전체에 대한 softmax(SCALE · 코사인)
+/// 사진 벡터(길이 1)가 가장 닮은 이름과 그 몫: 이름 전체에 대한 softmax(SCALE · 코사인). 1 등과 2 등의 코사인 차가 NAME_MARGIN 보다
+/// 작으면(두 이름 사이에서 갈팡질팡) 몫을 0 으로 돌려 이름을 붙이지 않게 한다
 fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)> {
     let l: Vec<f32> = vecs.chunks(DIM).map(|t| SCALE * t.iter().zip(e).map(|(a, b)| a * b).sum::<f32>()).collect();
     let (i, m) = l.iter().cloned().enumerate().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let second = l.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, x)| *x).fold(f32::NEG_INFINITY, f32::max);
     let z: f32 = l.iter().map(|x| (x - m).exp()).sum();
-    Some((names[i].clone(), 1.0 / z))
+    let share = if (m - second) / SCALE >= NAME_MARGIN { 1.0 / z } else { 0.0 };
+    Some((names[i].clone(), share))
 }
 
 /// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,
@@ -394,6 +412,45 @@ pub fn drain() {}
 mod tests {
     use super::*;
 
+    /// 화소마다 하던 원래 식(기준)
+    fn preprocess_ref(rgb: &[u8], w: usize, h: usize, patches: bool) -> Vec<f32> {
+        let n = SIZE * SIZE;
+        let mut out = vec![0.0; 3 * n];
+        let axis = |dst: usize, src: usize| -> (usize, usize, f32) {
+            let f = ((dst as f32 + 0.5) * src as f32 / SIZE as f32 - 0.5).max(0.0);
+            let a = (f as usize).min(src - 1);
+            (a, (a + 1).min(src - 1), f - a as f32)
+        };
+        for y in 0..SIZE {
+            let (y0, y1, fy) = axis(y, h);
+            for x in 0..SIZE {
+                let (x0, x1, fx) = axis(x, w);
+                for c in 0..3 {
+                    let p = |yy: usize, xx: usize| rgb[(yy * w + xx) * 3 + c] as f32;
+                    let top = p(y0, x0) * (1.0 - fx) + p(y0, x1) * fx;
+                    let bot = p(y1, x0) * (1.0 - fx) + p(y1, x1) * fx;
+                    let i = if patches { ((y / 32) * 8 + x / 32) * 3072 + c * 1024 + (y % 32) * 32 + x % 32 } else { c * n + y * SIZE + x };
+                    out[i] = (top * (1.0 - fy) + bot * fy) * (1.0 / 127.5) - 1.0;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn preprocess_same_as_reference() {
+        let mut s = 7u64;
+        for &(w, h) in &[(37usize, 211usize), (640, 480), (256, 256), (3, 900)] {
+            let rgb: Vec<u8> = (0..w * h * 3).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 56) as u8 }).collect();
+            for patches in [false, true] {
+                let mut out = vec![];
+                preprocess_into(&rgb, w as u32, h as u32, patches, &mut out);
+                let want = preprocess_ref(&rgb, w, h, patches);
+                assert!(out.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{w}x{h} {patches}");
+            }
+        }
+    }
+
     #[test]
     fn preprocess_range_and_layout() {
         // 왼쪽 절반 빨강, 오른쪽 절반 파랑인 4×2 사진
@@ -426,9 +483,9 @@ mod tests {
         let (n, p) = look_name(&names, &vecs, &e).unwrap();
         assert_eq!(n, "monitor");
         assert!(p > 0.99, "{p}");
-        // 어느 이름도 닮지 않은 사진: 몫이 셋으로 갈려 NAME_MIN 근처
+        // 어느 이름도 닮지 않은 사진: 1 등과 2 등의 차가 NAME_MARGIN 아래라 몫 0(이름 안 붙음)
         e[1] = 0.0;
-        assert!((look_name(&names, &vecs, &e).unwrap().1 - 1.0 / 3.0).abs() < 1e-4);
+        assert_eq!(look_name(&names, &vecs, &e).unwrap().1, 0.0);
     }
 
     #[test]

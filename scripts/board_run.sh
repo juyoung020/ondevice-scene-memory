@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 보드(Raspberry Pi 5 + D435 + DX-M1) 실시간 실행: D435 → 위치 추적 → 물체 기억 → 뷰어(:8091) 한 프로세스.
 #   bash scripts/board_run.sh [--tum <TUM 폴더>(녹화 속도 그대로, RATE=0 이면 최대 속도)] [ondevice 에 더 넘길 인자...]
+# 물체 기억에 넘기는 장면 간격: SEND_EVERY(기본 1 = 카메라 장면 모두, 2026-11-15 보드 23 kf/s 에서 장면 기다림 39 ms/kf 로 여유)
 # IMU 융합 모드: IMU=/dev/i2c-1 bash scripts/board_run.sh (--imu 는 위치 인자 묶음 안에 들어가야 함)
 # 기본 모델(MODELS=~/models):
 #   - 분할: objectsam-416_640.dxnn (클래스 없는 "object", NPU). 이름은 SigLIP2 사진 벡터 → 실내 낱말 표(vocab/indoor.voc, 104 개)로 붙는다.
@@ -16,8 +17,8 @@ M=${MODELS:-$HOME/models}
 SEG=${SEG:-$M/objectsam-416_640.dxnn}
 EMB=${EMB:-$M/siglip2-vision_npu.dxnn}
 OUT=${OUT:-data/memory/live}
-SRC="--realsense ${IMU:+--imu $IMU} --config docs/rtabmap_pi.ini --send-every 2 --reset-file $OUT/reset.req"
-if [ "${1:-}" = "--tum" ]; then SRC="--tum $2 --rate ${RATE:-1} --config docs/rtabmap_pi.ini --send-every 2"; shift 2; fi
+SRC="--realsense ${IMU:+--imu $IMU} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1} --reset-file $OUT/reset.req"
+if [ "${1:-}" = "--tum" ]; then SRC="--tum $2 --rate ${RATE:-1} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1}"; shift 2; fi
 RT=${RT:-auto}
 VOCAB=${VOCAB:-vocab/indoor.voc}
 # NPU 코어 묶기(DX-M1 코어 0·1·2, all = 셋 다). 2026-11-15 fr1_desk 에서 all/all 과 01/2 는 같은 속도(NPU 는 분할 9 ms · 사진 13 ms 로 한가하고, 시간은 CPU 쪽)

@@ -579,7 +579,14 @@ fn seg_check(a: &Args, seg: &mut dyn seg::Segmenter, n_max: usize) {
 fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter + Send> {
     // 스트림 입력이면 첫 장면의 보정값, 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
     let mut stream_rd = a.stream.as_deref().map(stream::StreamReader::open);
-    let stream_first = stream_rd.as_mut().map(|r| r.next().expect("--stream: 장면이 하나도 오지 않음"));
+    // 리셋을 연달아 누르면 첫 장면보다 리셋 블록이 먼저 올 수 있음 → 이어 읽기로 다시 열어 첫 장면을 기다림
+    let stream_first = stream_rd.as_mut().map(|r| loop {
+        match r.next() {
+            Some(f) => break f,
+            None if stream::reset_pending() => *r = stream::StreamReader::open(a.stream.as_deref().unwrap()),
+            None => panic!("--stream: 장면이 하나도 오지 않음"),
+        }
+    });
     let seq = if let Some(f) = &stream_first {
         tum::Tum::empty(f.k)
     } else {
@@ -1282,7 +1289,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         if nkf % 25 == 0 {
             let n = clock.n as f64;
-            println!("kf {nkf} objects {} ({} gone) | ms/kf load {:.0} seg {:.0} vo {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | pos ({:.2},{:.2},{:.2})",
+            println!("kf {nkf} objects {} ({} gone) | ms/kf wait {:.0} seg {:.0} vo {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | pos ({:.2},{:.2},{:.2})",
                      mem.objs.len(), mem.objs.iter().filter(|o| o.state == "gone").count(),
                      clock.load / n * 1e3, clock.seg / n * 1e3, clock.vo / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
                      n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);

@@ -311,7 +311,7 @@ pub struct Dictionary {
     pub last_word_id: i32,
     pub map_index_id: BTreeMap<i32, i32>,
     pub map_id_index: BTreeMap<i32, i32>,
-    pub index: Box<dyn WordIndex>,
+    pub index: Box<dyn WordIndex + Send>,
     pub nndr: f32,
     /// 사전 찾기 checks(원본 KNN_CHECKS = 32). 줄이면 빠르지만 단어가 달라짐(기본 32, Rust/DictChecks)
     pub checks: i32,
@@ -319,7 +319,7 @@ pub struct Dictionary {
 
 
 impl Dictionary {
-    pub fn new(index: Box<dyn WordIndex>, nndr: f32) -> Dictionary {
+    pub fn new(index: Box<dyn WordIndex + Send>, nndr: f32) -> Dictionary {
         Dictionary {
             words: BTreeMap::new(),
             not_indexed: BTreeSet::new(),
@@ -565,7 +565,7 @@ pub struct Memory {
 }
 
 impl Memory {
-    pub fn new(p: MemParams, index: Box<dyn WordIndex>) -> Memory {
+    pub fn new(p: MemParams, index: Box<dyn WordIndex + Send>) -> Memory {
         let nndr = p.nndr;
         let mut m = Memory {
             p,

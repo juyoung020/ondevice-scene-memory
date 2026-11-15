@@ -203,7 +203,7 @@ fn is_wall(p: &[(V3, [u8; 3])]) -> bool {
 /// 물체가 아닌 조각(이름을 붙여도 틀리는 검출): 바닥·천장 면(넓고 평평한 수평 면이 바닥 근처 또는 2 m 위),
 /// 선처럼 가는 조각(책상 모서리 · 문틀: 한 축만 길고 나머지 두 축이 3 cm 안), 아주 작은 조각(가장 긴 축 6 cm 안),
 /// 화면 가장자리 셋 이상에 잘린 마스크(장면 대부분을 덮는 배경 조각). 그러면 Some(까닭)
-fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, border_sides: usize) -> Option<&'static str> {
+fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, cam_z: f64, border_sides: usize) -> Option<&'static str> {
     if border_sides >= 3 {
         return Some("border");
     }
@@ -231,6 +231,10 @@ fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, border_sides: usize) -> Option<&'
     let horizontal = v[2][0].abs() > 0.9;
     if flat && horizontal && (m[2] < floor_z + 0.15 || m[2] > floor_z + 2.0) {
         return Some("floor/ceiling");
+    }
+    // 천장 조각: 카메라보다 30 cm 넘게 위의 평평한 수평 면(넓이 50 cm 넘음)
+    if span[0] < 0.05 && span[1] > 0.5 && horizontal && m[2] > cam_z + 0.3 {
+        return Some("ceiling");
     }
     None
 }
@@ -917,6 +921,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut est_traj: Vec<(f64, V3, M3)> = vec![]; // 추정 위치(시각, 위치, 자세) → poses_est.txt(TUM 형식)
     // 수평 합의(웹캠·녹화): 처음 장면들의 수평면 법선(세계 좌표)을 모아 다수결로 '위'를 정하면 세계를 한 번 바로 세운다
     let mut grav_obs: Vec<V3> = vec![];
+    // 바닥으로 기울기 고침(장면마다): 위치 그래프의 좌표가 지도 조각마다 기울어 있어도(새 지도 · 임시 위치 · 루프 클로저) 바닥이 수평이 되게
+    let mut tilt_c: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
     let mut leveled = a.stream.is_none() || a.no_level;
     // 실시간: 첫 장면 카메라가 똑바로 서 있다고 보고(위 = 첫 장면 카메라의 −y) 처음부터 수평으로 보여 주고, 바닥 합의가 나오면 한 번 고쳐 다시 쌓는다
@@ -1004,6 +1010,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let c_rs = Instant::now();
         if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && (force_rb || if det_rb { t - rb_t0 >= a.rebuild_every } else { last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every }) {
             force_rb = false;
+            UPS.lock().unwrap().retain(|s, _| kfs.kfs().iter().any(|k| k.seq == *s));
             let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
             kfs.clear_dirty();
@@ -1119,6 +1126,19 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         if a.stream.is_some() && leveled {
             est_traj.push((t, p, r));
+            // 바닥으로 기울기 고침: 세 장마다 바닥 면 법선을 재 고침 회전을 반씩 다가가게(잡음은 누름), 자세에 곱함
+            r = mm(&tilt_c, &r);
+            if nkf % 3 == 0 {
+                if let Some(n) = up_normal(&depth, w, h, seq.k, &r, true) {
+                    let n = { let l = norm(&n).max(1e-9); n.map(|x| x / l) };
+                    if n[2] > 25f64.to_radians().cos() {
+                        let half = { let m = add(&n, &[0.0, 0.0, 1.0]); let l = norm(&m).max(1e-9); m.map(|x| x / l) };
+                        let step = rot_between(&n, &half);
+                        tilt_c = orthonormal(&mm(&step, &tilt_c)); // 곱이 쌓여도 회전으로 남게
+                        r = mm(&step, &r);
+                    }
+                }
+            }
         }
         let c2 = Instant::now();
         clock.load += load;        clock.seg += seg_s;
@@ -1159,6 +1179,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let keep = (map_ok && a.stream.is_some() && a.rebuild_every >= 0.0)
             .then(|| kfs.push_lazy(t, anchor, raw.0, raw.1, h_now, w, h, dets, true))
             .flatten();
+        // 보관 장면에 이때 고친 카메라 자세의 위(카메라 좌표)를 붙여 둠: 다시 쌓을 때 노드가 움직여도 같은 기울기 고침을 다시 함
+        if let Some(kf) = &keep {
+            UPS.lock().unwrap().insert(kf.seq, [r[2][0], r[2][1], r[2][2]]); // Rᵀ·ẑ
+        }
         if let (Some(p), true) = (pw.as_mut(), map_ok) {
             // 깊이·사진은 이 뒤 본 스레드가 쓰지 않으므로 복사 없이 넘김
             let rgb_pts = std::mem::take(&mut *rgb);
@@ -1334,9 +1358,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     embed::finish();
     let n = clock.n.max(1) as f64;
-    let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
+    // 물체 이름별 수: 화면에 쓰는 이름(사진으로 붙인 이름, 없으면 분할 이름 object)
+    let mut by: std::collections::BTreeMap<String, u32> = Default::default();
     for o in &mem.objs {
-        *by.entry(o.name.as_str()).or_default() += 1;
+        let n = embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0);
+        if n != "ceiling" {
+            *by.entry(n).or_default() += 1;
+        }
     }
     let mut summary = json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
         "scene_points": n_pts, "scene_mb": scene_mb, "pts_dropped": pts_dropped.0, "pts_near_skipped": pts_dropped.1, "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
@@ -1436,14 +1464,36 @@ fn cam_height(hist: &[f64]) -> f64 {
     *s.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1
 }
 
+/// 거의 회전인 행렬을 회전으로(그람-슈미트: 행 셋을 서로 수직인 길이 1 로)
+fn orthonormal(m: &M3) -> M3 {
+    let unit = |v: V3| { let l = norm(&v).max(1e-12); v.map(|x| x / l) };
+    let a = unit(m[0]);
+    let b = unit(sub(&m[1], &a.map(|x| x * dot(&a, &m[1]))));
+    [a, b, cross(&a, &b)]
+}
+
+/// 보관 장면별 '그때 고친 카메라 자세의 위'(카메라 좌표, Rᵀ·ẑ): 키 = 보관 순번
+static UPS: std::sync::Mutex<std::collections::BTreeMap<u64, V3>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
+    let ups = UPS.lock().unwrap();
     kfs.kfs()
         .iter()
         .filter(|kf| kfs.usable(kf))
         .map(|kf| {
             let (r0, p0) = kfs.pose(kf);
             let p = mv(fix, &p0);
-            (kf.clone(), mm(fix, &r0), [p[0], p[1], p[2] - z0])
+            let r = mm(fix, &r0);
+            // 그 장면에서 바닥으로 고친 기울기를 지금 노드 자세에 다시: 카메라의 '위'가 세계 위가 되게
+            match ups.get(&kf.seq) {
+                Some(uc) => {
+                    let u = mv(&r, uc);
+                    let u = { let l = norm(&u).max(1e-9); u.map(|x| x / l) };
+                    let c = if u[2] > 25f64.to_radians().cos() { rot_between(&u, &[0.0, 0.0, 1.0]) } else { [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] };
+                    (kf.clone(), mm(&c, &r), [p[0], p[1], p[2] - z0])
+                }
+                None => (kf.clone(), r, [p[0], p[1], p[2] - z0]),
+            }
         })
         .collect()
 }
@@ -2104,7 +2154,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             continue;
         }
         let border = [x1 <= 1, y1 <= 1, x2 + 1 >= w, y2 + 1 >= h].iter().filter(|b| **b).count();
-        if let Some(why) = fragment(&pts, floor_z, border) {
+        if let Some(why) = fragment(&pts, floor_z, pwc[2], border) {
             if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() {
                 println!("fragdbg {why}");
             }
@@ -2190,6 +2240,10 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");
+        // 사진이 천장인 물체는 기억에 넣지 않음(위에서 볼 때 지도를 가림)
+        if look.as_ref().is_some_and(|l| l.0 == "ceiling") {
+            continue;
+        }
         // 이름 없는 분할 모델이 자른 벽·바닥·천장 면: 사진 이름이 구조물이면 구조물로 표시(뷰어가 따로 끄고 켬)
         let structural = o.name == "object" && look.as_ref().is_some_and(|l| embed::STRUCTURAL.contains(&l.0.as_str()));
         let mut e = json!({"id": o.id, "name": look.as_ref().map_or(&o.name, |l| &l.0), "seg_name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
@@ -2207,7 +2261,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
         objs.push(e);
     }
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
-    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).collect();
+    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).filter(|o| o.4 != "ceiling").collect();
     let traj = view.traj_update(traj);
     let wall = if view.live { wall_ms() } else { 0.0 };
     view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });

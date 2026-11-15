@@ -122,7 +122,7 @@
     <label class="row"><input type="checkbox" id="c_boxes" checked> Object boxes</label>
     <label class="row"><input type="checkbox" id="c_struct" checked> Structural objects</label>
     <label class="row"><input type="checkbox" id="c_gone" checked> Gone objects</label>
-    <label class="row"><input type="checkbox" id="c_ceil"> Show ceiling</label>
+    <label class="row" title="off: map points above the highest camera + 0.3 m and ceiling objects are hidden"><input type="checkbox" id="c_ceil"> 천장 보이기 (show ceiling)</label>
     <label class="row"><input type="checkbox" id="c_walls"> Walls as 2D lines</label>
     <label class="row"><input type="checkbox" id="c_map"> Occupancy map</label>
     <label class="row"><input type="checkbox" id="c_robot" checked> Robot</label>
@@ -807,7 +807,7 @@ function octFrame() {
   const R = oct.cur; oct.box = R ? R.box : null; oct.meta = R ? R.meta : null;
   // floor pad and grid go under the point map: framed before the octree list came (occupancy grid box, z 0 … 2), they sat
   // above the map's floor and the half-transparent dark pad dimmed everything below it (a white desk drew grey)
-  if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
+  if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(QS.get("top") === "1"); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
 }
 // file mode without the binary stream: the whole node list from octree.json
 async function loadOctree(o) {
@@ -834,7 +834,7 @@ const VIS_W = 4096;
 const octVis = { data:new Uint8Array(VIS_W * 4), tex:null };
 octVis.tex = new THREE.DataTexture(octVis.data, VIS_W, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
 octVis.tex.magFilter = octVis.tex.minFilter = THREE.NearestFilter; octVis.tex.generateMipmaps = false;
-const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:14 }, vis:{ value:octVis.tex }, nodes:{ value:null }, vox:{ value:0.02 }, g:{ value:32 }, depthL:{ value:5 },
+const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:14 }, vis:{ value:octVis.tex }, nodes:{ value:null }, ceil:{ value:1e9 }, vox:{ value:0.02 }, g:{ value:32 }, depthL:{ value:5 },
                  pass:{ value:0 }, depth:{ value:null }, res:{ value:new THREE.Vector2(1, 1) }, near:{ value:0.05 }, far:{ value:500 }, band:{ value:1.5 } };
 function octMaterial() {
   // round splats sized by the local point spacing: neighbouring points overlap into a closed surface and EDL shades its edges;
@@ -842,16 +842,18 @@ function octMaterial() {
   // weight (1 − r², Potree) for splats within a depth band behind the nearest surface (band × splat radius, at least 0.6 % of the depth).
   // The point's node comes from the slot attribute: node table texel = (origin xyz, (visible index + 1)·16 + level), 0 = not drawn.
   return octQuality(new THREE.ShaderMaterial({
-    uniforms:{ uNodes:octUni.nodes, uVox:octUni.vox, uG:octUni.g, uDepthL:octUni.depthL, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx,
+    uniforms:{ uNodes:octUni.nodes, uCeil:octUni.ceil, uVox:octUni.vox, uG:octUni.g, uDepthL:octUni.depthL, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx,
                uPass:octUni.pass, uDepth:octUni.depth, uRes:octUni.res, uNear:octUni.near, uFar:octUni.far, uBand:octUni.band },
-    vertexShader:`attribute vec3 color; attribute float slot; uniform sampler2D uNodes; uniform float uVox; uniform float uG; uniform float uDepthL; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC; varying float vR; varying float vZ;
+    vertexShader:`attribute vec3 color; attribute float slot; uniform sampler2D uNodes; uniform float uCeil; uniform float uVox; uniform float uG; uniform float uDepthL; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC; varying float vR; varying float vZ;
       float bitAt(float m, float b){ return mod(floor(m / exp2(b)), 2.0); }
       void main(){
         vec4 nd = texture2D(uNodes, vec2((mod(slot, ${NT_W}.0) + 0.5) / ${NT_W}.0, (floor(slot / ${NT_W}.0) + 0.5) / ${NT_H}.0));
         float vi = floor(nd.w / 16.0) - 1.0;
         if (vi < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vC = vec3(0.0); vR = 0.0; vZ = 0.0; return; }
         float lv = nd.w - 16.0 * floor(nd.w / 16.0), sp = uVox * exp2(uDepthL - lv);
-        vC = color; vec4 mv = modelViewMatrix * vec4(nd.xyz + position * sp * uG, 1.0);
+        vec3 wp = nd.xyz + position * sp * uG;
+        if (wp.z > uCeil) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vC = vec3(0.0); vR = 0.0; vZ = 0.0; return; }   // ceiling cut (no re-upload)
+        vC = color; vec4 mv = modelViewMatrix * vec4(wp, 1.0);
         vec3 p = position; float idx = vi, d = 0.0;
         for (int i = 0; i < 8; i++) {
           vec4 t = texture2D(uVis, vec2((idx + 0.5) / ${VIS_W}.0, 0.5));
@@ -985,6 +987,7 @@ function octUpdate() {
     s.p.visible = hi > lo; if (hi > lo) s.g.setDrawRange(lo, hi - lo);
   }
   octFlush(R);
+  octUni.ceil.value = opt("c_ceil") || !(camTop > -1e8) ? 1e9 : camTop + 0.3;   // ceiling cut: highest camera so far + 0.3 m
   const m = R.meta; octUni.nodes.value = R.tex; octUni.vox.value = m.vox; octUni.g.value = m.g; octUni.depthL.value = m.depth;
   oct.drawn = drawn; oct.nDrawn = nDrawn;
   const el = $("octinfo"); if (el) { let segs = 0; for (const b of R.blocks.values()) segs += b.segs.length; el.textContent = `points ${(drawn / 1e6).toFixed(2)} M drawn (${nDrawn} nodes, ${segs} pools) · budget ${(octBudget() / 1e6).toFixed(1)} M · map ${R.nodes.size} nodes`; }
@@ -1669,6 +1672,7 @@ if (QS.get("metrics") === "1") setInterval(() => {
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
   if (j.wall) poseWall = j.wall;   // ?metrics=1: 손카메라 위치 → 화면 시간(같은 보드 시계)
+  if (j.cam && j.cam.pos && j.cam.pos[2] > camTop) { camTop = j.cam.pos[2]; invalidate(); }
   if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
 }
 function startFileEvents() {
@@ -1762,6 +1766,7 @@ function frame(u8) {
   }
   postMessage(out, tr);
 }`;
+let camTop = -1e9;   // highest camera position seen this run (ceiling cut)
 const dlt = { head:null, objs:new Map(), order:[], traj:{ id:-1, nodes:[] }, on:false, mapWait:null, octWait:[] };
 let DELTA = false;
 function startDelta() {
@@ -1813,7 +1818,7 @@ function applyDelta(m) {
   }
   if (m.traj) {
     const tj = m.traj, a = tj.data;
-    if (tj.from === 0 || tj.id !== dlt.traj.id || tj.from !== dlt.traj.nodes.length) { if (dlt.traj.nodes.length) metEvent("new trajectory"); dlt.traj = { id:tj.id, nodes:[] }; }
+    if (tj.from === 0 || tj.id !== dlt.traj.id || tj.from !== dlt.traj.nodes.length) { if (dlt.traj.nodes.length) metEvent("new trajectory"); dlt.traj = { id:tj.id, nodes:[] }; if (tj.from === 0) camTop = -1e9; }
     const nodes = dlt.traj.nodes, base = nodes.length;
     for (let i = 0; i < a.length / 4; i++) nodes.push({ id:"A" + (base + i), kind:"agent", pos:[a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]], t:a[4 * i] });
   }
@@ -1829,6 +1834,7 @@ function applyDelta(m) {
   if (dlt.mapWait && view && view.grid) { const w = dlt.mapWait; dlt.mapWait = null; applyMapDelta(w); }
   if (changed) {
     if (m.ver) viewVer = m.ver;
+    if (view.cam && view.cam.pos && view.cam.pos[2] > camTop) camTop = view.cam.pos[2];
     if (m.wall) viewWall = m.wall;   // ?metrics=1: 지도 판을 낸 장면 → 화면
     applyView(view);
     if (latestPose && latestPose.t >= (view.stamp ?? 0)) { view.cam = latestPose.cam; view.pose = latestPose.pose; drawRobot(); }   // keep the newer fast pose

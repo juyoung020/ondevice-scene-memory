@@ -926,7 +926,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-rate °/s] [--imu-min-inliers N] [--imu-min-ratio R]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-rate °/s] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N]] [--Group/Name 값 ...]"
     );
 }
 
@@ -982,6 +982,10 @@ pub struct Args {
     /// IMU 모드: 광류 맞은 점이 이보다 적거나 맞은 비율이 이보다 낮은 장면은 위치만
     imu_min_inliers: f64,
     imu_min_ratio: f64,
+    /// IMU 모드: 이어지지 않은 새 지도를 맡겨 두고 기다리는 최대 시간(초). 지나면 새 지도를 받아들여 바로 쌓음
+    imu_hold_wait: f64,
+    /// IMU 모드: 앞의 믿는 지도 노드가 이보다 적으면(시작 직후) 기다리지 않고 바로 새 지도로
+    imu_hold_min_nodes: f64,
 }
 
 /// 명령줄(0 번은 프로그램 이름) → 설정. 도움말·잘못된 인자면 끝 코드
@@ -1026,6 +1030,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         imu_max_rate: 60.0,
         imu_min_inliers: 60.0,
         imu_min_ratio: 0.6,
+        imu_hold_wait: 2.0,
+        imu_hold_min_nodes: 30.0,
     };
     let mut i = 1;
     let num = |s: &str| -> Result<f64, i32> {
@@ -1090,6 +1096,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--imu-max-rate" => a.imu_max_rate = num(&val()?)?,
             "--imu-min-inliers" => a.imu_min_inliers = num(&val()?)?,
             "--imu-min-ratio" => a.imu_min_ratio = num(&val()?)?,
+            "--imu-hold-wait" => a.imu_hold_wait = num(&val()?)?,
+            "--imu-hold-min-nodes" => a.imu_hold_min_nodes = num(&val()?)?,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
             "--no-bridge" => a.bridge = false,
@@ -1264,6 +1272,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let mut n_bridge_fix = 0i64;
     let mut last_merge_try = f64::MIN;
     let mut newmap_t = f64::MIN; // 마지막으로 새 지도를 연 장면 시각
+    let (mut prev_map_small, mut accepted, mut n_accept) = (false, false, 0i64);
     let mut max_corr = (0f32, 0f32);
     let mut last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
     let mut n_bridge_ok = 0i64;
@@ -1507,6 +1516,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             }
             n_newmap += 1;
             newmap_t = fr.t;
+            // 앞의 믿는 지도가 작으면(시작 직후) 맡겨 두지 않고 바로 새 지도로
+            prev_map_small = ((sent_nodes.len() - held_nodes.len()) as f64) < a.imu_hold_min_nodes;
         }
         fresh = false;
         let mut process = true;
@@ -1613,7 +1624,18 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let hold = !anchored && !provisional;
         // IMU 모드: 이어지지 않은 새 지도는 위치는 임시 위치로 바로 보내되 지도 · 물체에는 맡겨 두기만(이어지면 다시 쌓기가 고친 위치로 넣음).
         // 놓친 사이 움직임을 모르는 임시 위치로 바로 쌓으면 같은 표면이 어긋난 채 두 겹으로 남는다
-        let map_hold = imu_on && !anchored && provisional;
+        // 맡겨 두기는 짧게: --imu-hold-wait 초 안에 안 이어지면(또는 앞 지도가 작으면) 새 지도를 받아들여 바로 쌓는다(맡겼던 장면도 그 지도 위치로).
+        // 나중에 이어지면 노드가 움직여 다시 쌓기가 고친 위치로 옮긴다
+        if anchored || new_map {
+            accepted = false;
+        }
+        let accept = prev_map_small || fr.t - newmap_t > a.imu_hold_wait;
+        if imu_on && !anchored && provisional && accept && !accepted {
+            accepted = true;
+            n_accept += 1;
+            common::info!("장면 {n}: 이어지지 않은 새 지도를 받아들임({:.1} 초 기다림) → 바로 쌓기", fr.t - newmap_t);
+        }
+        let map_hold = imu_on && !anchored && provisional && !accepted;
         let hold_g = hold || map_hold;
         if !anchored && provisional && new_map {
             // 새 지도 첫 장면 = 마지막으로 보낸 위치(그사이 움직임 모름): 표시 변환을 그에 맞춤
@@ -1661,7 +1683,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 if hold_g && !was_held {
                     held_nodes.insert(id, 0);
                 }
-                if anchored && was_held {
+                if !hold_g && was_held {
                     n_joined += held_nodes.remove(&id).unwrap();
                 }
                 let tn = pm.mul(&optical);
@@ -1807,7 +1829,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     common::info!("위치 질: 좋음 {} · 불확실 {} · 놓침 {}", nq[0], nq[1], nq[2]);
     if let Some(s) = eng.imu_summary() {
         common::info!("{s}");
-        common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함, 빠른 회전 {n_fast_rot} · 영상 근거 약함 {n_weak}), 이어지지 않은 새 지도라 맡겨 둔 장면 {n_map_held}");
+        common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함, 빠른 회전 {n_fast_rot} · 영상 근거 약함 {n_weak}), 이어지지 않은 새 지도라 맡겨 둔 장면 {n_map_held}, 기다리다 받아들인 새 지도 {n_accept}");
         common::info!("IMU: 보낸 위치 기준 지도 기울기 마지막 {tilt_map:.1}° · 최대 {tilt_map_max:.1}°, 장면 사이 위치 {} 개({:.0} 개/초)", crate::imu::FAST_N.load(Ordering::Relaxed), crate::imu::FAST_N.load(Ordering::Relaxed) as f64 / wall.max(1e-9));
         if let Some((ng, gd)) = eng.imu_grav() {
             common::info!("IMU: 가만히 있을 때 기울기를 중력 쪽으로 고친 장면 {ng}(합 {gd:.1}°), 중력과 어긋나 버린 다시 잡기 {n_reloc_tilt}");

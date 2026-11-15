@@ -536,7 +536,7 @@ mod engine {
                 Odom::Klt(o) => o.imu.as_ref().map(|u| {
                     let (n, d, f) = u.counts();
                     let b: Vec<u64> = u.ring().bad.iter().map(|x| x.load(Ordering::Relaxed)).collect();
-                    format!("IMU: 표본 {n} 개(링 가득 차 버림 {d}, 읽기 실패 {f}, 거른 표본 무효 {} · 포화 {} · 튐 {} · 같은 값 {} · 느린 읽기 {}, 간격이 벌어져 적분 안 함 {}), IMU 회전으로 이어 붙인 장면 {}, 자이로 치우침 {:.4} {:.4} {:.4} rad/s(영상으로 고친 수 {}), 지금 기울기 {:.1}°", b[0], b[1], b[2], b[3], b[4], u.n_gap.get(), o.by_imu, u.bias[0], u.bias[1], u.bias[2], u.n_bias_upd, u.tilt_deg(&o.pose_tf()))
+                    format!("IMU: 표본 {n} 개(링 가득 차 버림 {d}, 읽기 실패 {f}, 거른 표본 무효 {} · 포화 {} · 튐 {} · 같은 값 {} · 느린 읽기 {}, 간격이 벌어져 적분 안 함 {}), IMU 회전으로 이어 붙인 장면 {}, 자이로 치우침 {:.4} {:.4} {:.4} rad/s(영상으로 고친 수 {}, 영상과 계속 어긋나 시작 값으로 되돌린 수 {}), 지금 기울기 {:.1}°", b[0], b[1], b[2], b[3], b[4], u.n_gap.get(), o.by_imu, u.bias[0], u.bias[1], u.bias[2], u.n_bias_upd, u.n_bias_reset, u.tilt_deg(&o.pose_tf()))
                 }),
                 _ => None,
             }

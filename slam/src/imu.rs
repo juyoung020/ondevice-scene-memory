@@ -265,11 +265,14 @@ pub struct Fusion {
     pub n_bias_upd: u64,
     /// 표본 간격이 벌어져 회전을 내지 않은 장면 수
     pub n_gap: std::cell::Cell<u64>,
+    /// 시작 때 잡은 치우침(되돌리기용) · 되돌린 수
+    pub bias0: [f32; 4],
+    pub n_bias_reset: u64,
 }
 
 impl Fusion {
     pub fn new(ring: Arc<Ring>, calib: Calib, bridge_max: f64) -> Fusion {
-        Fusion { ring, calib, m: M34_I, mt: M34_I, have_m: false, bias: [0.0; 4], acc_lp: [0.0; 4], lp_init: false, seen: 0, bridge_max, bias_static: false, n_bias_upd: 0, n_gap: Default::default() }
+        Fusion { ring, calib, m: M34_I, mt: M34_I, have_m: false, bias: [0.0; 4], acc_lp: [0.0; 4], lp_init: false, seen: 0, bridge_max, bias_static: false, n_bias_upd: 0, n_gap: Default::default(), bias0: [0.0; 4], n_bias_reset: 0 }
     }
 
     /// (받은 표본 수, 링이 가득 차 버린 수, 읽기 실패 수)
@@ -314,6 +317,7 @@ impl Fusion {
             self.acc_lp = [(sa[0] / kf) as f32, (sa[1] / kf) as f32, (sa[2] / kf) as f32, 0.0];
             if var < 0.03f64.powi(2) && (g - 9.80665).abs() < 0.5 {
                 self.bias = [mw[0] as f32, mw[1] as f32, mw[2] as f32, 0.0];
+                self.bias0 = self.bias;
                 self.bias_static = true;
             }
             common::info!("IMU: 시작 표본 {k} 개, 중력 {g:.2} m/s², 자이로 치우침 {}", if self.bias_static { format!("{:.4} {:.4} {:.4} rad/s(가만히 있어 평균)", mw[0], mw[1], mw[2]) } else { "0(움직이는 중, 영상으로 고침)".into() });
@@ -374,6 +378,12 @@ impl Fusion {
             self.bias[i] = (self.bias[i] - k * ei[i]).clamp(-0.1, 0.1);
         }
         self.n_bias_upd += 1;
+    }
+
+    /// 영상과 계속 어긋날 때: 영상으로 고쳐 온 치우침이 틀렸다고 보고 시작 때 값으로 되돌림
+    pub fn reset_bias(&mut self) {
+        self.bias = self.bias0;
+        self.n_bias_reset += 1;
     }
 
     /// 지도 위(z)와 IMU 위의 사이각(도): pose = 몸체 → 지도

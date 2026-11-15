@@ -465,6 +465,8 @@ pub struct OdometryKlt {
     pub by_imu: usize,
     /// 이번 장면에서 영상 결과를 IMU 회전과 어긋나 버렸는지 · 그런 장면 수
     pub imu_rejected: bool,
+    /// 영상 결과를 IMU 와 어긋나 연달아 버린 장면 수(IMU_TRUST_MAX 에 닿으면 IMU 쪽을 의심: 치우침 되돌리고 영상을 받음)
+    imu_streak: u32,
 }
 
 impl OdometryKlt {
@@ -509,6 +511,7 @@ impl OdometryKlt {
             gravity_aligned: false,
             by_imu: 0,
             imu_rejected: false,
+            imu_streak: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
@@ -742,6 +745,7 @@ impl OdometryKlt {
     }
 
     pub fn process(&mut self, f: &Frame) -> OdomResult {
+        self.imu_streak = if self.imu_rejected { self.imu_streak + 1 } else { 0 };
         self.imu_rejected = false;
         let (w, h) = (f.cam.width as usize, f.cam.height as usize);
         let t0 = std::time::Instant::now();
@@ -832,9 +836,20 @@ impl OdometryKlt {
         }
         // IMU: 영상 회전이 자이로 회전과 크게 어긋나면 그 영상 결과는 받지 않음(엉뚱한 자리에 붙음). 카메라 전용 모드는 늘 false
         let base = self.pose;
+        // 0.3 초(10 장) 내내 영상이 IMU 와 어긋나면 IMU 쪽(치우침)이 틀렸다고 봄: 치우침을 시작 값으로 되돌리고 이번 장면은 영상을 그대로 받아 다시 맞춤
+        let check_rot = if self.imu_streak >= 10 {
+            if let Some(u) = self.imu.as_mut() {
+                u.reset_bias();
+                common::info!("IMU: 영상과 0.3 초 내내 어긋나 자이로 치우침을 시작 값으로 되돌리고 영상 자세로 다시 맞춤");
+            }
+            self.imu_streak = 0;
+            None
+        } else {
+            imu_rot
+        };
         let rejected = std::cell::Cell::new(false);
         let disagree = |p: &Tf| {
-            let d = imu_disagree(&imu_rot, &base.inverse().mul(p));
+            let d = imu_disagree(&check_rot, &base.inverse().mul(p));
             rejected.set(rejected.get() || d);
             d
         };

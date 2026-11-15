@@ -693,7 +693,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 eprintln!("viewer event: {e}, js heap {} MB, MemAvailable {avail} MB", g("jsmb"));
                 return respond(&mut s, 204, "text/plain", "", b"");
             }
-            eprintln!("viewer: {} fps (render {} ms), pose→screen p50 {} p95 {} ms (n {}), camera→screen p50 {} p95 {} ms, map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms), js heap {} MB, MemAvailable {} MB", g("fps"), g("rms"), g("lat50"), g("lat95"), g("n"), g("clat50"), g("clat95"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"), g("jsmb"), avail);
+            eprintln!("viewer: {} fps (render {} ms), pose updates {}/s, pose→screen p50 {} p95 {} ms (n {}), camera→screen p50 {} p95 {} ms, map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms), js heap {} MB, MemAvailable {} MB", g("fps"), g("rms"), g("np"), g("lat50"), g("lat95"), g("n"), g("clat50"), g("clat95"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"), g("jsmb"), avail);
             respond(&mut s, 204, "text/plain", "", b"")
         }
         "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),
@@ -852,6 +852,7 @@ fn stream_pusher(st: Arc<State>) {
     let pp = st.dir.join("pose.json");
     let mut seen = 0u64;
     let mut quiet = std::time::Instant::now();
+    let mut last_other = u64::MAX;
     loop {
         // in one program every change bumps; a separate viewer also looks at the folder every 50 ms
         let wait = if memfs::enabled() { Duration::from_secs(10) } else { Duration::from_millis(50) };
@@ -860,6 +861,29 @@ fn stream_pusher(st: Arc<State>) {
         if cl.is_empty() {
             continue;
         }
+        // pose.json 만 바뀜(장면 사이 위치 200 Hz): 위치만 보내고 view · 지도 · 점 목록은 보지 않음
+        let oth = memfs::other();
+        if memfs::enabled() && oth == last_other && quiet.elapsed() < Duration::from_secs(5) {
+            if let Some((v, b)) = memfs::get(&pp) {
+                let b = b.trim_ascii();
+                if b.starts_with(b"{") && b.ends_with(b"}") {
+                    let pose = Some((v.clone(), Arc::new(b.to_vec())));
+                    let e = std::str::from_utf8(b).ok().map(|t| sse("fpose", &t.replace('\n', " ")));
+                    cl.retain_mut(|c| match c.bin.as_mut() {
+                        Some(bc) => delta::pose_frame(bc, &pose).is_none_or(|f| c.s.write_all(&f).is_ok()),
+                        None => match &e {
+                            Some(e) if c.pv != v => {
+                                c.pv = v.clone();
+                                c.s.write_all(e.as_bytes()).is_ok()
+                            }
+                            _ => true,
+                        },
+                    });
+                }
+            }
+            continue;
+        }
+        last_other = oth;
         let vv = view_ver(&st);
         let pose = file_ver(&pp).and_then(|v| {
             let t = read_file(&pp)?;

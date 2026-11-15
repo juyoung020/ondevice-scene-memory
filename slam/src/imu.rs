@@ -36,6 +36,75 @@ pub struct Ring {
     /// 읽기 단에서 버린 표본 수(Bad 순서: 무효 값 · 포화 · 튐 · 같은 값 반복 · 느린 읽기)
     pub bad: [AtomicU64; 5],
     pub closed: AtomicBool,
+    /// 장면 사이 200 Hz 위치: 읽기 스레드가 표본마다 넣고 위치 내기 스레드가 꺼냄
+    pub fast: FastPose,
+}
+
+/// 장면 사이 위치를 채우는 기준: 마지막으로 보낸 장면의 위치(지도 좌표 몸체 · 광학 변환) · 지도 좌표 속도 · 그때 IMU 상태
+#[derive(Clone)]
+pub struct Anchor {
+    /// 장면 시각(카메라 시계)
+    pub t: f64,
+    pub body: Tf,
+    pub optical: Tf,
+    /// 지도 좌표 속도(m/s)
+    pub vel: [f32; 3],
+    m: M34,
+    mt: M34,
+    bias: [f32; 4],
+    shift: f64,
+}
+
+/// 읽기 스레드 → 위치 내기 스레드: 최근 표본(1.28 초)과 기준. 위치 = 기준 위치 × 기준 이후 자이로 회전, 이동은 등속(0.1 초까지) 뒤 유지
+#[derive(Default)]
+pub struct FastPose {
+    st: std::sync::Mutex<(std::collections::VecDeque<Sample>, Option<Anchor>, u64)>,
+    cv: std::sync::Condvar,
+}
+
+/// 기준 이후 이만큼(초) 지나면 IMU 만으로 위치를 내지 않음(자이로 치우침이 쌓임)
+pub const FAST_MAX: f64 = 1.0;
+/// 등속으로 옮기는 최대 시간(초)
+const FAST_VEL_MAX: f64 = 0.1;
+
+impl FastPose {
+    pub fn push(&self, s: Sample) {
+        let mut g = self.st.lock().unwrap();
+        if g.0.len() >= 256 {
+            g.0.pop_front();
+        }
+        g.0.push_back(s);
+        g.2 += 1;
+        drop(g);
+        self.cv.notify_one();
+    }
+
+    pub fn set_anchor(&self, a: Anchor) {
+        self.st.lock().unwrap().1 = Some(a);
+    }
+
+    /// 새 표본을 기다려(최대 timeout) 그 시각의 (카메라 시계 시각, 카메라 광학 → 지도). 기준이 없거나 낡았으면 None
+    pub fn next(&self, seen: &mut u64, timeout: std::time::Duration) -> Option<(f64, Tf)> {
+        let g = self.st.lock().unwrap();
+        let (g, _) = self.cv.wait_timeout_while(g, timeout, |s| s.2 == *seen).unwrap();
+        *seen = g.2;
+        let a = g.1.as_ref()?;
+        let s = *g.0.back()?;
+        let t = s.t - a.shift;
+        let dt = t - a.t;
+        if !(0.0..=FAST_MAX).contains(&dt) {
+            return None;
+        }
+        let (s0, s1) = g.0.as_slices();
+        let r = if dt > 0.0 { integrate(s0, s1, a.t + a.shift, s.t, &a.bias, gyro_step)? } else { M34_I };
+        let rb = m34_mul(&m34_mul(&a.m, &r), &a.mt);
+        let mut b = a.body.mul(&tf_of(&rb, [0.0; 3]));
+        let k = dt.min(FAST_VEL_MAX) as f32;
+        b.0[3] += a.vel[0] * k;
+        b.0[7] += a.vel[1] * k;
+        b.0[11] += a.vel[2] * k;
+        Some((t, b.mul(&a.optical)))
+    }
 }
 
 // SAFETY: 칸 [tail, head) 는 소비자만 읽고 생산자는 그 밖(head 자리)에만 쓴다. head 는 Release 로 내고 Acquire 로 읽는다
@@ -52,6 +121,7 @@ impl Ring {
             read_fail: AtomicU64::new(0),
             bad: Default::default(),
             closed: AtomicBool::new(false),
+            fast: FastPose::default(),
         })
     }
 
@@ -352,6 +422,11 @@ impl Fusion {
         Some(m34_mul(&m34_mul(&self.m, &r), &self.mt))
     }
 
+    /// 장면 사이 위치를 채울 기준(몸체 → 지도, 몸체 → 광학, 지도 좌표 속도). 아직 IMU 를 못 맞췄으면 None
+    pub fn anchor(&self, t: f64, body: Tf, optical: Tf, vel: [f32; 3]) -> Option<Anchor> {
+        (self.have_m && self.lp_init).then(|| Anchor { t, body, optical, vel, m: self.m, mt: self.mt, bias: self.bias, shift: self.calib.shift })
+    }
+
     /// 몸체 축의 위 방향(단위, 가속도 저역 통과 = 중력 반대)
     pub fn up_body(&self) -> Option<[f32; 4]> {
         if !self.have_m || !self.lp_init {
@@ -396,6 +471,26 @@ impl Fusion {
             None => -1.0,
         }
     }
+}
+
+/// 장면 사이 위치를 받는 곳(한 프로그램: 물체 기억 쪽이 pose.json 으로 냄). 인자 = (카메라 시계 시각, 카메라 광학 → 지도)
+pub static FAST_SINK: std::sync::OnceLock<Box<dyn Fn(f64, &Tf) + Send + Sync>> = std::sync::OnceLock::new();
+/// 낸 장면 사이 위치 수
+pub static FAST_N: AtomicU64 = AtomicU64::new(0);
+
+/// 위치 내기 스레드: IMU 표본마다(200 Hz) 기준 위치 × 자이로 회전을 FAST_SINK 로
+pub fn spawn_fast(ring: Arc<Ring>) {
+    let _ = std::thread::Builder::new().name("imu-pose".into()).spawn(move || {
+        let mut seen = 0u64;
+        while !ring.closed.load(Ordering::Relaxed) {
+            if let Some((t, p)) = ring.fast.next(&mut seen, std::time::Duration::from_millis(100)) {
+                if let Some(f) = FAST_SINK.get() {
+                    f(t, &p);
+                    FAST_N.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    });
 }
 
 /// ICM-42688-P 레지스터 변환 배율(±16 g, ±2000 °/s)
@@ -470,6 +565,7 @@ pub fn spawn_reader(dev: &str, ring: Arc<Ring>) -> Result<std::thread::JoinHandl
                             (prev, jumps, t_last) = (Some(v), 0, t);
                             let (a, w) = crate::simd::imu_raw(&b, ACC_S, GYR_S);
                             ring.push(Sample { w, a, t });
+                            ring.fast.push(Sample { w, a, t });
                         }
                         Err(k) => {
                             jumps += (k == Bad::Jump) as u32;

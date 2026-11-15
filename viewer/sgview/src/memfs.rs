@@ -32,11 +32,16 @@ pub fn publish(p: &Path, bytes: Arc<Vec<u8>>) {
     if let Some(m) = FILES.lock().unwrap().as_mut() {
         m.insert(key(p), (ver, bytes));
     }
-    bump();
+    if p.file_name().is_some_and(|f| f == "pose.json") {
+        bump_pose();
+    } else {
+        bump();
+    }
 }
 
 /// 파일 하나를 내림
 pub fn remove(p: &Path) {
+    OTHER.fetch_add(1, Ordering::Relaxed);
     if let Some(m) = FILES.lock().unwrap().as_mut() {
         m.remove(&key(p));
     }
@@ -44,6 +49,7 @@ pub fn remove(p: &Path) {
 
 /// 폴더 아래 파일을 모두 내림
 pub fn remove_dir(p: &Path) {
+    OTHER.fetch_add(1, Ordering::Relaxed);
     let k = key(p);
     if let Some(m) = FILES.lock().unwrap().as_mut() {
         m.retain(|q, _| !q.starts_with(&k));
@@ -69,8 +75,20 @@ pub fn read(p: &Path) -> Option<Arc<Vec<u8>>> {
 /// 판이 바뀔 때마다 늘어나는 번호(파일 걸기 · 지우기 · view 판 걸기): /stream 은 이것을 기다렸다 바뀐 것만 보낸다
 static CHANGE: Mutex<u64> = Mutex::new(0);
 static CHANGED: Condvar = Condvar::new();
+/// pose.json 말고 다른 것이 바뀐 번호
+static OTHER: AtomicU64 = AtomicU64::new(0);
+
+pub fn other() -> u64 {
+    OTHER.load(Ordering::Relaxed)
+}
 
 pub fn bump() {
+    OTHER.fetch_add(1, Ordering::Relaxed);
+    bump_pose();
+}
+
+/// pose.json 만 바뀜(장면 사이 위치 200 Hz): /stream 은 위치만 보내고 나머지 판은 보지 않음
+pub fn bump_pose() {
     *CHANGE.lock().unwrap() += 1;
     CHANGED.notify_all();
 }

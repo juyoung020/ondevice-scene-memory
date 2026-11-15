@@ -1527,6 +1527,20 @@ fn early_pose(pp: &Path, sf: &stream::StreamFrame) {
     out::write_direct(pp, out::json_bytes(&json!({"t": sf.t, "cam": cam, "pose": pose, "ok": ok, "wall": wall_ms()})));
 }
 
+/// 장면 사이 위치(IMU 회전, 200 Hz)를 pose.json 으로: early_pose 와 같은 좌표 바꾸기. 같은 프로세스 뷰어가 메모리에서 읽으므로 디스크에는 쓰지 않음
+fn fast_pose(pp: &Path, t: f64, twc: &slam::register::Tf) {
+    let Some((fix, z0v)) = *POSE_FIX.lock().unwrap() else { return };
+    if !sgview::memfs::enabled() {
+        return;
+    }
+    let a = twc.0.map(|v| v as f64);
+    let r0: M3 = [[a[0], a[1], a[2]], [a[4], a[5], a[6]], [a[8], a[9], a[10]]];
+    let (r, p) = (mm(&fix, &r0), mv(&fix, &[a[3], a[7], a[11]]));
+    let pwc = [p[0], p[1], p[2] - z0v];
+    let pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
+    sgview::memfs::publish(pp, std::sync::Arc::new(out::json_bytes(&json!({"t": t, "cam": {"pos": pwc, "R": r}, "pose": pose, "ok": true, "imu": true, "wall": wall_ms()}))));
+}
+
 static UPS: std::sync::Mutex<std::collections::BTreeMap<u64, V3>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
@@ -2625,6 +2639,11 @@ fn main() {
     let slam_th = a.slam.clone().map(|sa| {
         // 위치 프로그램 스레드는 물체 기억 역할 묶음(앞 코어 둘 등)을 물려받지 않게 프로세스 코어 전부에서 띄우고(따로 된 프로세스와 같은 자리),
         // 나눠 돌리기는 `slam` 역할 풀(기본 코어 전부, --threads slam=nice:코어 로 묶음)에서
+        // IMU 모드 실시간: 장면 사이 위치(200 Hz)를 pose.json 으로(뷰어가 메모리에서 읽음, 디스크에는 장면마다 쓰는 위치만)
+        if a.live > 0.0 {
+            let pp = a.out.join("pose.json");
+            let _ = slam::imu::FAST_SINK.set(Box::new(move |t, twc| fast_pose(&pp, t, twc)));
+        }
         out::thread_free();
         let (rx, th) = slam::app::spawn(sa, out::slam_pool()).unwrap_or_else(|e| panic!("--slam: {e}"));
         out::thread_role(out::Role::Main);

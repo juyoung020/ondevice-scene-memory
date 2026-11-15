@@ -564,6 +564,25 @@ mod engine {
             }
         }
 
+        /// IMU: 다시 잡은 위치(위치 추적 좌표, 몸체 → 지도)가 중력과 맞는지. 가만히 있어 IMU 위 방향을 바로 잴 수 있을 때 15° 넘게 기울면 false
+        pub fn imu_pose_plausible(&self, p: &Tf) -> bool {
+            match &self.odom {
+                Odom::Klt(o) if o.gravity_aligned => match o.imu.as_ref().and_then(|u| u.up_static()) {
+                    Some(u) => crate::simd::m34_vec(&crate::imu::m34_of_tf(p), &u)[2] >= 15f32.to_radians().cos(),
+                    None => true,
+                },
+                _ => true,
+            }
+        }
+
+        /// IMU: 중력 쪽으로 기울기를 고친 장면 수 · 각 합(°)
+        pub fn imu_grav(&self) -> Option<(usize, f64)> {
+            match &self.odom {
+                Odom::Klt(o) if o.imu.is_some() => Some((o.n_grav, o.grav_deg)),
+                _ => None,
+            }
+        }
+
         /// IMU: 보낸 위치(지도 보정 · 이어 붙임 포함, 몸체 → 지도) 기준 지도 위와 IMU 위 사이각(°)
         pub fn imu_tilt(&self, body: &Tf) -> Option<f32> {
             match &self.odom {
@@ -1214,6 +1233,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let mut n_bridge = 0i64;
     let mut n_global = 0i64;
     let mut global_tried = false;
+    let mut n_reloc_tilt = 0i64; // IMU: 중력과 15° 넘게 어긋나 버린 다시 잡기
     let mut n_loop_rejected = 0i64;
     let mut n_merge_try = 0i64;
     let mut nq = [0i64; 3]; // 위치 질별 장면 수
@@ -1362,7 +1382,11 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             // 빈틈 바로 뒤 첫 장면은 예산과 상관없이 한 번 꼭 해 봄(이어 붙이기 전에 제자리 찾기)
             if !relocalized && klt_path && (ms_since(c1) < 20.0 || !global_tried) {
                 global_tried = true;
-                if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize) {
+                if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize).filter(|r| {
+                    let ok = eng.imu_pose_plausible(&r.0);
+                    n_reloc_tilt += !ok as i64;
+                    ok
+                }) {
                     eng.odom_reset(p);
                     let info2 = eng.odom_process(&fr, None);
                     if info2.pose.is_some() {
@@ -1750,6 +1774,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         common::info!("{s}");
         common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함)");
         common::info!("IMU: 보낸 위치 기준 지도 기울기 마지막 {tilt_map:.1}° · 최대 {tilt_map_max:.1}°, 장면 사이 위치 {} 개({:.0} 개/초)", crate::imu::FAST_N.load(Ordering::Relaxed), crate::imu::FAST_N.load(Ordering::Relaxed) as f64 / wall.max(1e-9));
+        if let Some((ng, gd)) = eng.imu_grav() {
+            common::info!("IMU: 가만히 있을 때 기울기를 중력 쪽으로 고친 장면 {ng}(합 {gd:.1}°), 중력과 어긋나 버린 다시 잡기 {n_reloc_tilt}");
+        }
     }
     if provisional {
         common::info!("이어지지 않은 새 지도에서 임시 위치로 바로 보낸 장면 {n_prov}, 지도 전체에서 찾은 잇기 후보 {n_merge_try} 번");

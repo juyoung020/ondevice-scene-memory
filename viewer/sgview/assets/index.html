@@ -1674,7 +1674,7 @@ function onFilePose(j) {
   met.np++;
   if (!view || LIVE || !j.cam) return;
   if (j.wall) poseWall = j.wall;   // ?metrics=1: 손카메라 위치 → 화면 시간(같은 보드 시계)
-  if (j.wall && j.t > 1e9) poseCam = j.t * 1000;   // ?metrics=1: 카메라가 찍은 시각 → 화면(실시간 카메라 입력, 같은 보드 시계)
+  if (j.wall && j.t > 1e9) poseCam = (j.ts || j.t) * 1000;   // ?metrics=1: 센서 시각 → 화면(장면 위치는 카메라가 찍은 시각, 장면 사이 위치는 IMU 표본을 읽은 시각, 같은 보드 시계)
   if (j.cam && j.cam.pos && j.cam.pos[2] > camTop) { camTop = j.cam.pos[2]; invalidate(); }
   if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
 }

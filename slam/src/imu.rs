@@ -83,8 +83,8 @@ impl FastPose {
         self.st.lock().unwrap().1 = Some(a);
     }
 
-    /// 새 표본을 기다려(최대 timeout) 그 시각의 (카메라 시계 시각, 카메라 광학 → 지도). 기준이 없거나 낡았으면 None
-    pub fn next(&self, seen: &mut u64, timeout: std::time::Duration) -> Option<(f64, Tf)> {
+    /// 새 표본을 기다려(최대 timeout) 그 시각의 (카메라 시계 시각, 표본 시각(IMU 시계), 카메라 광학 → 지도). 기준이 없거나 낡았으면 None
+    pub fn next(&self, seen: &mut u64, timeout: std::time::Duration) -> Option<(f64, f64, Tf)> {
         let g = self.st.lock().unwrap();
         let (g, _) = self.cv.wait_timeout_while(g, timeout, |s| s.2 == *seen).unwrap();
         *seen = g.2;
@@ -103,7 +103,7 @@ impl FastPose {
         b.0[3] += a.vel[0] * k;
         b.0[7] += a.vel[1] * k;
         b.0[11] += a.vel[2] * k;
-        Some((t, b.mul(&a.optical)))
+        Some((t, s.t, b.mul(&a.optical)))
     }
 }
 
@@ -437,6 +437,32 @@ impl Fusion {
         (n > 5.0).then(|| [u[0] / n, u[1] / n, u[2] / n, 0.0])
     }
 
+    /// 몸체 축의 위 방향을 가만히 있을 때만(최근 50 ms 표본: 자이로 0.2 rad/s 안, 가속도 크기 g ± 0.4 m/s²). 저역 통과와 달리 회전에 늦지 않음
+    pub fn up_static(&self) -> Option<[f32; 4]> {
+        if !self.have_m || !self.lp_init {
+            return None;
+        }
+        let (_, a, b) = self.ring.view(0);
+        let n = a.len() + b.len();
+        if n < 10 {
+            return None;
+        }
+        let mut s = [0f32; 4];
+        for x in a.iter().chain(b.iter()).skip(n - 10) {
+            let w2: f32 = (0..3).map(|i| (x.w[i] - self.bias[i]).powi(2)).sum();
+            let g = (0..3).map(|i| x.a[i] * x.a[i]).sum::<f32>().sqrt();
+            if w2 > 0.04 || (g - 9.80665).abs() > 0.4 {
+                return None;
+            }
+            for i in 0..3 {
+                s[i] += x.a[i];
+            }
+        }
+        let u = m34_vec(&self.m, &s);
+        let k = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        Some([u[0] / k, u[1] / k, u[2] / k, 0.0])
+    }
+
     /// 광류가 잘 된 장면: IMU 회전(r_imu, 몸체)과 영상 회전(r_vis, 몸체)의 차이로 치우침을 조금 고침
     pub fn correct_bias(&mut self, r_imu: &M34, r_vis: &M34, dt: f64) {
         if !(dt > 0.005 && dt < 0.2) {
@@ -473,8 +499,8 @@ impl Fusion {
     }
 }
 
-/// 장면 사이 위치를 받는 곳(한 프로그램: 물체 기억 쪽이 pose.json 으로 냄). 인자 = (카메라 시계 시각, 카메라 광학 → 지도)
-pub static FAST_SINK: std::sync::OnceLock<Box<dyn Fn(f64, &Tf) + Send + Sync>> = std::sync::OnceLock::new();
+/// 장면 사이 위치를 받는 곳(한 프로그램: 물체 기억 쪽이 pose.json 으로 냄). 인자 = (카메라 시계 시각, 표본을 읽은 시각(UNIX), 카메라 광학 → 지도)
+pub static FAST_SINK: std::sync::OnceLock<Box<dyn Fn(f64, f64, &Tf) + Send + Sync>> = std::sync::OnceLock::new();
 /// 낸 장면 사이 위치 수
 pub static FAST_N: AtomicU64 = AtomicU64::new(0);
 
@@ -483,9 +509,9 @@ pub fn spawn_fast(ring: Arc<Ring>) {
     let _ = std::thread::Builder::new().name("imu-pose".into()).spawn(move || {
         let mut seen = 0u64;
         while !ring.closed.load(Ordering::Relaxed) {
-            if let Some((t, p)) = ring.fast.next(&mut seen, std::time::Duration::from_millis(100)) {
+            if let Some((t, ts, p)) = ring.fast.next(&mut seen, std::time::Duration::from_millis(100)) {
                 if let Some(f) = FAST_SINK.get() {
-                    f(t, &p);
+                    f(t, ts, &p);
                     FAST_N.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -642,6 +668,32 @@ mod tests {
         // 표본보다 뒤(30 ms 넘게)는 모름
         let tl = b.last().unwrap().t;
         assert!(integrate(a, b, tl - 0.1, tl + 0.05, &[0.0; 4], gyro_step).is_none());
+    }
+
+    /// 장면 사이 위치: 기준 위치 × 그 뒤 자이로 회전, 이동은 등속 0.1 초까지, 1 초 넘으면 멈춤
+    #[test]
+    fn fast_pose_between_frames() {
+        let fp = FastPose::default();
+        let w = [0.0, 0.0, 1.0, 0.0]; // z 축 1 rad/s
+        let (mut seen, d) = (0u64, std::time::Duration::from_millis(1));
+        let mut push = |i: usize| fp.push(Sample { w, a: [0.0, 0.0, 9.80665, 0.0], t: 100.0 + i as f64 * 0.005 });
+        for i in 0..20 {
+            push(i);
+        }
+        assert!(fp.next(&mut seen, d).is_none()); // 기준 없음
+        fp.set_anchor(Anchor { t: 100.0, body: Tf::IDENTITY, optical: Tf::IDENTITY, vel: [1.0, 0.0, 0.0], m: M34_I, mt: M34_I, bias: [0.0; 4], shift: 0.0 });
+        for i in 20..41 {
+            push(i);
+        }
+        let (t, _, p) = fp.next(&mut seen, d).unwrap();
+        assert!((t - 100.2).abs() < 1e-9);
+        let yaw = p.0[4].atan2(p.0[0]);
+        assert!((yaw - 0.2).abs() < 2e-3, "{yaw}");
+        assert!((p.0[3] - 0.1).abs() < 1e-6 && p.0[7].abs() < 1e-6, "{:?}", p.0);
+        for i in 41..241 {
+            push(i);
+        }
+        assert!(fp.next(&mut seen, d).is_none()); // 기준 뒤 1.2 초
     }
 
     /// 가득 차면 새 표본을 버린다(읽지 않은 칸을 덮어쓰지 않음)

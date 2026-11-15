@@ -463,6 +463,9 @@ pub struct OdometryKlt {
     pub gravity_aligned: bool,
     /// IMU 회전으로 이어 붙인 장면 수
     pub by_imu: usize,
+    /// IMU: 가만히 있을 때 기울기(roll · pitch)를 중력 쪽으로 고친 장면 수 · 고친 각 합(°)
+    pub n_grav: usize,
+    pub grav_deg: f64,
     /// 이번 장면에서 영상 결과를 IMU 회전과 어긋나 버렸는지 · 그런 장면 수
     pub imu_rejected: bool,
     /// 영상 결과를 IMU 와 어긋나 연달아 버린 장면 수(IMU_TRUST_MAX 에 닿으면 IMU 쪽을 의심: 치우침 되돌리고 영상을 받음)
@@ -510,6 +513,8 @@ impl OdometryKlt {
             level_pending: true,
             gravity_aligned: false,
             by_imu: 0,
+            n_grav: 0,
+            grav_deg: 0.0,
             imu_rejected: false,
             imu_streak: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
@@ -742,6 +747,37 @@ impl OdometryKlt {
         let ids_in: Vec<usize> = inl.iter().map(|&i| ids[i]).collect();
         let uv_in: Vec<[f32; 2]> = inl.iter().map(|&i| uvs[i]).collect();
         Some((pose, ids_in, uv_in, q))
+    }
+
+    /// IMU: 지도가 중력으로 맞춰져 있고 장비가 가만히 있으면(IMU 위 방향이 바로 잼) 위치 추적 자세의 기울기(roll · pitch)를
+    /// 중력 쪽으로 장면당 어긋남의 5 % (최대 0.3°)씩 돌린다. 카메라 자리를 축으로 자세 · 따라가는 점 · 되찾기 키프레임을 함께 돌려
+    /// 다음 장면 PnP 가 되돌리지 않게 한다(영상만으로는 기울기가 쌓여 가기만 함). 20° 넘게 어긋나면 IMU 쪽을 믿지 않고 두고, 방위(yaw)는 그대로
+    fn gravity_fix(&mut self) {
+        if !self.gravity_aligned {
+            return;
+        }
+        let Some(u) = self.imu.as_ref().and_then(|u| u.up_static()) else { return };
+        let w = crate::simd::m34_vec(&crate::imu::m34_of_tf(&self.pose), &u);
+        let (cx, cy) = (w[1], -w[0]); // w × ẑ
+        let s = (cx * cx + cy * cy).sqrt();
+        let ang = s.atan2(w[2]);
+        if !(ang > 1e-4 && ang < 0.35) {
+            return;
+        }
+        let a = (ang * 0.05).min(0.3f32.to_radians());
+        let rc = crate::simd::so3_exp([cx / s * a, cy / s * a, 0.0, 0.0]);
+        let c = [self.pose.x(), self.pose.y(), self.pose.z()];
+        let rcc = crate::simd::m34_vec(&rc, &[c[0], c[1], c[2], 0.0]);
+        let ct = crate::imu::tf_of(&rc, [c[0] - rcc[0], c[1] - rcc[1], c[2] - rcc[2]]);
+        self.pose = ct.mul(&self.pose);
+        for t in self.tracks.iter_mut() {
+            t.w = ct.transform_point(t.w);
+        }
+        if let Some(k) = self.kf.as_mut() {
+            k.1 = ct.mul(&k.1);
+        }
+        self.n_grav += 1;
+        self.grav_deg += a.to_degrees() as f64;
     }
 
     pub fn process(&mut self, f: &Frame) -> OdomResult {
@@ -1013,6 +1049,7 @@ impl OdometryKlt {
         self.spare = Some(prev);
         self.prev = Some(cur);
         self.prev_t = f.t;
+        self.gravity_fix();
         self.diag = Diag { method: 0, q, jump: jump_of(&pred, &pose) };
         self.result(transform, cov, inliers, n_tracks, kf)
     }

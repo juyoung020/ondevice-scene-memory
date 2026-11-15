@@ -19,9 +19,11 @@
 //! GET /api/search?q=<text>   objects ranked against the text (see search.rs); optional k (20) and min score (0.2)
 //! GET /api/files?p=a,b,..   many files below the memory dir in one reply (see pack_files)
 //! GET /stream               SSE: vv (view version) / fpose (pose.json), pushed when they change
+//! GET /bstream              binary deltas per page (changed objects, new trajectory points, changed map tiles, new octree nodes, pose; see delta.rs)
 //!
 //! In one program (`ondevice --serve`) the view comes from [`live`] (structure handed over by the pipeline, JSON built on
 //! request) and every other file from [`memfs`]; a separate viewer reads the folder.
+mod delta;
 pub mod live;
 pub mod memfs;
 mod search;
@@ -142,6 +144,8 @@ struct State {
     view: Mutex<Option<Arc<live::View>>>, // view.json read from the folder, by version (a separate viewer)
     maps: Mutex<MapHist>,
     streams: Mutex<Vec<StreamClient>>,    // open /stream pages (one thread pushes to all of them)
+    parts: Mutex<Option<Arc<delta::Parts>>>, // the current view split into objects + head (once per version, shared by every /bstream page)
+    octidx: Mutex<Option<Arc<delta::OctIdx>>>, // octree node list of the current view (read once per version)
     #[cfg(feature = "search")]
     text_enc: std::sync::OnceLock<search::TextEnc>, // --search-model: set once the model is loaded (search is by the letters of the name until then)
 }
@@ -151,6 +155,7 @@ struct StreamClient {
     s: TcpStream,
     vv: String,
     pv: String,
+    bin: Option<delta::Client>, // /bstream: what this page has (sent only what is new for it)
 }
 
 /// 파일 바이트: memmap 이 같은 프로세스에서 걸어 둔 것(memfs)이 있으면 그것, 아니면 디스크
@@ -676,7 +681,14 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
         }
         // ?metrics=1 page: frames drawn and pose → screen latency every 2 s, logged here (measuring on the board screen)
         "/api/metric" => {
-            eprintln!("viewer: {} fps, pose→screen p50 {} p95 {} ms (n {})", q.get("fps").map_or("-", |v| v), q.get("lat50").map_or("-", |v| v), q.get("lat95").map_or("-", |v| v), q.get("n").map_or("-", |v| v));
+            let g = |k: &str| q.get(k).map_or("-", |v| v.as_str());
+            // MemAvailable of this machine (board): run boundaries are logged with it to tell memory pressure from viewer work
+            let avail = fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).map_or("-".to_string(), |kb| (kb / 1024).to_string());
+            if let Some(e) = q.get("event") {
+                eprintln!("viewer event: {e}, js heap {} MB, MemAvailable {avail} MB", g("jsmb"));
+                return respond(&mut s, 204, "text/plain", "", b"");
+            }
+            eprintln!("viewer: {} fps (render {} ms), pose→screen p50 {} p95 {} ms (n {}), map→screen p50 {} p95 {} ms (n {}), view {} × fetch {} ms + apply {} ms, {} KB, max frame gap {} ms, long tasks {} (max {} ms), js heap {} MB, MemAvailable {} MB", g("fps"), g("rms"), g("lat50"), g("lat95"), g("n"), g("vlat50"), g("vlat95"), g("vn"), g("nv"), g("fms"), g("ams"), g("kb"), g("gap"), g("lt"), g("ltmax"), g("jsmb"), avail);
             respond(&mut s, 204, "text/plain", "", b"")
         }
         "/api/mode" =>respond(&mut s, 200, "application/json", "", b"{\"live\":false}"),
@@ -686,6 +698,12 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 None => "{\"robot\":null}".to_string(),
             };
             respond(&mut s, 200, "application/json", "", body.as_bytes())
+        }
+        "/bstream" => {
+            REQ.with(|r| r.borrow_mut().keep = false);
+            if let Ok(c) = s.try_clone() {
+                open_bstream(c, st);
+            }
         }
         "/stream" => {
             REQ.with(|r| r.borrow_mut().keep = false); // the event stream owns this connection until the page goes away
@@ -699,7 +717,12 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 return respond(&mut s, 200, "application/json", "", b"{\"unchanged\":true}");
             }
             let map_v = file_ver(&st.dir.join("map.pgm")).unwrap_or_default();
-            respond(&mut s, 200, "application/json", "", &v.api_body(&map_v))
+            // tr/tf: the page already has the first tf trajectory points of log tr → only the appended ones
+            let delta = q.get("tr").and_then(|t| t.parse().ok()).zip(q.get("tf").and_then(|t| t.parse().ok())).and_then(|(tr, tf)| v.api_delta(&map_v, tr, tf));
+            match delta {
+                Some(b) => respond(&mut s, 200, "application/json", "", &b),
+                None => respond(&mut s, 200, "application/json", "", &v.api_body(&map_v)),
+            }
         }
         // full map, or with ?since=<map_v> only the rows changed since that version (X-Y0..X-Y1, PGM row order; X-Full: 0)
         "/api/map" => match current_map(&st) {
@@ -796,8 +819,20 @@ fn open_stream(mut s: TcpStream, st: &Arc<State>) {
     }
     let _ = s.set_nodelay(true);
     let _ = s.set_write_timeout(Some(Duration::from_secs(5))); // a stuck page is dropped instead of holding the others
-    st.streams.lock().unwrap().push(StreamClient { s, vv: String::new(), pv: String::new() });
+    st.streams.lock().unwrap().push(StreamClient { s, vv: String::new(), pv: String::new(), bin: None });
     memfs::bump(); // the pusher sends the new page what it has now
+}
+
+/// Binary delta stream: no length, the body runs until the page goes away (read by the page's worker with fetch)
+fn open_bstream(mut s: TcpStream, st: &Arc<State>) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n";
+    if s.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let _ = s.set_nodelay(true);
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    st.streams.lock().unwrap().push(StreamClient { s, vv: String::new(), pv: String::new(), bin: Some(delta::Client::default()) });
+    memfs::bump();
 }
 
 /// The current view version (the handed-over view, else view.json's)
@@ -829,7 +864,27 @@ fn stream_pusher(st: Arc<State>) {
         });
         let keep = quiet.elapsed() > Duration::from_secs(10);
         let mut any = false;
+        // binary pages: the view split once, the map and octree list read once, then a frame per page with only what it lacks
+        let now = cl.iter().any(|c| c.bin.is_some()).then(|| {
+            let view = load_view(&st).and_then(|v| delta::parts(&st.parts, &v).map(|p| (v, p)));
+            let map = current_map(&st);
+            let oct = view.as_ref().and_then(|(_, p)| p.oct_ref()).and_then(|(run, path, ver)| delta::oct_idx(&st.octidx, &st.dir, run, &path, ver));
+            let pose = file_ver(&pp).and_then(|v| {
+                let t = read_file(&pp)?;
+                let b = t.trim_ascii();
+                (b.starts_with(b"{") && b.ends_with(b"}")).then(|| (v, Arc::new(b.to_vec())))
+            });
+            (view, map, oct, pose)
+        });
+        let hist = now.as_ref().map(|_| st.maps.lock().unwrap().vers.clone()).unwrap_or_default();
         cl.retain_mut(|c| {
+            if let Some(b) = c.bin.as_mut() {
+                let (view, map, oct, pose) = now.as_ref().unwrap();
+                let n = delta::Now { view: view.clone(), map: map.clone(), map_hist: &hist, oct: oct.clone(), pose: pose.clone() };
+                let f = delta::frame(b, &n).or_else(|| keep.then(|| vec![0u8; 4]));
+                any |= f.is_some();
+                return f.is_none_or(|f| c.s.write_all(&f).is_ok());
+            }
             let mut out = String::new();
             if let Some(v) = &vv {
                 if *v != c.vv {
@@ -920,6 +975,7 @@ pub fn serve(c: Config) {
         }
     };
     let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()),
+        parts: Mutex::new(None), octidx: Mutex::new(None),
         #[cfg(feature = "search")]
         text_enc: std::sync::OnceLock::new() });
     let l = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {

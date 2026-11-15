@@ -259,7 +259,8 @@ impl Clock {
 
 /// 한 장면의 '대략 수평'인 가장 큰 면(바닥·책상)을 RANSAC 으로 찾아 그 위쪽 법선을 세계 좌표로(IMU 없이 중력 방향 단서).
 /// 여러 장면의 법선을 모아 다수결로 수평을 정한다(gravity 합의).
-fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V3> {
+/// floor_only: 카메라보다 0.3 m 넘게 아래인 면만(실시간: 천장 · 책상 위를 바닥으로 잡지 않게)
+fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3, floor_only: bool) -> Option<V3> {
     let [fx, fy, cx, cy] = k;
     let mut pts: Vec<V3> = vec![];
     for v in (0..h).step_by(8) {
@@ -297,6 +298,9 @@ fn up_normal(depth: &Depth, w: usize, h: usize, k: [f64; 4], r: &M3) -> Option<V
             continue; // 가정한 위에서 50° 넘게 기운 면(벽)은 제외
         }
         let d = dot(&n, &a);
+        if floor_only && d > -0.3 {
+            continue; // 위쪽(가정한 위 기준) 면 = 천장 · 높은 면
+        }
         let cnt = pts.iter().filter(|q| (dot(&n, q) - d).abs() < 0.02 + 0.01 * q[2]).count();
         if cnt > best_c {
             (best_n, best_c) = (n, cnt);
@@ -551,7 +555,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none() || a.no_drop) // --no-drop: 스트림도 기다림
     });
     let mut mem = Memory::new(0.012, 0.04);
-    let mut view = ViewWorker::spawn(a.out.clone()); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
+    let mut view = ViewWorker::spawn(a.out.clone(), a.live > 0.0); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
     let mut z0: Option<f64> = None;
@@ -880,6 +884,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut grav_obs: Vec<V3> = vec![];
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
     let mut leveled = a.stream.is_none() || a.no_level;
+    // 실시간: 첫 장면 카메라가 똑바로 서 있다고 보고(위 = 첫 장면 카메라의 −y) 처음부터 수평으로 보여 주고, 바닥 합의가 나오면 한 번 고쳐 다시 쌓는다
+    let (mut upright, mut refine) = (a.stream.is_some() && a.live > 0.0 && !a.no_level, false);
     let mut force_rb = false; // 수평 버튼: 기다리지 않고 바로 다시 쌓기
     let mut stream_fix: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // 스트림 위치에 곱할 수평 맞춤 회전
     let mut stream_held = 0u32; // 맡아 둘 장면으로 받은 수
@@ -901,6 +907,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
+    let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, anchor, graph }) = rx.recv() {
         // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
         let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
@@ -940,6 +947,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }));
             } else {
             let i1 = Instant::now();
+            rb_cache = Some(rb.cache.clone());
             install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
             view.traj_replaced();
             let i2 = Instant::now();
@@ -964,7 +972,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
             kfs.clear_dirty();
-            rb_job = Some(std::thread::spawn(move || { out::thread_role(out::Role::Rebuild); let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved); out::slow(c_rb); r }));
+            let cache = rb_cache.clone();
+            rb_job = Some(std::thread::spawn(move || { out::thread_role(out::Role::Rebuild); let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved, cache); out::slow(c_rb); r }));
             last_rebuild = Instant::now();
             (rb_t0, rb_due) = (t, t + a.rebuild_every);
         }
@@ -1018,14 +1027,19 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             force_rb = true;
             common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
         }
+        if std::mem::take(&mut upright) && !leveled {
+            stream_fix = rot_between(&[-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]], &[0.0, 0.0, 1.0]);
+            (leveled, refine) = (true, true);
+            common::info!("수평: 첫 장면 카메라를 똑바로 선 것으로 보고 시작(바닥 합의가 나오면 고침)");
+        }
         if a.stream.is_some() {
             r = mm(&stream_fix, &r);
             p = mv(&stream_fix, &p);
         }
         let c_vo = Instant::now();
         // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
-        if !leveled && a.stream.is_some() {
-            if let Some(n) = up_normal(&depth, w, h, seq.k, &r) {
+        if (!leveled || refine) && a.stream.is_some() {
+            if let Some(n) = up_normal(&depth, w, h, seq.k, &r, refine) {
                 grav_obs.push(n);
             }
             if grav_obs.len() >= 15 {
@@ -1037,13 +1051,32 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let m0 = mean(&grav_obs);
                 let inl: Vec<V3> = grav_obs.iter().copied().filter(|n| dot(n, &m0) > 10f64.to_radians().cos()).collect();
                 if inl.len() * 10 >= grav_obs.len() * 6 {
+                    'lv: {
                     let up = mean(&inl);
                     let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
+                    let tilt = up[2].clamp(-1.0, 1.0).acos().to_degrees();
+                    if refine && tilt > 70.0 {
+                        // 첫 장면이 똑바르다는 가정과 70° 넘게 다르면 믿지 않음(세계를 뒤집지 않음, 천장은 floor_only 로 이미 빠짐 · 녹화 첫 장면은 46° 숙여 있기도 함): 모은 것을 버리고 계속
+                        common::info!("수평 맞춤: 바닥 합의가 처음 가정과 {tilt:.1}° 달라 버림");
+                        grav_obs.clear();
+                        break 'lv;
+                    }
+                    if std::mem::take(&mut refine) {
+                        // 처음 가정(첫 장면이 똑바름)을 바닥 합의로 고침: 지난 위치 · 바닥 높이 원점도 새 좌표로, 지도는 다시 쌓음
+                        for e in est_traj.iter_mut() {
+                            (e.1, e.2) = (mv(&fix, &e.1), mm(&fix, &e.2));
+                        }
+                        // 바닥 높이는 기울어진 채 잰 값이라 버리고, 이 장면에서 새 좌표로 다시 잰다(바닥 = z 0)
+                        hist_h.clear();
+                        z0 = None;
+                        (kfs.dirty, force_rb) = (true, true);
+                    }
                     r = mm(&fix, &r);
                     p = mv(&fix, &p);
                     stream_fix = mm(&fix, &stream_fix);
                     leveled = true;
                     common::info!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
+                    }
                 } else if grav_obs.len() > 60 {
                     grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
                 }
@@ -1149,7 +1182,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             clock.add(P::Scene, c_sc);
             let c_v = Instant::now();
             // 점 노드를 쓴 장면은 view.json 을 다음 장면으로 미룸(한 장면에 몰리지 않게). 병합은 제때(결과가 같게)
-            if scene_done && nkf > 1 {
+            if scene_done && nkf > 1 && !(out::memory_only() && a.live > 0.0) { // 메모리 기억 폴더는 같은 장면에서(미루면 실시간에선 장면마다 다시 미뤄져 판이 안 나감)
                 if merge {
                     mem.prune(t);
                     mem.merge_pass();
@@ -1194,6 +1227,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut installed = false;
     if let Some(job) = rb_job.take() {
         let rb = job.join().expect("다시 쌓기 스레드");
+        rb_cache = Some(rb.cache.clone());
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
         view.traj_replaced();
         (n_rebuild, installed) = (n_rebuild + 1, true);
@@ -1201,7 +1235,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     kfs.settle(true);
     if kfs.dirty && a.rebuild_every >= 0.0 {
         let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
-        let rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved);
+        let rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved, rb_cache.clone());
         kfs.clear_dirty();
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
         view.traj_replaced();
@@ -1323,7 +1357,31 @@ struct Rebuilt {
     n: usize,
     secs: f64,
     moved: (f64, f64),
+    /// 이번에 쌓을 때 쓴 장면·위치와 중간 상태: 다음 다시 쌓기가 바뀌지 않은 앞부분을 건너뜀
+    cache: std::sync::Arc<RbCache>,
+    /// 이번에 처음부터 다시 넣은 첫 장면 번호(0 = 처음부터)
+    start: usize,
 }
+
+/// 다시 쌓기 중간 상태: i 번째 장면을 넣기 직전의 지도·물체·길(장면 순서·위치가 같으면 그대로 이어 쌓아도 처음부터 쌓은 것과 같다)
+struct Ckpt {
+    i: usize,
+    grid: Grid,
+    scene: SceneMap,
+    mem: Memory,
+    traj: Vec<(f64, [f64; 3])>,
+    map_traj: Vec<(f64, V3, M3)>,
+}
+
+/// 지난 다시 쌓기: 장면마다 (순번, 회전, 위치)와 중간 상태(CKPT_EVERY 장마다, 최근 CKPT_KEEP 개)
+#[derive(Default)]
+struct RbCache {
+    keys: Vec<(u64, M3, V3)>,
+    ckpts: Vec<std::sync::Arc<Ckpt>>,
+}
+/// 중간 상태 간격(물체 정리 주기 15 의 배수라 그 자리에서 이어도 같은 결과)
+const CKPT_EVERY: usize = 120;
+const CKPT_KEEP: usize = 6;
 
 type Snap = Vec<(std::sync::Arc<kfstore::Kf>, M3, V3)>;
 
@@ -1351,7 +1409,8 @@ fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
 }
 
 /// 보관한 장면을 주어진 위치로 빈 지도·물체·지나온 길에 처음부터 쌓는다. 물체 id 는 next_id 부터.
-fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f64)) -> Rebuilt {
+/// 지난번(cache)과 앞부분 장면·위치가 같으면 그 끝 가까운 중간 상태에서 이어 쌓는다(루프 클로저로 뒤쪽 새 지도만 움직였을 때 그 부분만)
+fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f64), cache: Option<std::sync::Arc<RbCache>>) -> Rebuilt {
     let c0 = Instant::now();
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
@@ -1359,13 +1418,42 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let mut mem = Memory::new(0.012, 0.04);
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
+    let mut ckpts: Vec<std::sync::Arc<Ckpt>> = vec![];
+    let mut start = 0usize;
+    let mut old_keys: Vec<(u64, M3, V3)> = vec![];
+    if let Some(c) = cache.filter(|_| std::env::var_os("MEMMAP_RB_FULL").is_none()) {
+        // 처음 달라진 장면: 순번이 다르거나 노드가 실제로 움직임(kfstore 의 움직임 문턱 2 cm · 1° — 최적화의 아주 작은 흔들림은 같은 것으로 봄)
+        let d = snap
+            .iter()
+            .zip(c.keys.iter())
+            .position(|((kf, r, p), (s, r0, p0))| kf.seq != *s || norm(&sub(p, p0)) > kfstore::MOVE_T || kfstore::angle(r, r0) > kfstore::MOVE_R)
+            .unwrap_or(snap.len().min(c.keys.len()));
+        if std::env::var_os("MEMMAP_PARTS").is_some() {
+            common::info!("다시 쌓기: 지난번과 처음 달라진 장면 {d} / {}", snap.len());
+        }
+        if let Some(ck) = c.ckpts.iter().rev().find(|ck| ck.i <= d && ck.i > 0) {
+            (grid, scene, mem, traj, map_traj) = (ck.grid.clone(), ck.scene.clone(), ck.mem.clone(), ck.traj.clone(), ck.map_traj.clone());
+            scene.run = SceneMap::new_run();
+            start = ck.i;
+            ckpts = c.ckpts.iter().filter(|x| x.i <= start).cloned().collect();
+            old_keys = c.keys[..start].to_vec(); // 이어 받은 앞부분은 그때 위치로 쌓은 것
+        }
+    }
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 몇 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음).
     // 한 번에 푸는 장 수 = 풀의 스레드 수(최대 8): 푼 장면 하나가 약 2.1 MB(깊이 f32 + 컬러)라 32 장씩이면 최대 메모리가 67 MB 늘었다.
     // 쌓기가 차례대로라 8 장 넘게 미리 풀어도 빨라지지 않는다
     let dec_chunk = rayon::current_num_threads().clamp(1, 8);
     let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>, Option<PtsGrid>)> = Default::default();
-    for (i, (kf, r, pwc)) in snap.iter().enumerate() {
+    // 시험용 MEMMAP_CKPT_EVERY(15 의 배수)
+    let ck_every = std::env::var("MEMMAP_CKPT_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0 && v % 15 == 0).unwrap_or(CKPT_EVERY);
+    for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
+        if i > start && i % ck_every == 0 {
+            ckpts.push(std::sync::Arc::new(Ckpt { i, grid: grid.clone(), scene: scene.clone(), mem: mem.clone(), traj: traj.clone(), map_traj: map_traj.clone() }));
+            if ckpts.len() > CKPT_KEEP {
+                ckpts.remove(0);
+            }
+        }
         let cd = Instant::now();
         if dec.is_empty() {
             use rayon::prelude::*;
@@ -1395,8 +1483,10 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let t_exp = ce.elapsed().as_secs_f64();
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
-    common::info!("다시 쌓기 나눔: 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", t_map);
-    Rebuilt { pts, grid, scene, mem, traj, map_traj, last_seq, extra: vec![], n: snap.len(), secs, moved }
+    common::info!("다시 쌓기 나눔: 장면 {start} 번부터 {} 개(앞은 저장해 둔 상태) · 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", snap.len() - start, t_map);
+    old_keys.extend(snap[start..].iter().map(|(kf, r, p)| (kf.seq, *r, *p)));
+    let cache = std::sync::Arc::new(RbCache { keys: old_keys, ckpts });
+    Rebuilt { pts, grid, scene, mem, traj, map_traj, last_seq, extra: vec![], n: snap.len(), secs, moved, cache, start }
 }
 
 /// 다시 쌓은 지도로 갈아 끼우고, 쌓는 동안 새로 보관한 장면을 지금 위치로 이어서 넣는다
@@ -1419,8 +1509,8 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
     for ((kf, r, pwc), (d, rgb, dets)) in newer.iter().zip(unpack_all(&newer)) {
         map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &d, &rgb, kf.w, kf.h, &dets, true, grid, mem, traj, map_traj);
     }
-    common::info!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
-              rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
+    common::info!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개(그중 {} 번부터 다시) {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
+              rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.start, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
 }
 
 /// 스트림이 이만큼(초) 밀리면 가볍게 처리
@@ -2048,7 +2138,8 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
     let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).collect();
     let traj = view.traj_update(traj);
-    view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone() });
+    let wall = if view.live { wall_ms() } else { 0.0 };
+    view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });
 }
 
 /// 지나온 길 바뀐 몫: 덧붙인 점, 또는 다시 쌓기로 새로 만든 길 전체
@@ -2068,6 +2159,7 @@ struct ViewJob {
     pose: [f64; 3],
     cam: serde_json::Value,
     scene: serde_json::Value,
+    wall: f64, // 실시간: 이 판을 낸 장면의 벽시계(ms) — 뷰어(?metrics=1)가 지도 → 화면 지연을 잼. 재생은 0(view.json 에 안 실음)
 }
 
 enum ViewMsg {
@@ -2077,16 +2169,20 @@ enum ViewMsg {
 
 /// 뷰 스레드: 방 나누기 · 엣지(graph::build), map.pgm, view.json(디스크) 또는 같은 프로세스 뷰어에 구조 그대로 건 판(--serve).
 /// 받은 차례대로 하므로 방 번호 잇기 · 파일 차례는 본 스레드에서 하던 것과 같다
+/// 지도 → 뷰 넘김은 common::slot::Latest 한 칸: 실시간(메모리 기억 폴더)은 덮어써 가장 새 판만(본 스레드는 기다리지 않음,
+/// 덮어쓴 판의 길 점은 새 판 앞에 이어 붙여 하나도 잃지 않음), 디스크 기록 · 재생은 exact(하나도 건너뛰지 않음 — 결과가 늘 같게)
 struct ViewWorker {
-    tx: std::sync::mpsc::Sender<ViewMsg>,
+    slot: std::sync::Arc<common::slot::Latest<ViewMsg>>,
     handle: Option<std::thread::JoinHandle<()>>,
     sent: usize,   // 넘긴 길 점 수
     fresh: bool,   // 길이 새로 만들어짐(다시 쌓기 갈아 끼우기)
+    live: bool,    // 실시간 입력(판에 벽시계를 실음)
 }
 
 impl ViewWorker {
-    fn spawn(dir: PathBuf) -> ViewWorker {
-        let (tx, rx) = std::sync::mpsc::channel::<ViewMsg>();
+    fn spawn(dir: PathBuf, live: bool) -> ViewWorker {
+        let slot = std::sync::Arc::new(common::slot::Latest::<ViewMsg>::new(!out::memory_only()));
+        let rx = slot.clone();
         let handle = std::thread::Builder::new().name("view".into()).spawn(move || {
             out::thread_role(out::Role::Writer);
             let mut tr = rooms::Tracker::default();
@@ -2099,16 +2195,8 @@ impl ViewWorker {
                     log.extend(v);
                 }
             };
-            let mut back: Option<ViewMsg> = None;
-            loop {
-                let m = match back.take() {
-                    Some(m) => m,
-                    None => match rx.recv() {
-                        Ok(m) => m,
-                        Err(_) => break,
-                    },
-                };
-                let mut j = match m {
+            while let Some((_, m)) = rx.take() {
+                let j = match m {
                     ViewMsg::Flush(t) => {
                         let _ = t.send(());
                         continue;
@@ -2116,21 +2204,6 @@ impl ViewWorker {
                     ViewMsg::Job(j) => *j,
                 };
                 apply(&mut log, &j.traj);
-                // 실시간(메모리 기억 폴더): 밀린 판은 건너뛰고 마지막 것만(길은 모두 이어 붙임). 디스크 기록은 하나도 건너뛰지 않음(결과가 늘 같게)
-                if out::memory_only() {
-                    while let Ok(m2) = rx.try_recv() {
-                        match m2 {
-                            ViewMsg::Job(j2) => {
-                                apply(&mut log, &j2.traj);
-                                j = *j2;
-                            }
-                            other => {
-                                back = Some(other);
-                                break;
-                            }
-                        }
-                    }
-                }
                 let (grid_j, rooms, doors, edges) = match j.gi {
                     Some(mut g) => {
                         let ol: Vec<_> = j.ol.iter().map(|o| (o.0, o.1, o.2, o.3, o.4.as_str())).collect();
@@ -2151,6 +2224,9 @@ impl ViewWorker {
                 if !j.scene.is_null() {
                     head["scene_points"] = j.scene;
                 }
+                if j.wall > 0.0 {
+                    head["wall"] = json!(j.wall);
+                }
                 n += 1;
                 let len = log.len();
                 if out::memory_only() {
@@ -2160,7 +2236,7 @@ impl ViewWorker {
                 }
             }
         }).unwrap();
-        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true }
+        ViewWorker { slot, handle: Some(handle), sent: 0, fresh: true, live }
     }
     fn traj_update(&mut self, traj: &[(f64, [f64; 3])]) -> TrajUpd {
         let u = if std::mem::take(&mut self.fresh) || traj.len() < self.sent { TrajUpd::Reset(traj.to_vec()) } else { TrajUpd::Append(traj[self.sent..].to_vec()) };
@@ -2171,21 +2247,39 @@ impl ViewWorker {
     fn traj_replaced(&mut self) {
         self.fresh = true;
     }
-    fn send(&self, j: ViewJob) {
-        self.tx.send(ViewMsg::Job(Box::new(j))).expect("뷰 스레드");
+    fn send(&self, mut j: ViewJob) {
+        // 실시간: 뷰 스레드가 아직 안 꺼낸 판은 이 판으로 바꾸되 그 판의 길 점을 앞에 붙임(넣는 쪽은 이 스레드 하나라 put 은 덮어쓰지 않음)
+        if !out::memory_only() {
+            self.slot.put(0, ViewMsg::Job(Box::new(j)));
+            return;
+        }
+        if let Some((_, ViewMsg::Job(old))) = self.slot.try_take() {
+            j.traj = match (old.traj, j.traj) {
+                (_, TrajUpd::Reset(v)) => TrajUpd::Reset(v),
+                (TrajUpd::Reset(mut a), TrajUpd::Append(b)) => {
+                    a.extend(b);
+                    TrajUpd::Reset(a)
+                }
+                (TrajUpd::Append(mut a), TrajUpd::Append(b)) => {
+                    a.extend(b);
+                    TrajUpd::Append(a)
+                }
+            };
+        }
+        self.slot.put(0, ViewMsg::Job(Box::new(j)));
     }
     /// 넘긴 판을 모두 짤 때까지 기다림
     fn flush(&self) {
         let (t, r) = std::sync::mpsc::channel();
-        self.tx.send(ViewMsg::Flush(t)).expect("뷰 스레드");
+        self.slot.wait_empty(); // 덮어쓰는 칸: 남은 판이 꺼내진 뒤 끝 표시(판을 덮어쓰지 않게)
+        self.slot.put(0, ViewMsg::Flush(t));
         let _ = r.recv();
     }
 }
 
 impl Drop for ViewWorker {
     fn drop(&mut self) {
-        let (tx, _) = std::sync::mpsc::channel();
-        drop(std::mem::replace(&mut self.tx, tx));
+        self.slot.close();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

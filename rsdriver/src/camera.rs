@@ -148,6 +148,9 @@ pub fn parse_calib(raw: &RawCalib, dw: u32, dh: u32, cw: u32, ch: u32) -> Result
 pub struct Config {
     pub width: u32,
     pub height: u32,
+    /// 컬러 크기(0 = 깊이와 같음). 예: 1280×720 컬러 + 640×480 깊이. 정렬은 고른 컬러 모드의 내부 보정값으로 깊이를 컬러 격자에 옮긴다
+    pub color_width: u32,
+    pub color_height: u32,
     pub fps: u32,
     /// 빈 문자열 = 처음 찾은 카메라
     pub serial: String,
@@ -167,9 +170,16 @@ pub struct Config {
     pub yuy2: Yuy2Rule,
 }
 
+impl Config {
+    /// 컬러 (가로, 세로)
+    pub fn color_size(&self) -> (u32, u32) {
+        if self.color_width > 0 && self.color_height > 0 { (self.color_width, self.color_height) } else { (self.width, self.height) }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
-        Config { width: 640, height: 480, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, profile: Profile::Librealsense, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
+        Config { width: 640, height: 480, color_width: 0, color_height: 0, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, profile: Profile::Librealsense, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
     }
 }
 
@@ -404,12 +414,13 @@ impl Camera {
         }
         let Some((found, raw, ctl)) = pick else { return Err(format!("시리얼 {} 카메라가 없음", cfg.serial)) };
         let (w, h) = (cfg.width, cfg.height);
-        let calib = parse_calib(&raw, w, h, w, h)?;
+        let (cw, ch) = cfg.color_size();
+        let calib = parse_calib(&raw, w, h, cw, ch)?;
         // 흐름 노드는 따로 연다(제어용 fd 는 HWM·XU 에)
         let dnode = Node::open(&found.depth).map_err(|e| format!("{}: {e}", found.depth))?;
         let cnode = Node::open(&found.color).map_err(|e| format!("{}: {e}", found.color))?;
         let mut depth = Side::new(dnode, found.depth_meta.clone(), w, h, v4l2::FMT_Z16, cfg.fps)?;
-        let mut color = Side::new(cnode, found.color_meta.clone(), w, h, v4l2::FMT_YUYV, cfg.fps)?;
+        let mut color = Side::new(cnode, found.color_meta.clone(), cw, ch, v4l2::FMT_YUYV, cfg.fps)?;
         depth.start()?;
         color.start()?;
         // 제어: 컬러 PU 는 컬러 노드, 이미터는 깊이 XU
@@ -502,7 +513,9 @@ impl Camera {
             }
         }
         let t1 = Instant::now();
-        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+        // (w, h) = 컬러(출력·정렬 격자), (dw, dh) = 깊이
+        let (w, h) = { let (a, b) = self.cfg.color_size(); (a as usize, b as usize) };
+        let (dw, dh) = (self.cfg.width as usize, self.cfg.height as usize);
         let cb = self.color.held.unwrap();
         let db = self.depth.held.unwrap();
         let info_c = self.color.meta_of(cb.sequence);
@@ -510,7 +523,7 @@ impl Camera {
         {
             let cdata = self.color.s.data(&cb);
             let ddata = self.depth.s.data(&db);
-            if cdata.len() < self.color.stride * (h - 1) + w * 2 || ddata.len() < self.depth.stride * (h - 1) + w * 2 {
+            if cdata.len() < self.color.stride * (h - 1) + w * 2 || ddata.len() < self.depth.stride * (dh - 1) + dw * 2 {
                 self.color.release()?;
                 self.depth.release()?;
                 return self.next_into(out);
@@ -530,14 +543,14 @@ impl Camera {
                 }
             }
             fit(&mut out.aligned, w * h); // fast_align 이 처음에 0 으로 채움
-            let packed = self.depth.stride == w * 2 && (ddata.as_ptr() as usize) % 2 == 0;
+            let packed = self.depth.stride == dw * 2 && (ddata.as_ptr() as usize) % 2 == 0;
             if packed && !out.want_raw {
                 // mmap 깊이를 복사 없이 정렬 입력으로
-                let d16 = unsafe { std::slice::from_raw_parts(ddata.as_ptr() as *const u16, w * h) };
+                let d16 = unsafe { std::slice::from_raw_parts(ddata.as_ptr() as *const u16, dw * dh) };
                 self.aligner.process(d16, &mut out.aligned);
             } else {
-                out.depth_raw.resize(w * h, 0);
-                format::z16_copy(ddata, self.depth.stride, w, &mut out.depth_raw);
+                out.depth_raw.resize(dw * dh, 0);
+                format::z16_copy(ddata, self.depth.stride, dw, &mut out.depth_raw);
                 self.aligner.process(&out.depth_raw, &mut out.aligned);
             }
         }
@@ -574,8 +587,8 @@ impl Camera {
             "RealSense Intel RealSense D435 {} 펌웨어 {}, {}x{}@{}, 깊이 {}/m, 컬러 보정 fx {} fy {} cx {} cy {} 왜곡 모델 Inverse Brown Conrady, 정렬 rsdriver(fast_align)",
             self.calib.gvd.serial,
             self.calib.gvd.firmware,
-            self.cfg.width,
-            self.cfg.height,
+            self.cfg.color_size().0,
+            self.cfg.color_size().1,
             self.cfg.fps,
             self.depth_per_m(),
             k.fx,

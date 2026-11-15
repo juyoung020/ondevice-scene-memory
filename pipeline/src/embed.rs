@@ -138,6 +138,7 @@ fn put(id: u32, v: Vec<f32>) {
         let mut sums = SUMS.lock().unwrap();
         let s = sums.get_or_insert_with(Default::default).entry(id).or_insert_with(|| vec![0.0; v.len()]);
         s.iter_mut().zip(&v).for_each(|(a, b)| *a += b);
+        *NCOUNT.lock().unwrap().get_or_insert_with(Default::default).entry(id).or_insert(0) += 1;
         let mut m = s.clone();
         normalize(&mut m);
         m
@@ -149,6 +150,19 @@ fn put(id: u32, v: Vec<f32>) {
     }
     LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
 }
+
+/// 이름 고르기 확인(ONDEVICE_NAME_DEBUG): 그 물체의 평균 벡터에서 상위 4 이름 · 코사인 · 사진 수
+pub fn debug_name(id: u32) {
+    let Some((names, vecs)) = VOCAB.get() else { return };
+    let Some(mut m) = SUMS.lock().unwrap().as_ref().and_then(|s| s.get(&id).cloned()) else { return };
+    let n = NCOUNT.lock().unwrap().as_ref().and_then(|c| c.get(&id).cloned()).unwrap_or(0);
+    normalize(&mut m);
+    let mut l: Vec<(f32, &str)> = vecs.chunks(DIM).zip(names).map(|(t, nm)| (t.iter().zip(&m).map(|(a, b)| a * b).sum::<f32>(), nm.as_str())).collect();
+    l.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let cur = NAMES.lock().unwrap().as_ref().and_then(|x| x.get(&id).cloned());
+    println!("namedbg O{id} n{n} cur {:?} top {}", cur, l.iter().take(10).map(|(c, nm)| format!("{nm}:{c:.4}")).collect::<Vec<_>>().join(" "));
+}
+static NCOUNT: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> = std::sync::Mutex::new(None);
 
 /// 벡터 파일 경로(기억 폴더 기준 상대 경로)
 pub fn rel_path(id: u32) -> String {

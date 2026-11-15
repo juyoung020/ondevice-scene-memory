@@ -21,9 +21,10 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
                                                                NPU 물체 분할 ┘
 ```
 
-- **위치:** 위치 프로그램(크레이트 [slam/](slam/README.md), `ondevice --slam` · `ondevice slam`)은 RTAB-Map 0.24.2 에서 쓰는 경로(위치 추적·루프 클로저·GTSAM 그래프 최적화)를 Rust 로 옮긴 것으로, PC 에서 C++ 원본 `rtab_bridge` 와 출력이 바이트까지 같고 약 2.2 배 빠릅니다. 장면마다 카메라 위치를 구하고, 한 바퀴 돌아 아까 본 곳을 알아보면(루프 클로저) 지나온 위치를 다시 맞춥니다. 자세한 형식은 [docs/bridge.md](docs/bridge.md).
+- **위치:** 위치 프로그램(크레이트 [slam/](slam/README.md), `ondevice --slam` · `ondevice slam`)은 RTAB-Map 0.24.2 에서 쓰는 경로(위치 추적·루프 클로저·GTSAM 그래프 최적화)를 Rust 로 옮긴 것으로, PC 에서 C++ 원본(RTAB-Map 연결 프로그램)과 출력이 바이트까지 같았고 약 2.2 배 빠릅니다. 장면마다 카메라 위치를 구하고, 한 바퀴 돌아 아까 본 곳을 알아보면(루프 클로저) 지나온 위치를 다시 맞춥니다. 자세한 형식은 [docs/bridge.md](docs/bridge.md).
 - **점 지도:** Potree 방식(옥트리 단계별 상세도 + 둥근 점 + EDL 음영)으로 저장해, 뷰어는 화면에 필요한 만큼만 받아 그립니다. 루프 클로저로 위치가 고쳐지면 보관한 장면으로 지도와 물체를 다시 쌓습니다.
 - **실시간:** 처리가 밀리면 쌓인 장면을 건너뛰고 최신 장면부터 처리합니다(위치 정보는 버리지 않음). 지도 작업·다시 쌓기는 본 스레드 밖에서 돕니다.
+- **뷰어:** 서버가 페이지마다 보낸 판을 기억하고 바뀐 몫(물체 · 길 · 지도 32 칸 조각 · 점 지도 노드 · 카메라 위치)만 이진으로 밀어 줍니다(`/bstream`). 브라우저는 Web Worker 가 풀고, 점 지도는 큰 GPU 버퍼 몇 개에 바뀐 범위만 올려 그립니다.
 
 ## 되는 것
 
@@ -41,6 +42,7 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
 | 지도 갱신 | 약 11 장면/초, 지연 0.2 초 안팎(최대 0.25–0.35 초) |
 | 물체 분할 | 받은 장면의 90 % 이상(초당 약 10 번) |
 | 카메라 위치 오차 | 책상 4 cm, 사무실 3 cm, 58 m 복도 24 cm |
+| 보드 화면 뷰어(walk1 실제 속도) | 그리기 2–13 ms, 지도→화면 p95 36–147 ms, 프레임 사이 최대 간격 60–270 ms |
 
 측정 방법과 기록은 [docs/performance_log.md](docs/performance_log.md)에, 최적화별 전·후 요약은 [docs/optimization.md](docs/optimization.md)에 있습니다.
 
@@ -96,8 +98,8 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 - **아무 말로 찾기(보드):** 물체 기억은 기본으로 `~/models/siglip2-vision_npu.dxnn`(NPU) 사진 벡터를 남기고, 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 보드는 글 인코더를 Rust 로 계산하고(질의 하나 약 75 ms), PC 는 ONNX Runtime 으로 계산합니다. 확인 값은 [docs/npu_models.md](docs/npu_models.md) "글 인코더".
 - **움직일 때 번지면:** `--slam "… --exposure 8 --gain 110"` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
 
-- **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.
-- **NPU는 한 번에 한 프로그램만** 쓰세요. 두 개가 동시에 쓰면 NPU 연결이 끊겨 재부팅해야 할 수 있습니다. 새로 돌리기 전에 `pkill -f 'ondevice'`.
+- **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU 에서는 점 섞기 · EDL 패스를 끄고 한 번에 그립니다(점 크기 · 화질은 그대로). 주소 뒤 `?metrics=1` 이면 2 초마다 그리기 · 지연 · 프레임 간격 · 긴 작업 · 메모리를 서버 로그에 남깁니다.
+- **보드 메모리:** 무거운 실행(위치 + 분할)은 한 번에 둘까지 두세요(8 GB 에서 셋이면 메모리가 모자라 프로세스가 강제 종료됨).
 
 ## 주요 옵션 (ondevice)
 

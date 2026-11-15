@@ -200,6 +200,41 @@ fn is_wall(p: &[(V3, [u8; 3])]) -> bool {
     sd[0] * 2.0 < 0.08 && sd[1] * 4.0 > 0.8 && v[2][0].abs() < 0.35
 }
 
+/// 물체가 아닌 조각(이름을 붙여도 틀리는 검출): 바닥·천장 면(넓고 평평한 수평 면이 바닥 근처 또는 2 m 위),
+/// 선처럼 가는 조각(책상 모서리 · 문틀: 한 축만 길고 나머지 두 축이 3 cm 안), 아주 작은 조각(가장 긴 축 6 cm 안),
+/// 화면 가장자리 셋 이상에 잘린 마스크(장면 대부분을 덮는 배경 조각). 그러면 Some(까닭)
+fn fragment(p: &[(V3, [u8; 3])], floor_z: f64, border_sides: usize) -> Option<&'static str> {
+    if border_sides >= 3 {
+        return Some("border");
+    }
+    let n = p.len() as f64;
+    let m = [0, 1, 2].map(|k| p.iter().map(|q| q.0[k]).sum::<f64>() / n);
+    let mut c = [[0.0; 3]; 3];
+    for q in p {
+        let d = sub(&q.0, &m);
+        for i in 0..3 {
+            for j in 0..3 {
+                c[i][j] += d[i] * d[j] / n;
+            }
+        }
+    }
+    let (w, v) = eig_sym(&c);
+    // 표준편차 × 4 ≈ 고르게 퍼진 점의 폭
+    let span = w.map(|x| x.max(0.0).sqrt() * 4.0);
+    if span[2] < 0.06 {
+        return Some("tiny");
+    }
+    if span[1] < 0.03 && span[2] > 0.3 {
+        return Some("sliver");
+    }
+    let flat = span[0] < 0.04 && span[1] > 1.0;
+    let horizontal = v[2][0].abs() > 0.9;
+    if flat && horizontal && (m[2] < floor_z + 0.15 || m[2] > floor_z + 2.0) {
+        return Some("floor/ceiling");
+    }
+    None
+}
+
 #[derive(Default)]
 struct Clock {
     load: f64,
@@ -1292,6 +1327,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     view.flush();
     out::flush_writer();
+    if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() {
+        for o in mem.objs.iter().filter(|o| o.state != "gone") {
+            embed::debug_name(o.id);
+        }
+    }
     embed::finish();
     let n = clock.n.max(1) as f64;
     let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
@@ -2055,6 +2095,13 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
                 (to_w(&[(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]), [rgb[o], rgb[o + 1], rgb[o + 2]])
             }));
         if pts.len() < 50 || is_wall(&pts) {
+            continue;
+        }
+        let border = [x1 <= 1, y1 <= 1, x2 + 1 >= w, y2 + 1 >= h].iter().filter(|b| **b).count();
+        if let Some(why) = fragment(&pts, floor_z, border) {
+            if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() {
+                println!("fragdbg {why}");
+            }
             continue;
         }
         // 사진은 그 물체의 지금 사진보다 클 때만 만든다(장면마다 모든 검출을 복사하지 않게)

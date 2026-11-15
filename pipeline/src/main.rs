@@ -1299,7 +1299,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         *by.entry(o.name.as_str()).or_default() += 1;
     }
     let mut summary = json!({"keyframes": nkf, "objects": mem.objs.len(), "gone": mem.objs.iter().filter(|o| o.state == "gone").count(),
-        "scene_points": n_pts, "scene_mb": scene_mb, "pts_dropped": pts_dropped.0, "pts_near_skipped": pts_dropped.1, "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
+        "scene_points": n_pts, "scene_mb": scene_mb, "served_mb": sgview::memfs::total().1 as f64 / 1048576.0, "crop_mb": mem.objs.iter().filter_map(|o| o.crop.as_ref()).map(|c| c.rgb.len() + c.mask.len() + c.depth.len() * 2).sum::<usize>() as f64 / 1048576.0, "served_files": sgview::memfs::total().0, "pts_dropped": pts_dropped.0, "pts_near_skipped": pts_dropped.1, "ms_per_kf": {"load": clock.load / n * 1e3, "seg": clock.seg / n * 1e3, "vo": clock.vo / n * 1e3, "map": clock.map / n * 1e3,
         "obj": clock.obj / n * 1e3, "write": clock.write / n * 1e3}, "kf_per_s": n / t0.elapsed().as_secs_f64(), "by_name": by, "merged": mem.merged});
     if !clock.frame.is_empty() {
         let mut f = clock.frame.clone();

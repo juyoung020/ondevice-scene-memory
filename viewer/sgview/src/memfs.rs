@@ -35,6 +35,11 @@ pub fn publish(p: &Path, bytes: Arc<Vec<u8>>) {
     bump();
 }
 
+/// 걸어 둔 파일 수와 바이트 합(끝 요약용)
+pub fn total() -> (usize, usize) {
+    FILES.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.1.len()).sum()))
+}
+
 /// 파일 하나를 내림
 pub fn remove(p: &Path) {
     if let Some(m) = FILES.lock().unwrap().as_mut() {

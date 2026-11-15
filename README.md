@@ -81,7 +81,7 @@ target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sy
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 
-보드도 같은 한 명령입니다: D435 → 위치 추적 → 물체 기억 → 뷰어가 한 프로세스. 위치 프로그램의 원본(C++ `rtab_bridge`)과의 바이트 동일 확인은 PC(x86) 기준으로 마쳤고, 보드(ARM)에서의 같은 비교는 남아 있습니다(방법: [docs/board_bridge.md](docs/board_bridge.md)).
+보드도 같은 한 명령입니다: D435 → 위치 추적 → 물체 기억 → 뷰어가 한 프로세스. 보드 실행 파일은 Rust 이고, 함께 링크하는 것은 NPU 런타임(DXRT)과 C 표준 라이브러리뿐입니다(설치: [docs/board_bridge.md](docs/board_bridge.md)).
 
 ```bash
 cargo build --release --no-default-features --features dxrt   # target/release/ondevice (D435 입력은 rsdriver: V4L2 직접)
@@ -91,9 +91,9 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
     --serve "8091 --bind 0.0.0.0"     # 같은 네트워크의 PC·폰에서 http://<보드 주소>:8091
 ```
 
-- **D435 입력 고르기:** 리눅스 빌드의 기본은 `rsdriver`(librealsense2 없이 V4L2·UVC 직접)입니다. librealsense2 판은 `--features slam-realsense` 로 빌드하고 `--slam "--realsense --driver librealsense …"` 로 고릅니다. rsdriver 의 장면 시각은 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한 값이라(librealsense 의 global time 처럼 시계 차이를 계속 따라가지 않음) 두 판의 절대 시각은 다를 수 있고, 장면 간격은 같습니다. rsdriver 입력은 실제 카메라 확인이 남아 있습니다.
+- **D435 입력:** 리눅스 빌드는 `rsdriver`(V4L2 · UVC 직접, Rust)로 카메라를 엽니다. 제어 기본값은 librealsense 2.59.1 과 같습니다([docs/realsense_input.md](docs/realsense_input.md)). 장면 시각은 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한 값입니다.
 
-- **아무 말로 찾기(보드):** 물체 기억은 기본으로 `~/models/siglip2-vision_npu.dxnn`(NPU) 사진 벡터를 남기고, 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 뷰어가 뜬 뒤 1 ~ 2 분 걸려 올라오고, 그 전에는 이름 글자만 비교합니다. NPU 용 인코더를 만드는 법과 정확도는 `docs/performance_log.md` 의 SigLIP2 절.
+- **아무 말로 찾기(보드):** 물체 기억은 기본으로 `~/models/siglip2-vision_npu.dxnn`(NPU) 사진 벡터를 남기고, 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 보드는 글 인코더를 Rust 로 계산하고(질의 하나 약 75 ms), PC 는 ONNX Runtime 으로 계산합니다. 확인 값은 [docs/npu_models.md](docs/npu_models.md) "글 인코더".
 - **움직일 때 번지면:** `--slam "… --exposure 8 --gain 110"` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
 
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU에서는 뷰어가 자동으로 Low 화질로 시작합니다.
@@ -136,4 +136,4 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 
 [PolyForm Noncommercial License 1.0.0](LICENSE.md) — 개인 공부·연구·교육·비영리 목적으로는 자유롭게 쓰고 고치고 나눌 수 있고, **상업적 이용은 허용하지 않습니다.** 나눌 때는 `LICENSE.md` 의 저작권 표시(Required Notice)를 함께 전합니다.
 
-저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(RTAB-Map, librealsense, OpenCV, GTSAM, SigLIP2, DEEPX 런타임)은 각자의 라이선스를 따릅니다.
+저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), rsdriver 에 옮긴 librealsense 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(ONNX Runtime, SigLIP2, DEEPX 런타임)은 각자의 라이선스를 따릅니다.

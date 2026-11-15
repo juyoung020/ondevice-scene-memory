@@ -2287,6 +2287,9 @@ fn main() {
     if argv.flag("--mlock") && !common::threads::mlock_all() {
         common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
     }
+    // DXRT 설정(NPU 코어 묶기 · 버퍼 · NFH 스레드 · 프로파일러, common::dxrt::Config): 하위 명령(view)에도
+    #[cfg(feature = "dxrt")]
+    common::dxrt::Config::from_args(|k| argv.get(k), |k| argv.flag(k)).apply();
     match argv.0.get(1).map(String::as_str) {
         Some("slam") => {
             let code = slam::app::run(&argv.0[1..]).unwrap_or_else(|e| {
@@ -2306,13 +2309,6 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args(&argv);
-    #[cfg(feature = "dxrt")]
-    {
-        // --seg-npu · --embed-npu: 두 NPU 모델을 다른 NPU 코어에 묶음(기본 all)
-        use std::sync::atomic::Ordering::Relaxed;
-        seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
-        seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
-    }
     if let Some(m) = &a.embed {
         embed::start(m);
     }

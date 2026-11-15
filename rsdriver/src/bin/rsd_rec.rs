@@ -1,4 +1,4 @@
-//! rsdriver 로 녹화(D435 녹화 도구): 정렬 확인 도구 rs_align_check 가 읽는 폴더 꼴.
+//! rsdriver 로 녹화(D435 녹화 도구): rgb · depth(정렬) · depth_raw · calib.json · frames.tsv 폴더.
 //!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--fps 30] [--exposure ms | --ae-cap ms] [--camera-profile librealsense|tracking] [--gain g] [--emitter on|off] [--skip 30]
 //! 폴더: rgb/ depth/(= depth_rs/, rsdriver 정렬) depth_raw/ yuyv/<시각>.bin(원본 YUYV) calib.json frames.tsv(시각·순번·메타·해시)
 #[cfg(target_os = "linux")]

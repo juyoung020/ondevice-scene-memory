@@ -1,5 +1,5 @@
-//! 장면 입력: TUM 폴더 재생, RealSense 카메라(`realsense` 기능), 읽기 스레드(PrefetchSource).
-//! 원본: bridge/src/frame_source.h · tum_source.cpp · prefetch_source.h · realsense_source.cpp · depth_align.cpp.
+//! 장면 입력: TUM 폴더 재생, RealSense D435(`rsdriver` 기능), 읽기 스레드(PrefetchSource).
+//! 원본: RTAB-Map 연결 프로그램의 frame_source · tum_source · prefetch_source · realsense_source · depth_align(C++).
 //! 회색조·깊이 mm 바꾸기는 OpenCV 4.10 cvtColor(COLOR_BGR2GRAY) · Mat::convertTo 와 비트까지 같게 한다.
 use crate::{Camera, Features, Frame, Pose};
 use nalgebra::{Matrix3, Rotation3, Translation3, UnitQuaternion};
@@ -7,10 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "realsense")]
-pub mod realsense;
-#[cfg(feature = "realsense")]
-pub use realsense::RealSenseSource;
 #[cfg(feature = "rsdriver")]
 pub mod rsdriver;
 #[cfg(feature = "rsdriver")]

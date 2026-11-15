@@ -1,10 +1,10 @@
 # RealSense 카메라 입력과 깊이→컬러 정렬
 
-카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → 위치 프로그램(`ondevice --slam "--realsense …"`) → 물체 기억. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 Rust 크레이트 `tools/`(정렬 라이브러리 `tools::fast_align`, librealsense 와 견주는 도구 `rs_align_check`·`align_sdk_check`, librealsense2 C API 를 직접 부름)와 `rsdriver/`(D435 드라이버, 도구 `rsd_info`·`rsd_rec`), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
+카메라 입력부: RealSense **D435**(IMU 없는 모델, USB ID 8086:0b07) RGB-D → (깊이를 컬러 화면에 정렬) → 위치 프로그램(`ondevice --slam "--realsense …"`) → 물체 기억. 이 문서는 카메라 설정, 정렬 방법과 측정, 카메라를 처음 꽂았을 때 확인 순서를 적는다. 코드는 Rust 크레이트 `tools/`(정렬 라이브러리 `tools::fast_align`, 옮겨 온 librealsense 정렬 코드 `tools::rsref` 와 시험)와 `rsdriver/`(D435 드라이버, 도구 `rsd_info`·`rsd_rec`), librealsense 는 v2.59.1. 도구와 정렬은 D400 계열(D435·D455)에 같이 쓴다.
 
 ## D435 보정값과 깊이 범위
 
-- **보드에서 읽은 값**(2026-11-06, `rtab_bridge --realsense` 첫 줄): 펌웨어 5.16.0.1, 컬러 640×480 fx 614.20 · fy 614.69 · cx 324.95 · cy 241.56, 컬러 왜곡 모델 Inverse Brown-Conrady, 깊이 단위 1 mm(1000/m). USB 3(5 Gbps)으로 붙었다.
+- **보드에서 읽은 값**(2026-11-06, librealsense 2.59.1 로 연 첫 줄): 펌웨어 5.16.0.1, 컬러 640×480 fx 614.20 · fy 614.69 · cx 324.95 · cy 241.56, 컬러 왜곡 모델 Inverse Brown-Conrady, 깊이 단위 1 mm(1000/m). USB 3(5 Gbps)으로 붙었다.
 - **깊이 기준 카메라** = 왼쪽 IR. 두 IR 사이 기준선 50 mm. 깊이 내부 보정값은 Brown-Conrady 이고 계수가 모두 0(왜곡 없음).
 - **컬러 카메라**(OV2740, 롤링 셔터)는 깊이 기준 옆에 있다(`rsd_info` 의 `depth_to_color`). D435 컬러 왜곡 계수는 0 이라 왜곡 모델 이름과 상관없이 왜곡 없는 투영과 같다(`rsd_info` 의 `coeffs` 로 확인).
 - **깊이와 컬러의 화소 밀도**: 640×480 에서 깊이 fx 는 약 383(시야 87°), 컬러 fx 는 614(시야 69°)라 **컬러가 각도당 화소가 더 많다** → 정렬은 깊이 화소마다 사각형을 채우는 경우(아래 "SIMD 규칙").
@@ -76,7 +76,7 @@ Pi 5 에서 "정렬만 수십 ms" 라는 보고(Pi 4 에서 3 장/초, `align.pr
 
 ### 정확성
 
-`tools/tests/test_align.rs`(옮겨 온 librealsense 코드 `tools/src/rsref.rs`, Apache-2.0 출처 주석), `align_sdk_check`(이 기계의 실제 SDK), `rs_align_check`(녹화 폴더):
+`tools/tests/test_align.rs`(옮겨 온 librealsense 코드 `tools/src/rsref.rs`, Apache-2.0 출처 주석). "실제 rs2::align" 줄은 librealsense 2.59.1 SDK 를 software_device 로 불러 견준 값(2026-11):
 
 | 비교 | 결과 |
 |---|---|
@@ -117,28 +117,20 @@ Rust 판(WSL, 같은 PC, `bench_align --core 5`, 출력 비트 동일): 640×480
 
 ## 카메라 확인 순서
 
-빌드(리눅스: 보드 또는 WSL, librealsense2 는 `~/opt/librealsense`):
-
-```
-RUSTFLAGS="-L $HOME/opt/librealsense/lib -C link-arg=-Wl,-rpath,$HOME/opt/librealsense/lib" \
-  cargo build --release --features realsense --manifest-path tools/Cargo.toml
-cargo test --release --manifest-path tools/Cargo.toml -- --nocapture   # 정확성 표
-```
+정렬 정확성 시험: `cargo test --release -p tools -- --nocapture`.
 
 카메라를 **USB3 포트**(파란 포트)에 꽂고 `target/release` 에서:
 
 1. `rsd_info > rsd_info.json` — 장치·펌웨어·USB, 640×480 깊이·컬러 보정값과 외부 변환(rsdriver 가 장치에서 직접 읽은 값).
 2. `rsd_rec data/d435/desk01 600` — 녹화(`rgb/` · `depth/`(rsdriver 정렬) · `depth_raw/` · `calib.json` · `frames.tsv`).
-3. `rs_align_check data/d435/desk01`(`tools`, `realsense` 기능) — 녹화된 원래 깊이로 fast_align 과 librealsense rs2::align(software_device 로 다시)을 돌려 화소 차이·코어 하나 시간을 낸다. 정확한 식은 다른 화소 0 이어야 한다(끝 코드 0).
-4. 최소 거리: `rsd_rec data/d435/minz 450` 을 켜고 벽을 정면으로 1 m 에서 천천히 다가가며 가운데 깊이가 0 으로 떨어지는 거리를 적는다. 레이저 끔(`--emitter off`)과 비교.
-5. 물체 기억 입력: `rgbd2tum <녹화> <녹화>_freiburg3 fx fy cx cy 1000` 으로 TUM fr3 형식(5000/m)으로 바꿔 `ondevice --slam "--tum …"` 과 `rtabmap-rgbd_dataset` 에 넣는다.
+3. 최소 거리: `rsd_rec data/d435/minz 450` 을 켜고 벽을 정면으로 1 m 에서 천천히 다가가며 가운데 깊이가 0 으로 떨어지는 거리를 적는다. 레이저 끔(`--emitter off`)과 비교.
+4. 물체 기억 입력: `rgbd2tum <녹화> <녹화>_freiburg3 fx fy cx cy 1000` 으로 TUM fr3 형식(5000/m)으로 바꿔 `ondevice --slam "--tum …"` 에 넣는다.
 
-녹화 폴더: `rgb/`(컬러), `depth/`(fast_align 정렬, 컬러 크기), `depth_raw/`(정렬 전), `depth_rs/`(rs2::align), 각 목록 `rgb.txt`·`depth.txt`·`depth_raw.txt`·`depth_rs.txt`, 짝 `association.txt`, `calib.json`(보정값·설정·SDK 정렬 구현·변환 명령), `rec_stats.json`(장면 수·시간·rs2::align 과 다른 화소). PNG 는 `image` 크레이트로 쓴다(16 비트 회색·RGB8, 화소는 원래 lodepng 판과 같음). 깊이 PNG 는 카메라 단위 그대로(1 mm = 1): 단위 바꾸기와 fr3 보정값으로 다시 그리기는 `rgbd2tum` 한 곳에서 한다(TUM 입력은 폴더 이름으로 fr1/2/3 보정값을 고르고(`common::tum`) 5000/m 로 읽음).
+녹화 폴더: `rgb/`(컬러), `depth/`(fast_align 정렬, 컬러 크기), `depth_raw/`(정렬 전), `depth_rs/`(rsdriver 정렬), 각 목록 `rgb.txt`·`depth.txt`·`depth_raw.txt`·`depth_rs.txt`, 짝 `association.txt`, `calib.json`(보정값·설정·SDK 정렬 구현·변환 명령), `rec_stats.json`(장면 수·시간·rs2::align 과 다른 화소). PNG 는 `image` 크레이트로 쓴다(16 비트 회색·RGB8, 화소는 원래 lodepng 판과 같음). 깊이 PNG 는 카메라 단위 그대로(1 mm = 1): 단위 바꾸기와 fr3 보정값으로 다시 그리기는 `rgbd2tum` 한 곳에서 한다(TUM 입력은 폴더 이름으로 fr1/2/3 보정값을 고르고(`common::tum`) 5000/m 로 읽음).
 
 ## Pi 5 에서
 
-- librealsense v2.59.1 소스 빌드(`-DFORCE_RSUSB_BACKEND=ON -DBUILD_WITH_NEON=ON -DCMAKE_BUILD_TYPE=Release`, NEON 은 aarch64 기본값) 뒤 위 "빌드" 명령으로 같은 도구가 빌드된다.
-- 보드에서 `bench_align --core 3` 와 `rs_align_check <녹화> --core 3 --threads 3` 로 PC 환산 대신 실측을 남긴다. 도구가 찍는 SDK 정렬 구현 줄이 "NEON-optimized" 인지 확인한다.
+- 보드에서 `bench_align --core 3` 로 PC 환산 대신 실측을 남긴다(옮겨 온 NEON 경로와 fast_align).
 - PC 에서 aarch64 확인(WSL, `rustup target add aarch64-unknown-linux-gnu`, `g++-aarch64-linux-gnu`·`qemu-user`):
 
 ```

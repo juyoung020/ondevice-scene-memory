@@ -25,6 +25,8 @@
 pub mod live;
 pub mod memfs;
 mod search;
+#[cfg(feature = "search")]
+mod textnet;
 mod walls;
 
 use std::collections::HashMap;

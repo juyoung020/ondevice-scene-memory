@@ -159,7 +159,7 @@ mod worker {
     enum Net {
         #[cfg(feature = "onnx")]
         Onnx(ort::session::Session),
-        /// DX-M1: 입력·출력 모두 f32 (패치 나누기와 끝 MLP 는 런타임이 CPU 로 돌림)
+        /// DX-M1: 입력·출력 모두 f32(조각 배치 입력, NPU 작업 하나)
         #[cfg(feature = "dxrt")]
         Dx(crate::seg::dx::Engine),
     }
@@ -167,7 +167,7 @@ mod worker {
         fn open(model: &str) -> Net {
             #[cfg(feature = "dxrt")]
             if model.ends_with(".dxnn") {
-                let e = crate::seg::dx::Engine::with_cpu_tasks(model);
+                let e = crate::seg::dx::Engine::embed(model);
                 assert_eq!(e.out.len(), DIM * 4, "embed model output");
                 common::info!("embed: NPU 모델 {model}, 출력 {}", e.tensors[0].0);
                 return Net::Dx(e);

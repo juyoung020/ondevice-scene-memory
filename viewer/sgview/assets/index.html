@@ -1800,6 +1800,8 @@ function applyMapDelta(d) {
   gMap.visible = opt("c_map"); invalidate();
 }
 function applyDelta(m) {
+  if (m.pose) onFilePose(m.pose);   // the camera first: it does not wait for the view / map work below
+  if (!m.ver && !m.head && !m.objs && !m.traj && !m.map && !m.oct) { invalidate(); return; }
   const t0 = performance.now();
   met.kb += m.bytes / 1024; met.lastChange = t0;
   if (m.head) { const h = Object.assign({}, dlt.head || {}, m.head); for (const k of m.head.__del || []) delete h[k]; delete h.__del; dlt.head = h; }
@@ -1841,7 +1843,6 @@ function applyDelta(m) {
       octIndex(q.run, { vox:o.voxel, g:o.g, depth:o.depth, dir:o.dir }, q.list, q.n); return false;
     });
   }
-  if (m.pose) onFilePose(m.pose);
   if (m.ver) { met.fms += Math.max(0, performance.timeOrigin + t0 - m.t); met.ams += performance.now() - t0; met.nv++; }
   invalidate();
 }

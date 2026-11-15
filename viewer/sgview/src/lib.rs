@@ -869,7 +869,19 @@ fn stream_pusher(st: Arc<State>) {
         });
         let keep = quiet.elapsed() > Duration::from_secs(10);
         let mut any = false;
-        // binary pages: the view split once, the map and octree list read once, then a frame per page with only what it lacks
+        // binary pages: the camera pose goes out first on its own (the view split / map / octree list below can take
+        // tens of ms when a new view arrives), then the view split once, the map and octree list read once, then a frame per page with only what it lacks
+        if cl.iter().any(|c| c.bin.is_some()) {
+            let pose = file_ver(&pp).and_then(|v| {
+                let t = read_file(&pp)?;
+                let b = t.trim_ascii();
+                (b.starts_with(b"{") && b.ends_with(b"}")).then(|| (v, Arc::new(b.to_vec())))
+            });
+            cl.retain_mut(|c| match c.bin.as_mut().and_then(|b| delta::pose_frame(b, &pose)) {
+                Some(f) => c.s.write_all(&f).is_ok(),
+                None => true,
+            });
+        }
         let now = cl.iter().any(|c| c.bin.is_some()).then(|| {
             let view = load_view(&st).and_then(|v| delta::parts(&st.parts, &v).map(|p| (v, p)));
             let map = current_map(&st);

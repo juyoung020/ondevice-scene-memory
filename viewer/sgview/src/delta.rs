@@ -160,6 +160,22 @@ pub struct Now<'a> {
     pub pose: Option<(String, Arc<Vec<u8>>)>,
 }
 
+/// 위치만 담은 덩어리(바뀌었을 때): 판 · 지도 · 노드를 짜기 전에 먼저 보낸다(무거운 판이 위치를 늦추지 않게)
+pub fn pose_frame(c: &mut Client, pose: &Option<(String, Arc<Vec<u8>>)>) -> Option<Vec<u8>> {
+    let (v, b) = pose.as_ref()?;
+    if *v == c.pose_v {
+        return None;
+    }
+    let mut w = W(vec![0; 4]);
+    let at = w.open(7);
+    w.0.extend_from_slice(b);
+    w.close(at);
+    c.pose_v = v.clone();
+    let n = (w.0.len() - 4) as u32;
+    w.0[..4].copy_from_slice(&n.to_le_bytes());
+    Some(w.0)
+}
+
 /// 이 페이지가 아직 못 받은 것만 담은 덩어리(없으면 None)
 pub fn frame(c: &mut Client, now: &Now) -> Option<Vec<u8>> {
     let mut w = W(vec![0; 4]);

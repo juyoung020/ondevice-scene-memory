@@ -446,6 +446,14 @@ pub struct OdometryKlt {
     /// 마지막 성공 장면의 깊이 격자(깊이 ICP)
     prev_sub: Vec<u16>,
     cur_sub: Vec<u16>,
+    /// IMU 융합(None = 카메라 전용, 결과가 IMU 없는 판과 비트까지 같음)
+    pub imu: Option<crate::imu::Fusion>,
+    /// 다음 첫 장면을 중력으로 수평 맞춤(처음 · 원점 리셋 뒤)
+    level_pending: bool,
+    /// 지금 지도가 중력으로 수평 맞춰져 있음(지도 z = 위)
+    pub gravity_aligned: bool,
+    /// IMU 회전으로 이어 붙인 장면 수
+    pub by_imu: usize,
 }
 
 impl OdometryKlt {
@@ -485,6 +493,10 @@ impl OdometryKlt {
             depth_only: p.get_bool("OdomKlt/DepthOnly", false),
             prev_sub: Vec::new(),
             cur_sub: Vec::new(),
+            imu: None,
+            level_pending: true,
+            gravity_aligned: false,
+            by_imu: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
@@ -497,6 +509,11 @@ impl OdometryKlt {
     pub fn reset_tf(&mut self, pose: Tf) {
         // 같은 자리에서 다시 시작(이어 붙이기)이면 마지막 성공 장면 깊이를 남겨, 첫 장면에서 그 깊이와 ICP 로 실제 움직임을 잡는다
         let same_place = pose == self.pose;
+        // 원점에서 처음부터(리셋)면 다음 첫 장면을 다시 중력으로 수평 맞춤
+        if pose == Tf::IDENTITY {
+            self.level_pending = true;
+            self.gravity_aligned = false;
+        }
         self.pose = pose;
         self.prev = None;
         self.tracks.clear();
@@ -730,6 +747,17 @@ impl OdometryKlt {
             self.tracks.clear();
             // 이어 붙이기: 마지막 성공 장면 깊이가 남아 있으면 움직임 없음에서 시작하는 ICP 로 그사이 움직임을 바로잡음
             self.bridge_verified = false;
+            // IMU: 원점에서 시작하는 첫 장면이면 지도 z 를 중력 위로(가장 작은 회전, 방향은 그대로)
+            if let Some(u) = self.imu.as_mut() {
+                u.poll(&local, f.t, f.t);
+                if std::mem::take(&mut self.level_pending) && self.pose == Tf::IDENTITY {
+                    if let Some(up) = u.up_body() {
+                        self.pose = crate::imu::tf_of(&crate::imu::rot_between(&up, &[0.0, 0.0, 1.0, 0.0]), [0.0; 3]);
+                        self.gravity_aligned = true;
+                        common::info!("IMU: 첫 장면을 중력으로 수평 맞춤({:.1}° 기울어 있었음)", up[2].clamp(-1.0, 1.0).acos().to_degrees());
+                    }
+                }
+            }
             if !self.prev_sub.is_empty() && !f.depth_mm.is_empty() && sub_depth(&f.depth_mm, w, h, &mut self.cur_sub) > 1000 {
                 // 확인용이라 엄격하게: 점 절반 이상이 짝, 바닥·벽 하나처럼 미끄러지는 장면은 확인 안 된 것으로
                 if let Some(tpo) = icp_q(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &Tf::IDENTITY, 0.5, 1e-2) {
@@ -755,7 +783,25 @@ impl OdometryKlt {
         let dt = f.t - self.prev_t;
         // 1) 등속 예측 시작점
         // 0.2 초 넘게 비면(녹화 빈틈·놓친 뒤) 등속 예측은 틀리기 쉬워 쓰지 않음(움직임 없음에서 시작)
-        let pred = if !self.velocity.is_null() && dt > 0.0 && dt < 0.2 {
+        // IMU: 마지막 성공 장면 → 이번 장면 몸체 회전(이어 붙이기 한도 안)
+        let imu_rot = match self.imu.as_mut() {
+            Some(u) => {
+                u.poll(&local, f.t, self.prev_t);
+                if dt > 0.0 && dt <= u.bridge_max { u.rotation(self.prev_t, f.t) } else { None }
+            }
+            None => None,
+        };
+        let pred = if let Some(r) = &imu_rot {
+            // 회전은 IMU, 이동은 등속(0.2 초 안일 때만)
+            let tr = if !self.velocity.is_null() && dt < 0.2 {
+                let v = self.velocity.xyz_rpy();
+                let m = |x: f32| (x as f64 * dt) as f32;
+                [m(v[0]), m(v[1]), m(v[2])]
+            } else {
+                [0.0; 3]
+            };
+            Some(self.pose.mul(&crate::imu::tf_of(r, tr)))
+        } else if !self.velocity.is_null() && dt > 0.0 && dt < 0.2 {
             let v = self.velocity.xyz_rpy();
             let m = |x: f32| (x as f64 * dt) as f32;
             Some(self.pose.mul(&Tf::from_xyz_rpy(m(v[0]), m(v[1]), m(v[2]), m(v[3]), m(v[4]), m(v[5]))))
@@ -830,6 +876,31 @@ impl OdometryKlt {
                     return self.result(transform, Self::eye(1e-3), 0, n_tracks, true);
                 }
             }
+            // IMU: 영상이 다 실패한 짧은 구간은 마지막 성공 위치 × IMU 회전으로 이어 붙임(이동 0, 불확실).
+            // 마지막 성공 장면 · 점은 그대로 둬 다음 장면이 IMU 예측으로 거기서 다시 따라감
+            if let Some(r) = &imu_rot {
+                let pose_b = self.pose.mul(&crate::imu::tf_of(r, [0.0; 3]));
+                self.prev = Some(prev);
+                self.spare = Some(cur);
+                self.by_imu += 1;
+                self.diag = Diag { method: 5, q: Quality::default(), jump: -1.0 };
+                let mut cov = Self::eye(0.1);
+                for (i, row) in cov.iter_mut().enumerate().skip(3) {
+                    row[i] = 1e-3;
+                }
+                return OdomResult {
+                    pose: Some(pose_b.to_pose()),
+                    tf: pose_b,
+                    lost: false,
+                    covariance: cov,
+                    inliers: 0,
+                    matches: n_tracks,
+                    keyframe_updated: false,
+                    transform: self.pose.inverse().mul(&pose_b),
+                    features: Features::default(),
+                    reg: None,
+                };
+            }
             // 놓침: 마지막 성공 장면 그대로 둠(다음 장면이 거기서 다시)
             self.prev = Some(prev);
             self.spare = Some(cur);
@@ -841,6 +912,15 @@ impl OdometryKlt {
             let v = transform.xyz_rpy();
             let d = |x: f32| (x as f64 / dt) as f32;
             self.velocity = Tf::from_xyz_rpy(d(v[0]), d(v[1]), d(v[2]), d(v[3]), d(v[4]), d(v[5]));
+        }
+        // IMU: 광류가 잘 된 장면의 영상 회전으로 자이로 치우침을 고침
+        if let (Some(u), Some(r)) = (self.imu.as_mut(), &imu_rot) {
+            if std::env::var("IMU_DBG").is_ok() {
+                let (a, b) = (crate::imu::so3_log(r), crate::imu::so3_log(&crate::imu::m34_of_tf(&transform)));
+                let d = |v: [f32; 4]| v.map(|x| x.to_degrees() / dt as f32);
+                eprintln!("imu {:?} vis {:?} °/s bias {:?}", d(a), d(b), u.bias);
+            }
+            u.correct_bias(r, &crate::imu::m34_of_tf(&transform), dt);
         }
         self.pose = pose;
         let inliers = ids.len();

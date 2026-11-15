@@ -15,6 +15,7 @@ pub mod stream;
 pub mod app;
 pub mod bufpool;
 pub mod simd;
+pub mod imu;
 
 use nalgebra::{Isometry3, Point3};
 

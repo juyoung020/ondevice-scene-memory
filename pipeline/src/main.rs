@@ -429,6 +429,7 @@ struct Frame {
     seg: f64,
     lost: bool,       // 스트림 입력에서 위치를 놓친 장면(지도·물체에 넣지 않음)
     held: bool,       // 스트림: 맡아 둘 장면(믿는 지도와 이어지면 다시 쌓기 때 지도에 들어감)
+    gravity: bool,    // 스트림: 지도 z 가 중력 위(IMU)
     anchor: u32,      // 스트림: 기준 지도 노드 id(0 = 없음)
     graph: Vec<stream::Node>, // 스트림: 이 장면 앞에 온 그래프 블록 노드
 }
@@ -492,7 +493,7 @@ impl InferStage {
 
 /// 분할 단계 3 — 후처리: 마스크 해독, 본 스레드에 넘길 장면으로 묶음. 버퍼는 돌려준다.
 fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>) -> (Frame, (seg::SegIn, seg::SegRaw)) {
-    let (w, h, lost, held) = (j.sf.w, j.sf.h, j.sf.lost(), j.sf.held());
+    let (w, h, lost, held, gravity) = (j.sf.w, j.sf.h, j.sf.lost(), j.sf.held(), j.sf.gravity());
     let dets = j.do_seg.then(|| {
         let c = Instant::now();
         let d = j.dets.take().unwrap_or_else(|| seg::seg_post(&j.bufs.1, j.bufs.0.geom, w, h, conf));
@@ -503,7 +504,7 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         d
     });
     let mut sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, anchor: sf.anchor, graph: j.graph };
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, gravity, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
 
@@ -865,7 +866,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
                 graph.append(&mut rd.take_graph());
                 if !graph.is_empty() {
-                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, anchor: 0, graph };
+                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, gravity: false, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
                 common::info!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
@@ -909,7 +910,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let c1 = Instant::now();
                 let dets = Some(seg.run(&rgb, w, h, conf));
                 let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, anchor: 0, graph: vec![] };
+                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, gravity: false, anchor: 0, graph: vec![] };
                 if tx.send(f).is_err() {
                     break;
                 }
@@ -949,7 +950,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
     let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
-    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, gravity, anchor, graph }) = rx.recv() {
         // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
         let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
         *taken.n.lock().unwrap() += 1;
@@ -1068,6 +1069,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             kfs.dirty = true;
             force_rb = true;
             common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
+        }
+        // 위치 쪽이 IMU 로 지도를 중력 수평으로 맞춰 보냄: 받은 그대로 수평(첫 장면 가정 · 바닥 합의 없음, 수평 버튼은 그대로 됨)
+        if gravity && !leveled && a.stream.is_some() && !a.no_level {
+            (leveled, upright, refine) = (true, false, false);
+            common::info!("수평: 위치 추적이 IMU 중력으로 맞춘 지도를 그대로 씀");
         }
         if std::mem::take(&mut upright) && !leveled {
             stream_fix = rot_between(&[-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]], &[0.0, 0.0, 1.0]);

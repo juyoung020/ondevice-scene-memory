@@ -513,6 +513,41 @@ mod engine {
         /// 지도 전체에서 다시 잡기: 모든 지도 노드와 기술자 닮음(해밍 < 40 인 짝 수, 이번 특징 100 개 표본)으로 순위를 매기고
         /// 위 3 개만 PnP 로 맞춰 본다(최근 기준 장면만 보는 reloc 와 달리 오래전 노드도). 성공하면 (위치, 맞은 점, 공분산)
         /// 광류 경로: 방금 다시 시작한 장면이 마지막 성공 장면 깊이와 ICP 로 맞았는지
+        /// IMU 융합 켜기(광류 경로). F2F 면 Err
+        pub fn set_imu(&mut self, f: crate::imu::Fusion) -> Result<(), String> {
+            match &mut self.odom {
+                Odom::Klt(o) => {
+                    o.imu = Some(f);
+                    Ok(())
+                }
+                _ => Err("IMU 융합은 광류 경로(Odom/Strategy=9)에서만".into()),
+            }
+        }
+
+        /// 지도 z 가 중력 위로 맞춰져 있는지(IMU)
+        pub fn gravity_aligned(&self) -> bool {
+            matches!(&self.odom, Odom::Klt(o) if o.gravity_aligned)
+        }
+
+        /// IMU 진단: (지도 위와 IMU 위 사이각 °, IMU 로 이어 붙인 장면 수, 치우침, 치우침 고친 수)
+        /// IMU 끝 요약 한 줄
+        pub fn imu_summary(&self) -> Option<String> {
+            match &self.odom {
+                Odom::Klt(o) => o.imu.as_ref().map(|u| {
+                    let (n, d, f) = u.counts();
+                    format!("IMU: 표본 {n} 개(링 가득 차 버림 {d}, 읽기 실패 {f}), IMU 회전으로 이어 붙인 장면 {}, 자이로 치우침 {:.4} {:.4} {:.4} rad/s(영상으로 고친 수 {}), 지금 기울기 {:.1}°", o.by_imu, u.bias[0], u.bias[1], u.bias[2], u.n_bias_upd, u.tilt_deg(&o.pose_tf()))
+                }),
+                _ => None,
+            }
+        }
+
+        pub fn imu_diag(&self) -> Option<(f32, usize, [f32; 4], u64)> {
+            match &self.odom {
+                Odom::Klt(o) => o.imu.as_ref().map(|u| (u.tilt_deg(&o.pose_tf()), o.by_imu, u.bias, u.n_bias_upd)),
+                _ => None,
+            }
+        }
+
         /// 광류 경로의 마지막 장면 진단
         pub fn klt_diag(&self) -> Option<crate::klt::Diag> {
             match &self.odom {
@@ -828,7 +863,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초]] [--Group/Name 값 ...]"
     );
 }
 
@@ -873,6 +908,12 @@ pub struct Args {
     fps: u32,
     max_frames: i64,
     overrides: Vec<(String, String)>,
+    /// IMU 융합 모드: I2C 장치(빈 값 = 카메라 전용 모드)
+    imu: String,
+    /// IMU-카메라 보정 yaml(빈 값 = 저장소 docs/imu_cam_calib.yaml 을 빌드에 넣은 것)
+    imu_calib: String,
+    /// 영상이 다 실패한 구간을 IMU 회전으로 이어 붙이는 최대 시간(초)
+    imu_bridge: f64,
 }
 
 /// 명령줄(0 번은 프로그램 이름) → 설정. 도움말·잘못된 인자면 끝 코드
@@ -911,6 +952,9 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         fps: 30,
         max_frames: -1,
         overrides: vec![],
+        imu: String::new(),
+        imu_calib: String::new(),
+        imu_bridge: 1.0,
     };
     let mut i = 1;
     let num = |s: &str| -> Result<f64, i32> {
@@ -969,6 +1013,9 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
                 common::info!("--db: 이 판에는 데이터베이스 저장이 없어 넘어감");
             }
             "--max-frames" => a.max_frames = num(&val()?)? as i64,
+            "--imu" => a.imu = val()?,
+            "--imu-calib" => a.imu_calib = val()?,
+            "--imu-bridge" => a.imu_bridge = num(&val()?)?,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
             "--no-bridge" => a.bridge = false,
@@ -1051,6 +1098,17 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     if (a.realsense || a.rate > 0.0) && !a.no_boost {
         common::info!("위치 추적 스레드 우선: {}", common::threads::boost_tracking());
     }
+    // IMU 융합 모드: 읽기 스레드를 카메라보다 먼저 띄워 첫 장면 전에 중력·치우침을 잡는다
+    let imu_fusion = if a.imu.is_empty() {
+        None
+    } else {
+        let calib = crate::imu::Calib::parse(&if a.imu_calib.is_empty() { crate::imu::DEFAULT_CALIB.to_string() } else { std::fs::read_to_string(&a.imu_calib).map_err(|e| format!("{}: {e}", a.imu_calib))? })?;
+        let ring = crate::imu::Ring::new();
+        crate::imu::spawn_reader(&a.imu, ring.clone())?;
+        common::info!("모드: IMU 융합(시각 보정 {:+.4} 초, 이어 붙이기 최대 {} 초)", calib.shift, a.imu_bridge);
+        Some(crate::imu::Fusion::new(ring, calib, a.imu_bridge))
+    };
+    let imu_on = imu_fusion.is_some();
     // 스트림이 표준출력이면 그 파일 기술자를 따로 떼어 두고 표준출력은 표준오류로 돌린다
     #[cfg(unix)]
     let stream_fd = (!in_proc && a.out == "-").then(sys::take_stdout);
@@ -1105,6 +1163,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let reloc_min = params.get("Vis/MinInliers", 20i32).max(25);
     let mut eng = engine::Engine::new(&params, &odom_params, reloc_min);
     let klt_path = params.get("Odom/Strategy", 0i32) == 9;
+    if let Some(f) = imu_fusion {
+        eng.set_imu(f)?;
+    }
     // 실시간(카메라·찍은 속도 재생)이면 지도 갱신을 따로 도는 스레드로(--map-inline 으로 끔). 최대 속도 재생은 결정적이게 그대로
     if (a.realsense || a.rate > 0.0) && !a.map_inline {
         eng.start_map_thread();
@@ -1146,7 +1207,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let _ = writeln!(f, "# timestamp x y z qx qy qz qw (OpenCV 카메라 → RTAB-Map 지도, 보낸 그대로)");
     }
     if let Some(f) = stats_f.as_mut() {
-        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose,quality,method,klt_inliers,klt_ratio,reproj_rms,spread,jump");
+        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose,quality,method,klt_inliers,klt_ratio,reproj_rms,spread,jump{}", if imu_on { ",tilt_deg" } else { "" });
     }
     #[cfg(unix)]
     if !in_proc {
@@ -1506,7 +1567,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         // 맡길 장면: 새 지도에서 위치를 구했고 그 지도의 노드를 이미 보냈을 때
         let held = hold && pose.is_some() && !info.lost && !new_map && held_nodes.contains_key(&held_last);
         let mut of = OutFrame {
-            flags: if lost { stream::LOST } else { 0 } | if new_map { stream::NEW_MAP } else { 0 } | if corrected { stream::MAP_CORRECTED } else { 0 } | if held { stream::HELD } else { 0 },
+            flags: if lost { stream::LOST } else { 0 } | if new_map { stream::NEW_MAP } else { 0 } | if corrected { stream::MAP_CORRECTED } else { 0 } | if held { stream::HELD } else { 0 } | if eng.gravity_aligned() { stream::GRAVITY } else { 0 },
             map_id,
             seq: n as u64,
             t: fr.t,
@@ -1573,11 +1634,16 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         s_send.add(send_ms);
         s_total.add(total_ms);
         if let Some(f) = stats_f.as_mut() {
-            let _ = writeln!(
+            let _ = write!(
                 f,
                 "{n},{:.6},{read_ms:.3},{odom_ms:.3},{slam_ms:.3},{send_ms:.3},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
                 fr.t, lost as i32, new_map as i32, corrected as i32, loop_ as i32, info.features, info.inliers, held as i32, no_pose as i32, quality, dg.method, dg.q.inliers, dg.q.ratio, dg.q.rms, dg.q.spread, dg.jump
             );
+            // IMU 모드만 끝 칸(지도 위와 IMU 위 사이각)
+            if let Some((tilt, ..)) = eng.imu_diag() {
+                let _ = write!(f, ",{tilt:.2}");
+            }
+            let _ = writeln!(f);
         }
         n += 1;
     }
@@ -1608,6 +1674,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     }
     common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
     common::info!("위치 질: 좋음 {} · 불확실 {} · 놓침 {}", nq[0], nq[1], nq[2]);
+    if let Some(s) = eng.imu_summary() {
+        common::info!("{s}");
+    }
     if provisional {
         common::info!("이어지지 않은 새 지도에서 임시 위치로 바로 보낸 장면 {n_prov}, 지도 전체에서 찾은 잇기 후보 {n_merge_try} 번");
     }

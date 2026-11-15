@@ -18,6 +18,8 @@ pub const HELD: u32 = 8;
 pub const PROVISIONAL: u32 = 16;
 /// 위치가 불확실함(깊이 ICP · 확인 안 된 이어 붙이기 · 이어지지 않은 새 지도 · 다시 시작한 첫 장면): 뷰어가 카메라를 다른 색으로
 pub const UNCERTAIN: u32 = 32;
+/// 지도 z 가 중력 위(IMU 로 수평 맞춤): 받는 쪽은 바닥 합의·첫 장면 똑바름 가정 없이 그대로 수평으로 씀
+pub const GRAVITY: u32 = 64;
 /// 그래프 블록 MMG1 머리: 표시 4 + 머리 크기 4 + 노드 수 4 + 예약 4
 pub const GRAPH_HEADER_BYTES: usize = 16;
 pub const IDENTITY: [f64; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];

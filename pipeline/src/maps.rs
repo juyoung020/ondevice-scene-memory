@@ -784,7 +784,8 @@ impl Memory {
         // 두 번 이하로 본 물체는 3 초가 지나고 분할한 장면 8 장에서도 안 보였을 때 지움(분할을 건너뛴 장면은 못 본 것으로 세지 않음)
         let ns = self.n_seg;
         // 몇 번 안 보였고 분할 점수도 낮은 물체(책상 모서리 · 뭉개진 조각: 이름을 붙여도 대개 틀림)도 같은 때 지움
-        let weak = |o: &Obj| o.n_obs <= 2 || (o.n_obs < WEAK_OBS && o.score < WEAK_SCORE);
+        // 이름이 붙은 물체(사진으로 확실한 이름)는 지우지 않음: 몇 번만 본 진짜 물체(로봇 등)를 기억에서 잃지 않게
+        let weak = |o: &Obj| o.n_obs <= 2 || (o.n_obs < WEAK_OBS && o.score < WEAK_SCORE && crate::embed::name(o.id, o.name != "object").is_none());
         self.objs.retain(|o| !(weak(o) && now - o.last_seen > 3.0 && ns.saturating_sub(o.last_seg) >= 8));
         n0 - self.objs.len()
     }

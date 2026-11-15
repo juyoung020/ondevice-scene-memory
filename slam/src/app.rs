@@ -319,10 +319,12 @@ mod engine {
             let words = |d: &[u8; 32]| -> [u64; 4] { std::array::from_fn(|i| u64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap())) };
             let step = (self.cur.desc.len() / 100).max(1);
             let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
+            let from = self.kf_db.len().saturating_sub(40);
             let mut scores: Vec<(usize, usize)> = self
                 .kf_db
                 .iter()
                 .enumerate()
+                .skip(from)
                 .map(|(i, (kf, _))| {
                     let kw: Vec<[u64; 4]> = kf.desc.iter().map(words).collect();
                     let hits = q
@@ -338,7 +340,7 @@ mod engine {
                 eprintln!("global db {} q {} top {:?}", self.kf_db.len(), q.len(), &scores[..scores.len().min(3)]);
             }
             let cam = f.cam.clone();
-            for &(hits, i) in scores.iter().take(2) {
+            for &(hits, i) in scores.iter().take(1) {
                 if hits < 10 {
                     break;
                 }
@@ -460,7 +462,9 @@ mod engine {
             let step = (self.cur.desc.len() / 60).max(1);
             let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
             let mut best: Vec<(usize, usize)> = Vec::new();
-            for (i, (kf, _)) in self.kf_db.iter().enumerate() {
+            // 최근 40 노드만(장면당 시간 상한)
+            let from = self.kf_db.len().saturating_sub(40);
+            for (i, (kf, _)) in self.kf_db.iter().enumerate().skip(from) {
                 let (id, trusted) = self.kf_ids[i];
                 if !trusted || id <= 0 {
                     continue;
@@ -487,7 +491,7 @@ mod engine {
             }
             best.sort_by(|a, b| b.cmp(a));
             let cam = f.cam.clone();
-            for &(hits, i) in best.iter().take(2) {
+            for &(hits, i) in best.iter().take(1) {
                 if hits < 8 {
                     break;
                 }
@@ -568,7 +572,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--driver rsdriver|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--bridge-gap 초(1)] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -591,6 +595,8 @@ pub struct Args {
     bridge: bool,
     /// 이어지지 않은 새 지도의 장면을 맡아 두지 않고 임시 위치로 바로 보냄(--no-provisional 로 끔)
     provisional: bool,
+    /// 이 시간(초) 이하의 빈틈만 그 자리에서 이어 붙임(그보다 길면 새 지도, 깊이 ICP 로 확인되면 예외)
+    bridge_gap: f64,
     reset_at: i64,
     stride: usize,
     block: i32,
@@ -627,6 +633,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
         bridge: true,
         provisional: true,
+        bridge_gap: 1.0,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
@@ -696,6 +703,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
             "--no-bridge" => a.bridge = false,
             "--no-provisional" => a.provisional = false,
+            "--bridge-gap" => a.bridge_gap = num(&val()?)?,
             "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
             // 프로세스 설정(ondevice 가 처음에 읽음): 실시간 배치·메모리 묶기·조용히
             "--rt" => {
@@ -827,6 +835,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let mut n_global = 0i64;
     let mut n_loop_rejected = 0i64;
     let mut n_merge_try = 0i64;
+    let mut last_merge_try = f64::MIN;
     let mut max_corr = (0f32, 0f32);
     let mut last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
     let mut n_bridge_ok = 0i64;
@@ -957,7 +966,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 break;
             }
             // 최근 기준 장면으로 못 잡으면 지도 전체에서(광류 경로, 놓친 동안 장면마다)
-            if !relocalized && klt_path && fr.t - last_good_t > 0.2 {
+            // 장면당 예산: 이 장면에서 위치 추적이 이미 20 ms 넘게 썼으면 다음 장면으로 미룸(추적 스레드가 40 ms 넘게 막히지 않게)
+            if !relocalized && klt_path && fr.t - last_good_t > 0.2 && ms_since(c1) < 20.0 {
                 if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize) {
                     eng.odom_reset(p);
                     let info2 = eng.odom_process(&fr, None);
@@ -999,7 +1009,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let mut new_map = false;
         // 이어 붙이기는 그사이 움직임을 아는 경우만: 깊이 ICP 로 자리를 확인했거나 빈틈이 1 초 이하.
         // 그보다 길면(사람이 그사이 걸었을 수 있음) 새 지도를 열고 루프 클로저가 옛 지도와 잇게 둔다(틀린 이어 붙이기를 거대한 보정으로 끌어오지 않게)
-        if bridge && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 && (eng.bridge_verified() || gap_since_good <= 1.0) {
+        if bridge && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 && (eng.bridge_verified() || gap_since_good <= a.bridge_gap) {
             // 이어 붙이기: 위치 추적은 마지막 위치에서 다시 시작했다. 같은 지도에 큰 불확실성(0.5 m², 0.5 rad²)으로 이어
             // 지도가 끊기지 않게 하고, 실제로 어긋났으면 뒤의 루프 클로저가 그래프 최적화로 바로잡는다
             info.cov = [0.0; 36];
@@ -1047,7 +1057,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if process {
             eng.trusted = anchored;
             // 이어지지 않은 새 지도: 노드를 넣을 때마다 믿는 지도 노드 전체에서 이어 줄 후보를 찾아 루프 후보로 넘김
-            if !anchored && klt_path && data_id > 0 && pose.is_some() && eng.propose_merge(&fr, reloc_min as usize) {
+            // 잇기 후보 찾기는 1.5 초에 한 번, 이 장면 위치 추적이 가벼웠을 때만
+            if !anchored && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= 1.5 && ms_since(c1) < 15.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
                 n_merge_try += 1;
             }
             eng.slam_process(&fr, data_id > 0, pose, &info.cov, info.velocity());

@@ -107,7 +107,7 @@
     <div class="num">EDL strength <input type="number" id="n_edl" value="0.4" min="0" max="3" step="0.05"></div>
     <div class="num" title="depth steps smaller than this (log2 view depth, 0.025 ≈ 1.7 %: Kinect depth noise between neighbouring splats) are not shaded: the small depth jitter between overlapping splats of one surface stays unshaded, real edges and creases still darken">EDL tolerance <input type="number" id="n_edltol" value="0.025" min="0" max="0.1" step="0.002"></div>
     <label class="row"><input type="checkbox" id="c_labels" checked> Labels</label>
-    <label class="row"><input type="checkbox" id="c_olabels"> Object name labels</label>
+    <label class="row"><input type="checkbox" id="c_olabels" checked> Object name labels</label>
     <div class="num" title="label only the N largest objects still in place, one per name (0 = every object with its id); labels that would overlap another are left out">Max object name labels <input type="number" id="n_olmax" value="0" min="0" max="200" step="1"></div>
     <label class="row" title="short names beside each layer (3D map, objects, rooms)"><input type="checkbox" id="c_llabels"> Layer names</label>
     <label class="row"><input type="checkbox" id="c_points" checked> Segment points</label>
@@ -143,7 +143,7 @@
     <label class="row"><input type="checkbox" id="g_on"> Show graph layers</label>
     <label class="row"><input type="checkbox" id="g_objs" checked> Objects layer</label>
     <label class="row"><input type="checkbox" id="g_thumbs" checked> Object thumbnails</label>
-    <label class="row"><input type="checkbox" id="g_agents"> Agent trajectory</label>
+    <label class="row"><input type="checkbox" id="g_agents" checked> Agent trajectory</label>
     <label class="row"><input type="checkbox" id="g_rooms" checked> Rooms</label>
     <label class="row"><input type="checkbox" id="g_intra" checked> Intra-layer edges</label>
     <label class="row"><input type="checkbox" id="g_inter" checked> Inter-layer edges</label>

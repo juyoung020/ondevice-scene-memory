@@ -157,6 +157,7 @@ fn track_one(prev: &Pyr, cur: &Pyr, p0: [f32; 2], init: [f32; 2]) -> Option<[f32
 struct Track {
     w: [f32; 3],
     uv: [f32; 2],
+    id: u64,
 }
 
 /// 세계(몸체 축) 점 → 화소. tcw = 세계 → 광학 축
@@ -467,6 +468,13 @@ pub struct OdometryKlt {
     pub imu_rejected: bool,
     /// 영상 결과를 IMU 와 어긋나 연달아 버린 장면 수(IMU_TRUST_MAX 에 닿으면 IMU 쪽을 의심: 치우침 되돌리고 영상을 받음)
     imu_streak: u32,
+    /// 국소 묶음 조정 창(OdomKlt/LocalBA = 키프레임 수, 0 = 끔)
+    ba_n: usize,
+    win: std::collections::VecDeque<crate::klt_ba::Kf>,
+    win_pts: std::collections::HashMap<u64, nalgebra::Vector3<f64>>,
+    next_id: u64,
+    /// 묶음 조정한 키프레임 수
+    pub ba_runs: usize,
 }
 
 impl OdometryKlt {
@@ -512,6 +520,11 @@ impl OdometryKlt {
             by_imu: 0,
             imu_rejected: false,
             imu_streak: 0,
+            ba_n: p.get("OdomKlt/LocalBA", 6usize),
+            win: Default::default(),
+            win_pts: Default::default(),
+            next_id: 0,
+            ba_runs: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
@@ -532,6 +545,7 @@ impl OdometryKlt {
         self.pose = pose;
         self.prev = None;
         self.tracks.clear();
+        self.win_clear();
         self.kf = None;
         if !same_place {
             self.prev_sub.clear();
@@ -596,11 +610,85 @@ impl OdometryKlt {
             }
             occ[gy * gw + gx] = true;
             let wp = self.pose.transform_point([p.x, p.y, p.z]);
-            self.tracks.push(Track { w: wp, uv: [k.x, k.y] });
+            self.next_id += 1;
+            self.tracks.push(Track { w: wp, uv: [k.x, k.y], id: self.next_id });
         }
         if full && self.desc_tx.is_none() {
             self.kf = Some((feats, self.pose));
             self.kf_t = f.t;
+        }
+        self.win_record(f);
+    }
+
+    fn win_clear(&mut self) {
+        self.win.clear();
+        self.win_pts.clear();
+    }
+
+    /// 이 장면을 창의 키프레임으로(이미 이 장면이면 새 점만 더함): 지금 따라가는 점의 화소 · 깊이
+    fn win_record(&mut self, f: &Frame) {
+        if self.ba_n < 2 {
+            return;
+        }
+        let (w, h) = (f.cam.width as usize, f.cam.height as usize);
+        let depth_at = |uv: [f32; 2]| -> f32 {
+            let (x, y) = ((uv[0] + 0.5) as usize, (uv[1] + 0.5) as usize);
+            if f.depth_mm.is_empty() || x >= w || y >= h {
+                return f32::NAN;
+            }
+            let d = f.depth_mm[y * w + x];
+            let m = d as f32 * 0.001;
+            if d == 0 || d == u16::MAX || m <= self.min_depth || (self.max_depth > 0.0 && m > self.max_depth) { f32::NAN } else { m }
+        };
+        if self.win.back().is_none_or(|k| k.stamp != f.t) {
+            let local = Tf::from_pose(&f.cam.local);
+            let (r, t) = rt_from_tf(&self.pose.mul(&local).inverse());
+            self.win.push_back(crate::klt_ba::Kf { stamp: f.t, r, t, obs: Vec::new() });
+        }
+        let kf = self.win.back_mut().unwrap();
+        let have: std::collections::HashSet<u64> = kf.obs.iter().map(|o| o.0).collect();
+        for tr in &self.tracks {
+            if have.contains(&tr.id) {
+                continue;
+            }
+            let first = !self.win_pts.contains_key(&tr.id);
+            let dm = std::env::var("BA_DM").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let d = if dm == 2 || (dm == 1 && !first) { f32::NAN } else { depth_at(tr.uv) };
+            kf.obs.push((tr.id, tr.uv, d));
+            self.win_pts.entry(tr.id).or_insert_with(|| nalgebra::Vector3::new(tr.w[0] as f64, tr.w[1] as f64, tr.w[2] as f64));
+        }
+    }
+
+    /// 국소 묶음 조정: 이 장면(키프레임)을 창에 넣고 창 전체를 다듬어 지금 위치와 따라가는 점의 세계 위치를 고침
+    fn local_ba(&mut self, f: &Frame) {
+        if self.ba_n < 2 {
+            return;
+        }
+        self.win_record(f);
+        while self.win.len() > self.ba_n {
+            self.win.pop_front();
+        }
+        if self.win.len() < 2 {
+            return;
+        }
+        let k4 = [f.cam.fx, f.cam.fy, f.cam.cx, f.cam.cy];
+        let mut used: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for kf in &self.win {
+            used.extend(kf.obs.iter().map(|o| o.0));
+        }
+        self.win_pts.retain(|id, _| used.contains(id));
+        let ws = self.win.make_contiguous();
+        crate::klt_ba::solve(ws, &mut self.win_pts, &k4, 10);
+        self.ba_runs += 1;
+        let last = self.win.back().unwrap();
+        let local = Tf::from_pose(&f.cam.local);
+        self.pose = local.mul(&tf_from_rt(&last.r, &last.t)).inverse();
+        let alive: std::collections::HashSet<u64> = last.obs.iter().map(|o| o.0).collect();
+        self.tracks.retain(|t| alive.contains(&t.id));
+        for t in self.tracks.iter_mut() {
+            if let Some(p) = self.win_pts.get(&t.id) {
+                t.w = [p[0] as f32, p[1] as f32, p[2] as f32];
+            }
         }
     }
 
@@ -646,9 +734,11 @@ impl OdometryKlt {
         }
         let pose = kfp.mul(&info.tf);
         self.tracks.clear();
+        self.win_clear();
         for (k, p) in cf.kps.iter().zip(cf.pts3d.iter()) {
             if p.x.is_finite() {
-                self.tracks.push(Track { w: pose.transform_point([p.x, p.y, p.z]), uv: [k.x, k.y] });
+                self.next_id += 1;
+                self.tracks.push(Track { w: pose.transform_point([p.x, p.y, p.z]), uv: [k.x, k.y], id: self.next_id });
             }
         }
         self.kf = Some((cf, pose));
@@ -762,6 +852,7 @@ impl OdometryKlt {
         let Some(prev) = self.prev.take() else {
             // 첫 장면: 점만 만들고 '새로 시작'(공분산 9999)
             self.tracks.clear();
+        self.win_clear();
             // 이어 붙이기: 마지막 성공 장면 깊이가 남아 있으면 움직임 없음에서 시작하는 ICP 로 그사이 움직임을 바로잡음
             self.bridge_verified = false;
             // IMU: 원점에서 시작하는 첫 장면이면 지도 z 를 중력 위로(가장 작은 회전, 방향은 그대로)
@@ -788,6 +879,7 @@ impl OdometryKlt {
             // 어두워 점이 모자라도 깊이가 있으면 시작(깊이 ICP 로 이어 감)
             if self.tracks.len() < self.min_inliers && nd < 2000 {
                 self.tracks.clear();
+        self.win_clear();
                 self.prev_sub.clear();
                 self.spare = Some(cur);
                 return self.result(Tf::NULL, Self::eye(9999.0), 0, 0, false);
@@ -904,6 +996,7 @@ impl OdometryKlt {
                     self.pose = pose;
                     // 점은 이 장면에서 다시(보이는 만큼)
                     self.tracks.clear();
+        self.win_clear();
                     self.top_up(f);
                     std::mem::swap(&mut self.prev_sub, &mut self.cur_sub);
                     self.prev = Some(cur);
@@ -996,11 +1089,12 @@ impl OdometryKlt {
         // 안쪽 점만 남기고 이번 화소로
         let mut nt = Vec::with_capacity(ids.len());
         for (j, &i) in ids.iter().enumerate() {
-            nt.push(Track { w: self.tracks[i].w, uv: uvs[j] });
+            nt.push(Track { w: self.tracks[i].w, uv: uvs[j], id: self.tracks[i].id });
         }
         self.tracks = nt;
         let mut kf = false;
         if (self.tracks.len() as f32) < self.redetect * self.max_features as f32 {
+            self.local_ba(f);
             self.top_up(f);
             kf = true;
         }
@@ -1013,6 +1107,7 @@ impl OdometryKlt {
         self.spare = Some(prev);
         self.prev = Some(cur);
         self.prev_t = f.t;
+        let transform = if kf { base.inverse().mul(&self.pose) } else { transform };
         self.diag = Diag { method: 0, q, jump: jump_of(&pred, &pose) };
         self.result(transform, cov, inliers, n_tracks, kf)
     }

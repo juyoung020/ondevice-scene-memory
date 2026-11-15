@@ -6,19 +6,23 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// 지나온 길(시각, 위치): 덧붙이기만 하는 로그. 판은 길이만 들고 있어 판마다 길 전체를 복사하지 않는다
 /// (다시 쌓기로 길이 새로 만들어지면 로그도 새로)
-#[derive(Default)]
-pub struct TrajLog(RwLock<Vec<(f64, [f64; 3])>>);
+pub struct TrajLog(RwLock<Vec<(f64, [f64; 3])>>, u64);
+
+static LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl TrajLog {
     pub fn new() -> Arc<TrajLog> {
-        Arc::new(TrajLog::default())
+        Arc::new(TrajLog(RwLock::new(Vec::new()), LOG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
     }
     pub fn extend(&self, s: &[(f64, [f64; 3])]) {
         self.0.write().unwrap().extend_from_slice(s);
     }
     /// view.json 바이트(길은 앞 n 개)
     pub fn view_bytes(&self, head: &Value, n: usize) -> Vec<u8> {
-        live_bytes(head, &self.0.read().unwrap()[..n])
+        live_bytes(head, &self.0.read().unwrap()[..n], 0)
+    }
+    pub fn id(&self) -> u64 {
+        self.1
     }
     pub fn len(&self) -> usize {
         self.0.read().unwrap().len()
@@ -64,11 +68,51 @@ impl View {
         self.bytes
             .get_or_init(|| match &self.src {
                 Src::File(b) => b.clone(),
-                Src::Live { traj, n } => Arc::new(live_bytes(self.doc().unwrap_or(&Value::Null), &traj.0.read().unwrap()[..*n])),
+                Src::Live { traj, n } => Arc::new(live_bytes(self.doc().unwrap_or(&Value::Null), &traj.0.read().unwrap()[..*n], 0)),
             })
             .clone()
     }
-    /// /api/view 몸: {"v":판,"map_v":지도 판,"view":…} — 지도 판이 같으면 짠 것을 그대로
+    /// /api/view 몸, 지나온 길은 덧붙인 몫만: 브라우저가 같은 길(로그 id `tr`)의 앞 `tf` 점을 이미 가졌으면 그 뒤만 보냄
+    /// ("traj":{"id","from"}, graph.nodes = from 뒤). 같은 프로세스 판이 아니거나 길이 새로 만들어졌으면 None(통째로)
+    pub fn api_delta(&self, map_v: &str, tr: u64, tf: usize) -> Option<Vec<u8>> {
+        let Src::Live { traj, n } = &self.src else { return None };
+        if traj.id() != tr || tf > *n {
+            return None;
+        }
+        let head = self.doc()?;
+        let v = live_bytes(head, &traj.0.read().unwrap()[tf..*n], tf);
+        let mut b = Vec::with_capacity(v.len() + 96);
+        b.extend_from_slice(format!("{{\"v\":\"{}\",\"map_v\":\"{}\",\"traj\":{{\"id\":{},\"from\":{}}},\"view\":", self.ver, map_v, tr, tf).as_bytes());
+        b.extend_from_slice(&v);
+        b.push(b'}');
+        Some(b)
+    }
+    /// 지나온 길: (로그 id, 전체 길이, from 뒤 점들). 파일 판은 view.json 의 graph.nodes(로그 id 0, 판마다 통째로)
+    pub fn traj_from(&self, from: usize) -> (u64, usize, Vec<(f64, [f64; 3])>) {
+        match &self.src {
+            Src::Live { traj, n } => {
+                let g = traj.0.read().unwrap();
+                let f = from.min(*n);
+                (traj.id(), *n, g[f..*n].to_vec())
+            }
+            Src::File(_) => {
+                let nodes = self.doc().and_then(|d| d["graph"]["nodes"].as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
+                let v: Vec<_> = nodes.iter().filter(|n| n["kind"] == "agent").map(|n| {
+                    let p = |i: usize| n["pos"][i].as_f64().unwrap_or(0.0);
+                    (n["t"].as_f64().unwrap_or(0.0), [p(0), p(1), p(2)])
+                }).collect();
+                (0, v.len(), v)
+            }
+        }
+    }
+    /// 이 판의 길 로그 id(같은 프로세스 판만)
+    pub fn traj_id(&self) -> Option<u64> {
+        match &self.src {
+            Src::Live { traj, .. } => Some(traj.id()),
+            Src::File(_) => None,
+        }
+    }
+    /// /api/view 몸:{"v":판,"map_v":지도 판,"view":…} — 지도 판이 같으면 짠 것을 그대로
     pub fn api_body(&self, map_v: &str) -> Arc<Vec<u8>> {
         let mut c = self.body.lock().unwrap();
         if let Some((m, b)) = c.as_ref() {
@@ -78,7 +122,8 @@ impl View {
         }
         let v = self.bytes();
         let mut b = Vec::with_capacity(v.len() + 64);
-        b.extend_from_slice(format!("{{\"v\":\"{}\",\"map_v\":\"{}\",\"view\":", self.ver, map_v).as_bytes());
+        let tj = self.traj_id().map_or(String::new(), |id| format!("\"traj\":{{\"id\":{id},\"from\":0}},"));
+        b.extend_from_slice(format!("{{\"v\":\"{}\",\"map_v\":\"{}\",{tj}\"view\":", self.ver, map_v).as_bytes());
         b.extend_from_slice(&v);
         b.push(b'}');
         let b = Arc::new(b);
@@ -88,7 +133,7 @@ impl View {
 }
 
 /// head(키 차례 = serde_json 맵 차례) + 지나온 길 노드 → `serde_json::to_vec(view)` 와 같은 바이트
-pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])]) -> Vec<u8> {
+pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])], from: usize) -> Vec<u8> {
     let mut b = Vec::with_capacity(4096 + traj.len() * 80);
     let Some(m) = head.as_object() else {
         serde_json::to_writer(&mut b, head).unwrap();
@@ -110,7 +155,7 @@ pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])]) -> Vec<u8> {
                 if i > 0 {
                     b.push(b',');
                 }
-                b.extend_from_slice(format!("{{\"id\":\"A{i}\",\"kind\":\"agent\",\"pos\":").as_bytes());
+                b.extend_from_slice(format!("{{\"id\":\"A{}\",\"kind\":\"agent\",\"pos\":", from + i).as_bytes());
                 serde_json::to_writer(&mut b, &serde_json::json!(p)).unwrap();
                 b.extend_from_slice(b",\"t\":");
                 serde_json::to_writer(&mut b, &serde_json::json!(t)).unwrap();
@@ -125,16 +170,27 @@ pub fn live_bytes(head: &Value, traj: &[(f64, [f64; 3])]) -> Vec<u8> {
     b
 }
 
+/// 뷰 스레드 → 서버 넘김 칸: 가장 새 판만(넣기는 기다리지 않고, 서버가 아직 안 꺼낸 옛 판은 덮어씀)
+static HANDOFF: OnceLock<common::slot::Latest<Arc<View>>> = OnceLock::new();
+/// 서버가 꺼내 들고 있는 지금 판(HTTP · 밀어 보내기 · 저장이 함께 읽음)
 static CUR: Mutex<Option<Arc<View>>> = Mutex::new(None);
 
-/// 같은 프로세스의 물체 기억이 새 판을 건다(뷰어는 파일 대신 이것을 씀)
+fn handoff() -> &'static common::slot::Latest<Arc<View>> {
+    HANDOFF.get_or_init(|| common::slot::Latest::new(false))
+}
+
+/// 같은 프로세스의 물체 기억이 새 판을 건다(뷰어는 파일 대신 이것을 씀). 막히지 않음
 pub fn publish(v: View) {
-    *CUR.lock().unwrap() = Some(Arc::new(v));
+    let _ = handoff().put(0, Arc::new(v));
     crate::memfs::bump();
 }
 
 pub fn current() -> Option<Arc<View>> {
-    CUR.lock().unwrap().clone()
+    let mut c = CUR.lock().unwrap();
+    if let Some((_, v)) = handoff().try_take() {
+        *c = Some(v);
+    }
+    c.clone()
 }
 
 #[cfg(test)]
@@ -148,6 +204,6 @@ mod tests {
         let full = json!({"stamp": 3.0, "pose": [1, 2], "grid": null, "objects": [{"a": 1}], "rooms": [], "doors": [], "graph": {"nodes": nodes, "edges": edges}, "robot": "x", "cam": {"pos": [1.0]}, "scene_points": {"run": 1}});
         let mut head = full.clone();
         head["graph"] = json!({"edges": edges});
-        assert_eq!(super::live_bytes(&head, &traj), serde_json::to_vec(&full).unwrap());
+        assert_eq!(super::live_bytes(&head, &traj, 0), serde_json::to_vec(&full).unwrap());
     }
 }

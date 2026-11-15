@@ -186,22 +186,47 @@ pub fn read_vocab(p: &Path) -> Result<Vec<(String, Arc<Vec<f32>>)>, String> {
     Ok(names.into_iter().zip(f.chunks(dim)).map(|(n, v)| (n, Arc::new(v.to_vec()))).collect())
 }
 
-/// `--encode-vocab <names.txt> <out>`: one name a line → word vector file (done once on a PC; the file is then used as it is)
-#[cfg(feature = "search")]
+/// `--encode-vocab <names.txt> <out>`: one name a line → word vector file (done once on a PC; the file is then used as it is).
+/// A line may add descriptions after a colon, `monitor: a black computer screen; a turned-off monitor`. Each name's vector is the
+/// mean of the name in several sentences ("a photo of a {name}.", "a blurry photo of a {name}." …), plus the mean of its descriptions
+/// ("a photo of {description}.") when given — sentences match photos better than a bare word, and dark monitors stop looking like "webcam"
 pub fn encode_vocab(model: &Path, list: &Path, out: &Path) -> Result<usize, String> {
+    const TEMPLATES: [&str; 6] = ["a photo of a {}.", "a photo of the {}.", "a blurry photo of a {}.", "a dark photo of a {}.", "a close-up photo of a {}.", "a photo of a {} in an office."];
     let enc = TextEnc::load(model)?;
     let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
-    let names: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let mut b = format!("SGVOC 1 {} {DIM}\n", names.len()).into_bytes();
-    for n in &names {
+    let lines: Vec<(&str, Vec<&str>)> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(|l| match l.split_once(':') {
+        Some((n, d)) => (n.trim(), d.split(';').map(str::trim).filter(|x| !x.is_empty()).collect()),
+        None => (l, vec![]),
+    }).collect();
+    let unit = |mut v: Vec<f32>| {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            v.iter_mut().for_each(|x| *x /= n);
+        }
+        v
+    };
+    let mean = |texts: &[String]| -> Result<Vec<f32>, String> {
+        let mut s = vec![0f32; DIM];
+        for t in texts {
+            s.iter_mut().zip(enc.encode(t)?.iter()).for_each(|(a, b)| *a += b);
+        }
+        Ok(unit(s))
+    };
+    let mut b = format!("SGVOC 1 {} {DIM}\n", lines.len()).into_bytes();
+    for (n, _) in &lines {
         b.extend(n.as_bytes());
         b.push(b'\n');
     }
-    for n in &names {
-        b.extend(enc.encode(n)?.iter().flat_map(|x| x.to_le_bytes()));
+    for (n, d) in &lines {
+        let mut v = mean(&TEMPLATES.iter().map(|t| t.replace("{}", n)).collect::<Vec<_>>())?;
+        if !d.is_empty() {
+            let w = mean(&d.iter().map(|x| format!("a photo of {x}.")).collect::<Vec<_>>())?;
+            v = unit(v.iter().zip(&w).map(|(a, b)| a + b).collect());
+        }
+        b.extend(v.iter().flat_map(|x| x.to_le_bytes()));
     }
     std::fs::write(out, b).map_err(|e| format!("{}: {e}", out.display()))?;
-    Ok(names.len())
+    Ok(lines.len())
 }
 
 /// Text → unit vector, or None when no encoder is loaded (then only the letters of the name are compared)

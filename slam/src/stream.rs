@@ -14,6 +14,8 @@ pub const NEW_MAP: u32 = 2;
 pub const MAP_CORRECTED: u32 = 4;
 /// 맡아 둘 장면: 믿는 지도와 아직 안 이어진 새 지도의 위치·기준 노드가 들어 있음(LOST 와 함께 켬)
 pub const HELD: u32 = 8;
+/// 임시 위치: 아직 믿는 지도와 이어지지 않은 새 지도의 장면을, 마지막 위치에서 이어 붙인 표시 좌표로 보냄(이어지면 고친 위치로 다시 쌓임)
+pub const PROVISIONAL: u32 = 16;
 /// 그래프 블록 MMG1 머리: 표시 4 + 머리 크기 4 + 노드 수 4 + 예약 4
 pub const GRAPH_HEADER_BYTES: usize = 16;
 pub const IDENTITY: [f64; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];

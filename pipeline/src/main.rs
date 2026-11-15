@@ -121,7 +121,7 @@ fn args(v: &common::cli::Argv) -> Args {
         }),
         no_level: v.flag("--no-level"),
         rebuild_every: if v.flag("--no-rebuild") { -1.0 } else { get("--rebuild-every").map_or(5.0, |s| s.parse().unwrap()) },
-        kf_store_mb: get("--kf-store-mb").map_or(3000, |s| s.parse().unwrap()),
+        kf_store_mb: get("--kf-store-mb").map_or_else(kf_store_default_mb, |s| s.parse().unwrap()),
     }
 }
 
@@ -2256,6 +2256,14 @@ fn crop_score(rgb: &[u8], w: usize, h: usize, x1: usize, y1: usize, bw: usize, b
     ((bw * bh) as f32 * bright * crisp * edge) as u32
 }
 
+/// 장면 보관 예산 기본값: 시작할 때 쓸 수 있는 메모리(MemAvailable)의 15 %(리눅스), 그 밖은 3000 MB.
+/// 8 GB 보드에서 3000 MB 는 다른 실행과 겹치면 OOM 이 났다. 예산 안이면 보관·다시 쌓기 결과는 같다
+fn kf_store_default_mb() -> usize {
+    std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok())
+        .map_or(3000, |kb| (kb / 1024 * 15 / 100).max(256))
+}
+
 /// ax[x] = (x − cx)/fx, ay[y] = (y − cy)/fy: 화소마다 나누지 않게 미리(곱하는 차례는 그대로 → 같은 값)
 fn facing(d: &[f32], w: usize, h: usize, ax: &[f64], ay: &[f64], u: usize, v: usize, pc: &V3) -> bool {
     if u < 2 || v < 2 || u + 2 >= w || v + 2 >= h {
@@ -2320,12 +2328,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     // 한 프로그램(ondevice): 첫 인자가 slam · view 면 위치 프로그램만 · 뷰어 서버만, 그 밖(run 또는 없음)은 물체 기억(+ --slam · --serve)
     let argv = common::cli::Argv::env();
-    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등), --mlock: 메모리를 RAM 에 묶음. 권한이 없으면 조용히 그대로
+    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등). 권한이 없으면 조용히 그대로
     common::threads::set_rt(&argv.get("--rt").unwrap_or_default());
     common::log::set_quiet(argv.flag("--quiet"));
-    if argv.flag("--mlock") && !common::threads::mlock_all() {
-        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
-    }
     // DXRT 설정(NPU 코어 묶기 · 버퍼 · NFH 스레드 · 프로파일러, common::dxrt::Config): 하위 명령(view)에도
     #[cfg(feature = "dxrt")]
     common::dxrt::Config::from_args(|k| argv.get(k), |k| argv.flag(k)).apply();
@@ -2387,6 +2392,10 @@ fn main() {
         stream::hand_slam(rx);
         th
     });
+    // --mlock: 모델·스레드를 다 띄운 뒤 그때 있는 메모리만 묶는다(뒤에 늘어나는 장면 보관·지도는 묶지 않음)
+    if argv.flag("--mlock") && !common::threads::mlock_all() {
+        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
+    }
     if a.seg_check > 0 {
         return seg_check(&a, seg.as_mut(), a.seg_check);
     }

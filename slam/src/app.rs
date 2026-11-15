@@ -581,9 +581,11 @@ pub struct Args {
     poses: String,
     final_poses: String,
     stats: String,
+    align: String,
     serial: String,
     reset_file: String,
     realsense: bool,
+    driver: String,
     reloc_wait: f64,
     /// 놓친 뒤 다시 시작할 때 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙임(광류 경로, --no-bridge 로 끔)
     bridge: bool,
@@ -615,9 +617,11 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         poses: String::new(),
         final_poses: String::new(),
         stats: String::new(),
+        align: "rs2".into(),
         serial: String::new(),
         reset_file: String::new(),
         realsense: false,
+        driver: String::new(),
         reset_at: -1,
         stride: 1,
         reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
@@ -657,8 +661,10 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         match k {
             "--tum" => a.tum = val()?,
             "--realsense" => a.realsense = true,
+            "--driver" => a.driver = val()?,
             "--rate" => a.rate = num(&val()?)?,
             "--stride" => a.stride = num(&val()?)? as usize,
+            "--align" => a.align = val()?,
             "--serial" => a.serial = val()?,
             "--exposure" => a.exposure_ms = num(&val()?)?,
             "--ae-cap" => a.ae_cap_ms = num(&val()?)?,
@@ -1281,15 +1287,15 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     Ok(0)
 }
 
-/// D435 입력: rsdriver(V4L2·UVC 직접, `rsdriver` 기능)
+/// D435 입력: --driver rsdriver(V4L2 직접, 기본) | librealsense(--align 로 정렬 방식). 빌드에 든 것만 고를 수 있다
 fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
-    #[cfg(feature = "rsdriver")]
-    {
-        Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, &a.camera_profile)?))
-    }
-    #[cfg(not(feature = "rsdriver"))]
-    {
-        let _ = (&a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, a.w, a.h, a.fps, &a.camera_profile);
-        Err("D435 입력은 리눅스 빌드(rsdriver 기능)에만 있음".into())
+    let _ = (&a.align, &a.serial, a.exposure_ms, a.gain, a.w, a.h, a.fps);
+    let want = if a.driver.is_empty() { if cfg!(feature = "rsdriver") { "rsdriver" } else { "librealsense" } } else { a.driver.as_str() };
+    match want {
+        #[cfg(feature = "rsdriver")]
+        "rsdriver" => Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, &a.camera_profile)?)),
+        #[cfg(feature = "realsense")]
+        "librealsense" => Ok(Box::new(crate::io::RealSenseSource::new(a.w, a.h, a.fps, &a.align, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms)?)),
+        d => Err(format!("카메라 입력 {d} 이 이 빌드에 없음(--features rsdriver 또는 realsense 로 빌드)")),
     }
 }

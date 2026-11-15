@@ -128,8 +128,8 @@ fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)>
 
 /// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,
 /// 이름 없는 물체(object)는 몫 NAME_MIN_UNNAMED 이상이면 가장 닮은 이름을 쓴다. `--vocab` 이 없거나 벡터 계산 전이면 None
-pub fn name(id: u32, sure: bool) -> Option<(String, f32)> {
-    NAMES.lock().unwrap().as_ref()?.get(&id).filter(|(_, p)| *p >= if sure { NAME_MIN } else { NAME_MIN_UNNAMED }).cloned()
+pub fn name(id: u32, _sure: bool) -> Option<(String, f32)> {
+    NAMES.lock().unwrap().as_ref()?.get(&id).cloned() // 기준 없이 가장 닮은 이름을 늘 붙임(사용자 결정 26-11-15)
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {

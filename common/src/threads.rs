@@ -181,7 +181,7 @@ pub fn mlock_all() -> bool {
         unsafe extern "C" {
             fn mlockall(flags: i32) -> i32;
         }
-        return mlockall(1) == 0; // MCL_CURRENT
+        return mlockall(1 | 4) == 0; // MCL_CURRENT | MCL_ONFAULT: 닿은 쪽만(스레드 스택 8 MB 를 통째로 채우지 않음)
     }
     #[allow(unreachable_code)]
     false

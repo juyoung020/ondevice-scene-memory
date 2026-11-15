@@ -14,3 +14,5 @@ rayon = "1"
 default = []
 # ONNX Runtime 환경 하나(분할·깊이·사진 벡터·글 검색 모델이 함께 씀)
 onnx = ["dep:ort"]
+# DX-M1 NPU(DXRT C API, libdxrt 링크)
+dxrt = []

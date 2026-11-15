@@ -38,27 +38,50 @@ pub fn read_emb(p: &Path) -> Option<Vec<f32>> {
 
 #[cfg(feature = "search")]
 pub struct TextEnc {
-    sess: Mutex<ort::session::Session>,
+    net: Net,
     tok: tokenizers::Tokenizer,
     cache: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     /// word vectors read from a file (`--vocab`): never dropped, never computed
     known: std::sync::OnceLock<HashMap<String, Arc<Vec<f32>>>>,
 }
 
+/// The text encoder runner: plain Rust (`textnet`, weights from `text_model_fp16.onnx`), or ONNX Runtime (`search-onnx` builds)
+#[cfg(feature = "search")]
+enum Net {
+    Rust(crate::textnet::TextNet),
+    #[cfg(feature = "search-onnx")]
+    Onnx(Mutex<ort::session::Session>),
+}
+
 #[cfg(feature = "search")]
 impl TextEnc {
-    /// `dir` holds `tokenizer.json` and `text_model_fp16.onnx` (or `text_model.onnx`)
+    /// `dir` holds `tokenizer.json` and `text_model_fp16.onnx` (or `text_model.onnx` for ONNX Runtime).
+    /// `onnx`: run it with ONNX Runtime instead of the Rust encoder (`search-onnx` builds)
     pub fn load(dir: &Path) -> Result<TextEnc, String> {
-        let model = ["text_model_fp16.onnx", "text_model.onnx"].iter().map(|n| dir.join(n)).find(|p| p.exists())
-            .ok_or_else(|| format!("no text_model*.onnx in {}", dir.display()))?;
+        // PC(search-onnx): ONNX Runtime 이 Rust 인코더보다 2.2 배 빠르다(docs/npu_models.md "글 인코더")
+        Self::load_with(dir, cfg!(feature = "search-onnx"))
+    }
+
+    pub fn load_with(dir: &Path, onnx: bool) -> Result<TextEnc, String> {
+        let net = Self::open_net(dir, onnx)?;
         let mut tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         tok.with_truncation(Some(tokenizers::TruncationParams { max_length: TOKENS, ..Default::default() })).map_err(|e| e.to_string())?;
         tok.with_padding(Some(tokenizers::PaddingParams { strategy: tokenizers::PaddingStrategy::Fixed(TOKENS), pad_id: 0, pad_token: "<pad>".into(), ..Default::default() }));
-        let env = common::ort::env();
-        let sess = ort::session::Session::builder(env).map_err(|e| e.to_string())?
-            .with_intra_threads(4).map_err(|e| e.to_string())?
-            .commit_from_file(&model).map_err(|e| format!("{}: {e}", model.display()))?;
-        Ok(TextEnc { sess: Mutex::new(sess), tok, cache: Mutex::new(HashMap::new()), known: std::sync::OnceLock::new() })
+        Ok(TextEnc { net, tok, cache: Mutex::new(HashMap::new()), known: std::sync::OnceLock::new() })
+    }
+
+    fn open_net(dir: &Path, onnx: bool) -> Result<Net, String> {
+        #[cfg(feature = "search-onnx")]
+        if onnx {
+            let model = ["text_model_fp16.onnx", "text_model.onnx"].iter().map(|n| dir.join(n)).find(|p| p.exists())
+                .ok_or_else(|| format!("no text_model*.onnx in {}", dir.display()))?;
+            let sess = ort::session::Session::builder(common::ort::env()).map_err(|e| e.to_string())?
+                .with_intra_threads(4).map_err(|e| e.to_string())?
+                .commit_from_file(&model).map_err(|e| format!("{}: {e}", model.display()))?;
+            return Ok(Net::Onnx(Mutex::new(sess)));
+        }
+        let _ = onnx;
+        Ok(Net::Rust(crate::textnet::TextNet::load(&dir.join("text_model_fp16.onnx"))?))
     }
 
     /// Hand over word vectors made ahead of time (`read_vocab`): those words are answered without running the model
@@ -75,15 +98,7 @@ impl TextEnc {
         if let Some(v) = self.cache.lock().unwrap().get(&key) {
             return Ok(v.clone());
         }
-        let enc = self.tok.encode(key.as_str(), true).map_err(|e| e.to_string())?;
-        let ids: Vec<i64> = enc.get_ids().iter().map(|&i| i as i64).collect();
-        let mut v = {
-            let mut sess = self.sess.lock().unwrap();
-            let inp = ort::value::TensorRef::from_array_view(([1usize, ids.len()], &ids[..])).map_err(|e| e.to_string())?;
-            let out = sess.run(ort::inputs![inp]).map_err(|e| e.to_string())?;
-            let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            v.to_vec()
-        };
+        let mut v = self.run(&key)?;
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if n > 0.0 {
             v.iter_mut().for_each(|x| *x /= n);
@@ -95,6 +110,54 @@ impl TextEnc {
         }
         c.insert(key, v.clone());
         Ok(v)
+    }
+
+    /// Text (already lower-cased) → encoder output, not normalised
+    pub fn run(&self, text: &str) -> Result<Vec<f32>, String> {
+        let enc = self.tok.encode(text, true).map_err(|e| e.to_string())?;
+        let ids = enc.get_ids();
+        match &self.net {
+            Net::Rust(n) => n.run(ids),
+            #[cfg(feature = "search-onnx")]
+            Net::Onnx(sess) => {
+                let ids: Vec<i64> = ids.iter().map(|&i| i as i64).collect();
+                let inp = ort::value::TensorRef::from_array_view(([1usize, ids.len()], &ids[..])).map_err(|e| e.to_string())?;
+                let mut sess = sess.lock().unwrap();
+                let out = sess.run(ort::inputs![inp]).map_err(|e| e.to_string())?;
+                let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+                Ok(v.to_vec())
+            }
+        }
+    }
+}
+
+/// Rust encoder ↔ ONNX Runtime on the same texts: SGVIEW_TEXT_CHECK=<model dir> SGVIEW_TEXT_LIST=<texts, one a line>
+#[cfg(all(test, feature = "search-onnx"))]
+mod rust_vs_onnx {
+    #[test]
+    fn same_vectors() {
+        let (Ok(dir), Ok(list)) = (std::env::var("SGVIEW_TEXT_CHECK"), std::env::var("SGVIEW_TEXT_LIST")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let r = super::TextEnc::load_with(dir, false).unwrap();
+        let o = super::TextEnc::load_with(dir, true).unwrap();
+        let texts = std::fs::read_to_string(list).unwrap();
+        let texts: Vec<String> = texts.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+        let (mut tr, mut to, mut worst, mut maxd) = (0f64, 0f64, 1f32, 0f32);
+        for t in &texts {
+            let t0 = std::time::Instant::now();
+            let a = r.run(t).unwrap();
+            tr += t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            let b = o.run(t).unwrap();
+            to += t0.elapsed().as_secs_f64();
+            let (na, nb) = (a.iter().map(|x| x * x).sum::<f32>().sqrt(), b.iter().map(|x| x * x).sum::<f32>().sqrt());
+            let c = a.iter().zip(&b).map(|(x, y)| x * y).sum::<f32>() / (na * nb);
+            worst = worst.min(c);
+            maxd = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(maxd, f32::max);
+        }
+        let n = texts.len() as f64;
+        println!("texts {}: min cosine {worst:.7}, max |diff| {maxd:.2e}, rust {:.1} ms, onnx {:.1} ms per text", texts.len(), tr / n * 1e3, to / n * 1e3);
+        assert!(worst > 0.9999);
     }
 }
 
@@ -123,22 +186,47 @@ pub fn read_vocab(p: &Path) -> Result<Vec<(String, Arc<Vec<f32>>)>, String> {
     Ok(names.into_iter().zip(f.chunks(dim)).map(|(n, v)| (n, Arc::new(v.to_vec()))).collect())
 }
 
-/// `--encode-vocab <names.txt> <out>`: one name a line → word vector file (done once on a PC; the file is then used as it is)
-#[cfg(feature = "search")]
+/// `--encode-vocab <names.txt> <out>`: one name a line → word vector file (done once on a PC; the file is then used as it is).
+/// A line may add descriptions after a colon, `monitor: a black computer screen; a turned-off monitor`. Each name's vector is the
+/// mean of the name in several sentences ("a photo of a {name}.", "a blurry photo of a {name}." …), plus the mean of its descriptions
+/// ("a photo of {description}.") when given — sentences match photos better than a bare word, and dark monitors stop looking like "webcam"
 pub fn encode_vocab(model: &Path, list: &Path, out: &Path) -> Result<usize, String> {
+    const TEMPLATES: [&str; 6] = ["a photo of a {}.", "a photo of the {}.", "a blurry photo of a {}.", "a dark photo of a {}.", "a close-up photo of a {}.", "a photo of a {} in an office."];
     let enc = TextEnc::load(model)?;
     let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
-    let names: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let mut b = format!("SGVOC 1 {} {DIM}\n", names.len()).into_bytes();
-    for n in &names {
+    let lines: Vec<(&str, Vec<&str>)> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(|l| match l.split_once(':') {
+        Some((n, d)) => (n.trim(), d.split(';').map(str::trim).filter(|x| !x.is_empty()).collect()),
+        None => (l, vec![]),
+    }).collect();
+    let unit = |mut v: Vec<f32>| {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            v.iter_mut().for_each(|x| *x /= n);
+        }
+        v
+    };
+    let mean = |texts: &[String]| -> Result<Vec<f32>, String> {
+        let mut s = vec![0f32; DIM];
+        for t in texts {
+            s.iter_mut().zip(enc.encode(t)?.iter()).for_each(|(a, b)| *a += b);
+        }
+        Ok(unit(s))
+    };
+    let mut b = format!("SGVOC 1 {} {DIM}\n", lines.len()).into_bytes();
+    for (n, _) in &lines {
         b.extend(n.as_bytes());
         b.push(b'\n');
     }
-    for n in &names {
-        b.extend(enc.encode(n)?.iter().flat_map(|x| x.to_le_bytes()));
+    for (n, d) in &lines {
+        let mut v = mean(&TEMPLATES.iter().map(|t| t.replace("{}", n)).collect::<Vec<_>>())?;
+        if !d.is_empty() {
+            let w = mean(&d.iter().map(|x| format!("a photo of {x}.")).collect::<Vec<_>>())?;
+            v = unit(v.iter().zip(&w).map(|(a, b)| a + b).collect());
+        }
+        b.extend(v.iter().flat_map(|x| x.to_le_bytes()));
     }
     std::fs::write(out, b).map_err(|e| format!("{}: {e}", out.display()))?;
-    Ok(names.len())
+    Ok(lines.len())
 }
 
 /// Text → unit vector, or None when no encoder is loaded (then only the letters of the name are compared)
@@ -344,3 +432,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+

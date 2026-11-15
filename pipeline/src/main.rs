@@ -121,7 +121,7 @@ fn args(v: &common::cli::Argv) -> Args {
         }),
         no_level: v.flag("--no-level"),
         rebuild_every: if v.flag("--no-rebuild") { -1.0 } else { get("--rebuild-every").map_or(5.0, |s| s.parse().unwrap()) },
-        kf_store_mb: get("--kf-store-mb").map_or(3000, |s| s.parse().unwrap()),
+        kf_store_mb: get("--kf-store-mb").map_or_else(kf_store_default_mb, |s| s.parse().unwrap()),
     }
 }
 
@@ -1974,7 +1974,9 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     if dets.is_some() && map_ok {
         mem.n_seg += 1;
     }
-    let mut valid: Vec<u32> = vec![];
+    // 검출마다 쓰는 작업 칸(유효 화소 · 표본 · 깊이 · 세계 점)은 스레드에 하나 두고 다시 씀(장면마다 할당 없음)
+    thread_local! { static OS: std::cell::Cell<(Vec<u32>, Vec<(usize, usize, f64)>, Vec<f64>, Vec<(V3, [u8; 3])>)> = const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) }; }
+    let (mut valid, mut pix, mut zs, mut pts) = OS.with(|c| c.take());
     // 침식 작업 칸은 스레드에 하나(장면·검출마다 다시 씀)
     thread_local! { static EB: std::cell::Cell<ErodeBuf> = std::cell::Cell::new(ErodeBuf { a: vec![], b: vec![], run: vec![] }); }
     let mut eb = EB.with(|c| c.take());
@@ -2014,24 +2016,26 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             continue;
         }
         let step = (cnt / 2500).max(1);
-        let pix: Vec<(usize, usize, f64)> = valid.iter().step_by(step).map(|&o| {
+        pix.clear();
+        pix.extend(valid.iter().step_by(step).map(|&o| {
             let o = o as usize;
             (o % w, o / w, depth.at(o) as f64)
-        }).collect();
-        let mut zs: Vec<f64> = pix.iter().map(|q| q.2).collect();
+        }));
+        zs.clear();
+        zs.extend(pix.iter().map(|q| q.2));
         let mid = zs.len() / 2;
         let med = *zs.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
         if med > 5.0 {
             continue;
         }
-        let pts: Vec<(V3, [u8; 3])> = pix
+        pts.clear();
+        pts.extend(pix
             .iter()
             .filter(|q| (q.2 - med).abs() < 0.25 * med + 0.1)
             .map(|&(u, v, z)| {
                 let o = (v * w + u) * 3;
                 (to_w(&[(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z]), [rgb[o], rgb[o + 1], rgb[o + 2]])
-            })
-            .collect();
+            }));
         if pts.len() < 50 || is_wall(&pts) {
             continue;
         }
@@ -2050,6 +2054,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
         seen.insert(id);
     }
     EB.with(|c| c.set(eb));
+    OS.with(|c| c.set((valid, pix, zs, pts)));
     if dets.is_some() && map_ok {
         mem.check_missing(&seen, k, &r, &pwc, &depth, w, h);
     }
@@ -2164,8 +2169,10 @@ enum ViewMsg {
 
 /// 뷰 스레드: 방 나누기 · 엣지(graph::build), map.pgm, view.json(디스크) 또는 같은 프로세스 뷰어에 구조 그대로 건 판(--serve).
 /// 받은 차례대로 하므로 방 번호 잇기 · 파일 차례는 본 스레드에서 하던 것과 같다
+/// 지도 → 뷰 넘김은 common::slot::Latest 한 칸: 실시간(메모리 기억 폴더)은 덮어써 가장 새 판만(본 스레드는 기다리지 않음,
+/// 덮어쓴 판의 길 점은 새 판 앞에 이어 붙여 하나도 잃지 않음), 디스크 기록 · 재생은 exact(하나도 건너뛰지 않음 — 결과가 늘 같게)
 struct ViewWorker {
-    tx: std::sync::mpsc::Sender<ViewMsg>,
+    slot: std::sync::Arc<common::slot::Latest<ViewMsg>>,
     handle: Option<std::thread::JoinHandle<()>>,
     sent: usize,   // 넘긴 길 점 수
     fresh: bool,   // 길이 새로 만들어짐(다시 쌓기 갈아 끼우기)
@@ -2174,7 +2181,8 @@ struct ViewWorker {
 
 impl ViewWorker {
     fn spawn(dir: PathBuf, live: bool) -> ViewWorker {
-        let (tx, rx) = std::sync::mpsc::channel::<ViewMsg>();
+        let slot = std::sync::Arc::new(common::slot::Latest::<ViewMsg>::new(!out::memory_only()));
+        let rx = slot.clone();
         let handle = std::thread::Builder::new().name("view".into()).spawn(move || {
             out::thread_role(out::Role::Writer);
             let mut tr = rooms::Tracker::default();
@@ -2187,16 +2195,8 @@ impl ViewWorker {
                     log.extend(v);
                 }
             };
-            let mut back: Option<ViewMsg> = None;
-            loop {
-                let m = match back.take() {
-                    Some(m) => m,
-                    None => match rx.recv() {
-                        Ok(m) => m,
-                        Err(_) => break,
-                    },
-                };
-                let mut j = match m {
+            while let Some((_, m)) = rx.take() {
+                let j = match m {
                     ViewMsg::Flush(t) => {
                         let _ = t.send(());
                         continue;
@@ -2204,21 +2204,6 @@ impl ViewWorker {
                     ViewMsg::Job(j) => *j,
                 };
                 apply(&mut log, &j.traj);
-                // 실시간(메모리 기억 폴더): 밀린 판은 건너뛰고 마지막 것만(길은 모두 이어 붙임). 디스크 기록은 하나도 건너뛰지 않음(결과가 늘 같게)
-                if out::memory_only() {
-                    while let Ok(m2) = rx.try_recv() {
-                        match m2 {
-                            ViewMsg::Job(j2) => {
-                                apply(&mut log, &j2.traj);
-                                j = *j2;
-                            }
-                            other => {
-                                back = Some(other);
-                                break;
-                            }
-                        }
-                    }
-                }
                 let (grid_j, rooms, doors, edges) = match j.gi {
                     Some(mut g) => {
                         let ol: Vec<_> = j.ol.iter().map(|o| (o.0, o.1, o.2, o.3, o.4.as_str())).collect();
@@ -2251,7 +2236,7 @@ impl ViewWorker {
                 }
             }
         }).unwrap();
-        ViewWorker { tx, handle: Some(handle), sent: 0, fresh: true, live }
+        ViewWorker { slot, handle: Some(handle), sent: 0, fresh: true, live }
     }
     fn traj_update(&mut self, traj: &[(f64, [f64; 3])]) -> TrajUpd {
         let u = if std::mem::take(&mut self.fresh) || traj.len() < self.sent { TrajUpd::Reset(traj.to_vec()) } else { TrajUpd::Append(traj[self.sent..].to_vec()) };
@@ -2262,21 +2247,39 @@ impl ViewWorker {
     fn traj_replaced(&mut self) {
         self.fresh = true;
     }
-    fn send(&self, j: ViewJob) {
-        self.tx.send(ViewMsg::Job(Box::new(j))).expect("뷰 스레드");
+    fn send(&self, mut j: ViewJob) {
+        // 실시간: 뷰 스레드가 아직 안 꺼낸 판은 이 판으로 바꾸되 그 판의 길 점을 앞에 붙임(넣는 쪽은 이 스레드 하나라 put 은 덮어쓰지 않음)
+        if !out::memory_only() {
+            self.slot.put(0, ViewMsg::Job(Box::new(j)));
+            return;
+        }
+        if let Some((_, ViewMsg::Job(old))) = self.slot.try_take() {
+            j.traj = match (old.traj, j.traj) {
+                (_, TrajUpd::Reset(v)) => TrajUpd::Reset(v),
+                (TrajUpd::Reset(mut a), TrajUpd::Append(b)) => {
+                    a.extend(b);
+                    TrajUpd::Reset(a)
+                }
+                (TrajUpd::Append(mut a), TrajUpd::Append(b)) => {
+                    a.extend(b);
+                    TrajUpd::Append(a)
+                }
+            };
+        }
+        self.slot.put(0, ViewMsg::Job(Box::new(j)));
     }
     /// 넘긴 판을 모두 짤 때까지 기다림
     fn flush(&self) {
         let (t, r) = std::sync::mpsc::channel();
-        self.tx.send(ViewMsg::Flush(t)).expect("뷰 스레드");
+        self.slot.wait_empty(); // 덮어쓰는 칸: 남은 판이 꺼내진 뒤 끝 표시(판을 덮어쓰지 않게)
+        self.slot.put(0, ViewMsg::Flush(t));
         let _ = r.recv();
     }
 }
 
 impl Drop for ViewWorker {
     fn drop(&mut self) {
-        let (tx, _) = std::sync::mpsc::channel();
-        drop(std::mem::replace(&mut self.tx, tx));
+        self.slot.close();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -2311,6 +2314,14 @@ fn crop_score(rgb: &[u8], w: usize, h: usize, x1: usize, y1: usize, bw: usize, b
     let crisp = (sharp / 6.0).clamp(0.3, 1.0);
     let edge = if x1 == 0 || y1 == 0 || x1 + bw >= w || y1 + bh >= h { 0.6 } else { 1.0 };
     ((bw * bh) as f32 * bright * crisp * edge) as u32
+}
+
+/// 장면 보관 예산 기본값: 시작할 때 쓸 수 있는 메모리(MemAvailable)의 15 %(리눅스), 그 밖은 3000 MB.
+/// 8 GB 보드에서 3000 MB 는 다른 실행과 겹치면 OOM 이 났다. 예산 안이면 보관·다시 쌓기 결과는 같다
+fn kf_store_default_mb() -> usize {
+    std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok())
+        .map_or(3000, |kb| (kb / 1024 * 15 / 100).max(256))
 }
 
 /// ax[x] = (x − cx)/fx, ay[y] = (y − cy)/fy: 화소마다 나누지 않게 미리(곱하는 차례는 그대로 → 같은 값)
@@ -2377,12 +2388,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     // 한 프로그램(ondevice): 첫 인자가 slam · view 면 위치 프로그램만 · 뷰어 서버만, 그 밖(run 또는 없음)은 물체 기억(+ --slam · --serve)
     let argv = common::cli::Argv::env();
-    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등), --mlock: 메모리를 RAM 에 묶음. 권한이 없으면 조용히 그대로
+    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등). 권한이 없으면 조용히 그대로
     common::threads::set_rt(&argv.get("--rt").unwrap_or_default());
     common::log::set_quiet(argv.flag("--quiet"));
-    if argv.flag("--mlock") && !common::threads::mlock_all() {
-        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
-    }
+    // DXRT 설정(NPU 코어 묶기 · 버퍼 · NFH 스레드 · 프로파일러, common::dxrt::Config): 하위 명령(view)에도
+    #[cfg(feature = "dxrt")]
+    common::dxrt::Config::from_args(|k| argv.get(k), |k| argv.flag(k)).apply();
     match argv.0.get(1).map(String::as_str) {
         Some("slam") => {
             let code = slam::app::run(&argv.0[1..]).unwrap_or_else(|e| {
@@ -2402,13 +2413,6 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args(&argv);
-    #[cfg(feature = "dxrt")]
-    {
-        // --seg-npu · --embed-npu: 두 NPU 모델을 다른 NPU 코어에 묶음(기본 all)
-        use std::sync::atomic::Ordering::Relaxed;
-        seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
-        seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
-    }
     if let Some(m) = &a.embed {
         embed::start(m);
     }
@@ -2448,6 +2452,10 @@ fn main() {
         stream::hand_slam(rx);
         th
     });
+    // --mlock: 모델·스레드를 다 띄운 뒤 그때 있는 메모리만 묶는다(뒤에 늘어나는 장면 보관·지도는 묶지 않음)
+    if argv.flag("--mlock") && !common::threads::mlock_all() {
+        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
+    }
     if a.seg_check > 0 {
         return seg_check(&a, seg.as_mut(), a.seg_check);
     }

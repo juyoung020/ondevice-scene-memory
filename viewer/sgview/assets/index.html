@@ -628,61 +628,203 @@ async function loadSceneChunks(sp) {
 // cell of spacing voxel·2^(depth−L); a node is G such cells wide and its eight children (level L+1) halve both. Each point lives in
 // exactly one node (the coarsest one whose cell was still free), so coarse nodes give the whole room sparsely and finer nodes add detail.
 // Every frame the visible nodes are chosen by screen size (largest first) until the point budget is reached; only those are fetched and
-// drawn. Node file: N × uint16 xyz (fraction of the node cube) then N × RGB, uploaded as normalised attributes without parsing.
+// drawn. Node file: N × uint16 xyz (fraction of the node cube) then N × RGB, copied into the GPU pools as they are (no parsing).
+//
+// GPU pools: the map is split into spatial blocks (cubes ≥ 2.5 m); each block owns a few large preallocated BufferGeometry segments
+// (SEG_PTS points: uint16 xyz, RGB, uint16 node slot). A node is copied into a range of a segment and uploaded with updateRange
+// (bufferSubData of that range only, never the whole buffer); one draw call per segment instead of one per node. Per-node data
+// (origin, level, drawn / visible-node index) lives in a float node table texture (one texel per slot): the vertex shader places the
+// point from it and drops points of nodes that are not drawn this frame. A block is drawn only when one of its nodes was chosen (the
+// node choice already culls by the view frustum) and its draw range covers only the chosen nodes' ranges.
+// Rebuild (loop closure, leveling): the new run loads into its own pools while the old run keeps being drawn; when the new run's chosen
+// nodes are on the GPU the two swap in one frame and the old pools are freed one segment per frame (no freeze).
 const gOct = new THREE.Group(); scene.add(gOct);
 const OCT_BUDGET = +(QS.get("budget") || 0), OCT_REFINE = +(QS.get("refine") || 0);
 let octFitted = false;   // first octree framing done
-const oct = { run:null, ver:null, meta:null, nodes:new Map(), roots:[], busy:false, loading:0, loadedPts:0, drawn:0, nDrawn:0, box:null, tick:0 };
+const NT_W = 4096, NT_H = 4, NT_N = NT_W * NT_H, SEG_PTS = 1 << 17, BLOCK_M = 2.5;
+const oct = { cur:null, next:null, old:[], loading:0, drawn:0, nDrawn:0, box:null, want:null, meta:null };
 function octBudget() { return OCT_BUDGET || (quality === "high" ? 3000000 : 800000); }
-function octReset() {
-  for (const n of oct.nodes.values()) octUnload(n);
-  Object.assign(oct, { run:null, ver:null, meta:null, nodes:new Map(), roots:[], loadedPts:0, drawn:0, nDrawn:0, box:null });
+// A new run (rebuild, or the replay started over) reuses the dropped run's pools: its segments and node table are recycled one per
+// frame (slots cleared, buffers kept on the GPU), so a run change allocates and frees almost nothing (no GC spike, no buffer storm)
+oct.spareSegs = []; oct.spareTabs = [];
+function octNewRun(run, meta) {
+  let table, tex;
+  const sp = oct.spareTabs.pop();
+  if (sp) { ({ table, tex } = sp); table.fill(0); tex.needsUpdate = true; }
+  else { table = new Float32Array(NT_N * 4); tex = new THREE.DataTexture(table, NT_W, NT_H, THREE.RGBAFormat, THREE.FloatType); tex.magFilter = tex.minFilter = THREE.NearestFilter; tex.generateMipmaps = false; tex.needsUpdate = true; }
+  let lb = 0; for (let l = meta.depth; l >= 0; l--) if (meta.vox * meta.g * 2 ** (meta.depth - l) >= BLOCK_M) { lb = l; break; }
+  const grp = new THREE.Group(); gOct.add(grp);
+  return { run, meta, lb, nodes:new Map(), roots:[], blocks:new Map(), table, tex, grp, free:[], nextSlot:1, tlo:NT_N, thi:-1, loadedPts:0, box:null, tick:0, want:[], sel:null, t0:performance.now() };
 }
-function octUnload(n) {
-  if (!n.obj) return;
-  gOct.remove(n.obj); n.obj.geometry.dispose(); oct.loadedPts -= n.loadedN; n.obj = null; n.loadedN = 0; n.loadedVer = -1;
+// slot 0 is the dead slot: its table texel stays 0 (not drawn), so freed or spare pool ranges point at it
+function octSlot(R) { return R.free.length ? R.free.pop() : R.nextSlot < NT_N ? R.nextSlot++ : -1; }
+function octTable(R, s, x, y, z, w) { const o = 4 * s, T = R.table; T[o] = x; T[o + 1] = y; T[o + 2] = z; T[o + 3] = w; if (s < R.tlo) R.tlo = s; if (s > R.thi) R.thi = s; }
+function octBlock(R, nd) {
+  const k = nd.l < R.lb ? "c" : (() => { const f = 2 ** (nd.l - R.lb); return Math.floor(nd.x / f) + "/" + Math.floor(nd.y / f) + "/" + Math.floor(nd.z / f); })();
+  let b = R.blocks.get(k); if (!b) { b = { segs:[] }; R.blocks.set(k, b); }
+  return b;
 }
+function octSeg(R, cap) {
+  if (cap <= SEG_PTS && oct.spareSegs.length) { const s = oct.spareSegs.pop(); R.grp.add(s.p); return s; }
+  const n = Math.max(SEG_PTS, cap), g = new THREE.BufferGeometry();
+  const pos = new THREE.BufferAttribute(new Uint16Array(n * 3), 3, true), col = new THREE.BufferAttribute(new Uint8Array(n * 3), 3, true), sl = new THREE.BufferAttribute(new Uint16Array(n), 1, false);
+  for (const a of [pos, col, sl]) a.setUsage(THREE.DynamicDrawUsage);
+  g.setAttribute("position", pos); g.setAttribute("color", col); g.setAttribute("slot", sl);
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e4); g.setDrawRange(0, 0);
+  // drawn with an empty range until octUpdate picks its nodes: three still uploads its buffers (a run loading in the background is on
+  // the GPU before it is swapped in)
+  const p = new THREE.Points(g, octMat); p.frustumCulled = false; p.matrixAutoUpdate = false;
+  R.grp.add(p);
+  const s = { g, p, n, top:0, free:[], lo:Infinity, hi:-1, nodes:new Set(), zero:false };
+  p.userData.seg = s;
+  return s;
+}
+function octAlloc(R, nd, N) {
+  const b = octBlock(R, nd), cap = N > SEG_PTS / 2 ? N : Math.ceil(N * 1.25) + 32;   // room to grow in place (points are only added)
+  for (const s of b.segs) {
+    const i = s.free.findIndex(f => f[1] >= cap);
+    if (i >= 0) { const f = s.free[i], off = f[0]; if (f[1] === cap) s.free.splice(i, 1); else { f[0] += cap; f[1] -= cap; } return { s, off, cap }; }
+    if (s.top + cap <= s.n) { const off = s.top; s.top += cap; return { s, off, cap }; }
+  }
+  const s = octSeg(R, cap); b.segs.push(s); s.top = cap; return { s, off:0, cap };
+}
+function octRelease(R, nd) {
+  if (!nd.seg) return;
+  const s = nd.seg; s.g.attributes.slot.array.fill(0, nd.off, nd.off + nd.cap); octDirty(s, nd.off, nd.off + nd.cap);
+  s.free.push([nd.off, nd.cap]); s.nodes.delete(nd);
+  octTable(R, nd.slot, 0, 0, 0, 0); R.free.push(nd.slot);
+  R.loadedPts -= nd.loadedN; nd.seg = null; nd.slot = -1; nd.loadedN = 0; nd.loadedVer = -1; nd.tw = 0;
+}
+function octDirty(s, a, b) { if (a < s.lo) s.lo = a; if (b > s.hi) s.hi = b; }
+// node bytes → its pool range (in place when it still fits), slot attribute, table texel (not drawn until octUpdate picks it)
+function octPut(R, nd, buf, N, ver) {
+  if (!nd.seg || nd.cap < N) {
+    octRelease(R, nd);
+    const slot = octSlot(R); if (slot < 0) return;
+    const a = octAlloc(R, nd, N);
+    nd.seg = a.s; nd.off = a.off; nd.cap = a.cap; nd.slot = slot; a.s.nodes.add(nd);
+    a.s.g.attributes.slot.array.fill(0, nd.off + N, nd.off + nd.cap);
+  }
+  const s = nd.seg, at = s.g.attributes;
+  at.position.array.set(new Uint16Array(buf, 0, N * 3), nd.off * 3);
+  at.color.array.set(new Uint8Array(buf, N * 6, N * 3), nd.off * 3);
+  at.slot.array.fill(nd.slot, nd.off, nd.off + N);
+  octDirty(s, nd.off, nd.off + nd.cap);
+  octTable(R, nd.slot, nd.x * nd.size, nd.y * nd.size, nd.z * nd.size, 0); nd.tw = 0;
+  R.loadedPts += N - nd.loadedN; nd.loadedN = N; nd.loadedVer = ver;
+}
+// raw sub-uploads (three uploads a whole texture on needsUpdate): only the changed rectangle
+function texSub(tex, x, y, w, h, type, data) {
+  const p = renderer.properties.get(tex);
+  if (!p.__webglTexture || tex.version !== p.__version) return false;   // not on the GPU yet or a full upload is pending
+  const gl = renderer.getContext();
+  renderer.state.bindTexture(gl.TEXTURE_2D, p.__webglTexture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, type, data);
+  return true;
+}
+// once per frame before drawing: each segment's changed range (one bufferSubData per attribute), the changed table rows
+// GPU upload budget per frame (bytes of buffer sub-uploads): a big burst (a rebuilt map, a recycled pool's slots) goes up over several
+// frames instead of stalling one frame in the driver (frame gaps of 200+ ms with no script long task)
+const FLUSH_BYTES = WEAK_GPU ? 768 * 1024 : 8 * 1024 * 1024;
+function octFlush(R) {
+  let budget = FLUSH_BYTES;
+  for (const b of R.blocks.values()) for (const s of b.segs) {
+    if ((s.hi < 0 && !s.zero) || !s.p.visible) continue;
+    const cost = (s.hi >= 0 ? (s.hi - s.lo) * 11 : 0) + (s.zero ? s.n * 2 : 0);
+    if (cost > budget && budget < FLUSH_BYTES) continue;   // next frame (one oversize range still goes alone)
+    budget -= cost;   // a hidden segment keeps its changed range until it is drawn (three keeps one range per upload)
+    const at = s.g.attributes, n = s.hi - s.lo;
+    if (s.hi >= 0) {
+      at.position.updateRange.offset = s.lo * 3; at.position.updateRange.count = n * 3; at.position.needsUpdate = true;
+      at.color.updateRange.offset = s.lo * 3; at.color.updateRange.count = n * 3; at.color.needsUpdate = true;
+    }
+    // a recycled segment: its whole slot attribute (cleared to the dead slot) goes up once
+    if (s.zero) { at.slot.updateRange.offset = 0; at.slot.updateRange.count = s.n; s.zero = false; } else { at.slot.updateRange.offset = s.lo; at.slot.updateRange.count = n; }
+    at.slot.needsUpdate = true;
+    s.lo = Infinity; s.hi = -1;
+  }
+  if (R.thi < 0) return;
+  const gl = renderer.getContext();
+  for (let row = Math.floor(R.tlo / NT_W); row <= Math.floor(R.thi / NT_W); row++) {
+    const a = row === Math.floor(R.tlo / NT_W) ? R.tlo % NT_W : 0, b = row === Math.floor(R.thi / NT_W) ? R.thi % NT_W : NT_W - 1;
+    if (!texSub(R.tex, a, row, b - a + 1, 1, gl.FLOAT, R.table.subarray(4 * (row * NT_W + a), 4 * (row * NT_W + b + 1)))) { R.tex.needsUpdate = true; break; }
+  }
+  R.tlo = NT_N; R.thi = -1;
+}
+function octFreeRun(R) { if (R) { R.grp.visible = false; oct.old.push(R); } }
+// a dropped run: its segments are freed one per frame (a big map is hundreds of MB of buffers: freeing them at once stalls the GPU)
+function octFreeStep() {
+  const R = oct.old[0]; if (!R) return;
+  R.grp.visible = false;
+  const c = R.grp.children[0];
+  if (c) {
+    R.grp.remove(c);
+    const s = c.userData.seg;
+    if (s && s.n === SEG_PTS && oct.spareSegs.length < 96) {   // kept for the next run: slots to the dead slot, nothing freed
+      s.g.attributes.slot.array.fill(0); Object.assign(s, { top:0, free:[], lo:Infinity, hi:-1, zero:true }); s.nodes.clear(); s.g.setDrawRange(0, 0);
+      oct.spareSegs.push(s);
+    } else c.geometry.dispose();
+    return;
+  }
+  gOct.remove(R.grp); R.nodes.clear(); R.blocks.clear();
+  if (oct.spareTabs.length < 2) oct.spareTabs.push({ table:R.table, tex:R.tex }); else R.tex.dispose();
+  oct.old.shift();
+}
+// node list of a run (all of it, or only the nodes that changed: binary stream): nodes are added or grow, never removed within a run
+function octIndex(run, meta, list, n) {
+  let R = oct.cur && oct.cur.run === run ? oct.cur : oct.next && oct.next.run === run ? oct.next : null;
+  if (!R) {
+    R = octNewRun(run, meta); if (oct.cur) metEvent("new map run " + run);
+    if (!oct.cur) { oct.cur = R; R.grp.visible = true; } else { octFreeRun(oct.next); oct.next = R; }
+  }
+  const m = R.meta; let added = false;
+  for (let i = 0; i < n; i++) {
+    const l = list[6 * i], x = list[6 * i + 1], y = list[6 * i + 2], z = list[6 * i + 3], key = l + "/" + x + "/" + y + "/" + z;
+    let nd = R.nodes.get(key);
+    if (!nd) {
+      const size = m.vox * m.g * 2 ** (m.depth - l);
+      nd = { key, l, x, y, z, size, spacing:m.vox * 2 ** (m.depth - l), kids:[], seg:null, off:0, cap:0, slot:-1, tw:0, loadedN:0, loadedVer:-1, loading:false, used:0,
+             box:new THREE.Box3(new THREE.Vector3(x * size, y * size, z * size), new THREE.Vector3((x + 1) * size, (y + 1) * size, (z + 1) * size)) };
+      nd.center = nd.box.getCenter(new THREE.Vector3()); nd.radius = size * 0.866;
+      R.nodes.set(key, nd); added = true;
+      if (l >= m.depth - 1) { if (!R.box) R.box = nd.box.clone(); else R.box.union(nd.box); }
+    }
+    nd.n = list[6 * i + 4]; nd.ver = list[6 * i + 5];
+  }
+  if (added) {
+    R.roots = [];
+    for (const nd of R.nodes.values()) nd.kids = [];
+    for (const nd of R.nodes.values()) {
+      const p = R.nodes.get((nd.l - 1) + "/" + Math.floor(nd.x / 2) + "/" + Math.floor(nd.y / 2) + "/" + Math.floor(nd.z / 2));
+      if (p) p.kids.push(nd); else R.roots.push(nd);
+    }
+  }
+  if (R === oct.cur) octFrame();
+  invalidate();
+}
+function octFrame() {
+  const R = oct.cur; oct.box = R ? R.box : null; oct.meta = R ? R.meta : null;
+  // floor pad and grid go under the point map: framed before the octree list came (occupancy grid box, z 0 … 2), they sat
+  // above the map's floor and the half-transparent dark pad dimmed everything below it (a white desk drew grey)
+  if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
+}
+// file mode without the binary stream: the whole node list from octree.json
 async function loadOctree(o) {
-  if (oct.run !== o.run) { octReset(); oct.run = o.run; }
-  if (oct.busy || oct.ver === o.ver) return;
-  oct.busy = true; pendingLoads++;
+  const R = [oct.cur, oct.next].find(r => r && r.run === o.run);
+  if (oct.busyList || (R && oct.listVer === o.ver)) return;
+  oct.busyList = true; pendingLoads++;
   try {
     const r = await fetch("/file/" + o.path + "?v=" + o.ver);
     if (r.ok) {
       const j = await r.json();
-      if (oct.run === o.run && j.run === o.run) {
-        const m = { vox:j.voxel, g:j.g, depth:j.depth, dir:o.dir };
-        oct.meta = m;
-        const box = new THREE.Box3();
-        for (const [l, x, y, z, n, ver] of j.nodes) {
-          const key = l + "/" + x + "/" + y + "/" + z;
-          let nd = oct.nodes.get(key);
-          if (!nd) {
-            const size = m.vox * m.g * 2 ** (m.depth - l);
-            nd = { key, l, x, y, z, size, spacing:m.vox * 2 ** (m.depth - l), kids:[], obj:null, loadedN:0, loadedVer:-1, loading:false, used:0,
-                   box:new THREE.Box3(new THREE.Vector3(x * size, y * size, z * size), new THREE.Vector3((x + 1) * size, (y + 1) * size, (z + 1) * size)) };
-            nd.center = nd.box.getCenter(new THREE.Vector3()); nd.radius = size * 0.866;
-            oct.nodes.set(key, nd);
-          }
-          nd.n = n; nd.ver = ver;
-          if (l >= m.depth - 1) box.union(nd.box);
-        }
-        oct.roots = [];
-        for (const nd of oct.nodes.values()) nd.kids = [];
-        for (const nd of oct.nodes.values()) {
-          const p = oct.nodes.get((nd.l - 1) + "/" + Math.floor(nd.x / 2) + "/" + Math.floor(nd.y / 2) + "/" + Math.floor(nd.z / 2));
-          if (p) p.kids.push(nd); else oct.roots.push(nd);
-        }
-        oct.box = box.isEmpty() ? null : box;
-        oct.ver = o.ver;
-        // floor pad and grid go under the point map: framed before the octree list came (occupancy grid box, z 0 … 2), they sat
-        // above the map's floor and the half-transparent dark pad dimmed everything below it (a white desk drew grey)
-        if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
-        invalidate();
+      if (j.run === o.run) {
+        const a = new Int32Array(j.nodes.length * 6); j.nodes.forEach((nd, i) => a.set(nd, 6 * i));
+        octIndex(o.run, { vox:j.voxel, g:j.g, depth:j.depth, dir:o.dir }, a, j.nodes.length); oct.listVer = o.ver;
       }
     }
   } catch (e) {}
-  oct.busy = false; pendingLoads--; loadDone();
+  oct.busyList = false; pendingLoads--; loadDone();
 }
 // Visible-node texture (Potree's adaptive point size): one texel per drawn node in breadth-first order, R = mask of drawn children
 // (bit = octant x + 2y + 4z), G·256 + B = index offset to its first drawn child (children follow in octant order). The vertex shader
@@ -692,19 +834,25 @@ const VIS_W = 4096;
 const octVis = { data:new Uint8Array(VIS_W * 4), tex:null };
 octVis.tex = new THREE.DataTexture(octVis.data, VIS_W, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
 octVis.tex.magFilter = octVis.tex.minFilter = THREE.NearestFilter; octVis.tex.generateMipmaps = false;
-const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:14 }, vis:{ value:octVis.tex },
+const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:14 }, vis:{ value:octVis.tex }, nodes:{ value:null }, vox:{ value:0.02 }, g:{ value:32 }, depthL:{ value:5 },
                  pass:{ value:0 }, depth:{ value:null }, res:{ value:new THREE.Vector2(1, 1) }, near:{ value:0.05 }, far:{ value:500 }, band:{ value:1.5 } };
 function octMaterial() {
   // round splats sized by the local point spacing: neighbouring points overlap into a closed surface and EDL shades its edges;
   // colours are drawn as stored (sRGB photo colours straight to the sRGB canvas). Pass 1 (blended splats, see renderFrame): colour ×
   // weight (1 − r², Potree) for splats within a depth band behind the nearest surface (band × splat radius, at least 0.6 % of the depth).
+  // The point's node comes from the slot attribute: node table texel = (origin xyz, (visible index + 1)·16 + level), 0 = not drawn.
   return octQuality(new THREE.ShaderMaterial({
-    uniforms:{ uIdx:{ value:0 }, uSpacing:{ value:0.01 }, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx,
+    uniforms:{ uNodes:octUni.nodes, uVox:octUni.vox, uG:octUni.g, uDepthL:octUni.depthL, uVis:octUni.vis, uScale:pointUniforms.scale, uK:octUni.sizeK, uMin:octUni.minPx, uMax:octUni.maxPx,
                uPass:octUni.pass, uDepth:octUni.depth, uRes:octUni.res, uNear:octUni.near, uFar:octUni.far, uBand:octUni.band },
-    vertexShader:`attribute vec3 color; uniform float uIdx; uniform float uSpacing; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC; varying float vR; varying float vZ;
+    vertexShader:`attribute vec3 color; attribute float slot; uniform sampler2D uNodes; uniform float uVox; uniform float uG; uniform float uDepthL; uniform sampler2D uVis; uniform float uScale; uniform float uK; uniform float uMin; uniform float uMax; varying vec3 vC; varying float vR; varying float vZ;
       float bitAt(float m, float b){ return mod(floor(m / exp2(b)), 2.0); }
-      void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        vec3 p = position; float idx = uIdx, d = 0.0;
+      void main(){
+        vec4 nd = texture2D(uNodes, vec2((mod(slot, ${NT_W}.0) + 0.5) / ${NT_W}.0, (floor(slot / ${NT_W}.0) + 0.5) / ${NT_H}.0));
+        float vi = floor(nd.w / 16.0) - 1.0;
+        if (vi < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vC = vec3(0.0); vR = 0.0; vZ = 0.0; return; }
+        float lv = nd.w - 16.0 * floor(nd.w / 16.0), sp = uVox * exp2(uDepthL - lv);
+        vC = color; vec4 mv = modelViewMatrix * vec4(nd.xyz + position * sp * uG, 1.0);
+        vec3 p = position; float idx = vi, d = 0.0;
         for (int i = 0; i < 8; i++) {
           vec4 t = texture2D(uVis, vec2((idx + 0.5) / ${VIS_W}.0, 0.5));
           float m = floor(t.r * 255.0 + 0.5);
@@ -715,7 +863,7 @@ function octMaterial() {
           idx += floor(t.g * 255.0 + 0.5) * 256.0 + floor(t.b * 255.0 + 0.5) + before;
           p = p * 2.0 - o; d += 1.0;
         }
-        float px = uSpacing / exp2(d) * uK * uScale / -mv.z;
+        float px = sp / exp2(d) * uK * uScale / -mv.z;
         gl_PointSize = clamp(px, uMin, uMax); vR = 0.5 * gl_PointSize * -mv.z / uScale; vZ = -mv.z; gl_Position = projectionMatrix * mv; }`,
     fragmentShader:`uniform float uPass; uniform sampler2D uDepth; uniform vec2 uRes; uniform float uNear; uniform float uFar; uniform float uBand; varying vec3 vC; varying float vR; varying float vZ;
       void main(){ vec2 q = gl_PointCoord * 2.0 - 1.0; float r2 = dot(q, q); if (r2 > 1.0) discard;
@@ -732,34 +880,22 @@ function octMaterial() {
         if (vZ > front + max(uBand * vR, 0.006 * front)) discard;
         float w = 1.0 - r2; gl_FragColor = vec4(vC * w, w); }`, extensions:{ fragDepth:true } }));
 }
-// one material for every node (one program and state set; the two per-node uniforms are set just before each node is drawn)
+// one material for every pool segment (one program and state set)
 const octMat = octMaterial();
-function octNodeUniforms() { const u = octMat.uniforms; u.uIdx.value = this.userData.i; u.uSpacing.value = this.userData.sp; octMat.uniformsNeedUpdate = true; }
 // High: paraboloid splat depth (gl_FragDepth turns off early depth rejection, so Low keeps flat discs for the Pi 5 GPU)
 function octQuality(m) { const on = quality === "high"; if (!!m.defines.PARA !== on) { if (on) m.defines.PARA = 1; else delete m.defines.PARA; m.needsUpdate = true; } return m; }
 // nodes come in batches (one /api/files request for up to 12 nodes or 300 k points, two batches in flight), largest on screen first
-const octFile = nd => oct.meta.dir + "/n" + nd.l + "_" + nd.x + "_" + nd.y + "_" + nd.z + ".bin";
-async function octLoad(nds) {
+const octFile = (R, nd) => R.meta.dir + "/n" + nd.l + "_" + nd.x + "_" + nd.y + "_" + nd.z + ".bin";
+async function octLoad(R, nds) {
   oct.loading++;
-  const run = oct.run, vers = nds.map(nd => nd.ver);
+  const vers = nds.map(nd => nd.ver);
   for (const nd of nds) nd.loading = true;
   try {
-    const got = await loadBatch(nds.map(octFile));
+    const got = await loadBatch(nds.map(nd => octFile(R, nd)));
     nds.forEach((nd, i) => {
-      const buf = got[octFile(nd)], N = buf ? Math.floor(buf.byteLength / 9) : 0;
-      if (oct.run !== run || N <= 0) return;
-      queueUpload(buf.byteLength, () => {
-      if (oct.run !== run || vers[i] !== nd.ver) return;
-      const g = new THREE.BufferGeometry();
-      g.setAttribute("position", new THREE.BufferAttribute(new Uint16Array(buf, 0, N * 3), 3, true));
-      g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(buf, N * 6, N * 3), 3, true));
-      g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0.5, 0.5, 0.5), 0.87);
-      octUnload(nd);
-      const p = new THREE.Points(g, octMat); p.onBeforeRender = octNodeUniforms;
-      p.position.set(nd.x * nd.size, nd.y * nd.size, nd.z * nd.size); p.scale.setScalar(nd.size); p.frustumCulled = false; p.visible = false;
-      p.updateMatrix(); p.matrixAutoUpdate = false;
-      nd.obj = p; nd.loadedN = N; nd.loadedVer = vers[i]; oct.loadedPts += N; gOct.add(p); invalidate();
-      });
+      const buf = got[octFile(R, nd)], N = buf ? Math.floor(buf.byteLength / 9) : 0;
+      if (N <= 0 || (R !== oct.cur && R !== oct.next)) return;
+      queueUpload(buf.byteLength, () => { if ((R === oct.cur || R === oct.next) && vers[i] === nd.ver) { octPut(R, nd, buf, N, vers[i]); invalidate(); } });
     });
   } catch (e) {}
   for (const nd of nds) nd.loading = false;
@@ -767,41 +903,65 @@ async function octLoad(nds) {
   octPump();
 }
 function octPump() {
-  while (oct.loading < 2 && upQ.length < 24 && oct.want && oct.want.length && oct.run !== null) {
-    const b = []; let pts = 0;
-    while (oct.want.length && b.length < 12 && pts < 300000) { const nd = oct.want.shift(); if (!nd.loading && (!nd.obj || nd.loadedVer !== nd.ver)) { b.push(nd); pts += nd.n; } }
-    if (!b.length) break;
-    octLoad(b);
+  // a run being swapped in loads first; the drawn run keeps refining after it
+  for (const R of [oct.next, oct.cur]) {
+    if (!R) continue;
+    while (oct.loading < 2 && upQ.length < 24 && R.want.length) {
+      const b = []; let pts = 0;
+      while (R.want.length && b.length < 12 && pts < 300000) { const nd = R.want.shift(); if (!nd.loading && (!nd.seg || nd.loadedVer !== nd.ver)) { b.push(nd); pts += nd.n; } }
+      if (!b.length) break;
+      octLoad(R, b);
+    }
   }
 }
 const _frus = new THREE.Frustum(), _pm = new THREE.Matrix4();
 const oc = n => (n.x & 1) | ((n.y & 1) << 1) | ((n.z & 1) << 2);   // octant of a node inside its parent
-// choose the nodes to draw: largest on screen first, until the point budget; fetch the missing ones (6 in flight); free the least
-// recently used nodes when the loaded points exceed twice the budget
-function octUpdate() {
-  if (!oct.meta || !opt("c_scene")) { gOct.visible = false; oct.drawn = 0; return; }
-  gOct.visible = true;
-  camera.updateMatrixWorld(); _pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); _frus.setFromProjectionMatrix(_pm);
-  const proj = pointUniforms.scale.value, cam = camera.position, budget = octBudget(), minPx = oct.meta.g * (OCT_REFINE || (quality === "high" ? 1.0 : 2.2));   // refine while a node's point spacing on screen (2·radius / G) is above ~2 px (low: ~4 px; the adaptive splat size closes the surface, 1.6 → 2.2 looked the same at 0.8× the points)
+// choose a run's nodes: largest on screen first, until the point budget; nodes beyond the middle of the fog band (drawn faded) refine
+// one step coarser (1.5× the on-screen spacing), nearer ones exactly as before; the missing ones are fetched; the least recently used
+// are freed when the loaded points exceed twice the budget
+function octSelect(R) {
+  const proj = pointUniforms.scale.value, cam = camera.position, budget = octBudget(), minPx = R.meta.g * (OCT_REFINE || (quality === "high" ? 1.0 : 2.2));   // refine while a node's point spacing on screen (2·radius / G) is above ~2 px (low: ~4 px)
+  const farD = scene.fog ? (scene.fog.near + scene.fog.far) / 2 : Infinity;
   const pr = nd => { const d = nd.center.distanceTo(cam); return d < nd.radius ? 1e9 : nd.radius * proj / d; };
   const heap = [];   // binary max-heap on priority
   const push = nd => { if (!_frus.intersectsBox(nd.box)) return; const e = [pr(nd), nd]; heap.push(e); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] >= e[0]) break; heap[i] = heap[p]; i = p; } heap[i] = e; };
   const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { let i = 0; for (;;) { let c = 2 * i + 1; if (c >= heap.length) break; if (c + 1 < heap.length && heap[c + 1][0] > heap[c][0]) c++; if (heap[c][0] <= last[0]) break; heap[i] = heap[c]; i = c; } heap[i] = last; } return top; };
-  for (const r of oct.roots) push(r);
+  for (const r of R.roots) push(r);
   const sel = new Set(), want = []; let pts = 0;
-  const tick = ++oct.tick;
+  const tick = ++R.tick;
   while (heap.length) {
     const [p, nd] = pop();
-    if (p < minPx && nd.l > 0) continue;
+    if (nd.l > 0 && p < (nd.center.distanceTo(cam) - nd.radius > farD ? 1.5 * minPx : minPx)) continue;
     if (pts + nd.n > budget) break;
     sel.add(nd); pts += nd.n; nd.used = tick;
-    if (!nd.obj || nd.loadedVer !== nd.ver) want.push(nd);
+    if (!nd.seg || nd.loadedVer !== nd.ver) want.push(nd);
     for (const k of nd.kids) push(k);
   }
-  oct.want = want; octPump();
+  R.want = want; R.sel = sel; R.selPts = pts;
+  if (R.loadedPts > 2 * budget) {
+    const old = [...R.nodes.values()].filter(n => n.seg && !sel.has(n)).sort((a, b) => a.used - b.used);
+    for (const n of old) { if (R.loadedPts <= 1.5 * budget) break; octRelease(R, n); }
+  }
+}
+function octUpdate() {
+  octFreeStep();
+  const R0 = oct.cur;
+  if (!R0 || !opt("c_scene")) { gOct.visible = false; oct.drawn = 0; return; }
+  gOct.visible = true;
+  camera.updateMatrixWorld(); _pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); _frus.setFromProjectionMatrix(_pm);
+  // a rebuilt map loading in the background: swap when its chosen nodes are all on the GPU (or after 6 s), then free the old pools
+  const N = oct.next;
+  if (N) {
+    octSelect(N); octFlush(N);
+    let ready = !N.want.length; if (ready) for (const nd of N.sel) if (!nd.seg || nd.loadedVer !== nd.ver) { ready = false; break; }
+    if ((ready && N.sel.size) || performance.now() - N.t0 > 6000) { octFreeRun(oct.cur); oct.cur = N; oct.next = null; N.grp.visible = true; octFrame(); }
+  }
+  const R = oct.cur;
+  octSelect(R);
+  oct.want = R.want; octPump();
   // drawn nodes in breadth-first order → visible-node texture (see octMaterial)
-  const isOn = nd => sel.has(nd) && nd.obj && nd.obj.geometry;
-  const order = [], q = oct.roots.filter(isOn);
+  const sel = R.sel, isOn = nd => sel.has(nd) && nd.seg;
+  const order = [], q = R.roots.filter(isOn);
   for (let h = 0; h < q.length && q.length < VIS_W; h++) { const nd = q[h]; nd._i = h; order.push(nd); }
   // breadth-first: children of each node in octant order, appended after everything queued so far
   let visChanged = false;
@@ -815,18 +975,19 @@ function octUpdate() {
   if (visChanged) octVis.tex.needsUpdate = true;   // uploaded only when the drawn node set changed (an orbit over a loaded map uploads nothing)
   const drawSet = new Set(order);
   let drawn = 0, nDrawn = 0;
-  for (const nd of oct.nodes.values()) {
-    if (!nd.obj) continue;
-    const on = drawSet.has(nd);
-    nd.obj.visible = on;
-    if (on) { nd.obj.userData.i = nd._i; nd.obj.userData.sp = nd.spacing; drawn += nd.loadedN; nDrawn++; }
+  for (const b of R.blocks.values()) for (const s of b.segs) {
+    let lo = Infinity, hi = -1;
+    for (const nd of s.nodes) {
+      const on = drawSet.has(nd), w = on ? (nd._i + 1) * 16 + nd.l : 0;
+      if (w !== nd.tw) { nd.tw = w; octTable(R, nd.slot, nd.x * nd.size, nd.y * nd.size, nd.z * nd.size, w); }
+      if (on) { drawn += nd.loadedN; nDrawn++; if (nd.off < lo) lo = nd.off; if (nd.off + nd.cap > hi) hi = nd.off + nd.cap; }
+    }
+    s.p.visible = hi > lo; if (hi > lo) s.g.setDrawRange(lo, hi - lo);
   }
-  oct.drawn = drawn; oct.nDrawn = nDrawn; oct.selPts = pts;
-  if (oct.loadedPts > 2 * budget) {
-    const old = [...oct.nodes.values()].filter(n => n.obj && !sel.has(n)).sort((a, b) => a.used - b.used);
-    for (const n of old) { if (oct.loadedPts <= 1.5 * budget) break; octUnload(n); }
-  }
-  const el = $("octinfo"); if (el) el.textContent = `points ${(drawn / 1e6).toFixed(2)} M drawn (${nDrawn} nodes) · budget ${(budget / 1e6).toFixed(1)} M · map ${oct.nodes.size} nodes`;
+  octFlush(R);
+  const m = R.meta; octUni.nodes.value = R.tex; octUni.vox.value = m.vox; octUni.g.value = m.g; octUni.depthL.value = m.depth;
+  oct.drawn = drawn; oct.nDrawn = nDrawn;
+  const el = $("octinfo"); if (el) { let segs = 0; for (const b of R.blocks.values()) segs += b.segs.length; el.textContent = `points ${(drawn / 1e6).toFixed(2)} M drawn (${nDrawn} nodes, ${segs} pools) · budget ${(octBudget() / 1e6).toFixed(1)} M · map ${R.nodes.size} nodes`; }
 }
 
 function drawObjects() {  invalidate();
@@ -834,8 +995,8 @@ function drawObjects() {  invalidate();
   gObjs.visible = true;
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor)
     const sp = view.scene_points, mat = () => pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") });
-    if (sp.octree) {   // octree map: the level-of-detail pass (octUpdate) picks and fetches nodes every frame
-      loadOctree(sp.octree);
+    if (sp.octree) {   // octree map: the level-of-detail pass (octUpdate) picks and fetches nodes every frame (node list: binary stream, else octree.json)
+      if (!DELTA) loadOctree(sp.octree);
     } else if (sp.chunks != null) {   // chunked map: only chunks not yet fetched are downloaded and appended to gScene (not rebuilt here)
       loadSceneChunks(sp);
     } else {
@@ -1055,9 +1216,10 @@ $("wsave").onclick = () => {
 function ensureLabel(key, text, cls) {
   let e = labelEls.get(key);
   if (!e) { e = document.createElement("div"); e.className = "lbl" + (cls ? " " + cls : ""); $("labels").appendChild(e); labelEls.set(key, e); }
-  if (e.textContent !== text) e.textContent = text;
+  if (e.textContent !== text) { e.textContent = text; e._sz = null; }
   return e;
 }
+function labelSize(e) { if (!e._sz) e._sz = [e.offsetWidth, e.offsetHeight]; return e._sz; }
 const _v = new THREE.Vector3();
 function updateLabels() {
   const want = new Set();
@@ -1070,10 +1232,12 @@ function updateLabels() {
       const e = ensureLabel(key, text, cls);
       const x = (_v.x + 1) / 2 * w, y = (1 - _v.y) / 2 * h; e.style.left = x + "px";
       const hit = r => boxes.some(b => r.left < b.right + 2 && r.right > b.left - 2 && r.top < b.bottom + 1 && r.bottom > b.top - 1);
+      // label boxes from the cached size (measured once per text): no layout read per label per frame (that forced a layout each time)
+      const [lw, lh] = labelSize(e);
       let r;
       for (const dy of avoid ? [0, -1, 1] : [0]) {   // spot taken: try one label height above, then below
-        e.style.top = y + dy * e.offsetHeight + "px"; r = e.getBoundingClientRect();
-        if (!avoid || !hit(r)) break; r = null;
+        const ty = y + dy * lh; r = { left:x - lw / 2, right:x + lw / 2, top:ty - lh, bottom:ty };
+        if (!avoid || !hit(r)) { e.style.top = ty + "px"; break; } r = null;
       }
       if (!r) return;
       boxes.push(r); want.add(key);
@@ -1083,8 +1247,9 @@ function updateLabels() {
       for (const p of pts) { _v.set(...p).project(camera); if (_v.z > 1) continue; if (!best || _v.x < best[0]) best = [_v.x, _v.y]; }
       if (!best || Math.abs(best[1]) > 1) return;
       const e = ensureLabel(key, text, "layer"); want.add(key);
-      e.style.left = Math.max((best[0] + 1) / 2 * w - 14, e.offsetWidth + 8) + "px"; e.style.top = ((1 - best[1]) / 2 * h) + "px";
-      boxes.push(e.getBoundingClientRect());
+      const [lw, lh] = labelSize(e), L = Math.max((best[0] + 1) / 2 * w - 14, lw + 8), T = (1 - best[1]) / 2 * h;
+      e.style.left = L + "px"; e.style.top = T + "px";
+      boxes.push({ left:L - lw, right:L, top:T - lh / 2, bottom:T + lh / 2 });
     };
     for (const id of new Set([selected, hoverId])) {   // hovered / selected object: one pill with the state dot
       const o = id != null && objs.get(id); if (!o) continue;
@@ -1223,8 +1388,11 @@ async function renderCropsNow(o, v) {
   }
 }
 function fillSelect() {
+  // rebuilt only when the list text changes (positions move every view; a new option list re-lays out the panel)
   const s = $("s_obj"), cur = s.value;
-  s.innerHTML = '<option value="">(none)</option>' + [...objs.values()].sort((a, b) => a.id - b.id).map(o => `<option value="${o.id}">${o.name}#${o.id}</option>`).join("");
+  const html = '<option value="">(none)</option>' + [...objs.values()].sort((a, b) => a.id - b.id).map(o => `<option value="${o.id}">${o.name}#${o.id}</option>`).join("");
+  if (html === s._html) return;
+  s._html = html; s.innerHTML = html;
   s.value = cur;
 }
 $("s_obj").onchange = e => select(e.target.value === "" ? null : +e.target.value);
@@ -1487,11 +1655,16 @@ async function fetchView() {
 let latestPose = null;
 // ?metrics=1: 2 초마다 그린 프레임 수 · 위치(pose.json wall) → 화면 지연을 서버 로그로(/api/metric)
 let poseWall = 0, viewWall = 0;
-const met = { frames: 0, lat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0 };
+const met = { frames: 0, lat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0, gap: 0, lastRaf: 0, lastChange: -1e9, lt: 0, ltMax: 0 };
+// freezes: longest gap between animation frames while the scene is changing (data applied within the last second), and main-thread
+// long tasks (> 50 ms, count and longest)
+// ?metrics=1: run boundaries (a new trajectory / octree run) with the page's JS heap; the server adds the board's MemAvailable
+function metEvent(what) { if (QS.get("metrics") === "1") fetch(`/api/metric?event=${encodeURIComponent(what)}&jsmb=${performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) : "-"}`).catch(() => {}); }
+try { new PerformanceObserver(l => { for (const e of l.getEntries()) { met.lt++; met.ltMax = Math.max(met.ltMax, e.duration); } }).observe({ entryTypes:["longtask"] }); } catch (e) {}
 if (QS.get("metrics") === "1") setInterval(() => {
   const dt = (performance.now() - met.t0) / 1000, qq = (a, p) => { a.sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(0) : "-"; };
-  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}`).catch(() => {});
-  met.frames = 0; met.lat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = 0; met.t0 = performance.now();
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}&gap=${met.gap.toFixed(0)}&lt=${met.lt}&ltmax=${met.ltMax.toFixed(0)}&jsmb=${performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) : "-"}`).catch(() => {});
+  met.frames = 0; met.lat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = met.gap = met.lt = met.ltMax = 0; met.t0 = performance.now();
 }, 2000);
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
@@ -1516,6 +1689,162 @@ function startFileEvents() {
   })();
 }
 
+// ---------------- binary delta stream (/bstream) ----------------
+// The server remembers what this page has and sends only what is new (see viewer/sgview/src/delta.rs): changed view keys, changed
+// or new objects (+ the id order), appended trajectory points, changed 32-cell map tiles, octree nodes that grew, the camera pose.
+// A worker reads the stream, decodes each frame (JSON parse, map tiles → RGBA in texture row order, typed arrays) and transfers the
+// buffers; the main thread only applies them. The connection is retried every second; a new connection starts from nothing (full state).
+const DELTA_SRC = `
+const dec = new TextDecoder();
+onmessage = e => run(e.data.url);
+async function run(url) {
+  for (;;) {
+    try {
+      const r = await fetch(url, { cache:"no-store" });
+      postMessage({ open:true });
+      const rd = r.body.getReader();
+      let buf = new Uint8Array(1 << 16), n = 0;
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        if (n + value.length > buf.length) { const b = new Uint8Array(Math.max(buf.length * 2, n + value.length)); b.set(buf.subarray(0, n)); buf = b; }
+        buf.set(value, n); n += value.length;
+        let o = 0;
+        while (n - o >= 4) {
+          const len = buf[o] | buf[o + 1] << 8 | buf[o + 2] << 16 | buf[o + 3] << 24;
+          if (n - o - 4 < len) break;
+          if (len > 0) frame(buf.slice(o + 4, o + 4 + len));
+          o += 4 + len;
+        }
+        if (o) { buf.copyWithin(0, o, n); n -= o; }
+      }
+    } catch (e) {}
+    postMessage({ open:false });
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+function frame(u8) {
+  const t = performance.timeOrigin + performance.now(), dv = new DataView(u8.buffer), out = { t, bytes:u8.length }, tr = [];
+  const str16 = o => [dec.decode(u8.subarray(o + 2, o + 2 + dv.getUint16(o, true))), o + 2 + dv.getUint16(o, true)];
+  for (let o = 0; o + 5 <= u8.length;) {
+    const tag = u8[o], len = dv.getUint32(o + 1, true), a = o + 5, e = a + len; o = e;
+    if (tag === 1) { const [v, b] = str16(a); out.ver = v; out.wall = dv.getFloat64(b, true); }
+    else if (tag === 2) out.head = JSON.parse(dec.decode(u8.subarray(a, e)));
+    else if (tag === 3) {
+      const no = dv.getUint32(a, true), order = new Uint32Array(no); let p = a + 4;
+      for (let i = 0; i < no; i++, p += 4) order[i] = dv.getUint32(p, true);
+      const ns = dv.getUint32(p, true), set = []; p += 4;
+      for (let i = 0; i < ns; i++) { const l = dv.getUint32(p, true); set.push(JSON.parse(dec.decode(u8.subarray(p + 4, p + 4 + l)))); p += 4 + l; }
+      out.objs = { order, set }; tr.push(order.buffer);
+    } else if (tag === 4) {
+      const id = dv.getFloat64(a, true), from = dv.getUint32(a + 8, true), k = dv.getUint32(a + 12, true);
+      const data = new Float64Array(u8.buffer.slice(a + 16, a + 16 + k * 32));
+      out.traj = { id, from, data }; tr.push(data.buffer);
+    } else if (tag === 5) {
+      let [ver, p] = str16(a); const w = dv.getUint32(p, true), h = dv.getUint32(p + 4, true), full = u8[p + 8] === 1, k = dv.getUint32(p + 9, true), tiles = []; p += 13;
+      for (let i = 0; i < k; i++) {
+        const x0 = dv.getUint32(p, true), y0 = dv.getUint32(p + 4, true), tw = dv.getUint32(p + 8, true), th = dv.getUint32(p + 12, true); p += 16;
+        // PGM rows (row 0 = max y) → texture rows (row 0 = min y); 205 = unknown: transparent
+        const rgba = new Uint8Array(tw * th * 4);
+        for (let r = 0; r < th; r++) {
+          const src = p + (th - 1 - r) * tw, dst = r * tw * 4;
+          for (let x = 0; x < tw; x++) { const v = u8[src + x], q = dst + 4 * x; rgba[q] = rgba[q + 1] = rgba[q + 2] = v; rgba[q + 3] = v === 205 ? 0 : 255; }
+        }
+        p += tw * th;
+        tiles.push({ x:x0, y:h - y0 - th, w:tw, h:th, rgba }); tr.push(rgba.buffer);
+      }
+      out.map = { ver, w, h, full, tiles };
+    } else if (tag === 6) {
+      const run = dv.getFloat64(a, true), reset = u8[a + 8] === 1, k = dv.getUint32(a + 9, true), list = new Int32Array(k * 6); let p = a + 13;
+      for (let i = 0; i < k; i++, p += 21) { list[6 * i] = u8[p]; list[6 * i + 1] = dv.getInt32(p + 1, true); list[6 * i + 2] = dv.getInt32(p + 5, true); list[6 * i + 3] = dv.getInt32(p + 9, true); list[6 * i + 4] = dv.getUint32(p + 13, true); list[6 * i + 5] = dv.getUint32(p + 17, true); }
+      out.oct = { run, reset, list, n:k }; tr.push(list.buffer);
+    } else if (tag === 7) out.pose = JSON.parse(dec.decode(u8.subarray(a, e)));
+  }
+  postMessage(out, tr);
+}`;
+const dlt = { head:null, objs:new Map(), order:[], traj:{ id:-1, nodes:[] }, on:false, mapWait:null, octWait:[] };
+let DELTA = false;
+function startDelta() {
+  DELTA = true;
+  const w = new Worker(URL.createObjectURL(new Blob([DELTA_SRC], { type:"text/javascript" })));
+  w.onmessage = e => { const m = e.data; if ("open" in m) { dlt.on = m.open; return; } try { applyDelta(m); } catch (err) { console.error(err); } };
+  w.postMessage({ url:new URL("/bstream", location.href).href });
+}
+// occupancy map: tiles copied into the page's RGBA (the aligned redraw reads it) and uploaded as sub-rectangles
+function applyMapDelta(d) {
+  const g = view && view.grid; if (!g) return;
+  const key = [d.w, d.h, g.origin[0], g.origin[1], g.resolution].join("|"), res = g.resolution;
+  let whole = false;
+  if (!mapState || mapState.w !== d.w || mapState.h !== d.h || d.full) {
+    if (mapState) { mapState.tex.dispose(); mapState.mesh.geometry.dispose(); mapState.mesh.material.dispose(); gMap.remove(mapState.mesh); }
+    const rgba = new Uint8Array(d.w * d.h * 4), tex = new THREE.DataTexture(rgba, d.w, d.h, THREE.RGBAFormat);
+    tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter;
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(d.w * res, d.h * res), new THREE.MeshBasicMaterial({ map:tex, side:THREE.DoubleSide, alphaTest:0.5 }));
+    gMap.add(mesh);
+    mapState = { w:d.w, h:d.h, rgba, tex, mesh, ver:d.ver, key:"", res, ox:g.origin[0], oy:g.origin[1] };
+    whole = true;
+  }
+  if (mapState.key !== key) {   // the grid moved (same size): place the plane again, pixels follow in the tiles
+    mapState.mesh.position.set(g.origin[0] + d.w * res / 2, g.origin[1] + d.h * res / 2, 0);
+    if (mapState.res !== res) { mapState.mesh.geometry.dispose(); mapState.mesh.geometry = new THREE.PlaneGeometry(d.w * res, d.h * res); }
+    Object.assign(mapState, { key, res, ox:g.origin[0], oy:g.origin[1] });
+  }
+  const { rgba, w } = mapState, gl = renderer.getContext();
+  for (const t of d.tiles) {
+    for (let r = 0; r < t.h; r++) rgba.set(t.rgba.subarray(r * t.w * 4, (r + 1) * t.w * 4), ((t.y + r) * w + t.x) * 4);
+    if (!whole && !texSub(mapState.tex, t.x, t.y, t.w, t.h, gl.UNSIGNED_BYTE, t.rgba)) whole = true;
+  }
+  if (whole) mapState.tex.needsUpdate = true;
+  mapState.ver = d.ver;
+  if (alignTheta !== 0 || alignState) queueAligned();
+  gMap.visible = opt("c_map"); invalidate();
+}
+function applyDelta(m) {
+  const t0 = performance.now();
+  met.kb += m.bytes / 1024; met.lastChange = t0;
+  if (m.head) { const h = Object.assign({}, dlt.head || {}, m.head); for (const k of m.head.__del || []) delete h[k]; delete h.__del; dlt.head = h; }
+  if (m.objs) {
+    const keep = new Set(m.objs.order);
+    for (const id of dlt.objs.keys()) if (!keep.has(id)) dlt.objs.delete(id);
+    for (const o of m.objs.set) dlt.objs.set(o.id, o);
+    dlt.order = m.objs.order;
+  }
+  if (m.traj) {
+    const tj = m.traj, a = tj.data;
+    if (tj.from === 0 || tj.id !== dlt.traj.id || tj.from !== dlt.traj.nodes.length) { if (dlt.traj.nodes.length) metEvent("new trajectory"); dlt.traj = { id:tj.id, nodes:[] }; }
+    const nodes = dlt.traj.nodes, base = nodes.length;
+    for (let i = 0; i < a.length / 4; i++) nodes.push({ id:"A" + (base + i), kind:"agent", pos:[a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]], t:a[4 * i] });
+  }
+  const changed = (m.ver || m.head || m.objs || m.traj) && dlt.head;
+  if (changed) {
+    const v = Object.assign({}, dlt.head);
+    v.objects = []; for (const id of dlt.order) { const o = dlt.objs.get(id); if (o) v.objects.push(o); }
+    v.graph = { edges:(dlt.head.graph && dlt.head.graph.edges) || [], nodes:dlt.traj.nodes };
+    view = v;
+  }
+  // map tiles / octree nodes that came before the view keys they need (grid origin, octree meta) wait for them
+  if (m.map) { const w = dlt.mapWait; dlt.mapWait = w && !m.map.full && w.w === m.map.w && w.h === m.map.h ? Object.assign({}, m.map, { full:w.full, tiles:w.tiles.concat(m.map.tiles) }) : m.map; }
+  if (dlt.mapWait && view && view.grid) { const w = dlt.mapWait; dlt.mapWait = null; applyMapDelta(w); }
+  if (changed) {
+    if (m.ver) viewVer = m.ver;
+    if (m.wall) viewWall = m.wall;   // ?metrics=1: 지도 판을 낸 장면 → 화면
+    applyView(view);
+    if (latestPose && latestPose.t >= (view.stamp ?? 0)) { view.cam = latestPose.cam; view.pose = latestPose.pose; drawRobot(); }   // keep the newer fast pose
+    updateWalls();
+    bootDone("first");
+  }
+  if (m.oct) dlt.octWait.push(m.oct);
+  if (dlt.octWait.length) {
+    const o = view && view.scene_points && view.scene_points.octree;
+    dlt.octWait = dlt.octWait.filter(q => {
+      if (!o || o.run !== q.run) return o == null || q.run > o.run;   // an older run is dropped, a newer one waits for its keys
+      octIndex(q.run, { vox:o.voxel, g:o.g, depth:o.depth, dir:o.dir }, q.list, q.n); return false;
+    });
+  }
+  if (m.pose) onFilePose(m.pose);
+  if (m.ver) { met.fms += Math.max(0, performance.timeOrigin + t0 - m.t); met.ams += performance.now() - t0; met.nv++; }
+  invalidate();
+}
 
 // ---------------- live metrics: what each stage costs in this page ----------------
 let jointsCur = null, jointsT = 0;   // robot joint / state vector, order defined by the robot URDF (the model is added later)
@@ -1575,13 +1904,14 @@ function styleRobot(root) {
 }
 const robotEdge = { todo:null, cache:new Map(), mat:new THREE.LineBasicMaterial({ color:0x15171d }), busy:false };
 function robotEdges() {
-  if (!robotModel || !gRobot.visible || robotEdge.busy) return;
+  // only for a model that is drawn (handheld runs never attach it; an edge pass on its big meshes took 0.3–0.7 s per mesh at Pi speed)
+  if (!robotModel || !robotModel.root.parent || !gRobot.visible || robotEdge.busy) return;
   if (!robotEdge.todo) { robotEdge.todo = []; robotModel.root.traverse(o => { if (o.isMesh) robotEdge.todo.push(o); }); }
   if (!robotEdge.todo.length) return;
   robotEdge.busy = true;
   const idle = window.requestIdleCallback || (f => setTimeout(f, 16));
   idle(function step() {
-    if (!gRobot.visible) { robotEdge.busy = false; return; }   // hidden again: continue when shown
+    if (!gRobot.visible || !robotModel.root.parent) { robotEdge.busy = false; return; }   // hidden again: continue when shown
     const o = robotEdge.todo.shift();
     if (o) {
       if (!robotEdge.cache.has(o.geometry)) robotEdge.cache.set(o.geometry, new THREE.EdgesGeometry(o.geometry, 38));
@@ -1680,6 +2010,7 @@ function attachRobotModel() {
   robotGrp.remove(...robotGrp.children.filter(c => c.userData.fallback));   // the box/cone stand-in goes away
   if (!robotModel.root.parent) robotGrp.add(robotModel.root);
   robotModel.root.scale.setScalar(opt("n_rscale"));
+  robotEdges();
 }
 function setJoints(vals) {
   if (!robotModel) return;
@@ -1917,7 +2248,7 @@ const upQ = [], UP_BYTES = WEAK_GPU ? 1.5e6 : 16e6, UP_MS = WEAK_GPU ? 4 : 8;
 let upKick = 0;
 function queueUpload(bytes, fn) { upQ.push({ bytes, fn }); if (!upKick) upKick = setTimeout(kickUploads, 100); }
 // no animation frames (hidden tab, headless virtual-time screenshot): nothing to keep smooth, drain from a timer instead
-function kickUploads() { upKick = 0; if (performance.now() - lastCamT > 90) { while (upQ.length) upQ.shift().fn(); invalidate(); frame(); } if (upQ.length || oct.loading) upKick = setTimeout(kickUploads, 100); }
+function kickUploads() { upKick = 0; if (performance.now() - lastCamT > 90) { if (document.hidden) while (upQ.length) upQ.shift().fn(); else drainUploads(performance.now()); invalidate(); frame(); } if (upQ.length || oct.loading) upKick = setTimeout(kickUploads, 100); }
 function drainUploads(t0) {
   let b = 0, n = 0;
   while (upQ.length && b < UP_BYTES && performance.now() - t0 < UP_MS) { const u = upQ.shift(); b += u.bytes; u.fn(); n++; }
@@ -1951,13 +2282,15 @@ function frame() {
   if (poseWall) { met.lat.push(Date.now() - poseWall); poseWall = 0; }
   if (viewWall) { met.vlat.push(Date.now() - viewWall); viewWall = 0; }
 }
-(function loop() { requestAnimationFrame(loop); frame(); })();
-loadRobotModel();
+(function loop() { requestAnimationFrame(loop); const t = performance.now(); if (met.lastRaf && t - met.lastChange < 1000) met.gap = Math.max(met.gap, t - met.lastRaf); met.lastRaf = t; frame(); })();
+// the robot model (GLB meshes, joint panel) is not needed for the first frame: loaded when the page is idle after start-up
+(window.requestIdleCallback || (f => setTimeout(f, 1500)))(() => loadRobotModel(), { timeout:4000 });
 loadRobotKind().then(invalidate);
 // 주소 뒤 ?c_scene=0&n_edl=0.6 처럼 체크 상자·숫자 칸 초기값을 정할 수 있음(시험·시연용)
 for (const [k, v] of new URLSearchParams(location.search)) { const e = document.getElementById(k); if (e && e.type === "checkbox" && e.checked !== (v === "1")) e.click(); else if (e && e.type === "number") { e.value = v; e.dispatchEvent(new Event("change")); } }
 camFromQuery();
-startLive().then(live => { if (!live) { $("boot").classList.add("gone"); startFileEvents(); } });
+// binary delta stream by default; ?legacy=1 (or ?poll=1: headless screenshot tools) keeps the JSON polling path
+startLive().then(live => { if (!live) { $("boot").classList.add("gone"); if (QS.get("legacy") === "1" || QS.get("poll") === "1" || !window.ReadableStream) startFileEvents(); else startDelta(); } });
 </script>
 </body>
 </html>

@@ -406,20 +406,27 @@ impl Grid {
     pub fn add(&mut self, cam: (f64, f64), occ: &[(f64, f64, bool)], floor: &[(f64, f64)]) {
         let c = |x: f64, y: f64| ((x / self.res).floor() as i32, (y / self.res).floor() as i32);
         let (cx, cy) = c(cam.0, cam.1);
-        let oc: Vec<(i32, i32, bool)> = occ.iter().map(|p| { let (x, y) = c(p.0, p.1); (x, y, p.2) }).collect();
-        let fc: Vec<(i32, i32)> = floor.iter().map(|p| c(p.0, p.1)).collect();
+        // 칸 번호·표시 판은 스레드에 하나 두고 다시 씀(장면마다 할당 없음)
+        thread_local! { static GS: std::cell::Cell<(Vec<(i32, i32, bool)>, Vec<(i32, i32)>, Vec<u8>)> = const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) }; }
+        let (mut oc, mut fc, mut fl) = GS.with(|g| g.take());
+        oc.clear();
+        oc.extend(occ.iter().map(|p| { let (x, y) = c(p.0, p.1); (x, y, p.2) }));
+        fc.clear();
+        fc.extend(floor.iter().map(|p| c(p.0, p.1)));
         let (mut x0, mut y0, mut x1, mut y1) = (cx, cy, cx, cy);
         for (x, y) in oc.iter().map(|p| (p.0, p.1)).chain(fc.iter().copied()) {
             (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
         }
         let (bw, bh) = ((x1 as i64 - x0 as i64 + 1) as usize, (y1 as i64 - y0 as i64 + 1) as usize);
         if bw * bh > 1 << 24 {
+            GS.with(|g| g.set((oc, fc, fl)));
             return self.add_sets(cam, occ, floor); // 장면 범위가 터무니없이 크면(위치가 튐) 칸 집합으로
         }
         const O: u8 = 1;
         const T: u8 = 2;
         const F: u8 = 4;
-        let mut fl = vec![0u8; bw * bh];
+        fl.clear();
+        fl.resize(bw * bh, 0);
         let at = |x: i32, y: i32| (y - y0) as usize * bw + (x - x0) as usize;
         for &(x, y, t) in &oc {
             fl[at(x, y)] |= O | if t { T } else { 0 };
@@ -439,23 +446,37 @@ impl Grid {
                 fl[at(cx + (x - cx) * k / n, cy + (y - cy) * k / n)] |= F;
             }
         }
+        // 줄마다 타일 경계로 나눈 구간: 표시가 하나도 없으면 건너뛰고(비교 고리는 NEON 으로 묶임), 있으면 타일을 한 번만 찾는다
         for yy in 0..bh {
-            for xx in 0..bw {
-                let f = fl[yy * bw + xx];
-                if f & (O | F) == 0 {
-                    continue;
-                }
-                let e = self.cell_mut(x0 + xx as i32, y0 + yy as i32);
-                if f & O != 0 {
-                    e.0 += 1;
-                    if f & T != 0 {
-                        e.2 += 1;
+            let y = y0 + yy as i32;
+            let row = &fl[yy * bw..(yy + 1) * bw];
+            let mut xx = 0usize;
+            while xx < bw {
+                let x = x0 + xx as i32;
+                let end = (bw).min(xx + (GT - (x & (GT - 1))) as usize);
+                let seg = &row[xx..end];
+                if seg.iter().any(|&f| f & (O | F) != 0) {
+                    let t = self.tiles.entry((x >> 6, y >> 6)).or_insert_with(|| vec![(0, 0, 0); (GT * GT) as usize].into_boxed_slice());
+                    let base = ((y & (GT - 1)) * GT + (x & (GT - 1))) as usize;
+                    for (j, &f) in seg.iter().enumerate() {
+                        if f & (O | F) == 0 {
+                            continue;
+                        }
+                        let e = &mut t[base + j];
+                        if f & O != 0 {
+                            e.0 += 1;
+                            if f & T != 0 {
+                                e.2 += 1;
+                            }
+                        } else {
+                            e.1 += 1;
+                        }
                     }
-                } else {
-                    e.1 += 1;
                 }
+                xx = end;
             }
         }
+        GS.with(|g| g.set((oc, fc, fl)));
     }
     /// add 와 같은 값을 칸 집합으로(장면 범위가 너무 클 때만)
     fn add_sets(&mut self, cam: (f64, f64), occ: &[(f64, f64, bool)], floor: &[(f64, f64)]) {

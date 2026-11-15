@@ -1369,7 +1369,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             embed::debug_name(o.id);
         }
     }
-    embed::finish();
+    // 리셋으로 끝난 실행이면 사진 벡터 작업 스레드는 다음 실행이 이어 씀(끄면 리셋 뒤 물체 이름이 안 붙음), id 별 이름·벡터 합만 비움
+    if stream::reset_pending() {
+        embed::drain();
+        embed::clear();
+    } else {
+        embed::finish();
+    }
     let n = clock.n.max(1) as f64;
     // 물체 이름별 수: 화면에 쓰는 이름(사진으로 붙인 이름, 없으면 분할 이름 object)
     let mut by: std::collections::BTreeMap<String, u32> = Default::default();

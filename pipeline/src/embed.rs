@@ -151,6 +151,14 @@ fn put(id: u32, v: Vec<f32>) {
     LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
 }
 
+/// 리셋: 물체 id 가 처음부터 다시 쓰이므로 id 별 이름·벡터 합을 비운다
+pub fn clear() {
+    *SUMS.lock().unwrap() = None;
+    *LATEST.lock().unwrap() = None;
+    *NAMES.lock().unwrap() = None;
+    *NCOUNT.lock().unwrap() = None;
+}
+
 /// 이름 고르기 확인(ONDEVICE_NAME_DEBUG): 그 물체의 평균 벡터에서 상위 4 이름 · 코사인 · 사진 수
 pub fn debug_name(id: u32) {
     let Some((names, vecs)) = VOCAB.get() else { return };

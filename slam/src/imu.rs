@@ -33,6 +33,8 @@ pub struct Ring {
     tail: AtomicU64,
     pub dropped: AtomicU64,
     pub read_fail: AtomicU64,
+    /// 읽기 단에서 버린 표본 수(Bad 순서: 무효 값 · 포화 · 튐 · 같은 값 반복 · 느린 읽기)
+    pub bad: [AtomicU64; 5],
     pub closed: AtomicBool,
 }
 
@@ -48,6 +50,7 @@ impl Ring {
             tail: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             read_fail: AtomicU64::new(0),
+            bad: Default::default(),
             closed: AtomicBool::new(false),
         })
     }
@@ -145,7 +148,13 @@ pub fn integrate(s0: &[Sample], s1: &[Sample], t0: f64, t1: f64, bias: &[f32; 4]
     let mut r = M34_I;
     let mut tp = t0;
     let mut last = first.w;
+    // 구간 안에 표본 간격이 MAX_GAP 넘게 벌어졌으면(읽기 실패 · 버린 표본 · 스레드 밀림) 그 사이 회전을 모름: 적분하지 않음
+    let mut ps = t0;
     for s in a.iter().chain(b.iter()) {
+        if s.t.min(t1) - ps > MAX_GAP {
+            return None;
+        }
+        ps = s.t;
         let end = s.t.min(t1);
         if end > tp {
             r = step(&r, &s.w, bias, (end - tp) as f32);

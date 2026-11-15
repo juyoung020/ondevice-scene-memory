@@ -430,6 +430,7 @@ struct Frame {
     lost: bool,       // 스트림 입력에서 위치를 놓친 장면(지도·물체에 넣지 않음)
     held: bool,       // 스트림: 맡아 둘 장면(믿는 지도와 이어지면 다시 쌓기 때 지도에 들어감)
     gravity: bool,    // 스트림: 지도 z 가 중력 위(IMU)
+    no_map: bool,     // 스트림: 위치만(IMU 로 이어 붙인 구간 · 영상이 IMU 와 어긋난 뒤), 지도 · 물체 · 보관에 넣지 않음
     anchor: u32,      // 스트림: 기준 지도 노드 id(0 = 없음)
     graph: Vec<stream::Node>, // 스트림: 이 장면 앞에 온 그래프 블록 노드
 }
@@ -493,7 +494,7 @@ impl InferStage {
 
 /// 분할 단계 3 — 후처리: 마스크 해독, 본 스레드에 넘길 장면으로 묶음. 버퍼는 돌려준다.
 fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>) -> (Frame, (seg::SegIn, seg::SegRaw)) {
-    let (w, h, lost, held, gravity) = (j.sf.w, j.sf.h, j.sf.lost(), j.sf.held(), j.sf.gravity());
+    let (w, h, lost, held, gravity, no_map) = (j.sf.w, j.sf.h, j.sf.lost(), j.sf.held(), j.sf.gravity(), j.sf.no_map());
     let dets = j.do_seg.then(|| {
         let c = Instant::now();
         let d = j.dets.take().unwrap_or_else(|| seg::seg_post(&j.bufs.1, j.bufs.0.geom, w, h, conf));
@@ -504,7 +505,7 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         d
     });
     let mut sf = j.sf;
-    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, gravity, anchor: sf.anchor, graph: j.graph };
+    let f = Frame { t: sf.t, p: sf.p, r: sf.r, rgb: std::mem::take(&mut sf.rgb), w, h, depth: j.depth, dets, load: j.load, seg: j.t_front + j.t[1] + j.t[2], lost, held, gravity, no_map, anchor: sf.anchor, graph: j.graph };
     (f, j.bufs)
 }
 
@@ -794,7 +795,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                             }
                             _ => true,
                         };
-                        let do_seg = want_seg && !lost;
+                        let do_seg = want_seg && !lost && !sf.no_map();
                         if !lost {
                             if do_seg {
                                 last_seg = Some((sf.p, sf.r, 0));
@@ -873,7 +874,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
                 graph.append(&mut rd.take_graph());
                 if !graph.is_empty() {
-                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, gravity: false, anchor: 0, graph };
+                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, gravity: false, no_map: false, anchor: 0, graph };
                     let _ = tx.send(f);
                 }
                 common::info!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
@@ -917,7 +918,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let c1 = Instant::now();
                 let dets = Some(seg.run(&rgb, w, h, conf));
                 let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, gravity: false, anchor: 0, graph: vec![] };
+                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, gravity: false, no_map: false, anchor: 0, graph: vec![] };
                 if tx.send(f).is_err() {
                     break;
                 }
@@ -957,7 +958,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
     let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
-    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, gravity, anchor, graph }) = rx.recv() {
+    while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, gravity, no_map, anchor, graph }) = rx.recv() {
         // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
         let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
         *taken.n.lock().unwrap() += 1;
@@ -1039,6 +1040,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
             }
             continue;
+        }
+        if held && no_map {
+            continue; // 위치만 장면은 맡아 두지도 않음
         }
         if held {
             // 맡아 둘 장면: 믿는 지도와 이어지지 않은 새 지도의 위치라 지금 지도에는 넣지 않고 보관만 한다.
@@ -1141,7 +1145,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             est_traj.push((t, p, r));
             // 바닥으로 기울기 고침: 세 장마다 바닥 면 법선을 재 고침 회전을 반씩 다가가게(잡음은 누름), 자세에 곱함
             r = mm(&tilt_c, &r);
-            if nkf % 3 == 0 {
+            if nkf % 3 == 0 && !no_map {
                 if let Some(n) = up_normal(&depth, w, h, seq.k, &r, true) {
                     let n = { let l = norm(&n).max(1e-9); n.map(|x| x / l) };
                     if n[2] > 25f64.to_radians().cos() {
@@ -1173,7 +1177,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         if below.len() > 50 {
             let k95 = (below.len() as f64 * 0.95) as usize;
             let ch = *below.select_nth_unstable_by(k95, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
-            if (0.5..2.5).contains(&ch) {
+            if (0.5..2.5).contains(&ch) && !no_map {
                 hist_h.push(ch);
             }
         }
@@ -1182,7 +1186,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let pwc = [p[0], p[1], p[2] - z0v];
         let floor_z = pwc[2] - h_now;
         // 위치가 확인된 장면만 지도·물체에 넣는다(실패해 예측 위치뿐인 장면은 지도를 어긋나게 함)
-        let map_ok = leveled;
+        let map_ok = leveled && !no_map;
         let (c3, c4) = map_frame(a, seq.k, t, &r, &pwc, floor_z, &depth, &rgb, w, h, &dets, map_ok, &mut grid, &mut mem, &mut traj, &mut map_traj);
         clock.part[P::Vo as usize] += (c2 - c_vo).as_secs_f64();
         clock.part[P::Map as usize] += (c3 - c2).as_secs_f64();

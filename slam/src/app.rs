@@ -535,7 +535,8 @@ mod engine {
             match &self.odom {
                 Odom::Klt(o) => o.imu.as_ref().map(|u| {
                     let (n, d, f) = u.counts();
-                    format!("IMU: 표본 {n} 개(링 가득 차 버림 {d}, 읽기 실패 {f}), IMU 회전으로 이어 붙인 장면 {}, 자이로 치우침 {:.4} {:.4} {:.4} rad/s(영상으로 고친 수 {}), 지금 기울기 {:.1}°", o.by_imu, u.bias[0], u.bias[1], u.bias[2], u.n_bias_upd, u.tilt_deg(&o.pose_tf()))
+                    let b: Vec<u64> = u.ring().bad.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+                    format!("IMU: 표본 {n} 개(링 가득 차 버림 {d}, 읽기 실패 {f}, 거른 표본 무효 {} · 포화 {} · 튐 {} · 같은 값 {} · 느린 읽기 {}, 간격이 벌어져 적분 안 함 {}), IMU 회전으로 이어 붙인 장면 {}, 자이로 치우침 {:.4} {:.4} {:.4} rad/s(영상으로 고친 수 {}), 지금 기울기 {:.1}°", b[0], b[1], b[2], b[3], b[4], u.n_gap.get(), o.by_imu, u.bias[0], u.bias[1], u.bias[2], u.n_bias_upd, u.tilt_deg(&o.pose_tf()))
                 }),
                 _ => None,
             }
@@ -546,6 +547,11 @@ mod engine {
                 Odom::Klt(o) => o.imu.as_ref().map(|u| (u.tilt_deg(&o.pose_tf()), o.by_imu, u.bias, u.n_bias_upd)),
                 _ => None,
             }
+        }
+
+        /// IMU: 이번 장면에서 영상 결과를 IMU 회전과 어긋나 버렸는지
+        pub fn imu_rejected(&self) -> bool {
+            matches!(&self.odom, Odom::Klt(o) if o.imu_rejected)
         }
 
         /// 광류 경로의 마지막 장면 진단
@@ -1184,6 +1190,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let mut max_corr = (0f32, 0f32);
     let mut last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
     let mut n_bridge_ok = 0i64;
+    // IMU: 이어 붙인 장면 · 영상이 IMU 와 어긋난 장면 뒤 IMU_SETTLE 장까지는 위치만(지도에 안 쌓음)
+    const IMU_SETTLE: u32 = 5;
+    let (mut since_imu, mut n_imu_hold, mut n_imu_reject) = (u32::MAX, 0i64, 0i64);
 
     let mut refs: VecDeque<Ref> = VecDeque::new();
     let mut ref_next = 0usize;
@@ -1207,7 +1216,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let _ = writeln!(f, "# timestamp x y z qx qy qz qw (OpenCV 카메라 → RTAB-Map 지도, 보낸 그대로)");
     }
     if let Some(f) = stats_f.as_mut() {
-        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose,quality,method,klt_inliers,klt_ratio,reproj_rms,spread,jump{}", if imu_on { ",tilt_deg" } else { "" });
+        let _ = writeln!(f, "seq,t,read_ms,odom_ms,slam_ms,send_ms,lost,new_map,map_corrected,loop,features,inliers,held,no_pose,quality,method,klt_inliers,klt_ratio,reproj_rms,spread,jump{}", if imu_on { ",tilt_deg,no_map" } else { "" });
     }
     #[cfg(unix)]
     if !in_proc {
@@ -1353,11 +1362,16 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let no_pose = pose.is_none();
         // 위치 질: 0 좋음(광류 · 다시 잡기), 1 불확실(ICP · 기술자 되찾기 · 첫 장면 · 이어 붙인 구간 · 이어지지 않은 새 지도), 2 놓침
         let dg = eng.klt_diag().unwrap_or_default();
+        let imu_rej = imu_on && eng.imu_rejected();
+        n_imu_reject += imu_rej as i64;
+        since_imu = if imu_on && pose.is_some() && (dg.method == 5 || imu_rej) { 0 } else { since_imu.saturating_add(1) };
+        let imu_hold = imu_on && pose.is_some() && since_imu <= IMU_SETTLE;
+        n_imu_hold += imu_hold as i64;
         let quality = if pose.is_none() {
             2u8
         } else if relocalized {
             0
-        } else if dg.method != 0 || !anchored || eng.prov_from > 0 {
+        } else if dg.method != 0 || !anchored || eng.prov_from > 0 || imu_hold {
             1
         } else {
             0
@@ -1415,7 +1429,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         }
         let mut force_node = false;
         // 이어지지 않은 새 지도 · 이어 붙인 구간: 장면마다(0.2 초 간격, 장면 예산 안) 앞 지도들의 노드에서 이을 후보를 찾고, 찾으면 이 장면을 바로 노드로
-        if (fixing || !anchored) && klt_path && pose.is_some() && fr.t - last_merge_try >= 0.2 && ms_since(c1) < 25.0 {
+        if (fixing || !anchored) && !imu_hold && klt_path && pose.is_some() && fr.t - last_merge_try >= 0.2 && ms_since(c1) < 25.0 {
             last_merge_try = fr.t;
             if eng.propose_merge(&fr, reloc_min as usize) {
                 n_merge_try += 1;
@@ -1425,6 +1439,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let det_rate = if anchored || klt_path { detection_rate } else { detection_rate.max(4.0) }; // 이어지기를 기다리는 동안은 더 자주 찾아봄
         if !force_node && det_rate > 0.0 && prev_stamp > 0.0 && fr.t > prev_stamp && fr.t - prev_stamp < 1.0 / det_rate as f64 {
             process = false;
+        }
+        if imu_hold {
+            process = false; // 위치만: 지도 노드로 넣지 않음
         }
         if process {
             prev_stamp = fr.t;
@@ -1567,7 +1584,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         // 맡길 장면: 새 지도에서 위치를 구했고 그 지도의 노드를 이미 보냈을 때
         let held = hold && pose.is_some() && !info.lost && !new_map && held_nodes.contains_key(&held_last);
         let mut of = OutFrame {
-            flags: if lost { stream::LOST } else { 0 } | if new_map { stream::NEW_MAP } else { 0 } | if corrected { stream::MAP_CORRECTED } else { 0 } | if held { stream::HELD } else { 0 } | if eng.gravity_aligned() { stream::GRAVITY } else { 0 },
+            flags: if lost { stream::LOST } else { 0 } | if new_map { stream::NEW_MAP } else { 0 } | if corrected { stream::MAP_CORRECTED } else { 0 } | if held { stream::HELD } else { 0 } | if eng.gravity_aligned() { stream::GRAVITY } else { 0 } | if imu_hold { stream::NO_MAP } else { 0 },
             map_id,
             seq: n as u64,
             t: fr.t,
@@ -1641,7 +1658,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             );
             // IMU 모드만 끝 칸(지도 위와 IMU 위 사이각)
             if let Some((tilt, ..)) = eng.imu_diag() {
-                let _ = write!(f, ",{tilt:.2}");
+                let _ = write!(f, ",{tilt:.2},{}", imu_hold as i32);
             }
             let _ = writeln!(f);
         }
@@ -1676,6 +1693,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     common::info!("위치 질: 좋음 {} · 불확실 {} · 놓침 {}", nq[0], nq[1], nq[2]);
     if let Some(s) = eng.imu_summary() {
         common::info!("{s}");
+        common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함)");
     }
     if provisional {
         common::info!("이어지지 않은 새 지도에서 임시 위치로 바로 보낸 장면 {n_prov}, 지도 전체에서 찾은 잇기 후보 {n_merge_try} 번");

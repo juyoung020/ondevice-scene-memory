@@ -20,6 +20,8 @@ pub const PROVISIONAL: u32 = 16;
 pub const UNCERTAIN: u32 = 32;
 /// 지도 z 가 중력 위(IMU 로 수평 맞춤): 받는 쪽은 바닥 합의·첫 장면 똑바름 가정 없이 그대로 수평으로 씀
 pub const GRAVITY: u32 = 64;
+/// 위치만: IMU 로 이어 붙인 장면 · 영상이 IMU 회전과 어긋난 장면과 그 뒤 몇 장. 받는 쪽은 카메라 위치만 옮기고 지도(점유 격자 · 점 지도 · 물체 기억 · 보관)에 넣지 않는다
+pub const NO_MAP: u32 = 128;
 /// 그래프 블록 MMG1 머리: 표시 4 + 머리 크기 4 + 노드 수 4 + 예약 4
 pub const GRAPH_HEADER_BYTES: usize = 16;
 pub const IDENTITY: [f64; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];

@@ -33,6 +33,8 @@ pub struct Ring {
     tail: AtomicU64,
     pub dropped: AtomicU64,
     pub read_fail: AtomicU64,
+    /// 읽기 단에서 버린 표본 수(Bad 순서: 무효 값 · 포화 · 튐 · 같은 값 반복 · 느린 읽기)
+    pub bad: [AtomicU64; 5],
     pub closed: AtomicBool,
 }
 
@@ -48,6 +50,7 @@ impl Ring {
             tail: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             read_fail: AtomicU64::new(0),
+            bad: Default::default(),
             closed: AtomicBool::new(false),
         })
     }
@@ -128,6 +131,46 @@ impl Calib {
     }
 }
 
+/// 적분 구간 안에서 허용하는 표본 간격(초, 200 Hz 의 4 칸)
+pub const MAX_GAP: f64 = 0.02;
+
+/// 읽기 단에서 버리는 표본 종류(Ring::bad 칸 번호)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Bad {
+    /// 칩의 무효 값(-32768) · 바이트가 모두 0 · 모두 0xFF(버스 오류)
+    Invalid = 0,
+    /// 한 축이라도 ±2000 °/s · ±16 g 끝(실제 값을 모름)
+    Saturated = 1,
+    /// 앞 표본과 견줘 5 ms 사이 물리적으로 불가능한 변화(자이로 15 rad/s · 가속도 8 g 넘게)
+    Jump = 2,
+    /// 여섯 값이 앞 표본과 똑같음(레지스터가 새 값으로 안 바뀜)
+    Repeat = 3,
+    /// 읽기에 4 ms 넘게 걸림(버스 막힘 · 다시 시도: 시각을 모름)
+    Slow = 4,
+}
+
+/// 레지스터 12 바이트(가속도 xyz · 자이로 xyz, 빅 엔디언 i16) 검사. prev = 앞에서 받아들인 표본의 원값, jumps = 튐으로 연달아 버린 수(3 번 넘으면 새 기준으로 받아들임)
+pub fn check_raw(b: &[u8], prev: Option<&[i16; 6]>, jumps: u32) -> Result<[i16; 6], Bad> {
+    let v: [i16; 6] = std::array::from_fn(|i| i16::from_be_bytes([b[2 * i], b[2 * i + 1]]));
+    if v.contains(&i16::MIN) || b[..12].iter().all(|&x| x == 0) || b[..12].iter().all(|&x| x == 0xFF) {
+        return Err(Bad::Invalid);
+    }
+    if v.iter().any(|x| x.unsigned_abs() >= 32700) {
+        return Err(Bad::Saturated);
+    }
+    if let Some(p) = prev {
+        if *p == v {
+            return Err(Bad::Repeat);
+        }
+        // 가속도 8 g = 16,384 LSB, 자이로 15 rad/s ≈ 14,080 LSB
+        let d = |i: usize| (v[i] as i32 - p[i] as i32).abs();
+        if jumps < 3 && ((0..3).any(|i| d(i) > 16_384) || (3..6).any(|i| d(i) > 14_080)) {
+            return Err(Bad::Jump);
+        }
+    }
+    Ok(v)
+}
+
 /// [t0, t1](IMU 시각) 자이로 사전적분: 표본 i 의 값이 (t_{i-1}, t_i] 동안 이어졌다고 봄. 두 조각 슬라이스를 그대로 읽음
 /// 끝 쪽 표본이 30 ms 넘게 모자라거나 시작 쪽이 비면 None
 pub fn integrate(s0: &[Sample], s1: &[Sample], t0: f64, t1: f64, bias: &[f32; 4], step: fn(&M34, &[f32; 4], &[f32; 4], f32) -> M34) -> Option<M34> {
@@ -145,7 +188,13 @@ pub fn integrate(s0: &[Sample], s1: &[Sample], t0: f64, t1: f64, bias: &[f32; 4]
     let mut r = M34_I;
     let mut tp = t0;
     let mut last = first.w;
+    // 구간 안에 표본 간격이 MAX_GAP 넘게 벌어졌으면(읽기 실패 · 버린 표본 · 스레드 밀림) 그 사이 회전을 모름: 적분하지 않음
+    let mut ps = t0;
     for s in a.iter().chain(b.iter()) {
+        if s.t.min(t1) - ps > MAX_GAP {
+            return None;
+        }
+        ps = s.t;
         let end = s.t.min(t1);
         if end > tp {
             r = step(&r, &s.w, bias, (end - tp) as f32);
@@ -214,11 +263,13 @@ pub struct Fusion {
     /// 시작할 때 가만히 있어 치우침을 평균으로 잡았는지
     pub bias_static: bool,
     pub n_bias_upd: u64,
+    /// 표본 간격이 벌어져 회전을 내지 않은 장면 수
+    pub n_gap: std::cell::Cell<u64>,
 }
 
 impl Fusion {
     pub fn new(ring: Arc<Ring>, calib: Calib, bridge_max: f64) -> Fusion {
-        Fusion { ring, calib, m: M34_I, mt: M34_I, have_m: false, bias: [0.0; 4], acc_lp: [0.0; 4], lp_init: false, seen: 0, bridge_max, bias_static: false, n_bias_upd: 0 }
+        Fusion { ring, calib, m: M34_I, mt: M34_I, have_m: false, bias: [0.0; 4], acc_lp: [0.0; 4], lp_init: false, seen: 0, bridge_max, bias_static: false, n_bias_upd: 0, n_gap: Default::default() }
     }
 
     /// (받은 표본 수, 링이 가득 차 버린 수, 읽기 실패 수)
@@ -290,7 +341,10 @@ impl Fusion {
             return None;
         }
         let (_, a, b) = self.ring.view(0);
-        let r = integrate(a, b, t0 + self.calib.shift, t1 + self.calib.shift, &self.bias, gyro_step)?;
+        let Some(r) = integrate(a, b, t0 + self.calib.shift, t1 + self.calib.shift, &self.bias, gyro_step) else {
+            self.n_gap.set(self.n_gap.get() + 1);
+            return None;
+        };
         Some(m34_mul(&m34_mul(&self.m, &r), &self.mt))
     }
 
@@ -387,21 +441,36 @@ pub fn spawn_reader(dev: &str, ring: Arc<Ring>) -> Result<std::thread::JoinHandl
             if unsafe { sched_setscheduler(0, 1, &prio) } != 0 {
                 common::threads::apply(-10, 0);
             }
+            // 시각: 단조 시계 + 시작 때 고정한 UNIX 오프셋(카메라 시각과 같은 방식, NTP 가 시스템 시계를 옮겨도 뒤로 가거나 튀지 않음)
+            let (base_unix, base) = (unix_now(), std::time::Instant::now());
+            let now_s = || base_unix + base.elapsed().as_secs_f64();
             let period = 0.005;
-            let mut next = unix_now();
+            let mut next = now_s();
             let mut b = [0u8; 16];
+            let (mut prev, mut jumps, mut t_last) = (None::<[i16; 6]>, 0u32, f64::MIN);
             while !ring.closed.load(Ordering::Relaxed) {
-                let ta = unix_now();
+                let ta = now_s();
                 let ok = f.write(&[0x1Fu8]).is_ok_and(|n| n == 1) && f.read(&mut b[..12]).is_ok_and(|n| n == 12);
-                let tb = unix_now();
+                let tb = now_s();
                 if ok {
-                    let (a, w) = crate::simd::imu_raw(&b, ACC_S, GYR_S);
-                    ring.push(Sample { w, a, t: 0.5 * (ta + tb) });
+                    let t = 0.5 * (ta + tb);
+                    let chk = if tb - ta > 0.004 || t <= t_last { Err(Bad::Slow) } else { check_raw(&b, prev.as_ref(), jumps) };
+                    match chk {
+                        Ok(v) => {
+                            (prev, jumps, t_last) = (Some(v), 0, t);
+                            let (a, w) = crate::simd::imu_raw(&b, ACC_S, GYR_S);
+                            ring.push(Sample { w, a, t });
+                        }
+                        Err(k) => {
+                            jumps += (k == Bad::Jump) as u32;
+                            ring.bad[k as usize].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 } else {
                     ring.read_fail.fetch_add(1, Ordering::Relaxed);
                 }
                 next += period;
-                let now = unix_now();
+                let now = now_s();
                 // 밀렸으면 몰아 읽지 않음(레지스터에는 최신 값 하나뿐: 같은 값을 다른 시각으로 여러 번 쓰게 됨)
                 if next < now {
                     next = now;
@@ -504,6 +573,33 @@ mod tests {
             f.correct_bias(&r, &vis, t1 - t0);
         }
         assert!((f.bias[2] - 0.02).abs() < 2e-3, "{:?}", f.bias);
+    }
+
+    /// 읽기 단 거르기: 무효 · 포화 · 반복 · 튐(3 번 연달아면 새 기준)
+    #[test]
+    fn raw_filter() {
+        let enc = |v: [i16; 6]| -> [u8; 12] { let mut b = [0u8; 12]; for i in 0..6 { b[2 * i..2 * i + 2].copy_from_slice(&v[i].to_be_bytes()); } b };
+        let p = [10, -20, 2048, 3, -4, 5];
+        assert_eq!(check_raw(&enc(p), None, 0), Ok(p));
+        assert_eq!(check_raw(&[0u8; 12], None, 0), Err(Bad::Invalid));
+        assert_eq!(check_raw(&[0xFFu8; 12], None, 0), Err(Bad::Invalid));
+        assert_eq!(check_raw(&enc([i16::MIN, 0, 2048, 0, 0, 1]), None, 0), Err(Bad::Invalid));
+        assert_eq!(check_raw(&enc([0, 0, 2048, 32767, 0, 1]), None, 0), Err(Bad::Saturated));
+        assert_eq!(check_raw(&enc(p), Some(&p), 0), Err(Bad::Repeat));
+        let j = [10, -20, 2048, 20000, -4, 5];
+        assert_eq!(check_raw(&enc(j), Some(&p), 0), Err(Bad::Jump));
+        assert_eq!(check_raw(&enc(j), Some(&p), 3), Ok(j));
+    }
+
+    /// 구간 안 표본 간격이 벌어지면 적분하지 않음
+    #[test]
+    fn integrate_gap() {
+        let ring = Ring::new();
+        feed(&ring, 0.0, 40, [0.0, 0.0, 1.0, 0.0]);
+        feed(&ring, 0.3, 40, [0.0, 0.0, 1.0, 0.0]);
+        let (_, a, b) = ring.view(0);
+        assert!(integrate(a, b, 0.05, 0.15, &[0.0; 4], gyro_step).is_some());
+        assert!(integrate(a, b, 0.1, 0.4, &[0.0; 4], gyro_step).is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! 같은 프로세스의 위치 프로그램(--slam)은 메모리 큐로, 녹화·파이프(--stream)는 바이트 스트림으로 온다. 형식·읽기는 `slam::stream` 하나를 쓰고,
 //! 여기서는 둘 다 같은 함수로 `StreamFrame` 을 만든다. 형식과 좌표 약속은 docs/bridge.md "스트림 형식".
 use crate::geom::*;
-pub use slam::stream::{GRAVITY, HELD, LOST, MAP_CORRECTED, NEW_MAP};
+pub use slam::stream::{GRAVITY, HELD, LOST, MAP_CORRECTED, NEW_MAP, NO_MAP};
 use slam::stream::OutFrame;
 
 /// 읽기 버퍼: 머리·그래프 블록용. 사진은 이보다 커서 버퍼를 거치지 않고 받을 자리에 바로 읽힌다
@@ -54,6 +54,10 @@ impl StreamFrame {
     }
     pub fn held(&self) -> bool {
         self.flags & HELD != 0
+    }
+    /// 위치만(IMU 로 이어 붙였거나 영상이 IMU 와 어긋난 뒤): 카메라만 옮기고 지도 · 물체에 넣지 않음
+    pub fn no_map(&self) -> bool {
+        self.flags & NO_MAP != 0
     }
 }
 

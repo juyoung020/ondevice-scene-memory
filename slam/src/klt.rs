@@ -386,6 +386,15 @@ pub struct Diag {
     pub jump: f32,
 }
 
+/// 영상이 낸 장면 사이 움직임(transform, 몸체)의 회전이 IMU 자이로 회전과 5° + 회전량의 10 % 넘게 다른지. IMU 회전이 없으면 false
+fn imu_disagree(imu_rot: &Option<crate::simd::M34>, transform: &Tf) -> bool {
+    let Some(r) = imu_rot else { return false };
+    let e = crate::imu::so3_log(&crate::simd::m34_mul(&crate::simd::m34_t(r), &crate::imu::m34_of_tf(transform)));
+    let w = crate::imu::so3_log(r);
+    let n = |v: [f32; 4]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().to_degrees();
+    n(e) > 5.0 + 0.1 * n(w)
+}
+
 fn jump_of(pred: &Option<Tf>, pose: &Tf) -> f32 {
     match pred {
         Some(p) => {
@@ -454,6 +463,8 @@ pub struct OdometryKlt {
     pub gravity_aligned: bool,
     /// IMU 회전으로 이어 붙인 장면 수
     pub by_imu: usize,
+    /// 이번 장면에서 영상 결과를 IMU 회전과 어긋나 버렸는지 · 그런 장면 수
+    pub imu_rejected: bool,
 }
 
 impl OdometryKlt {
@@ -497,6 +508,7 @@ impl OdometryKlt {
             level_pending: true,
             gravity_aligned: false,
             by_imu: 0,
+            imu_rejected: false,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
@@ -730,6 +742,7 @@ impl OdometryKlt {
     }
 
     pub fn process(&mut self, f: &Frame) -> OdomResult {
+        self.imu_rejected = false;
         let (w, h) = (f.cam.width as usize, f.cam.height as usize);
         let t0 = std::time::Instant::now();
         if let Some(rx) = &self.desc_rx {
@@ -817,14 +830,27 @@ impl OdometryKlt {
             let inits: Vec<[f32; 2]> = self.tracks.iter().map(|t| project(&tcw, &k4, t.w).unwrap_or(t.uv)).collect();
             out = self.attempt(&prev, &cur, &inits, &k4, &local, need);
         }
-        if out.is_none() && !self.depth_only {
-            out = self.attempt(&prev, &cur, &still, &k4, &local, need);
+        // IMU: 영상 회전이 자이로 회전과 크게 어긋나면 그 영상 결과는 받지 않음(엉뚱한 자리에 붙음). 카메라 전용 모드는 늘 false
+        let base = self.pose;
+        let rejected = std::cell::Cell::new(false);
+        let disagree = |p: &Tf| {
+            let d = imu_disagree(&imu_rot, &base.inverse().mul(p));
+            rejected.set(rejected.get() || d);
+            d
+        };
+        if out.as_ref().is_some_and(|o| disagree(&o.0)) {
+            out = None;
         }
+        if out.is_none() && !self.depth_only {
+            out = self.attempt(&prev, &cur, &still, &k4, &local, need).filter(|o| !disagree(&o.0));
+        }
+        self.imu_rejected = rejected.get();
         let t_trk = t0.elapsed().as_secs_f64();
         let n_tracks = self.tracks.len();
         let Some((pose, ids, uvs, q)) = out else {
             // 먼저 마지막 키프레임과 기술자 맞추기(밝기만 있으면 더 정확), 안 되면 깊이 ICP
-            if let Some((pose, cov, inl)) = self.recover(f, pred) {
+            self.imu_rejected = rejected.get();
+            if let Some((pose, cov, inl)) = self.recover(f, pred).filter(|r| !disagree(&r.0)) {
                 if !f.depth_mm.is_empty() {
                     sub_depth(&f.depth_mm, w, h, &mut self.prev_sub);
                 }
@@ -852,7 +878,7 @@ impl OdometryKlt {
                 let rel = pred.map(|p| self.pose.inverse().mul(&p)).unwrap_or(Tf::IDENTITY);
                 let linv = local.inverse();
                 let init = linv.mul(&rel).mul(&local);
-                if let Some(tpo) = icp(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &init) {
+                if let Some(tpo) = icp(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &init).filter(|tpo| !disagree(&self.pose.mul(&local.mul(tpo).mul(&linv)))) {
                     let transform = local.mul(&tpo).mul(&linv);
                     let pose = self.pose.mul(&transform);
                     if dt > 0.0 {
@@ -876,6 +902,7 @@ impl OdometryKlt {
                     return self.result(transform, Self::eye(1e-3), 0, n_tracks, true);
                 }
             }
+            self.imu_rejected = rejected.get();
             // IMU: 영상이 다 실패한 짧은 구간은 마지막 성공 위치 × IMU 회전으로 이어 붙임(이동 0, 불확실).
             // 마지막 성공 장면 · 점은 그대로 둬 다음 장면이 IMU 예측으로 거기서 다시 따라감
             if let Some(r) = &imu_rot {

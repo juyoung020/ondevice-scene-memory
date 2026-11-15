@@ -1,4 +1,4 @@
-//! D435 입력(`rsdriver` 기능): librealsense2 없이 V4L2·UVC 로 직접(rsdriver 크레이트). 장면 모양은 RealSenseSource 와 같다
+//! D435 입력(`rsdriver` 기능): librealsense2 없이 V4L2·UVC 로 직접(rsdriver 크레이트). 장면 모양은 원본 C++ realsense_source 와 같다
 //! (컬러 RGB8, 컬러 격자에 정렬한 깊이, 보정값 = 컬러 카메라).
 //! 시각: rsdriver 는 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한다(librealsense 의 global time 처럼
 //! 장치·시스템 시계 차이를 계속 따라가지 않음). 장면끼리의 간격은 장치 시각 그대로다.

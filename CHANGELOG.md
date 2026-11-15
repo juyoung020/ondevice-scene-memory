@@ -18,18 +18,21 @@
 - 보드 실시간 배치 `--rt`(카메라 · 추론 등 역할별 SCHED_FIFO · 코어), `--mlock`, `--quiet`, 보드 설정 `scripts/board_tune.sh` · PGO 빌드 `scripts/pgo.sh` · aarch64 교차 시험 `scripts/cross_check.sh`.
 - 보드(aarch64) YUYV→RGB · 회색조, 설명자 해밍 거리, BRIEF 9×9 상자 합, 깊이 → 컬러 정렬 사각형 채우기, 보관 장면 풀기를 NEON 으로 계산한다(결과 비트 동일).
 - PC 에서 보드 실행 파일을 교차 빌드해 보내는 `scripts/cross_board.sh` 와 빠른 확인용 빌드 설정 `--profile dev-fast`.
-- Rust 로 다시 짠 위치 프로그램 `slam/`(`ondevice --slam` · `ondevice slam`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 `rtab_bridge` 와 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
+- Rust 로 다시 짠 위치 프로그램 `slam/`(`ondevice --slam` · `ondevice slam`): RTAB-Map 0.24.2 · OpenCV · GTSAM 의 쓰는 경로를 옮겨 C++ 원본과 출력 스트림이 바이트까지 같고 PC 에서 2.5 – 3.1 배 빠르다.
 - 한 프로그램 `ondevice`: 위치 추적(`--slam`) → 지도·물체 → 뷰어 서버(`--serve`)를 한 프로세스에서 복사 없이 돌린다(기억 폴더는 장면 스트림 방식과 바이트 동일). 뷰어는 이 프로세스가 쓴 기억 파일을 디스크에서 다시 읽지 않고 메모리에서 보낸다.
-- D435 입력을 librealsense2 없이 `rsdriver` 로 받는 `--driver rsdriver`(리눅스 기본, librealsense 판은 `--driver librealsense`).
+- D435 입력을 librealsense2 없이 `rsdriver`(V4L2 · UVC 직접, Rust)로 받는다.
 - 라이선스: PolyForm Noncommercial 1.0.0(상업적 이용 금지), `LICENSE.md`.
 - 물체 이름을 사진으로 붙이기 `ondevice --vocab vocab/names.voc`: 이름 1,225 개(LVIS · COCO 등) 중 사진이 가장 닮은 이름을 쓴다(tv → monitor · laptop computer).
 - 이름 글 벡터를 미리 만들어 두는 `ondevice view --encode-vocab <이름 목록> <파일>` 과 그 파일을 읽는 뷰어 `--vocab`.
 - 물체 이름은 `--vocab` 이 붙인다(몫 0.15 이상). 사진 이름이 floor · wall · ceiling · baseboard 면 구조물로 표시한다.
+- 뷰어 검색의 SigLIP2 글 인코더를 Rust 로 직접 계산한다(`text_model_fp16.onnx` 의 가중치를 그대로 읽음, ONNX Runtime 과 같은 벡터). 보드 실행 파일에서 ONNX Runtime 이 빠졌다.
+- DXRT 설정을 한곳에서: `--seg-npu` · `--embed-npu` · `--npu-buffers` · `--npu-nfh` · `--npu-profile` · `--npu-ort`(모델은 기본으로 NPU 작업만).
 
 ### Changed
 - 이어지지 않은 새 지도의 장면을 맡아 두지 않고 마지막 위치에서 이어 붙인 임시 위치(스트림 표시 `PROVISIONAL`=16)로 바로 보낸다(화면이 멈추지 않음, slam 그래프 제약 없음). 루프 클로저로 이어지면 노드가 참 위치로 다시 가서 memmap 이 다시 쌓는다. `--no-provisional` 로 예전처럼 맡아 둠. 새 지도 동안 노드마다 믿는 지도 노드 전체에서 이을 후보를 찾아 slam 의 루프 검증에 넘긴다.
 - rsd_rec: PNG 쓰기를 쓰기 스레드 3 개로 옮기고 같은 깊이를 두 번 쓰지 않는다(Pi 5 에서 1–5 초씩 빠지던 녹화 빈틈 → 600 장 시험에서 쓰기 줄 꽉 참 0, 최대 장면 간격 0.23 초).
 - 1 초 넘는 녹화·USB 빈틈 뒤에는 이어 붙이지 않고(깊이 ICP 로 자리가 확인되면 예외) 새 지도를 열어 루프 클로저로 합친다. 기존 노드를 1 m · 57° 넘게 옮기는 루프 클로저는 버린다(`RGBD/MaxCorrectionLinear/Angular`).
+- 보드 빌드는 ONNX Runtime 을 넣지 않고, 토크나이저는 순수 Rust 정규식(fancy-regex)으로 돈다(글 1,329 개에서 토큰이 같음).
 - **호환 변경:** 물체 분할은 클래스 없는 ObjectSAM 만 쓴다. COCO 이름 표 · `--seg-names` · YOLO26 공식 dxnn(모델 안 CPU 후처리) 출력 배치를 뺐고, 클래스를 내는 모델은 첫 검출에서 멈춘다. 이름은 늘 SigLIP2 사진 벡터로 붙인다.
 - 놓친 뒤 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙인다(광류 경로, `--no-bridge` 로 예전 동작). 광류 경로에서는 다시 잡기 대기가 0 초다.
 - D435 컬러를 60 Hz 깜빡임 맞춤 · 자동 화이트 밸런스 · 역광 보정 끔으로 연다.
@@ -54,6 +57,8 @@
 - 검색의 이름 일치 기준을 이름 1,225 개에 맞췄다("화면" 같은 이름 아닌 말이 엉뚱한 물체를 찾지 않음).
 
 ### Removed
+- C++ 비교 기준 `bridge/`(rtab_bridge)와 그 검증 도구 `check_tum`.
+- librealsense2 C API 입력(`--driver librealsense` · `slam-realsense` 기능)과 librealsense 와 견주는 도구 `rs_align_check` · `align_sdk_check`. 보드 실행 파일은 NPU 런타임(libdxrt) 말고는 C/C++ 라이브러리를 링크하지 않는다.
 - 뷰어의 `--ingest` 스트림 입력.
 - 쓰지 않던 입력·위치 방식: 웹캠 입력(`--cam` · `--rec`), 카메라만으로 위치(`--pose vo|dvo`|dvo` · `--fast-pose` · SuperPoint), 딥러닝 깊이(`--depth <모델>` · `--scale-win`), `--snaps` · `--npu-par` 와 `cam` 빌드 기능.
 - librealsense 판 녹화 도구 `rs_info` · `rs_rec`(같은 일은 `rsd_info` · `rsd_rec`), 개발용 `objcrop` · `objdup` · `onnx_info`, 문서에 쓰이지 않는 결과 그림 51 개.

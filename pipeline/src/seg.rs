@@ -456,6 +456,10 @@ pub mod dx {
     /// 분할(`--seg-npu`)과 사진 벡터(`--embed-npu`)를 다른 코어에 두면 서로 줄 서지 않고 함께 돈다
     pub static SEG_BOUND: AtomicU32 = AtomicU32::new(0);
     pub static EMBED_BOUND: AtomicU32 = AtomicU32::new(0);
+    /// DXRT 추론 버퍼 수(모델마다 입력·출력·중간 버퍼 한 벌씩). 기본(0)은 런타임이 6 벌을 잡아 분할 모델만 130 MB 가 상주했다.
+    /// 분할은 함께 올리는 장 수 + 1, 사진 벡터는 한 장씩이라 2 벌이면 기다리지 않는다
+    pub static SEG_BUFFERS: AtomicU32 = AtomicU32::new(2);
+    pub const EMBED_BUFFERS: u32 = 2;
     /// "all" · "0" · "1" · "2" · "01" · "12" · "02" → bound_option
     pub fn parse_bound(s: &str) -> u32 {
         match s {
@@ -510,14 +514,14 @@ pub mod dx {
     }
     impl Engine {
         pub fn new(path: &str) -> Engine {
-            Engine::open(path, -1, SEG_BOUND.load(Relaxed))
+            Engine::open(path, -1, SEG_BOUND.load(Relaxed), SEG_BUFFERS.load(Relaxed))
         }
         /// 모델 안의 CPU 부분까지 런타임이 돌리게 연다(ONNX Runtime). 입력·출력이 모델 원래의 것(f32)이 된다
         pub fn with_cpu_tasks(path: &str) -> Engine {
-            Engine::open(path, 1, EMBED_BOUND.load(Relaxed))
+            Engine::open(path, 1, EMBED_BOUND.load(Relaxed), EMBED_BUFFERS)
         }
-        fn open(path: &str, use_ort: c_int, bound_option: u32) -> Engine {
-            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: 0, device_id: -1, bound_option, use_ort, reserved: [0; 6] };
+        fn open(path: &str, use_ort: c_int, bound_option: u32, buffers: u32) -> Engine {
+            let o = Options { struct_size: std::mem::size_of::<Options>() as u32, buffer_count: buffers as _, device_id: -1, bound_option, use_ort, reserved: [0; 6] };
             let mut e = std::ptr::null_mut();
             let p = CString::new(path).unwrap();
             unsafe {

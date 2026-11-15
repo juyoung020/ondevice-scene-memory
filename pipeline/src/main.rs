@@ -2317,6 +2317,7 @@ fn main() {
         use std::sync::atomic::Ordering::Relaxed;
         seg::dx::SEG_BOUND.store(seg::dx::parse_bound(&argv.get("--seg-npu").unwrap_or_default()), Relaxed);
         seg::dx::EMBED_BOUND.store(seg::dx::parse_bound(&argv.get("--embed-npu").unwrap_or_default()), Relaxed);
+        seg::dx::SEG_BUFFERS.store(a.npu_jobs as u32 + 1, Relaxed);
     }
     if let Some(m) = &a.embed {
         embed::start(m);

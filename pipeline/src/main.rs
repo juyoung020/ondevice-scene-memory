@@ -2286,12 +2286,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     // 한 프로그램(ondevice): 첫 인자가 slam · view 면 위치 프로그램만 · 뷰어 서버만, 그 밖(run 또는 없음)은 물체 기억(+ --slam · --serve)
     let argv = common::cli::Argv::env();
-    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등), --mlock: 메모리를 RAM 에 묶음. 권한이 없으면 조용히 그대로
+    // --rt: 역할별 SCHED_FIFO(카메라 받기·추론 등). 권한이 없으면 조용히 그대로
     common::threads::set_rt(&argv.get("--rt").unwrap_or_default());
     common::log::set_quiet(argv.flag("--quiet"));
-    if argv.flag("--mlock") && !common::threads::mlock_all() {
-        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
-    }
+
     match argv.0.get(1).map(String::as_str) {
         Some("slam") => {
             let code = slam::app::run(&argv.0[1..]).unwrap_or_else(|e| {
@@ -2358,6 +2356,10 @@ fn main() {
         stream::hand_slam(rx);
         th
     });
+    // --mlock: 모델·스레드를 다 띄운 뒤 그때 있는 메모리만 묶는다(뒤에 늘어나는 장면 보관·지도는 묶지 않음)
+    if argv.flag("--mlock") && !common::threads::mlock_all() {
+        common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
+    }
     if a.seg_check > 0 {
         return seg_check(&a, seg.as_mut(), a.seg_check);
     }

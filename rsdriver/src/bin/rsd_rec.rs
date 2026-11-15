@@ -1,5 +1,5 @@
 //! rsdriver 로 녹화(D435 녹화 도구): rgb · depth(정렬) · depth_raw · calib.json · frames.tsv 폴더.
-//!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--color-size 1280x720] [--fps 30] [--exposure ms | --ae-cap ms] [--camera-profile librealsense|tracking] [--gain g] [--emitter on|off] [--skip 30] [--writers 3] [--queue 150]
+//!   rsd_rec <출력 폴더> [장면=60] [--size 640x480] [--color-size 1280x720] [--fps 30] [--exposure ms | --ae-cap ms] [--camera-profile librealsense|tracking] [--gain g] [--emitter on|off] [--skip 30] [--writers 3] [--queue 150] [--rgb-only]
 //! 폴더: rgb/ depth/(rsdriver 정렬, depth_rs.txt 도 이것을 가리킴) depth_raw/ yuyv/<시각>.bin(원본 YUYV) calib.json frames.tsv(시각·순번·메타·해시)
 #[cfg(target_os = "linux")]
 fn main() {
@@ -74,6 +74,7 @@ fn main() {
     }
     let fnv = |b: &[u8]| b.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3));
     let b16 = |v: &[u16]| v.iter().fold(0xcbf29ce484222325u64, |h, x| x.to_le_bytes().iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
+    let rgb_only = a.iter().any(|x| x == "--rgb-only"); // 카메라-IMU 보정 녹화: 컬러 PNG 만 써서 디스크 부담을 줄임
     let writers: usize = arg("--writers").and_then(|s| s.parse().ok()).unwrap_or(3);
     let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(arg("--queue").and_then(|s| s.parse().ok()).unwrap_or(150));
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
@@ -82,21 +83,24 @@ fn main() {
     let mut hs = Vec::new();
     for _ in 0..writers.max(1) {
         let (rx, back_tx, lines, out) = (rx.clone(), back_tx.clone(), lines.clone(), out.clone());
+        let rgb_only = rgb_only;
         hs.push(std::thread::spawn(move || loop {
             let job = { rx.lock().unwrap().recv() };
             let Ok(j) = job else { break };
             let tc = &j.tc;
             let _ = write_png_rgb(&join(&out, &format!("rgb/{tc}.png")), &j.rgb, w, h);
-            let _ = write_png16(&join(&out, &format!("depth/{tc}.png")), &j.aligned, w, h);
-            let _ = write_png16(&join(&out, &format!("depth_raw/{tc}.png")), &j.raw, dw, dh);
-            let _ = std::fs::write(join(&out, &format!("yuyv/{tc}.bin")), &j.yuyv);
+            if !rgb_only {
+                let _ = write_png16(&join(&out, &format!("depth/{tc}.png")), &j.aligned, w, h);
+                let _ = write_png16(&join(&out, &format!("depth_raw/{tc}.png")), &j.raw, dw, dh);
+                let _ = std::fs::write(join(&out, &format!("yuyv/{tc}.bin")), &j.yuyv);
+            }
             let line = j.meta.replace("{H}", &format!("{:016x}\t{:016x}\t{:016x}\t{:016x}", fnv(&j.yuyv), b16(&j.raw), fnv(&j.rgb), b16(&j.aligned)));
             lines.lock().unwrap().insert(j.seq, line);
             let _ = back_tx.send(j);
         }));
     }
     drop(back_tx);
-    let mut o = Output { want_raw: true, want_yuyv: true, ..Default::default() };
+    let mut o = Output { want_raw: !rgb_only, want_yuyv: !rgb_only, ..Default::default() };
     let mut dropped = 0usize;
     for seq in 0..n {
         // 돌려받은 버퍼가 있으면 그것에 채움

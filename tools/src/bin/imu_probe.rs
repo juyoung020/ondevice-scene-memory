@@ -1,5 +1,6 @@
 //! ICM-42688-P 연결 확인: I2C 로 칩을 찾아 가속도·자이로를 읽고, 가만히 둔 동안의 중력 방향과 자이로 치우침을 찍는다.
-//!   imu_probe [/dev/i2c-1] [초=5]
+//!   imu_probe [/dev/i2c-1] [초=5] [기록.csv]
+//! 기록.csv 를 주면 표본마다 `시각_ns,wx,wy,wz,ax,ay,az`(rad/s, m/s²) 를 쓴다. 시각은 rsd_rec 장면 시각과 같은 UNIX 시계(Kalibr imu0.csv 형식).
 //! 배선(Pi 5 핀 번호): VCC → 1(3.3 V), GND → 6, SDA → 3, SCL → 5. I2C 켜기: sudo dtparam i2c_arm=on (재부팅 없이 적용)
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ fn convert(b: &[u8; 12]) -> ([f64; 3], [f64; 3]) {
 }
 
 /// 찾기·설정·읽기. 끝 코드(0 = 성공)와 찍을 줄을 out 에
-fn probe(bus: &mut dyn Bus, secs: f64, out: &mut dyn FnMut(bool, String), sleep: &mut dyn FnMut(Duration), clock: &mut dyn FnMut() -> f64) -> i32 {
+fn probe(bus: &mut dyn Bus, secs: f64, out: &mut dyn FnMut(bool, String), sleep: &mut dyn FnMut(Duration), clock: &mut dyn FnMut() -> f64, log: &mut dyn FnMut(&[f64; 3], &[f64; 3])) -> i32 {
     let mut addr = 0u16;
     for a in [0x68u16, 0x69] {
         let mut who = [0u8];
@@ -65,6 +66,7 @@ fn probe(bus: &mut dyn Bus, secs: f64, out: &mut dyn FnMut(bool, String), sleep:
         let mut b = [0u8; 12];
         if rd(bus, 0x1F, &mut b) {
             let (a, g) = convert(&b);
+            log(&a, &g);
             for i in 0..3 {
                 sa[i] += a[i];
                 sg[i] += g[i];
@@ -78,6 +80,10 @@ fn probe(bus: &mut dyn Bus, secs: f64, out: &mut dyn FnMut(bool, String), sleep:
         }
         next += 0.005;
         let now = clock();
+        // 밀렸으면 따라잡으려 몰아 읽지 않음(레지스터는 최신 값 하나뿐이라 같은 값을 다른 시각으로 여러 번 쓰게 됨)
+        if next < now {
+            next = now;
+        }
         if next > now {
             sleep(Duration::from_secs_f64(next - now));
         }
@@ -136,6 +142,14 @@ fn main() {
             }
         };
         let mut bus = linux::I2c(f);
+        let mut csv = args.get(3).map(|p| {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(p).unwrap_or_else(|e| {
+                eprintln!("{p}: {e}");
+                std::process::exit(1)
+            }));
+            let _ = writeln!(w, "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]");
+            w
+        });
         let t0 = Instant::now();
         let rc = probe(
             &mut bus,
@@ -149,7 +163,17 @@ fn main() {
             },
             &mut std::thread::sleep,
             &mut || t0.elapsed().as_secs_f64(),
+            &mut |a, g| {
+                if let Some(w) = csv.as_mut() {
+                    let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+                    let r = std::f64::consts::PI / 180.0;
+                    let _ = writeln!(w, "{ns},{:.6},{:.6},{:.6},{:.5},{:.5},{:.5}", g[0] * r, g[1] * r, g[2] * r, a[0], a[1], a[2]);
+                }
+            },
         );
+        if let Some(mut w) = csv {
+            let _ = w.flush();
+        }
         std::process::exit(rc);
     }
     #[cfg(not(target_os = "linux"))]
@@ -204,7 +228,7 @@ mod tests {
         let rc = probe(&mut bus, 1.0, &mut |e, l| lines.push((e, l)), &mut |d| slept += d, &mut || {
             t += 0.0025;
             t
-        });
+        }, &mut |_, _| {});
         assert_eq!(rc, 0);
         assert_eq!(bus.writes, vec![(0x69, 0x11, 0x01), (0x69, 0x4F, 0x07), (0x69, 0x50, 0x07), (0x69, 0x4E, 0x0F)]);
         assert_eq!(lines[0], (false, "주소 0x69: WHO_AM_I 0x47 (ICM-42688-P)".to_string()));
@@ -231,7 +255,7 @@ mod tests {
             }
         }
         let mut lines = vec![];
-        let rc = probe(&mut Dead, 1.0, &mut |e, l| lines.push((e, l)), &mut |_| {}, &mut || 0.0);
+        let rc = probe(&mut Dead, 1.0, &mut |e, l| lines.push((e, l)), &mut |_| {}, &mut || 0.0, &mut |_, _| {});
         assert_eq!(rc, 2);
         assert!(lines[0].0);
     }

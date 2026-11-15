@@ -13,11 +13,6 @@ path = "src/lib.rs"
 image = { version = "0.25", default-features = false, features = ["png"] }
 common = { path = "../common" }
 
-[features]
-default = []
-# librealsense2 와 견주는 도구(C API 를 직접 부름: rs_align_check · align_sdk_check, slam realsense 입력)
-realsense = []
-
 
 [[bin]]
 name = "bench_align"
@@ -31,16 +26,4 @@ path = "src/bin/imu_probe.rs"
 name = "npu_prep"
 path = "src/bin/npu_prep.rs"
 
-[[bin]]
-name = "check_tum"
-path = "src/bin/check_tum.rs"
 
-[[bin]]
-name = "rs_align_check"
-path = "src/bin/rs_align_check.rs"
-required-features = ["realsense"]
-
-[[bin]]
-name = "align_sdk_check"
-path = "src/bin/align_sdk_check.rs"
-required-features = ["realsense"]

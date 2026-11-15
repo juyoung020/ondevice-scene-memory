@@ -1,10 +1,10 @@
 # 위치 프로그램 → 물체 기억: 장면 넘기기
 
-`slam/`(Rust)의 위치 프로그램이 RGB-D 입력으로 장면마다 위치를 구하고, 위치 + 컬러 + 컬러에 맞춘 깊이를 물체 기억(memmap)으로 넘긴다. 둘은 실행 파일 `ondevice` 한 프로세스에서 돌고(`ondevice --slam "…"`), 물체 기억은 받은 장면으로 TUM 입력과 같은 지도·물체·씬그래프 단계를 돈다. 위치 프로그램은 RTAB-Map 0.24.2 에서 우리 설정이 지나가는 경로(F2F 위치 추적 · 루프 클로저 · GTSAM 최적화)를 Rust 로 옮긴 것이고, PC 에서 C++ 원본 `rtab_bridge` 와 스트림·위치 파일·장면별 판단이 바이트까지 같다(모듈과 검증: [slam/README.md](../slam/README.md)). 아래에서 "RTAB-Map" 은 이 처리 방식을 가리킨다.
+`slam/`(Rust)의 위치 프로그램이 RGB-D 입력으로 장면마다 위치를 구하고, 위치 + 컬러 + 컬러에 맞춘 깊이를 물체 기억(memmap)으로 넘긴다. 둘은 실행 파일 `ondevice` 한 프로세스에서 돌고(`ondevice --slam "…"`), 물체 기억은 받은 장면으로 TUM 입력과 같은 지도·물체·씬그래프 단계를 돈다. 위치 프로그램은 RTAB-Map 0.24.2 에서 우리 설정이 지나가는 경로(F2F 위치 추적 · 루프 클로저 · GTSAM 최적화)를 Rust 로 옮긴 것이고, PC 에서 C++ 원본(RTAB-Map 0.24.2 연결 프로그램)과 스트림·위치 파일·장면별 판단이 바이트까지 같았다(모듈과 검증: [slam/README.md](../slam/README.md)). 아래에서 "RTAB-Map" 은 이 처리 방식을 가리킨다.
 
 ```
 RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rgb.txt·depth.txt, 시험용)
-        │ 깊이 → 컬러 정렬(io/realsense.rs, librealsense align)          │
+        │ 깊이 → 컬러 정렬(rsdriver, tools::fast_align = rs2::align 규칙) │
         └──────────────┬───────────────────────────────────┘
                        ▼
      RTAB-Map 위치 추적(매 장, Odometry) + 지도 갱신(Rtabmap::process, DetectionRate 1/초)
@@ -20,13 +20,13 @@ RealSense D435 (컬러 RGB8 + 깊이 Z16, 640×480@30)      TUM 폴더 재생(rg
 장면은 두 가지로 넘긴다. 결과(기억 폴더)는 두 방식이 바이트까지 같다.
 
 - **한 프로세스(기본):** `ondevice --slam "<위치 인자>" …`. 위치 루프(`slam::app`)가 같은 프로세스의 스레드로 돌고, 장면은 아래 스트림 형식으로 바꾸지 않고 메모리 큐(`slam::stream::Writer::channel`)로 넘어간다. 컬러·깊이 버퍼는 PNG·카메라에서 채운 그대로 memmap 까지 옮겨지고(복사 0 번), 큐 길이·`--block`/`--drop`·그래프 블록을 버리지 않는 규칙·리셋 블록 차례는 파이프와 같다. `--serve "<포트> …"` 를 더하면 뷰어 서버(sgview)도 같은 프로세스에서 뜨고, 기억 폴더에 쓴 파일을 메모리에서 보낸다.
-- **장면 스트림:** `ondevice slam … --out <파일>` 로 위치만 돌려 스트림을 남기고 `ondevice --stream <파일> …` 로 다시 돌린다(같은 녹화로 설정을 바꿔 볼 때, C++ `rtab_bridge` 와 견줄 때). 스트림 형식 쓰기·읽기는 `slam::stream` 하나다.
+- **장면 스트림:** `ondevice slam … --out <파일>` 로 위치만 돌려 스트림을 남기고 `ondevice --stream <파일> …` 로 다시 돌린다(같은 녹화로 설정을 바꿔 볼 때). 스트림 형식 쓰기·읽기는 `slam::stream` 하나다.
 
 ```bash
 # 빌드(저장소 맨 위 작업 공간): target/release/ondevice
 cargo build --release
 
-# 카메라 → 위치 추적 → 물체 기억 → 뷰어, 한 프로세스(실시간). D435 입력은 리눅스 기본 rsdriver(V4L2 직접), --driver librealsense 는 --features slam-realsense 빌드
+# 카메라 → 위치 추적 → 물체 기억 → 뷰어, 한 프로세스(실시간). D435 입력은 rsdriver(V4L2 · UVC 직접, 리눅스 빌드)
 ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-every 2" \
   --every 1 --live 1 --seg <분할 모델> --max-depth 3.5 --out data/memory/live --serve "8091 --bind 0.0.0.0"
 
@@ -41,9 +41,9 @@ ondevice --stream data/office.mmf --every 2 --max-depth 3.5 --out data/memory/of
 
 `--slam` · `--serve` 의 인자는 공백으로 나눈다(경로에 공백이 없어야 함). 명령줄은 시작할 때 한 번 읽어 위치 · 물체 기억 · 뷰어 설정으로 나누고, 잘못된 위치 인자는 스레드를 띄우기 전에 멈춘다. `ondevice view <기억 폴더> …` 는 뷰어만 띄운다.
 
-| 위치 인자(`--slam "…"` · `ondevice slam …`, `rtab_bridge` 와 같음) | 뜻 |
+| 위치 인자(`--slam "…"` · `ondevice slam …`) | 뜻 |
 |---|---|
-| `--realsense [--driver rsdriver\|librealsense] [--align rs2] [--serial S] [--size 640x480] [--fps 30]` | RealSense 입력(IMU 는 켜지 않음). `--driver` 는 빌드에 든 것 중에서(기본 rsdriver), `--align` 은 librealsense 판의 정렬 방식. rsdriver 의 장면 시각 = 컬러 장치 시각 + 첫 장면에서 한 번 정한 시스템 시계 차이(librealsense global time 과 절대값이 다를 수 있음, 간격은 같음) |
+| `--realsense [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense\|tracking] [--exposure ms \| --ae-cap ms] [--gain 0..128]` | D435 입력(rsdriver, IMU 는 켜지 않음). 제어 묶음은 [realsense_input.md](realsense_input.md) |
 | `--tum <폴더> [--rate R]` | TUM 폴더 재생. 보정값은 물체 기억의 TUM 입력과 같이 폴더 이름으로(`common::tum`)(freiburg1·2·3), 폴더에 `calibration.txt`(fx fy cx cy, ETH3D 형식)가 있으면 그 값 |
 | `--config <ini>` | RTAB-Map 설정(`[Core]`), 그 뒤 `--Group/Name 값` 으로 덮어씀 |
 | `--out -\|<파일>` | 스트림 출력(기본 표준출력, `--slam` 에서는 쓰지 않음). 파일로 남겨 두면 `ondevice --stream <파일>` 로 다시 돌릴 수 있음 |
@@ -56,20 +56,8 @@ ondevice --stream data/office.mmf --every 2 --max-depth 3.5 --out data/memory/of
 | `--stats <파일>` | 장면별 시간·놓침·새 지도·지도 보정·특징 수(CSV) |
 | `--max-frames N` | 앞 N 장만 |
 | `--reset-at N` | 시험용: N 번째 장면에서 리셋 파일이 생긴 것처럼 처음부터 |
-| `--db <파일>` | `rtab_bridge` 만: RTAB-Map 데이터베이스로 남김(`rtabmap-databaseViewer`). 위치 프로그램은 넘어감 |
 
 로그는 표준오류로 나간다(표준출력은 스트림 전용).
-
-### C++ 원본(비교 기준)
-
-`bridge/src` 의 `rtab_bridge`(C++, RTAB-Map 0.24.2 라이브러리 링크)는 위치 프로그램을 견주는 기준으로만 쓴다(Cargo 빌드 밖, 보드 ARM 비교는 [board_bridge.md](board_bridge.md)). 인자·스트림은 같다. 빌드(WSL·보드, librealsense 가 없으면 TUM 재생만):
-
-```bash
-cmake -S bridge -B ~/build/bridge -G Ninja -DCMAKE_PREFIX_PATH="$HOME/opt/rtabmap;$HOME/opt/librealsense"
-ninja -C ~/build/bridge
-```
-
-보드의 RTAB-Map·OpenCV·GTSAM 소스 빌드는 [board_bridge.md](board_bridge.md).
 
 | 물체 기억 인자 | 뜻 |
 |---|---|
@@ -154,13 +142,13 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 ## 검증 (WSL Ubuntu 24.04, TUM 재생, 2026-11-05)
 
-아래 두 절은 C++ `rtab_bridge` 로 잰 값이다. 위치 프로그램은 지금 ini(`docs/rtabmap_pi.ini`, GFTT/BRIEF + GTSAM)로 같은 입력을 넣으면 출력이 바이트까지 같아 그 조합의 정확도가 같다. ORB · g2o 조합은 C++ 원본에만 있다.
+아래 두 절은 C++ 원본(RTAB-Map 0.24.2 연결 프로그램)으로 잰 값이다. 위치 프로그램은 지금 ini(`docs/rtabmap_pi.ini`, GFTT/BRIEF + GTSAM)로 같은 입력을 넣으면 출력이 바이트까지 같아 그 조합의 정확도가 같다. ORB · g2o 조합은 C++ 원본으로만 쟀다.
 
-`check_tum`(`tools/`, 환경 변수 `BRIDGE`·`MEMMAP`·`ATE`·`INI`·`SEG`) 으로 시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할(당시 기본, 지금은 ObjectSAM), `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
+시퀀스마다 세 번 돌려 견줌. 이 표는 RTAB-Map 0.24.2 를 Ubuntu 패키지(OpenCV 4.6 xfeatures2d 없음, g2o)로 빌드한 GFTT/ORB · g2o 조합으로 잰 것이다. 지금 ini 의 GFTT/BRIEF · GTSAM 과의 비교는 아래 "특징·최적화기 비교". memmap 은 ONNX Runtime CPU 로 YOLO26s-seg 분할(당시 기본, 지금은 ObjectSAM), `--depth kinect --every 2`, 최대 거리 사무실·책상 3.5 m, 복도 4 m.
 
 - **기준**: 같은 설정 + 모든 장면을 지도 노드로 끝까지 돌려 최적화한 위치 → `ondevice --tum --gt`(오프라인 경로).
 - **같은 위치 오프라인**: 스트림 실행이 보낸 위치 파일 그대로 → `ondevice --tum --gt`. 스트림과 위치가 같고 입력 경로만 다르다.
-- **스트림**: `rtab_bridge` 가 보낸 장면 스트림을 물체 기억 `--stream` 으로(보드와 같은 설정, 장면이 들어올 때의 위치).
+- **스트림**: 연결 프로그램이 보낸 장면 스트림을 물체 기억 `--stream` 으로(보드와 같은 설정, 장면이 들어올 때의 위치).
 
 위치 오차는 정답 기준 `ate`(맞춘 뒤 RMSE).
 
@@ -185,7 +173,7 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 ### 특징·최적화기 비교 (WSL, 2026-11-08)
 
-`rtab_bridge --tum <시퀀스> --config <ini> --out /dev/null` 을 조합마다 세 번, 다섯 조합을 서로 다른 코어에서 동시에 돌림. 오차는 정답 기준 `ate`, "끝 그래프" = `--final-poses`(최적화된 지도 노드), "보낸 위치" = `--poses`(장면이 들어온 순간). 세 시퀀스 모두 놓침 0(정확도 우선 + ORB 책상 한 번만 놓침 1).
+C++ 원본 `--tum <시퀀스> --config <ini> --out /dev/null` 을 조합마다 세 번, 다섯 조합을 서로 다른 코어에서 동시에 돌림. 오차는 정답 기준 `ate`, "끝 그래프" = `--final-poses`(최적화된 지도 노드), "보낸 위치" = `--poses`(장면이 들어온 순간). 세 시퀀스 모두 놓침 0(정확도 우선 + ORB 책상 한 번만 놓침 1).
 
 | 빌드 · 설정 | 사무실 끝 그래프 | 책상 끝 그래프 | 보낸 위치 사무실 / 책상 | 위치 추적 ms/장 |
 |---|---|---|---|---|
@@ -203,10 +191,10 @@ memmap 은 늘 점 지도를 만든다(Potree 방식으로 보여 줌).
 
 위치 프로그램(PC WSL, 최대 속도 재생): fr1 책상 268 장/초, 복도 232 장/초로 C++ 원본의 약 2.2 – 2.3 배. 본 스레드 계산은 장면당 2.8 – 3.1 ms(위치 추적 평균 2.6 – 2.9 ms)라 벽시계는 PNG 읽기 스레드가 정한다. 기록: [performance_log.md](performance_log.md) "Rust 위치 프로그램(slam_bridge) 통합 재검증".
 
-C++ `rtab_bridge` 값([performance_log.md](performance_log.md) "연결 프로그램 시간"): PC 코어 하나에서 18 ms/장(그중 위치 추적 9.8 ms, TUM PNG 읽기 8 ms), 지도 갱신 1 초에 한 번 14 ms(최대 44 ms). 30 장/초 재생에서 위치 추적은 장면을 놓치지 않고, memmap 이 느리면 쓰기 큐에서 장면이 버려진다.
+C++ 원본 값([performance_log.md](performance_log.md) "연결 프로그램 시간"): PC 코어 하나에서 18 ms/장(그중 위치 추적 9.8 ms, TUM PNG 읽기 8 ms), 지도 갱신 1 초에 한 번 14 ms(최대 44 ms). 30 장/초 재생에서 위치 추적은 장면을 놓치지 않고, memmap 이 느리면 쓰기 큐에서 장면이 버려진다.
 
 장면 넘기기(쓰기 스레드 0.8 ms/장 + memmap 읽기 스레드 0.5 ms/장)는 본 스레드 밖에서 돈다. 파이프 버퍼는 1 MB, 카메라가 준 RGB 사진은 그대로 쓰고, 큐에 든 장면은 저마다 제 버퍼를 가진다. memmap 은 사진·깊이를 받을 자리에 바로 읽는다.
 
-## 깊이 정렬 바꿔 끼우기
+## 깊이 정렬
 
-깊이를 컬러 격자로 옮기는 곳은 `slam/src/io/realsense.rs` 하나다(`rtab_bridge` 는 `bridge/src/depth_align.cpp`). `--align <이름>` 으로 고르고, 지금은 `rs2`(librealsense align, CPU).
+깊이를 컬러 격자로 옮기는 곳은 rsdriver 하나다(`tools::fast_align`, librealsense `rs2::align` 과 화소까지 같은 규칙, [realsense_input.md](realsense_input.md)).

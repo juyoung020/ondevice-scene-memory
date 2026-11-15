@@ -11,11 +11,8 @@ nalgebra = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 rsdriver = { path = "../rsdriver", optional = true }
-tools = { path = "../tools", optional = true }
 
 [features]
 default = []
-# D435 입력(librealsense2 C API 를 직접 부름, tools::rs2 선언)
-realsense = ["dep:tools", "tools/realsense"]
-# D435 입력(rsdriver: V4L2·UVC 직접, librealsense2 없이). 둘 다 켜면 --driver 로 고름(기본 rsdriver)
+# D435 입력(rsdriver: V4L2·UVC 직접)
 rsdriver = ["dep:rsdriver"]

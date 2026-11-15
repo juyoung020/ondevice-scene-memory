@@ -907,6 +907,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
     let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
+    let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
     while let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, anchor, graph }) = rx.recv() {
         // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
         let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
@@ -946,6 +947,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 }));
             } else {
             let i1 = Instant::now();
+            rb_cache = Some(rb.cache.clone());
             install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
             view.traj_replaced();
             let i2 = Instant::now();
@@ -970,7 +972,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
             let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
             kfs.clear_dirty();
-            rb_job = Some(std::thread::spawn(move || { out::thread_role(out::Role::Rebuild); let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved); out::slow(c_rb); r }));
+            let cache = rb_cache.clone();
+            rb_job = Some(std::thread::spawn(move || { out::thread_role(out::Role::Rebuild); let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved, cache); out::slow(c_rb); r }));
             last_rebuild = Instant::now();
             (rb_t0, rb_due) = (t, t + a.rebuild_every);
         }
@@ -1224,6 +1227,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut installed = false;
     if let Some(job) = rb_job.take() {
         let rb = job.join().expect("다시 쌓기 스레드");
+        rb_cache = Some(rb.cache.clone());
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
         view.traj_replaced();
         (n_rebuild, installed) = (n_rebuild + 1, true);
@@ -1231,7 +1235,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     kfs.settle(true);
     if kfs.dirty && a.rebuild_every >= 0.0 {
         let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
-        let rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved);
+        let rb = rebuild_maps(a, seq.k, &snap, mem.next + 100_000, kfs.moved, rb_cache.clone());
         kfs.clear_dirty();
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
         view.traj_replaced();
@@ -1353,7 +1357,31 @@ struct Rebuilt {
     n: usize,
     secs: f64,
     moved: (f64, f64),
+    /// 이번에 쌓을 때 쓴 장면·위치와 중간 상태: 다음 다시 쌓기가 바뀌지 않은 앞부분을 건너뜀
+    cache: std::sync::Arc<RbCache>,
+    /// 이번에 처음부터 다시 넣은 첫 장면 번호(0 = 처음부터)
+    start: usize,
 }
+
+/// 다시 쌓기 중간 상태: i 번째 장면을 넣기 직전의 지도·물체·길(장면 순서·위치가 같으면 그대로 이어 쌓아도 처음부터 쌓은 것과 같다)
+struct Ckpt {
+    i: usize,
+    grid: Grid,
+    scene: SceneMap,
+    mem: Memory,
+    traj: Vec<(f64, [f64; 3])>,
+    map_traj: Vec<(f64, V3, M3)>,
+}
+
+/// 지난 다시 쌓기: 장면마다 (순번, 회전, 위치)와 중간 상태(CKPT_EVERY 장마다, 최근 CKPT_KEEP 개)
+#[derive(Default)]
+struct RbCache {
+    keys: Vec<(u64, M3, V3)>,
+    ckpts: Vec<std::sync::Arc<Ckpt>>,
+}
+/// 중간 상태 간격(물체 정리 주기 15 의 배수라 그 자리에서 이어도 같은 결과)
+const CKPT_EVERY: usize = 120;
+const CKPT_KEEP: usize = 6;
 
 type Snap = Vec<(std::sync::Arc<kfstore::Kf>, M3, V3)>;
 
@@ -1381,7 +1409,8 @@ fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {
 }
 
 /// 보관한 장면을 주어진 위치로 빈 지도·물체·지나온 길에 처음부터 쌓는다. 물체 id 는 next_id 부터.
-fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f64)) -> Rebuilt {
+/// 지난번(cache)과 앞부분 장면·위치가 같으면 그 끝 가까운 중간 상태에서 이어 쌓는다(루프 클로저로 뒤쪽 새 지도만 움직였을 때 그 부분만)
+fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f64), cache: Option<std::sync::Arc<RbCache>>) -> Rebuilt {
     let c0 = Instant::now();
     let mut grid = Grid::new(0.05);
     let mut scene = SceneMap::new(a.scene_vox, 0.04);
@@ -1389,13 +1418,42 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let mut mem = Memory::new(0.012, 0.04);
     mem.next = next_id;
     let (mut traj, mut map_traj) = (vec![], vec![]);
+    let mut ckpts: Vec<std::sync::Arc<Ckpt>> = vec![];
+    let mut start = 0usize;
+    let mut old_keys: Vec<(u64, M3, V3)> = vec![];
+    if let Some(c) = cache.filter(|_| std::env::var_os("MEMMAP_RB_FULL").is_none()) {
+        // 처음 달라진 장면: 순번이 다르거나 노드가 실제로 움직임(kfstore 의 움직임 문턱 2 cm · 1° — 최적화의 아주 작은 흔들림은 같은 것으로 봄)
+        let d = snap
+            .iter()
+            .zip(c.keys.iter())
+            .position(|((kf, r, p), (s, r0, p0))| kf.seq != *s || norm(&sub(p, p0)) > kfstore::MOVE_T || kfstore::angle(r, r0) > kfstore::MOVE_R)
+            .unwrap_or(snap.len().min(c.keys.len()));
+        if std::env::var_os("MEMMAP_PARTS").is_some() {
+            common::info!("다시 쌓기: 지난번과 처음 달라진 장면 {d} / {}", snap.len());
+        }
+        if let Some(ck) = c.ckpts.iter().rev().find(|ck| ck.i <= d && ck.i > 0) {
+            (grid, scene, mem, traj, map_traj) = (ck.grid.clone(), ck.scene.clone(), ck.mem.clone(), ck.traj.clone(), ck.map_traj.clone());
+            scene.run = SceneMap::new_run();
+            start = ck.i;
+            ckpts = c.ckpts.iter().filter(|x| x.i <= start).cloned().collect();
+            old_keys = c.keys[..start].to_vec(); // 이어 받은 앞부분은 그때 위치로 쌓은 것
+        }
+    }
     let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 몇 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음).
     // 한 번에 푸는 장 수 = 풀의 스레드 수(최대 8): 푼 장면 하나가 약 2.1 MB(깊이 f32 + 컬러)라 32 장씩이면 최대 메모리가 67 MB 늘었다.
     // 쌓기가 차례대로라 8 장 넘게 미리 풀어도 빨라지지 않는다
     let dec_chunk = rayon::current_num_threads().clamp(1, 8);
     let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>, Option<PtsGrid>)> = Default::default();
-    for (i, (kf, r, pwc)) in snap.iter().enumerate() {
+    // 시험용 MEMMAP_CKPT_EVERY(15 의 배수)
+    let ck_every = std::env::var("MEMMAP_CKPT_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0 && v % 15 == 0).unwrap_or(CKPT_EVERY);
+    for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
+        if i > start && i % ck_every == 0 {
+            ckpts.push(std::sync::Arc::new(Ckpt { i, grid: grid.clone(), scene: scene.clone(), mem: mem.clone(), traj: traj.clone(), map_traj: map_traj.clone() }));
+            if ckpts.len() > CKPT_KEEP {
+                ckpts.remove(0);
+            }
+        }
         let cd = Instant::now();
         if dec.is_empty() {
             use rayon::prelude::*;
@@ -1425,8 +1483,10 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let t_exp = ce.elapsed().as_secs_f64();
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
-    common::info!("다시 쌓기 나눔: 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", t_map);
-    Rebuilt { pts, grid, scene, mem, traj, map_traj, last_seq, extra: vec![], n: snap.len(), secs, moved }
+    common::info!("다시 쌓기 나눔: 장면 {start} 번부터 {} 개(앞은 저장해 둔 상태) · 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", snap.len() - start, t_map);
+    old_keys.extend(snap[start..].iter().map(|(kf, r, p)| (kf.seq, *r, *p)));
+    let cache = std::sync::Arc::new(RbCache { keys: old_keys, ckpts });
+    Rebuilt { pts, grid, scene, mem, traj, map_traj, last_seq, extra: vec![], n: snap.len(), secs, moved, cache, start }
 }
 
 /// 다시 쌓은 지도로 갈아 끼우고, 쌓는 동안 새로 보관한 장면을 지금 위치로 이어서 넣는다
@@ -1449,8 +1509,8 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
     for ((kf, r, pwc), (d, rgb, dets)) in newer.iter().zip(unpack_all(&newer)) {
         map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &d, &rgb, kf.w, kf.h, &dets, true, grid, mem, traj, map_traj);
     }
-    common::info!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개 {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
-              rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
+    common::info!("다시 쌓기: 노드 최대 {:.1} cm·{:.1}° 움직임 → 장면 {} 개(그중 {} 번부터 다시) {:.2} 초(작업 스레드), 그동안 들어온 장면 {} 개 이어 넣음(작업 스레드 + 본 스레드), 물체 {} 개(id 이어받음 {kept})",
+              rb.moved.0 * 100.0, rb.moved.1, rb.n, rb.start, rb.secs, format!("{n_extra} + {}", newer.len()), mem.objs.len());
 }
 
 /// 스트림이 이만큼(초) 밀리면 가볍게 처리

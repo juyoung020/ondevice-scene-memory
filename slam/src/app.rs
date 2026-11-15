@@ -1166,7 +1166,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             // 최근 기준 장면으로 못 잡으면 지도 전체에서(광류 경로, 놓친 동안 장면마다)
             // 장면당 예산: 이 장면에서 위치 추적이 이미 20 ms 넘게 썼으면 다음 장면으로 미룸(추적 스레드가 40 ms 넘게 막히지 않게)
             // 빈틈 바로 뒤 첫 장면은 예산과 상관없이 한 번 꼭 해 봄(이어 붙이기 전에 제자리 찾기)
-            if !relocalized && klt_path && fr.t - last_good_t > 0.2 && (ms_since(c1) < 20.0 || !global_tried) {
+            if !relocalized && klt_path && fr.t - last_good_t > 0.5 && (ms_since(c1) < 20.0 || !global_tried) {
                 global_tried = true;
                 if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize) {
                     eng.odom_reset(p);

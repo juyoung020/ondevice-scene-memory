@@ -366,6 +366,8 @@ pub struct OdometryKlt {
     kf_t: f64,
     /// 되찾기용 기술자를 새로 뽑는 최소 간격(초)
     desc_every: f64,
+    desc_every_kf: u32,
+    kf_count: u32,
     ext: Extractor,
     reg: RegistrationVis,
     /// 다음 장면 피라미드에 다시 쓸 버퍼
@@ -408,6 +410,8 @@ impl OdometryKlt {
             kf: None,
             kf_t: 0.0,
             desc_every: p.get("OdomKlt/DescEvery", 0.0f64),
+            desc_every_kf: p.get("OdomKlt/DescEveryKf", 1u32),
+            kf_count: 0,
             ext: Extractor::new(p),
             reg: RegistrationVis::new(p),
             spare: None,
@@ -461,7 +465,12 @@ impl OdometryKlt {
     fn top_up(&mut self, f: &Frame) {
         // 되찾기용 특징(BRIEF 기술자)은 0.5 초에 한 번만 새로 뽑음: 그 사이 키프레임은 GFTT·3D 점만(장면당 시간 줄임)
         // OdomKlt/DescEvery 초(기본 0 = 키프레임마다, 결과가 시간과 무관하게 같음)
-        let full = self.kf.as_ref().is_none_or(|_| f.t - self.kf_t >= self.desc_every);
+        // 또는 키프레임 N 번에 한 번(OdomKlt/DescEveryKf, 장면 수로 정해 결과가 시간과 무관)
+        self.kf_count += 1;
+        let full = self.kf.as_ref().is_none_or(|_| f.t - self.kf_t >= self.desc_every && self.kf_count >= self.desc_every_kf);
+        if full {
+            self.kf_count = 0;
+        }
         let feats = if full {
             self.ext.extract(f)
         } else {

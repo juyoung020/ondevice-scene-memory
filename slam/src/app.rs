@@ -194,11 +194,176 @@ mod engine {
         }
     }
 
+    /// 지도 단계 결과(동기면 매번, 지도 스레드면 끝난 단계마다 갱신)
+    #[derive(Clone, Default)]
+    pub struct MapSt {
+        loop_id: i32,
+        corr: ((f32, f32), u32),
+        lp: BTreeMap<i32, Tf>,
+        last_id: i32,
+        map_corr: Tf,
+        jobs: u64,
+    }
+
+    fn snap_of(s: &Slam) -> MapSt {
+        MapSt {
+            loop_id: s.loop_closure_id(),
+            corr: (s.info.max_correction, s.info.rejected_by_correction),
+            lp: s.local_optimized_tf().clone(),
+            last_id: s.last_location_id(),
+            map_corr: s.map_correction(),
+            jobs: 0,
+        }
+    }
+
+    pub enum Cmd {
+        Proc(Box<NodeInput>, i32, u64, bool),
+        NewMap(std::sync::mpsc::SyncSender<i32>),
+        Reset(std::sync::mpsc::SyncSender<()>),
+    }
+
+    /// 지도(Slam)를 이 스레드에서 바로 부르거나, 지도 스레드에 일을 넘김
+    pub enum MapHost {
+        Inline(Box<Slam>, MapSt),
+        Thread {
+            tx: Option<std::sync::mpsc::Sender<Cmd>>,
+            h: Option<std::thread::JoinHandle<Box<Slam>>>,
+            /// 끝난 단계 결과 + 그 단계에서 정해진 (일 번호, 노드 id)
+            done: Arc<Mutex<(Vec<MapSt>, Vec<(u64, i32)>)>>,
+            st: MapSt,
+            jobs: u64,
+        },
+        Empty,
+    }
+
+    impl MapHost {
+        fn jobs(&self) -> u64 {
+            match self {
+                MapHost::Thread { jobs, .. } => *jobs,
+                MapHost::Inline(_, st) => st.jobs,
+                MapHost::Empty => 0,
+            }
+        }
+        /// 지금 볼 결과
+        fn st(&self) -> &MapSt {
+            match self {
+                MapHost::Thread { st, .. } => st,
+                MapHost::Inline(_, st) => st,
+                MapHost::Empty => unreachable!(),
+            }
+        }
+        /// 노드 넣기. 돌려줌: 이번에 id 가 정해진 (일 번호, 노드 id)
+        fn process(&mut self, inp: NodeInput, forced: i32, node: bool, job: u64) -> Vec<(u64, i32)> {
+            match self {
+                MapHost::Inline(s, st) => {
+                    s.forced_hyp = forced;
+                    s.process(&inp);
+                    *st = snap_of(s);
+                    st.jobs = job;
+                    if node { vec![(job, s.last_location_id())] } else { vec![] }
+                }
+                MapHost::Thread { tx, done, st, jobs, .. } => {
+                    *jobs = job;
+                    let _ = tx.as_ref().unwrap().send(Cmd::Proc(Box::new(inp), forced, job, node));
+                    // 끝난 단계가 있으면 가장 최근 결과로(루프 클로저는 그 단계들 가운데 있었으면 알림)
+                    let (sts, ids) = std::mem::take(&mut *done.lock().unwrap());
+                    if let Some(last) = sts.last() {
+                        let lp_loop = sts.iter().rev().find(|x| x.loop_id > 0).map(|x| x.loop_id).unwrap_or(0);
+                        let rej: u32 = sts.iter().map(|x| x.corr.1).sum();
+                        let mc = sts.iter().fold((0f32, 0f32), |m, x| (m.0.max(x.corr.0 .0), m.1.max(x.corr.0 .1)));
+                        *st = last.clone();
+                        st.loop_id = lp_loop;
+                        st.corr = (mc, rej);
+                    } else {
+                        st.loop_id = 0;
+                        st.corr = ((0.0, 0.0), 0);
+                    }
+                    ids
+                }
+                MapHost::Empty => unreachable!(),
+            }
+        }
+        /// 지도 스레드에 쌓인 일이 끝나길 기다림(새 지도·리셋·끝 그래프처럼 순서가 중요한 일 앞에서)
+        fn trigger_new_map(&mut self) -> i32 {
+            match self {
+                MapHost::Inline(s, _) => s.trigger_new_map(),
+                MapHost::Thread { tx, .. } => {
+                    let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
+                    let _ = tx.as_ref().unwrap().send(Cmd::NewMap(rtx));
+                    rrx.recv().unwrap_or(-1)
+                }
+                MapHost::Empty => -1,
+            }
+        }
+        fn reset(&mut self) {
+            match self {
+                MapHost::Inline(s, st) => {
+                    s.reset();
+                    *st = snap_of(s);
+                }
+                MapHost::Thread { tx, st, .. } => {
+                    let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
+                    let _ = tx.as_ref().unwrap().send(Cmd::Reset(rtx));
+                    let _ = rrx.recv();
+                    *st = MapSt::default();
+                }
+                MapHost::Empty => {}
+            }
+        }
+        fn start_thread(&mut self) {
+            let MapHost::Inline(..) = self else { return };
+            let MapHost::Inline(mut slam, st0) = std::mem::replace(self, MapHost::Empty) else { unreachable!() };
+            let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+            let done: Arc<Mutex<(Vec<MapSt>, Vec<(u64, i32)>)>> = Default::default();
+            let d2 = done.clone();
+            let h = std::thread::spawn(move || {
+                common::threads::rt("slam"); // 지도 스레드도 위치 프로그램 역할 코어에
+                while let Ok(c) = rx.recv() {
+                    match c {
+                        Cmd::Proc(inp, forced, job, node) => {
+                            slam.forced_hyp = forced;
+                            slam.process(&inp);
+                            let st = snap_of(&slam);
+                            let mut d = d2.lock().unwrap();
+                            d.0.push(st);
+                            if node {
+                                d.1.push((job, slam.last_location_id()));
+                            }
+                        }
+                        Cmd::NewMap(r) => {
+                            let _ = r.send(slam.trigger_new_map());
+                        }
+                        Cmd::Reset(r) => {
+                            slam.reset();
+                            let _ = r.send(());
+                        }
+                    }
+                }
+                slam
+            });
+            let jobs = st0.jobs;
+            *self = MapHost::Thread { tx: Some(tx), h: Some(h), done, st: st0, jobs };
+        }
+        /// 지도 스레드를 끝내고 Slam 을 돌려받음(끝 그래프)
+        fn inline(&mut self) -> &mut Slam {
+            if let MapHost::Thread { tx, h, .. } = self {
+                drop(tx.take());
+                let s = h.take().unwrap().join().expect("지도 스레드");
+                let st = snap_of(&s);
+                *self = MapHost::Inline(s, st);
+            }
+            match self {
+                MapHost::Inline(s, _) => s,
+                _ => unreachable!(),
+            }
+        }
+    }
+
     pub struct Engine {
         ext: Extractor,
         odom: Odom,
         reloc: RegistrationVis,
-        slam: Slam,
+        slam: MapHost,
         cam: Arc<Mutex<Option<Camera>>>,
         /// 지금 장면 SensorData 의 특징(위치 추적이 data.setFeatures 로 채운 것)
         cur: Features,
@@ -211,7 +376,9 @@ mod engine {
         /// 지도 노드마다 특징(기술자·3D)과 그때 위치 추적 위치: 놓쳤을 때 지도 전체에서 다시 잡기(global_reloc)
         kf_db: Vec<(Features, Tf)>,
         /// kf_db 와 같은 순서: (지도 노드 id, 믿는 지도의 노드인지)
-        kf_ids: Vec<(i32, bool)>,
+        kf_ids: Vec<(i32, bool, u64)>,
+        /// 다음 지도 단계에 넘길 루프 후보
+        forced_hyp: i32,
         /// 지금 지도가 믿는 지도인지(app 이 slam_process 앞에 알려 줌)
         pub trusted: bool,
     }
@@ -242,7 +409,7 @@ mod engine {
                 ext: Extractor::new(odom_params),
                 odom,
                 reloc,
-                slam,
+                slam: { let st = snap_of(&slam); MapHost::Inline(Box::new(slam), st) },
                 cam,
                 cur: Features::default(),
                 prev_stamp: 0.0,
@@ -252,6 +419,7 @@ mod engine {
                 ref_unknown: 0,
                 kf_db: Vec::new(),
                 kf_ids: Vec::new(),
+                forced_hyp: 0,
                 trusted: true,
             }
         }
@@ -319,10 +487,12 @@ mod engine {
             let words = |d: &[u8; 32]| -> [u64; 4] { std::array::from_fn(|i| u64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap())) };
             let step = (self.cur.desc.len() / 100).max(1);
             let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
+            let from = self.kf_db.len().saturating_sub(40);
             let mut scores: Vec<(usize, usize)> = self
                 .kf_db
                 .iter()
                 .enumerate()
+                .skip(from)
                 .map(|(i, (kf, _))| {
                     let kw: Vec<[u64; 4]> = kf.desc.iter().map(words).collect();
                     let hits = q
@@ -338,7 +508,7 @@ mod engine {
                 eprintln!("global db {} q {} top {:?}", self.kf_db.len(), q.len(), &scores[..scores.len().min(3)]);
             }
             let cam = f.cam.clone();
-            for &(hits, i) in scores.iter().take(2) {
+            for &(hits, i) in scores.iter().take(1) {
                 if hits < 10 {
                     break;
                 }
@@ -425,7 +595,7 @@ mod engine {
                 if let Some(p) = pose {
                     if !self.cur.desc.is_empty() {
                         self.kf_db.push((self.cur.clone(), p));
-                        self.kf_ids.push((0, self.trusted)); // id 는 process 뒤에 채움
+                        self.kf_ids.push((0, self.trusted, 0)); // id 는 process 뒤에 채움
                     }
                 }
             }
@@ -440,11 +610,18 @@ mod engine {
                 NodeFeatures::default()
             };
             let inp = NodeInput { features, stamp: f.t, pose: pose.unwrap_or(Tf::NULL), cov: *cov, velocity, image_size: (f.cam.width, f.cam.height) };
-            let had = self.kf_ids.last().map(|x| x.0 == 0).unwrap_or(false);
-            self.slam.process(&inp);
-            if node && had {
+            let had = node && self.kf_ids.last().map(|x| x.0 == 0).unwrap_or(false);
+            let job = self.slam.jobs() + 1;
+            if had {
                 if let Some(l) = self.kf_ids.last_mut() {
-                    l.0 = self.slam.last_location_id();
+                    l.2 = job;
+                }
+            }
+            let forced = std::mem::take(&mut self.forced_hyp);
+            for (k, id) in self.slam.process(inp, forced, had, job) {
+                // 지도 노드 id 가 정해진 kf_db 칸을 채움(지도 스레드면 한 단계 늦게 옴)
+                if let Some(e) = self.kf_ids.iter_mut().find(|e| e.0 == 0 && e.2 == k) {
+                    e.0 = id;
                 }
             }
         }
@@ -460,8 +637,10 @@ mod engine {
             let step = (self.cur.desc.len() / 60).max(1);
             let q: Vec<[u64; 4]> = self.cur.desc.iter().step_by(step).map(words).collect();
             let mut best: Vec<(usize, usize)> = Vec::new();
-            for (i, (kf, _)) in self.kf_db.iter().enumerate() {
-                let (id, trusted) = self.kf_ids[i];
+            // 최근 40 노드만(장면당 시간 상한)
+            let from = self.kf_db.len().saturating_sub(40);
+            for (i, (kf, _)) in self.kf_db.iter().enumerate().skip(from) {
+                let (id, trusted, _) = self.kf_ids[i];
                 if !trusted || id <= 0 {
                     continue;
                 }
@@ -487,13 +666,13 @@ mod engine {
             }
             best.sort_by(|a, b| b.cmp(a));
             let cam = f.cam.clone();
-            for &(hits, i) in best.iter().take(2) {
+            for &(hits, i) in best.iter().take(1) {
                 if hits < 8 {
                     break;
                 }
                 let info = self.reloc.compute_tf(&self.kf_db[i].0, &self.cur, &cam, Tf::NULL);
                 if !info.tf.is_null() && info.inliers >= min_inliers {
-                    self.slam.forced_hyp = self.kf_ids[i].0;
+                    self.forced_hyp = self.kf_ids[i].0;
                     return true;
                 }
             }
@@ -502,21 +681,21 @@ mod engine {
 
         /// 이번 단계 루프 보정 크기(m, rad)와 크기 때문에 버린 루프 수
         pub fn correction_info(&self) -> ((f32, f32), u32) {
-            (self.slam.info.max_correction, self.slam.info.rejected_by_correction)
+            self.slam.st().corr
         }
 
         pub fn loop_closure_id(&self) -> i32 {
-            self.slam.loop_closure_id()
+            self.slam.st().loop_id
         }
         pub fn local_optimized(&self) -> &BTreeMap<i32, Tf> {
-            self.slam.local_optimized_tf()
+            &self.slam.st().lp
         }
         pub fn last_location_id(&self) -> i32 {
-            self.slam.last_location_id()
+            self.slam.st().last_id
         }
         /// None = null Transform
         pub fn map_correction(&self) -> Option<Tf> {
-            let c = self.slam.map_correction();
+            let c = self.slam.st().map_corr;
             (!c.is_null()).then_some(c)
         }
         pub fn trigger_new_map(&mut self) -> i32 {
@@ -528,10 +707,17 @@ mod engine {
             self.slam.reset();
         }
 
+        /// 지도 갱신(노드 넣기·루프 클로저·그래프 최적화)을 따로 도는 스레드로: 위치 추적 스레드는 기다리지 않고
+        /// 지난 단계 결과(지도 보정·최적화 위치)를 쓴다(한 노드 늦음). 실시간 입력에서만 켠다(재생 결과는 그대로 결정적)
+        pub fn start_map_thread(&mut self) {
+            self.slam.start_thread();
+        }
+
         /// Rtabmap::getGraph(optimized=true, global=true): (id, 시각, 위치). 노드가 없으면 빔
         pub fn final_graph(&mut self) -> Vec<(i32, f64, Tf)> {
-            let (poses, _) = self.slam.get_graph(true, true);
-            poses.iter().filter_map(|(id, t)| self.slam.mem.sig(*id).map(|s| (*id, s.stamp, *t))).collect()
+            let slam = self.slam.inline();
+            let (poses, _) = slam.get_graph(true, true);
+            poses.iter().filter_map(|(id, t)| slam.mem.sig(*id).map(|s| (*id, s.stamp, *t))).collect()
         }
     }
 }
@@ -568,7 +754,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--Group/Name 값 ...]"
+        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--bridge-gap 초(1)] [--reset-at N] [--Group/Name 값 ...]"
     );
 }
 
@@ -591,6 +777,10 @@ pub struct Args {
     bridge: bool,
     /// 이어지지 않은 새 지도의 장면을 맡아 두지 않고 임시 위치로 바로 보냄(--no-provisional 로 끔)
     provisional: bool,
+    /// 이 시간(초) 이하의 빈틈만 그 자리에서 이어 붙임(그보다 길면 새 지도, 깊이 ICP 로 확인되면 예외)
+    bridge_gap: f64,
+    /// 지도 갱신을 위치 추적 스레드에서 바로(시험·비교용)
+    map_inline: bool,
     reset_at: i64,
     stride: usize,
     block: i32,
@@ -627,6 +817,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 0(바로 다시 시작), F2F 1 초
         bridge: true,
         provisional: true,
+        bridge_gap: 1.0,
+        map_inline: false,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
@@ -696,6 +888,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
             "--no-bridge" => a.bridge = false,
             "--no-provisional" => a.provisional = false,
+            "--bridge-gap" => a.bridge_gap = num(&val()?)?,
+            "--map-inline" => a.map_inline = true,
             "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
             // 프로세스 설정(ondevice 가 처음에 읽음): 실시간 배치·메모리 묶기·조용히
             "--rt" => {
@@ -821,12 +1015,17 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let reloc_min = params.get("Vis/MinInliers", 20i32).max(25);
     let mut eng = engine::Engine::new(&params, &odom_params, reloc_min);
     let klt_path = params.get("Odom/Strategy", 0i32) == 9;
+    // 실시간(카메라·찍은 속도 재생)이면 지도 갱신을 따로 도는 스레드로(--map-inline 으로 끔). 최대 속도 재생은 결정적이게 그대로
+    if (a.realsense || a.rate > 0.0) && !a.map_inline {
+        eng.start_map_thread();
+    }
     let reloc_wait = if a.reloc_wait >= 0.0 { a.reloc_wait } else if klt_path { 0.0 } else { 1.0 };
     let bridge = a.bridge && klt_path;
     let mut n_bridge = 0i64;
     let mut n_global = 0i64;
     let mut n_loop_rejected = 0i64;
     let mut n_merge_try = 0i64;
+    let mut last_merge_try = f64::MIN;
     let mut max_corr = (0f32, 0f32);
     let mut last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
     let mut n_bridge_ok = 0i64;
@@ -957,7 +1156,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 break;
             }
             // 최근 기준 장면으로 못 잡으면 지도 전체에서(광류 경로, 놓친 동안 장면마다)
-            if !relocalized && klt_path && fr.t - last_good_t > 0.2 {
+            // 장면당 예산: 이 장면에서 위치 추적이 이미 20 ms 넘게 썼으면 다음 장면으로 미룸(추적 스레드가 40 ms 넘게 막히지 않게)
+            if !relocalized && klt_path && fr.t - last_good_t > 0.2 && ms_since(c1) < 20.0 {
                 if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize) {
                     eng.odom_reset(p);
                     let info2 = eng.odom_process(&fr, None);
@@ -999,7 +1199,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let mut new_map = false;
         // 이어 붙이기는 그사이 움직임을 아는 경우만: 깊이 ICP 로 자리를 확인했거나 빈틈이 1 초 이하.
         // 그보다 길면(사람이 그사이 걸었을 수 있음) 새 지도를 열고 루프 클로저가 옛 지도와 잇게 둔다(틀린 이어 붙이기를 거대한 보정으로 끌어오지 않게)
-        if bridge && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 && (eng.bridge_verified() || gap_since_good <= 1.0) {
+        if bridge && !fresh && !relocalized && pose.is_some() && info.cov[0] >= 9999.0 && (eng.bridge_verified() || gap_since_good <= a.bridge_gap) {
             // 이어 붙이기: 위치 추적은 마지막 위치에서 다시 시작했다. 같은 지도에 큰 불확실성(0.5 m², 0.5 rad²)으로 이어
             // 지도가 끊기지 않게 하고, 실제로 어긋났으면 뒤의 루프 클로저가 그래프 최적화로 바로잡는다
             info.cov = [0.0; 36];
@@ -1047,7 +1247,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if process {
             eng.trusted = anchored;
             // 이어지지 않은 새 지도: 노드를 넣을 때마다 믿는 지도 노드 전체에서 이어 줄 후보를 찾아 루프 후보로 넘김
-            if !anchored && klt_path && data_id > 0 && pose.is_some() && eng.propose_merge(&fr, reloc_min as usize) {
+            // 잇기 후보 찾기는 1.5 초에 한 번, 이 장면 위치 추적이 가벼웠을 때만
+            if !anchored && klt_path && data_id > 0 && pose.is_some() && fr.t - last_merge_try >= 1.5 && ms_since(c1) < 15.0 && { last_merge_try = fr.t; eng.propose_merge(&fr, reloc_min as usize) } {
                 n_merge_try += 1;
             }
             eng.slam_process(&fr, data_id > 0, pose, &info.cov, info.velocity());

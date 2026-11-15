@@ -363,6 +363,7 @@ pub struct OdometryKlt {
     prev: Option<Pyr>,
     /// 마지막 키프레임 특징과 그때 위치(광류가 끊겼을 때 되찾기)
     kf: Option<(Features, Tf)>,
+    kf_t: f64,
     ext: Extractor,
     reg: RegistrationVis,
     /// 다음 장면 피라미드에 다시 쓸 버퍼
@@ -403,6 +404,7 @@ impl OdometryKlt {
             pose: Tf::IDENTITY,
             prev: None,
             kf: None,
+            kf_t: 0.0,
             ext: Extractor::new(p),
             reg: RegistrationVis::new(p),
             spare: None,
@@ -425,7 +427,7 @@ impl OdometryKlt {
             depth_only: p.get_bool("OdomKlt/DepthOnly", false),
             prev_sub: Vec::new(),
             cur_sub: Vec::new(),
-            par: p.get_bool("OdomKlt/Parallel", true),
+            par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
 
@@ -454,7 +456,15 @@ impl OdometryKlt {
 
     /// 키프레임: 이 장면 특징(GFTT·BRIEF·3D)을 뽑아 되찾기용으로 두고, 따라가는 점 둘레(min_distance 칸)가 빈 곳의 점을 더함
     fn top_up(&mut self, f: &Frame) {
-        let feats = self.ext.extract(f);
+        // 되찾기용 특징(BRIEF 기술자)은 0.5 초에 한 번만 새로 뽑음: 그 사이 키프레임은 GFTT·3D 점만(장면당 시간 줄임)
+        let full = self.kf.as_ref().is_none_or(|_| f.t - self.kf_t >= 0.5);
+        let feats = if full {
+            self.ext.extract(f)
+        } else {
+            let kps = self.ext.detect(f);
+            let pts3d = self.ext.keypoints_3d(f, &kps);
+            Features { kps, pts3d, desc: Vec::new() }
+        };
         let (w, h) = (f.cam.width as usize, f.cam.height as usize);
         let cs = self.min_distance.max(1.0) as f32;
         let (gw, gh) = ((w as f32 / cs) as usize + 1, (h as f32 / cs) as usize + 1);
@@ -477,7 +487,10 @@ impl OdometryKlt {
             let wp = self.pose.transform_point([p.x, p.y, p.z]);
             self.tracks.push(Track { w: wp, uv: [k.x, k.y] });
         }
-        self.kf = Some((feats, self.pose));
+        if full {
+            self.kf = Some((feats, self.pose));
+            self.kf_t = f.t;
+        }
     }
 
     /// 광류가 모두 실패했을 때: 마지막 키프레임 특징과 이번 장면 특징을 기술자로 맞춤(RTAB-Map 맞추기 그대로). 성공하면 점을 이 장면에서 새로

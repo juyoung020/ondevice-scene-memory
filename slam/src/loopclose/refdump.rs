@@ -356,8 +356,8 @@ fn run(seq: &str, real: bool) -> Option<(usize, usize, Vec<String>)> {
         params.set("Rust/DictChecks", &c);
     }
     let sync = Arc::new(Mutex::new((0u32, 0u64)));
-    let index: Box<dyn WordIndex> = if real { Box::new(SyncedIndex { inner: flann::KdTreeIndex::from_params(&params), sync: sync.clone() }) } else { Box::new(ReplayIndex { log: flog.clone(), built: false }) };
-    let opt: Box<dyn PoseGraphOptimizer> = if real { Box::new(TimedOpt(GtsamOptimizer(crate::graph::OptimizerParams::from_params(&params)))) } else { Box::new(ReplayOpt { calls, mismatch: mism.clone(), n: 0 }) };
+    let index: Box<dyn WordIndex + Send> = if real { Box::new(SyncedIndex { inner: flann::KdTreeIndex::from_params(&params), sync: sync.clone() }) } else { Box::new(ReplayIndex { log: flog.clone(), built: false }) };
+    let opt: Box<dyn PoseGraphOptimizer + Send> = if real { Box::new(TimedOpt(GtsamOptimizer(crate::graph::OptimizerParams::from_params(&params)))) } else { Box::new(ReplayOpt { calls, mismatch: mism.clone(), n: 0 }) };
     let rng = parse_rng(&format!("{dir}/flann.txt"));
     let mut slam_ms = 0.0f64;
     let (mut my_loops, mut my_prox) = (0usize, 0usize);

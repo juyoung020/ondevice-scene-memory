@@ -184,8 +184,8 @@ pub struct Slam {
     pub p: SlamParams,
     pub mem: Memory,
     pub bayes: BayesFilter,
-    pub opt: Box<dyn PoseGraphOptimizer>,
-    pub reg: Box<dyn LoopRegistration>,
+    pub opt: Box<dyn PoseGraphOptimizer + Send>,
+    pub reg: Box<dyn LoopRegistration + Send>,
     optimized: BTreeMap<i32, Tf>,
     constraints: LinkMap,
     map_correction: Tf,
@@ -201,7 +201,7 @@ pub struct Slam {
 }
 
 impl Slam {
-    pub fn new(params: &crate::params::Params, index: Box<dyn WordIndex>, opt: Box<dyn PoseGraphOptimizer>, reg: Box<dyn LoopRegistration>) -> Slam {
+    pub fn new(params: &crate::params::Params, index: Box<dyn WordIndex + Send>, opt: Box<dyn PoseGraphOptimizer + Send>, reg: Box<dyn LoopRegistration + Send>) -> Slam {
         let p = SlamParams::from_params(params);
         let mp = MemParams {
             stm_size: params.get("Mem/STMSize", 10usize),

@@ -1479,48 +1479,66 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
             old_keys = c.keys[..start].to_vec(); // 이어 받은 앞부분은 그때 위치로 쌓은 것
         }
     }
-    let (mut t_dec, mut t_map, mut t_obj, mut t_pts) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    // 보관 장면 풀기(깊이·컬러·검출·점 격자)는 장면끼리 상관없어 몇 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음).
+    let (mut t_dec, mut t_map, mut t_obj) = (0.0f64, 0.0f64, 0.0f64);
+    // 보관 장면 풀기(깊이·컬러·검출)는 장면끼리 상관없어 몇 장씩 여러 코어로 미리 풀고, 쌓기는 차례대로(결과 같음).
     // 한 번에 푸는 장 수 = 풀의 스레드 수(최대 8): 푼 장면 하나가 약 2.1 MB(깊이 f32 + 컬러)라 32 장씩이면 최대 메모리가 67 MB 늘었다.
     // 쌓기가 차례대로라 8 장 넘게 미리 풀어도 빨라지지 않는다
     let dec_chunk = rayon::current_num_threads().clamp(1, 8);
-    let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>, Option<PtsGrid>)> = Default::default();
+    let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>)> = Default::default();
     // 시험용 MEMMAP_CKPT_EVERY(15 의 배수)
     let ck_every = std::env::var("MEMMAP_CKPT_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0 && v % 15 == 0).unwrap_or(CKPT_EVERY);
-    for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
-        if i > start && i % ck_every == 0 {
-            ckpts.push(std::sync::Arc::new(Ckpt { i, grid: grid.clone(), scene: scene.clone(), mem: mem.clone(), traj: traj.clone(), map_traj: map_traj.clone() }));
-            if ckpts.len() > CKPT_KEEP {
-                ckpts.remove(0);
+    // 점 지도는 점유 격자·물체와 서로 상관없음: 따로 도는 스레드가 같은 장면 순서로 쌓는다(각자 차례대로라 결과 같음, 시간은 둘 중 긴 쪽)
+    let mut main_ck: Vec<(usize, Grid, Memory, Vec<(f64, [f64; 3])>, Vec<(f64, V3, M3)>)> = vec![];
+    let (scene, scene_ck, t_pts, pts, t_exp) = std::thread::scope(|sc| {
+        let mut scene = scene;
+        let h = sc.spawn(move || {
+            out::thread_role(out::Role::Rebuild);
+            let mut cks: Vec<(usize, SceneMap)> = vec![];
+            let mut t = 0.0f64;
+            for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
+                if i > start && i % ck_every == 0 {
+                    cks.push((i, scene.clone()));
+                }
+                let cp = Instant::now();
+                // 점 작업 스레드가 보관해 둔 점 격자(온 장면을 풀지 않음)
+                if let Some(g) = kf.pts.wait().as_ref().map(PtsGrid::from_z) {
+                    grid_points(k, &g, r, pwc, &mut scene, i as u32);
+                }
+                t += cp.elapsed().as_secs_f64();
+            }
+            let ce = Instant::now();
+            let pts = Some(export_points(&mut scene)); // 점 지도 옥트리 노드 파일도 작업 스레드에서
+            (scene, cks, t, pts, ce.elapsed().as_secs_f64())
+        });
+        for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
+            if i > start && i % ck_every == 0 {
+                main_ck.push((i, grid.clone(), mem.clone(), traj.clone(), map_traj.clone()));
+            }
+            let cd = Instant::now();
+            if dec.is_empty() {
+                use rayon::prelude::*;
+                let end = (i + dec_chunk).min(snap.len());
+                dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets())).collect::<Vec<_>>().into();
+            }
+            let (kd, kr, kdets) = dec.pop_front().unwrap();
+            t_dec += cd.elapsed().as_secs_f64();
+            let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kdets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
+            t_map += (c3 - cd).as_secs_f64();
+            t_obj += (c4 - c3).as_secs_f64();
+            if (i + 1) % 15 == 0 {
+                mem.prune(kf.t);
+                mem.merge_pass();
             }
         }
-        let cd = Instant::now();
-        if dec.is_empty() {
-            use rayon::prelude::*;
-            let end = (i + dec_chunk).min(snap.len());
-            dec = snap[i..end].par_iter().map(|(kf, _, _)| (Depth::M(kf.depth()), kf.rgb(), kf.dets(), kf.pts.wait().as_ref().map(PtsGrid::from_z))).collect::<Vec<_>>().into();
-        }
-        let (kd, kr, kdets, kpts) = dec.pop_front().unwrap();
-        t_dec += cd.elapsed().as_secs_f64();
-        let (c3, c4) = map_frame(a, k, kf.t, r, pwc, pwc[2] - kf.h_cam, &kd, &kr, kf.w, kf.h, &kdets, true, &mut grid, &mut mem, &mut traj, &mut map_traj);
-        {
-            // 점 지도: 점 작업 스레드가 보관해 둔 점 격자(온 장면을 풀지 않음)
-            let cp = Instant::now();
-            if let Some(g) = kpts {
-                grid_points(k, &g, r, pwc, &mut scene, i as u32);
-            }
-            t_pts += cp.elapsed().as_secs_f64();
-        }
-        t_map += (c3 - cd).as_secs_f64();
-        t_obj += (c4 - c3).as_secs_f64();
-        if (i + 1) % 15 == 0 {
-            mem.prune(kf.t);
-            mem.merge_pass();
-        }
+        h.join().expect("점 지도 다시 쌓기 스레드")
+    });
+    for ((i, g, m, tr, mt), (j, sc)) in main_ck.into_iter().zip(scene_ck) {
+        debug_assert_eq!(i, j);
+        ckpts.push(std::sync::Arc::new(Ckpt { i, grid: g, scene: sc, mem: m, traj: tr, map_traj: mt }));
     }
-    let ce = Instant::now();
-    let pts = Some(export_points(&mut scene)); // 점 지도 옥트리 노드 파일도 작업 스레드에서
-    let t_exp = ce.elapsed().as_secs_f64();
+    while ckpts.len() > CKPT_KEEP {
+        ckpts.remove(0);
+    }
     let last_seq = snap.last().map_or(0, |s| s.0.seq);
     let secs = c0.elapsed().as_secs_f64();
     common::info!("다시 쌓기 나눔: 장면 {start} 번부터 {} 개(앞은 저장해 둔 상태) · 보관 장면 풀기 {t_dec:.2} 초 + 점유 격자 {:.2} 초 + 물체 {t_obj:.2} 초 + 점 지도 {t_pts:.2} 초 + 노드 바이트 {t_exp:.2} 초, 합 {secs:.2} 초(병합 포함)", snap.len() - start, t_map);

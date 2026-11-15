@@ -807,7 +807,7 @@ function octFrame() {
   const R = oct.cur; oct.box = R ? R.box : null; oct.meta = R ? R.meta : null;
   // floor pad and grid go under the point map: framed before the octree list came (occupancy grid box, z 0 … 2), they sat
   // above the map's floor and the half-transparent dark pad dimmed everything below it (a white desk drew grey)
-  if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(false); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
+  if (oct.box) { if (!userMoved && !QS.get("cam") && !octFitted) fitView(QS.get("top") === "1"); else { const b = contentBox(); if (b) stageFor(b); } octFitted = true; }
 }
 // file mode without the binary stream: the whole node list from octree.json
 async function loadOctree(o) {

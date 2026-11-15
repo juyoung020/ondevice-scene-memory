@@ -834,7 +834,8 @@ const VIS_W = 4096;
 const octVis = { data:new Uint8Array(VIS_W * 4), tex:null };
 octVis.tex = new THREE.DataTexture(octVis.data, VIS_W, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
 octVis.tex.magFilter = octVis.tex.minFilter = THREE.NearestFilter; octVis.tex.generateMipmaps = false;
-const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:14 }, vis:{ value:octVis.tex }, nodes:{ value:null }, ceil:{ value:1e9 }, vox:{ value:0.02 }, g:{ value:32 }, depthL:{ value:5 },
+// splat size cap: 50 px (v0.8.0) so near surfaces stay closed on the board / PC screens; 14 px on touch screens (phones), where close-up points swelled into big discs
+const octUni = { sizeK:{ value:1.3 }, minPx:{ value:1.5 }, maxPx:{ value:matchMedia("(pointer: coarse)").matches ? 14 : 50 }, vis:{ value:octVis.tex }, nodes:{ value:null }, ceil:{ value:1e9 }, vox:{ value:0.02 }, g:{ value:32 }, depthL:{ value:5 },
                  pass:{ value:0 }, depth:{ value:null }, res:{ value:new THREE.Vector2(1, 1) }, near:{ value:0.05 }, far:{ value:500 }, band:{ value:1.5 } };
 function octMaterial() {
   // round splats sized by the local point spacing: neighbouring points overlap into a closed surface and EDL shades its edges;
@@ -1657,8 +1658,8 @@ async function fetchView() {
 // fast camera pose (pose.json, a few hundred bytes, written every keyframe): the handheld camera moves without waiting for view.json
 let latestPose = null;
 // ?metrics=1: 2 초마다 그린 프레임 수 · 위치(pose.json wall) → 화면 지연을 서버 로그로(/api/metric)
-let poseWall = 0, viewWall = 0;
-const met = { frames: 0, lat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0, gap: 0, lastRaf: 0, lastChange: -1e9, lt: 0, ltMax: 0 };
+let poseWall = 0, viewWall = 0, poseCam = 0;
+const met = { frames: 0, lat: [], clat: [], vlat: [], t0: performance.now(), rms: 0, fms: 0, ams: 0, nv: 0, kb: 0, gap: 0, lastRaf: 0, lastChange: -1e9, lt: 0, ltMax: 0 };
 // freezes: longest gap between animation frames while the scene is changing (data applied within the last second), and main-thread
 // long tasks (> 50 ms, count and longest)
 // ?metrics=1: run boundaries (a new trajectory / octree run) with the page's JS heap; the server adds the board's MemAvailable
@@ -1666,12 +1667,13 @@ function metEvent(what) { if (QS.get("metrics") === "1") fetch(`/api/metric?even
 try { new PerformanceObserver(l => { for (const e of l.getEntries()) { met.lt++; met.ltMax = Math.max(met.ltMax, e.duration); } }).observe({ entryTypes:["longtask"] }); } catch (e) {}
 if (QS.get("metrics") === "1") setInterval(() => {
   const dt = (performance.now() - met.t0) / 1000, qq = (a, p) => { a.sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(0) : "-"; };
-  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}&gap=${met.gap.toFixed(0)}&lt=${met.lt}&ltmax=${met.ltMax.toFixed(0)}&jsmb=${performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) : "-"}`).catch(() => {});
-  met.frames = 0; met.lat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = met.gap = met.lt = met.ltMax = 0; met.t0 = performance.now();
+  fetch(`/api/metric?fps=${(met.frames / dt).toFixed(1)}&lat50=${qq(met.lat, 0.5)}&lat95=${qq(met.lat, 0.95)}&n=${met.lat.length}&clat50=${qq(met.clat, 0.5)}&clat95=${qq(met.clat, 0.95)}&vlat50=${qq(met.vlat, 0.5)}&vlat95=${qq(met.vlat, 0.95)}&vn=${met.vlat.length}&rms=${(met.rms / Math.max(met.frames, 1)).toFixed(1)}&fms=${(met.fms / Math.max(met.nv, 1)).toFixed(1)}&ams=${(met.ams / Math.max(met.nv, 1)).toFixed(1)}&nv=${met.nv}&kb=${met.kb.toFixed(0)}&gap=${met.gap.toFixed(0)}&lt=${met.lt}&ltmax=${met.ltMax.toFixed(0)}&jsmb=${performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) : "-"}`).catch(() => {});
+  met.frames = 0; met.lat = []; met.clat = []; met.vlat = []; met.rms = met.fms = met.ams = met.nv = met.kb = met.gap = met.lt = met.ltMax = 0; met.t0 = performance.now();
 }, 2000);
 function onFilePose(j) {
   if (!view || LIVE || !j.cam) return;
   if (j.wall) poseWall = j.wall;   // ?metrics=1: 손카메라 위치 → 화면 시간(같은 보드 시계)
+  if (j.wall && j.t > 1e9) poseCam = j.t * 1000;   // ?metrics=1: 카메라가 찍은 시각 → 화면(실시간 카메라 입력, 같은 보드 시계)
   if (j.cam && j.cam.pos && j.cam.pos[2] > camTop) { camTop = j.cam.pos[2]; invalidate(); }
   if (!latestPose || j.t > latestPose.t || j.t < latestPose.t - 5) { latestPose = j; hhLost = j.ok === false; view.cam = j.cam; view.pose = j.pose; drawRobot(); invalidate(); }
 }
@@ -1995,8 +1997,10 @@ function stepChase(dt) {
 }
 $("c_chase").onchange = () => { autoFit = false; camGoal = null; invalidate(); };
 $("c_blend").onchange = invalidate; $("c_edl").onchange = invalidate; $("n_edl").onchange = invalidate; $("n_edltol").onchange = invalidate;
-// weak GPU (Pi 5 V3D): one direct pass — the splat-blend pass (point map drawn twice + float accumulate) and EDL (full-screen depth pass) cost 30–95 ms a frame there. Points keep their size; ?c_blend=1 / ?c_edl=1 turn them back on
-if (WEAK_GPU) { $("c_blend").checked = false; $("c_edl").checked = false; }
+// weak GPU (Pi 5 V3D): EDL depth shading stays on (as in v0.8.0: it is what makes the point map read as 3D surfaces; one full-screen pass);
+// the splat-blend pass (point map drawn a second time into a half-float target) stays off there. ?c_blend=1 / ?c_edl=0 override
+if (WEAK_GPU) { $("c_blend").checked = false; }
+for (const k of ["c_blend", "c_edl"]) if (QS.has(k)) $(k).checked = QS.get(k) === "1";
 $("n_octk").onchange = () => { octUni.sizeK.value = opt("n_octk"); invalidate(); };
 let followOff = new THREE.Vector3(-0.8, -0.8, 0.55);function stepFollow(dt) {
   if (!$("c_follow").checked || !robotGrp) return false;

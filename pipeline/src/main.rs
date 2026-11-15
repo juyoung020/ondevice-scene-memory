@@ -578,6 +578,8 @@ fn seg_check(a: &Args, seg: &mut dyn seg::Segmenter, n_max: usize) {
 }
 
 fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter + Send> {
+    // 새 실행(리셋): 받는 스레드가 위치를 바로 낼 회전 · 원점과 마지막 위치를 비움(본 스레드가 첫 장면에서 다시 정함)
+    (*POSE_FIX.lock().unwrap(), *POSE_LAST.lock().unwrap()) = (None, None);
     // 스트림 입력이면 첫 장면의 보정값, 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
     let mut stream_rd = a.stream.as_deref().map(stream::StreamReader::open);
     // 리셋을 연달아 누르면 첫 장면보다 리셋 블록이 먼저 올 수 있음 → 이어 읽기로 다시 열어 첫 장면을 기다림
@@ -654,6 +656,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         let (every, conf, live, no_skip) = (a.every, a.conf, a.live, a.no_skip);
         let (seg_min, infer_min, seg_pipe, npu_jobs) = (a.seg_min_ms / 1e3, a.infer_min_ms / 1e3, a.seg_pipe, a.npu_jobs);
         let seg_skip = a.seg_skip;
+        let pose_out = (a.live > 0.0).then(|| a.out.join("pose.json"));
         std::thread::spawn(move || {
             let mut seg = seg;
             out::thread_role(out::Role::Reader);
@@ -756,6 +759,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                 let hold_on = rate > 0.0 || drop_late;
                 let mut c_seg0: Option<Instant> = None;
                 while let Some(mut sf) = next.take() {
+                    // 실시간: 받은 장면의 카메라 위치를 분할 · 지도 일을 기다리지 않고 바로 뷰어로(건너뛰는 장면도)
+                    if let Some(pp) = &pose_out {
+                        early_pose(pp, &sf);
+                    }
                     // 지도 보정이 바뀐 장면(루프 클로저): 이후 장면은 새 보정으로 오고, 지난 장면은 그래프 블록의 노드 위치로 다시 쌓는다
                     n_corr += (sf.flags & stream::MAP_CORRECTED != 0) as u32;
                     graph.append(&mut sf.graph);
@@ -934,6 +941,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut tilt_c: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다(--no-level 이면 그대로)
     let mut leveled = a.stream.is_none() || a.no_level;
+    // 실시간 스트림: 위치는 받는 스레드가 바로 냄(early_pose)
+    let early_pose_on = a.stream.is_some() && a.live > 0.0;
     // 실시간: 첫 장면 카메라가 똑바로 서 있다고 보고(위 = 첫 장면 카메라의 −y) 처음부터 수평으로 보여 주고, 바닥 합의가 나오면 한 번 고쳐 다시 쌓는다
     let (mut upright, mut refine) = (a.stream.is_some() && a.live > 0.0 && !a.no_level, false);
     let mut force_rb = false; // 수평 버튼: 기다리지 않고 바로 다시 쌓기
@@ -1035,9 +1044,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
             if w == 0 {
                 continue;
             }
-            if a.live > 0.0 {
+            if a.live > 0.0 && POSE_FIX.lock().unwrap().is_none() {
                 // 뷰어: 마지막 위치 그대로, 놓침 표시(손카메라 빨간색)
-                out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
+                out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
             }
             continue;
         }
@@ -1056,8 +1065,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                     _ => {}
                 }
             }
-            if a.live > 0.0 {
-                out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
+            if a.live > 0.0 && POSE_FIX.lock().unwrap().is_none() {
+                out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
             }
             continue;
         }
@@ -1183,6 +1192,8 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         let h_now = cam_height(&hist_h);
         let z0v = if leveled { *z0.get_or_insert(p[2] - h_now) } else { p[2] - h_now };
+        // 실시간 스트림: 받는 스레드가 다음 장면부터 이 회전 · 원점으로 위치를 바로 냄(이 장면은 아직 아무도 안 냈으면 아래에서)
+        let pose_first = early_pose_on && POSE_FIX.lock().unwrap().replace((stream_fix, z0v)).is_none();
         let pwc = [p[0], p[1], p[2] - z0v];
         let floor_z = pwc[2] - h_now;
         // 위치가 확인된 장면만 지도·물체에 넣는다(실패해 예측 위치뿐인 장면은 지도를 어긋나게 함)
@@ -1211,10 +1222,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
         cam_json = json!({"pos": pwc, "R": r});
         nkf += 1;
-        // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(뷰어가 0.1 초마다 받아 손카메라를 바로 움직임),
+        // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(스트림은 받는 스레드가 받자마자 냄, 여기서는 첫 장면과 TUM · 카메라 입력만),
         // 지도·물체·그래프(view.json)는 0.4 초마다
-        if a.live > 0.0 {
-            out::write_owned(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true, "wall": wall_ms()})));
+        if a.live > 0.0 && (!early_pose_on || pose_first) {
+            out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true, "wall": wall_ms()})));
         }
         // 메모리 기억 폴더(--serve): 받은 장면마다 바로 뷰어에(view 판은 뷰 스레드가 짜고 밀리면 마지막 것만, 점 노드는 점 작업 스레드가 한가할 때마다). 디스크 기록이면 0.4 · 1 초 간격
         let write_now = write_late || if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= view_gap || nkf == 1 } else { nkf % (if behind { 15 } else { 5 }) == 0 || nkf == 1 };
@@ -1496,6 +1507,26 @@ fn orthonormal(m: &M3) -> M3 {
 }
 
 /// 보관 장면별 '그때 고친 카메라 자세의 위'(카메라 좌표, Rᵀ·ẑ): 키 = 보관 순번
+/// 실시간 위치 바로 내기(스트림): 본 스레드가 정한 받은 좌표 → 화면 좌표(수평 회전 · 바닥 높이 원점). 정해지기 전(첫 장면)과 TUM · 카메라 입력은 본 스레드가 씀
+static POSE_FIX: std::sync::Mutex<Option<(M3, f64)>> = std::sync::Mutex::new(None);
+/// 받는 스레드가 마지막으로 낸 위치(놓친 장면 · 맡아 둔 장면은 그 자리에 놓침 표시로)
+static POSE_LAST: std::sync::Mutex<Option<(serde_json::Value, [f64; 3])>> = std::sync::Mutex::new(None);
+
+/// 받은 장면의 카메라 위치를 pose.json 으로 바로(분할 · 점 지도 · 물체 일을 기다리지 않음, 기록 스레드 줄도 거치지 않음).
+/// 본 스레드가 쓰던 값과 같은 식: 위치 = 수평 회전 · 받은 위치 − 바닥 높이 원점, 방향 = 수평 회전 · 받은 회전
+fn early_pose(pp: &Path, sf: &stream::StreamFrame) {
+    let Some((fix, z0v)) = *POSE_FIX.lock().unwrap() else { return };
+    let mut last = POSE_LAST.lock().unwrap();
+    let ok = !sf.lost() && !sf.held();
+    if ok {
+        let (r, p) = (mm(&fix, &sf.r), mv(&fix, &sf.p));
+        let pwc = [p[0], p[1], p[2] - z0v];
+        *last = Some((json!({"pos": pwc, "R": r}), [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])]));
+    }
+    let Some((cam, pose)) = last.as_ref() else { return };
+    out::write_direct(pp, out::json_bytes(&json!({"t": sf.t, "cam": cam, "pose": pose, "ok": ok, "wall": wall_ms()})));
+}
+
 static UPS: std::sync::Mutex<std::collections::BTreeMap<u64, V3>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn snapshot(kfs: &kfstore::KfStore, fix: &M3, z0: f64) -> Snap {

@@ -1292,6 +1292,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     view.flush();
     out::flush_writer();
+    if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() {
+        for o in mem.objs.iter().filter(|o| o.state != "gone") {
+            embed::debug_name(o.id);
+        }
+    }
     embed::finish();
     let n = clock.n.max(1) as f64;
     let mut by: std::collections::BTreeMap<&str, u32> = Default::default();

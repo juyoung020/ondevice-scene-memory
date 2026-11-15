@@ -1,6 +1,6 @@
 [package]
 name = "sgview"
-version = "0.8.0"
+version = "0.9.0"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
 description = "Native scene-graph viewer server (Rust, no Python / Spark-DSG): serves view.json + map + object files and the three.js page; walls (2D lines + state vector) in Rust."

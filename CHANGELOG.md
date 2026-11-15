@@ -6,7 +6,11 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-15
+
 ### Added
+- 뷰어가 바뀐 몫만 이진으로 받는다(`/bstream`: 물체 · 길 · 지도 조각 · 점 지도 노드 · 카메라 위치, Web Worker 해독).
+- 뷰어 `?metrics=1` 에 프레임 사이 최대 간격 · 긴 작업 · JS 힙 · 보드 남은 메모리.
 - D435 컬러 1280×720(`--color-size 1280x720`, 깊이는 640×480 그대로, 정렬은 고른 컬러 모드의 보정값).
 - `scripts/board_tune.sh --no-remote`(원격 화면 멈춤) · NPU 인터럽트 코어 1 · `--revert`(처음 값으로 되돌림).
 - 모델 기본값: `--seg` ObjectSAM(PC `models/ObjectSAM-416_640.onnx`, 보드 `~/models/objectsam-416_640.dxnn`) · `--embed` SigLIP2 영상 인코더 · `--vocab vocab/indoor.voc`. 모델 폴더는 `ONDEVICE_MODELS`, `--embed off` 로 이름 붙이기 끔.
@@ -32,6 +36,11 @@
 - DXRT 설정을 한곳에서: `--seg-npu` · `--embed-npu` · `--npu-buffers` · `--npu-nfh` · `--npu-profile` · `--npu-ort`(모델은 기본으로 NPU 작업만).
 
 ### Changed
+- 보드 화면 뷰어가 점 지도를 큰 GPU 버퍼에 바뀐 범위만 올려 그리고, 다시 쌓기 · 재생 다시 시작에도 멈추지 않는다.
+- 지도 · 뷰 · 뷰어 서버 사이 넘김이 가장 새 판만 남기는 칸(`common::slot::Latest`)으로 바뀌었다.
+- 카메라 위치가 지도 · 물체 판보다 먼저 뷰어에 간다.
+- 수평이 실행 내내 유지된다(장면마다 바닥 면으로 기울기를 고치고 다시 쌓을 때도 같게).
+- 화면 가장자리에 잘린 · 아주 작은 · 가는 조각과 바닥/천장 면 검출을 물체로 넣지 않고, 몇 번만 본 약한 이름 없는 물체는 지운다.
 - 이어지지 않은 새 지도의 장면을 맡아 두지 않고 마지막 위치에서 이어 붙인 임시 위치(스트림 표시 `PROVISIONAL`=16)로 바로 보낸다(화면이 멈추지 않음, slam 그래프 제약 없음). 루프 클로저로 이어지면 노드가 참 위치로 다시 가서 memmap 이 다시 쌓는다. `--no-provisional` 로 예전처럼 맡아 둠. 새 지도 동안 노드마다 믿는 지도 노드 전체에서 이을 후보를 찾아 slam 의 루프 검증에 넘긴다.
 - rsd_rec: PNG 쓰기를 쓰기 스레드 3 개로 옮기고 같은 깊이를 두 번 쓰지 않는다(Pi 5 에서 1–5 초씩 빠지던 녹화 빈틈 → 600 장 시험에서 쓰기 줄 꽉 참 0, 최대 장면 간격 0.23 초).
 - 1 초 넘는 녹화·USB 빈틈 뒤에는 이어 붙이지 않고(깊이 ICP 로 자리가 확인되면 예외) 새 지도를 열어 루프 클로저로 합친다. 기존 노드를 1 m · 57° 넘게 옮기는 루프 클로저는 버린다(`RGBD/MaxCorrectionLinear/Angular`).
@@ -68,6 +77,8 @@
 - librealsense 판 녹화 도구 `rs_info` · `rs_rec`(같은 일은 `rsd_info` · `rsd_rec`), 개발용 `objcrop` · `objdup` · `onnx_info`, 문서에 쓰이지 않는 결과 그림 51 개.
 
 ### Fixed
+- 다시 쌓기와 점 작업 스레드가 서로 기다려 장면을 버리지 않는 재생이 멈추던 문제.
+- 실행 요약의 물체 이름별 수가 화면 이름 대신 분할 이름(object)을 세던 문제.
 - 검색: 무엇에도 안 닮은 흐린 사진이 아무 말에나 걸리던 것.
 - 뷰어를 켜고 첫 검색이 느리던 것(보드 2.6 초 → 0.45 초).
 - 뷰어: 폰에서 점이 큰 동그라미로 부풀던 것(점 크기 상한 50 → 14 화소).
@@ -238,7 +249,8 @@
 ### Fixed
 - 모델 설정 필드 순서로 초기화가 깨지던 문제.
 
-[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/juyoung020/ondevice-scene-memory/compare/v0.5.0...v0.6.0

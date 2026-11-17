@@ -118,6 +118,11 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
     FILES.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.keys().filter(|q| q.starts_with(&k)).cloned().collect())
 }
 
+/// 걸린 파일 수 · 바이트 합(메모리 기억 폴더 크기 재기)
+pub fn usage() -> (usize, u64) {
+    FILES.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|(_, b)| b.len() as u64).sum()))
+}
+
 /// 걸린 파일 전부(디스크에 저장할 때)
 pub fn all() -> Vec<(PathBuf, Arc<Vec<u8>>)> {
     FILES.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.iter().map(|(p, (_, b))| (p.clone(), b.clone())).collect())

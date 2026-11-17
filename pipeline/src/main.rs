@@ -1363,6 +1363,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
                      mem.objs.len(), mem.objs.iter().filter(|o| o.state == "gone").count(),
                      clock.load / n * 1e3, clock.seg / n * 1e3, clock.vo / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
                      n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);
+            // 메모리: 프로세스 RSS · 메모리 기억 폴더(파일 수 · MB) · 보관 장면(MB)
+            let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches(" kB").trim().parse::<f64>().ok())).unwrap_or(0.0) / 1024.0;
+            let (mf, mb) = sgview::memfs::usage();
+            println!("mem kf {nkf} t {:.1} rss_mb {rss:.0} memfs_files {mf} memfs_mb {:.1} kfstore_mb {:.1}", t, mb as f64 / 1048576.0, kfs.bytes() as f64 / 1048576.0);
         }
     }
     // 끝: 마지막 다시 쌓기 뒤에 노드가 또 움직였으면 끝난 그래프로 한 번 더(결과 지도·물체·poses_map.txt 가 최종 위치를 따름)

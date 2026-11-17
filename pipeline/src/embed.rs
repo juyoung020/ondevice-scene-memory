@@ -162,7 +162,8 @@ pub fn name(id: u32, _sure: bool) -> Option<(String, f32)> {
     common::prof::lock(&NAMES, common::prof::W::LockEmbed).as_ref()?.get(&id).cloned() // 기준 없이 가장 닮은 이름을 늘 붙임(사용자 결정 26-11-15)
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
-fn put(id: u32, v: Vec<f32>) {
+/// 벡터 하나를 그 물체에 더함. 돌려줌: 지금까지 사진 벡터의 평균 방향(길이 1, 검색 줄 · 이름 · 구조물 판정이 쓰는 벡터)
+fn put(id: u32, v: Vec<f32>) -> Vec<f32> {
     // 이름은 그 물체의 사진 벡터를 모두 더한 평균 방향으로(사진 한 장의 흔들림·어두움에 덜 휘둘림)
     let mean = {
         let mut sums = SUMS.lock().unwrap();
@@ -187,6 +188,7 @@ fn put(id: u32, v: Vec<f32>) {
         };
     }
     common::prof::lock(&LATEST, common::prof::W::LockEmbed).get_or_insert_with(Default::default).insert(id, v);
+    mean
 }
 
 /// 리셋: 물체 id 가 처음부터 다시 쓰이므로 id 별 이름·벡터 합을 비운다
@@ -346,7 +348,9 @@ mod worker {
         let mut v = std::mem::take(&mut outs[f.slot]);
         v.truncate(DIM);
         normalize(&mut v);
-        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // 검색 줄(벡터 파일)은 이 물체를 본 각도 모두의 평균 방향(길이 1): 한 장의 흔들림 · 어두움에 덜 휘둘림, 물체마다 한 줄 그대로
+        let mean = put(f.job.id, v);
+        let bytes: Vec<u8> = mean.iter().flat_map(|x| x.to_le_bytes()).collect();
         common::prof::copy(common::prof::C::EmbedBytes, bytes.len());
         if crate::out::memory_only() {
             crate::out::publish(&f.job.path, bytes); // --serve: 기억 폴더는 메모리에만(끝에 · 저장 버튼으로 디스크에)
@@ -358,7 +362,6 @@ mod worker {
                 crate::out::publish(&f.job.path, bytes);
             }
         }
-        put(f.job.id, v);
         st.n += 1;
         st.pre += f.pre;
         st.net += (t1 - f.t0).as_secs_f64() * 1e3;

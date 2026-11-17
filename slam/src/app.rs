@@ -926,7 +926,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-rate °/s] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-rate °/s] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
     );
 }
 
@@ -986,6 +986,14 @@ pub struct Args {
     imu_hold_wait: f64,
     /// IMU 모드: 앞의 믿는 지도 노드가 이보다 적으면(시작 직후) 기다리지 않고 바로 새 지도로
     imu_hold_min_nodes: f64,
+    /// 녹화 IMU 재생(Kalibr imu0.csv): IMU 융합 모드를 --imu 대신 이 파일로(--tum · --rsdrec 재생과 함께)
+    imu_csv: String,
+    /// 끊김 시험: 주기:길이(초). 첫 장면부터 주기마다 길이만큼 장면을 빼고, --stress-imu-gap 이면 IMU 표본도 뺌
+    stress_gap: (f64, f64),
+    stress_imu_gap: bool,
+    /// 흐림 시험: 노출(초) 동안 각속도만큼 번진 영상(각속도는 --stress-gyro 또는 --imu-csv 파일)
+    stress_blur: f64,
+    stress_gyro: String,
 }
 
 /// 명령줄(0 번은 프로그램 이름) → 설정. 도움말·잘못된 인자면 끝 코드
@@ -1032,6 +1040,11 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         imu_min_ratio: 0.6,
         imu_hold_wait: 2.0,
         imu_hold_min_nodes: 30.0,
+        imu_csv: String::new(),
+        stress_gap: (0.0, 0.0),
+        stress_imu_gap: false,
+        stress_blur: 0.0,
+        stress_gyro: String::new(),
     };
     let mut i = 1;
     let num = |s: &str| -> Result<f64, i32> {
@@ -1052,6 +1065,16 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         };
         match k {
             "--tum" => a.tum = val()?,
+            "--rsdrec" => a.tum = val()?,
+            "--imu-csv" => a.imu_csv = val()?,
+            "--stress-gap" => {
+                let v = val()?;
+                let (p, l) = v.split_once(':').ok_or(2)?;
+                a.stress_gap = (num(p)?, num(l)?);
+            }
+            "--stress-imu-gap" => a.stress_imu_gap = true,
+            "--stress-blur" => a.stress_blur = num(&val()?)?,
+            "--stress-gyro" => a.stress_gyro = val()?,
             "--realsense" => a.realsense = true,
             "--driver" => a.driver = val()?,
             "--rate" => a.rate = num(&val()?)?,
@@ -1186,15 +1209,31 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         common::info!("위치 추적 스레드 우선: {}", common::threads::boost_tracking());
     }
     // IMU 융합 모드: 읽기 스레드를 카메라보다 먼저 띄워 첫 장면 전에 중력·치우침을 잡는다
-    let imu_fusion = if a.imu.is_empty() {
+    let calib = crate::imu::Calib::parse(&if a.imu_calib.is_empty() { crate::imu::DEFAULT_CALIB.to_string() } else { std::fs::read_to_string(&a.imu_calib).map_err(|e| format!("{}: {e}", a.imu_calib))? })?;
+    if !a.imu_csv.is_empty() && a.tum.is_empty() {
+        return Err("--imu-csv 는 --tum · --rsdrec 재생과 함께".into());
+    }
+    // 녹화 IMU 재생: 실시간 읽기 스레드 자리에 파일 표본을 같은 링으로(최대 속도 재생은 장면마다 그 시각까지, 찍은 속도 재생은 재생 시계로)
+    let mut imu_replay = if a.imu_csv.is_empty() { None } else { Some(crate::imu::CsvReplay::load(&a.imu_csv, calib.shift)?) };
+    let mut imu_ring = None;
+    let imu_fusion = if a.imu.is_empty() && imu_replay.is_none() {
         None
     } else {
-        let calib = crate::imu::Calib::parse(&if a.imu_calib.is_empty() { crate::imu::DEFAULT_CALIB.to_string() } else { std::fs::read_to_string(&a.imu_calib).map_err(|e| format!("{}: {e}", a.imu_calib))? })?;
         let ring = crate::imu::Ring::new();
-        crate::imu::spawn_reader(&a.imu, ring.clone())?;
+        match &imu_replay {
+            Some(r) => {
+                r.count_into(&ring);
+                let (t0, t1) = r.span();
+                common::info!("IMU 재생: {} 표본 {} 개({t0:.3} – {t1:.3})", a.imu_csv, r.len());
+            }
+            None => {
+                crate::imu::spawn_reader(&a.imu, ring.clone())?;
+            }
+        }
         crate::imu::spawn_fast(ring.clone());
+        imu_ring = Some(ring.clone());
         common::info!("모드: IMU 융합(시각 보정 {:+.4} 초, 이어 붙이기 최대 {} 초)", calib.shift, a.imu_bridge);
-        Some(crate::imu::Fusion::new(ring, calib, a.imu_bridge))
+        Some(crate::imu::Fusion::new(ring, calib.clone(), a.imu_bridge))
     };
     let imu_on = imu_fusion.is_some();
     // 스트림이 표준출력이면 그 파일 기술자를 따로 떼어 두고 표준출력은 표준오류로 돌린다
@@ -1205,9 +1244,34 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
 
     #[allow(unused_assignments)]
     let mut skipped = None;
+    let mut stress_counts = None;
     let src: Box<dyn FrameSource> = if !a.tum.is_empty() {
-        let ts = TumSource::with_stride(&a.tum, a.rate, a.stride)?;
+        let mut ts = TumSource::with_stride(&a.tum, a.rate, a.stride)?;
         skipped = Some(ts.skipped_counter());
+        // 끊김 시험: 첫 장면 + 주기 k 번째마다 길이만큼 장면(--stress-imu-gap 이면 IMU 표본도) 뺌
+        if a.stress_gap.0 > 0.0 && a.stress_gap.1 > 0.0 {
+            let t0 = ts.t_first();
+            ts.drop = (1..10_000).map(|k| (t0 + k as f64 * a.stress_gap.0, t0 + k as f64 * a.stress_gap.0 + a.stress_gap.1)).collect();
+            if let (Some(r), true) = (imu_replay.as_mut(), a.stress_imu_gap) {
+                r.drop = ts.drop.clone();
+            }
+            common::info!("끊김 시험: {} 초마다 {} 초 장면 뺌{}", a.stress_gap.0, a.stress_gap.1, if a.stress_imu_gap { "(IMU 표본도)" } else { "" });
+        }
+        // 흐림 시험: 녹화 IMU 의 각속도로 번진 영상(카메라 전용 · IMU 모드가 같은 영상을 받게 같은 파일에서)
+        if a.stress_blur > 0.0 {
+            let gp = if a.stress_gyro.is_empty() { &a.imu_csv } else { &a.stress_gyro };
+            if gp.is_empty() {
+                return Err("--stress-blur 에는 --stress-gyro 또는 --imu-csv 가 필요".into());
+            }
+            let s = crate::imu::CsvReplay::load(gp, calib.shift)?.samples();
+            let (r_ci, shift) = (calib.r_ci, calib.shift);
+            ts.blur = Some((a.stress_blur, Box::new(move |t| crate::imu::CsvReplay::gyro_at(&s, &r_ci, shift, t))));
+            common::info!("흐림 시험: 노출 {} ms 동안 각속도만큼 번짐({gp})", a.stress_blur * 1e3);
+        }
+        stress_counts = Some((ts.n_drop.clone(), ts.n_blur.clone()));
+        if let (Some(r), Some(ring)) = (imu_replay.take_if(|_| a.rate > 0.0), imu_ring.as_ref()) {
+            r.spawn_timed(ring.clone(), ts.clock(), a.rate);
+        }
         Box::new(ts)
     } else {
         open_camera(&a)?
@@ -1342,6 +1406,10 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     while !STOP.load(Ordering::Relaxed) && (a.max_frames < 0 || n < a.max_frames) {
         let c0 = Instant::now();
         let Some(mut fr) = src.next()? else { break };
+        // 녹화 IMU 재생(최대 속도): 이 장면을 처리하는 순간 실시간이면 링에 있을 표본까지
+        if let (Some(r), Some(ring)) = (imu_replay.as_mut(), imu_ring.as_ref()) {
+            r.feed(ring, fr.t + calib.shift + crate::imu::REPLAY_LEAD);
+        }
         fr.id = n + 1;
         // 리셋 요청(뷰어의 Reset 버튼: 한 프로그램이면 common::control 신호, 따로 띄운 뷰어면 --reset-file 파일): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
         // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다
@@ -1801,6 +1869,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         n += 1;
     }
     let wall = t_run.elapsed().as_secs_f64();
+    if let Some(r) = &imu_ring {
+        r.closed.store(true, Ordering::Relaxed); // 읽기 · 재생 · 위치 내기 스레드 끝냄
+    }
     writer.close();
     let mut s_write = Summary::default();
     for x in writer.write_ms() {
@@ -1843,6 +1914,9 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     common::info!("루프 정합에서 단어 id 가 겹치지 않는 노드(원본은 id 순서를 씀) {} 번, 다시 잡기에서 원본이 고쳐 둔 기준 장면을 다시 씀 {} 번(두 번째 판 순서를 모름 {} 번)", eng.loop_unique_ids.load(Ordering::Relaxed), eng.ref_reuse, eng.ref_unknown);
     if let Some(s) = skipped {
         common::info!("재생에서 밀려 건너뛴 장면 {}", s.load(Ordering::Relaxed));
+    }
+    if let Some((d, b)) = &stress_counts {
+        common::info!("시험 조건: 뺀 장면 {}, 흐리게 한 장면 {}", d.load(Ordering::Relaxed), b.load(Ordering::Relaxed));
     }
     common::info!("위치 추적이 밀려 버린 장면 {}", src.dropped());
     common::info!("보냄 {}, 밀려 버림 {}, 그래프 블록 {n_graph} 개(노드 {n_graph_nodes} 개)", writer.written(), writer.dropped());

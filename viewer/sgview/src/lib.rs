@@ -26,6 +26,7 @@
 mod delta;
 pub mod live;
 pub mod memfs;
+pub mod objtable;
 mod search;
 #[cfg(feature = "search")]
 mod textnet;

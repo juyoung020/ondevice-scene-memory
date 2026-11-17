@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "search")]
 use std::sync::Mutex;
 
 pub const DIM: usize = 768;
@@ -25,11 +24,13 @@ pub const NULLS: [&str; 5] = ["a photo", "an image", "a blurry photo", "nothing"
 /// Token count the text encoder was trained with
 const TOKENS: usize = 64;
 
+/// a · b (unit vectors → cosine): [`crate::objtable::dot`] (NEON on the board, the plain loop elsewhere)
 pub fn cos(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    crate::objtable::dot(a, b)
 }
 
-/// One object vector file → unit vector (None when missing or not DIM floats)
+/// One object vector file → unit vector (None when missing or not DIM floats): the per-query reading the memory table replaced (test reference)
+#[cfg(test)]
 pub fn read_emb(p: &Path) -> Option<Vec<f32>> {
     let b = crate::memfs::read(p)?;
     if b.len() != DIM * 4 {
@@ -235,6 +236,10 @@ pub fn encode_vocab(model: &Path, list: &Path, out: &Path) -> Result<usize, Stri
 /// Text → unit vector, or None when no encoder is loaded (then only the letters of the name are compared)
 pub type Encode<'a> = &'a dyn Fn(&str) -> Option<Arc<Vec<f32>>>;
 
+/// The objects' picture vectors as one table in memory (by vector file), with SCALE · cos(name, picture) kept for every
+/// vocabulary name then every NULLS text: a query reads no vector file and computes no name × picture product
+static TABLE: Mutex<Option<crate::objtable::ObjTable<std::path::PathBuf>>> = Mutex::new(None);
+
 /// log(Σ e^x)
 fn lse(xs: impl Iterator<Item = f32>) -> f32 {
     let v: Vec<f32> = xs.collect();
@@ -294,21 +299,43 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
     };
     // names that stand out for the query and sit close to its closest name say the same thing as the query: they do not compete with it for a picture
     let same = |n: &str| n == ql || alike.contains(n);
+    // picture logits against every vocabulary name and NULLS, kept per object until its vector or the vocabulary changes;
+    // a query then needs one dot product per object (query · picture) and the log-sum-exp over the kept logits
+    // the memory table: vocabulary words then NULLS, picture vectors synced to the vector files (only new or changed ones computed)
+    let mut table = TABLE.lock().unwrap();
+    let table = table.get_or_insert_with(|| crate::objtable::ObjTable::new(DIM, SCALE));
+    let paths: Vec<Option<std::path::PathBuf>> = objs.iter().map(|o| o["emb"].as_str().map(|p| root.join(p))).collect();
+    if tq.is_some() && !ql.is_empty() {
+        table.set_words(vocab.iter().map(|(_, v)| v.clone()).chain(nulls.iter().cloned()).collect());
+        let items: Vec<(std::path::PathBuf, Arc<Vec<u8>>)> = paths.iter().flatten().filter_map(|p| crate::memfs::read(p).map(|b| (p.clone(), b))).collect();
+        table.sync_bytes(&items);
+    }
+    let rows: Vec<Option<usize>> = paths.iter().map(|p| p.as_ref().and_then(|p| table.row(p))).collect();
+    let keep: Vec<usize> = (0..vocab.len()).filter(|&i| !same(&vocab[i].0)).collect();
+    // p_look per object: one dot product (query · picture) and the log-sum-exp over the kept logits, objects in parallel
+    let table = &*table;
+    let look = |row: &Option<usize>| -> f32 {
+        match (&tq, row) {
+            (Some(t), Some(r)) => {
+                let lq = SCALE * cos(t, table.vector(*r));
+                let (logit, nv) = (table.logits(*r), vocab.len());
+                let z = lse(std::iter::once(lq).chain(keep.iter().map(|&i| logit[i])).chain(logit[nv..].iter().copied()));
+                (lq - z).exp()
+            }
+            _ => 0.0,
+        }
+    };
+    #[cfg(feature = "search")]
+    let looks: Vec<f32> = { use rayon::prelude::*; rows.par_iter().with_min_len(16).map(look).collect() };
+    #[cfg(not(feature = "search"))]
+    let looks: Vec<f32> = rows.iter().map(look).collect();
     let mut hits: Vec<(f32, serde_json::Value)> = vec![];
-    for (o, nl) in objs.iter().zip(&names) {
+    for ((o, nl), p_look) in objs.iter().zip(&names).zip(looks) {
         if ql.is_empty() {
             break;
         }
         let exact = !nl.is_empty() && (nl.contains(&ql) || ql.contains(nl.as_str()));
         let p_name = if exact { 1.0 } else { p_names.get(nl.as_str()).copied().unwrap_or(0.0) };
-        let p_look = match (&tq, o["emb"].as_str().and_then(|p| read_emb(&root.join(p)))) {
-            (Some(t), Some(e)) => {
-                let lq = SCALE * cos(t, &e);
-                let z = lse(std::iter::once(lq).chain(vocab.iter().filter(|(n, _)| !same(n)).map(|(_, v)| SCALE * cos(v, &e))).chain(nulls.iter().map(|v| SCALE * cos(v, &e))));
-                (lq - z).exp()
-            }
-            _ => 0.0,
-        };
         let score = 1.0 - (1.0 - p_name) * (1.0 - p_look);
         if score >= min {
             let r3 = |x: f32| (x as f64 * 1000.0).round() / 1000.0;
@@ -453,6 +480,140 @@ pub fn load_encoder(dir: &str, vocab: Option<&str>) -> Option<TextEnc> {
         Err(e) => {
             eprintln!("search: {e} — searching by name only");
             None
+        }
+    }
+}
+
+/// Same ranking and scores as the per-query computation it replaced (kept here as the reference), and query time by object count
+#[cfg(test)]
+mod pre_tests {
+    use super::*;
+    fn search_ref(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: usize, min: f32) -> serde_json::Value {
+        let ql = q.trim().to_lowercase();
+        let objs = view["objects"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+        let names: Vec<String> = objs.iter().map(|o| o["name"].as_str().unwrap_or("").to_lowercase()).collect();
+        let tq = if ql.is_empty() { None } else { enc(&ql) };
+        // class-name vectors, and how well the query matches each name
+        let vocab: Vec<(String, Arc<Vec<f32>>)> = match &tq {
+            Some(_) => vocabulary(root, &names).into_iter().filter(|n| !n.is_empty()).filter_map(|n| enc(&n).map(|v| (n, v))).collect(),
+            None => vec![],
+        };
+        let nulls: Vec<Arc<Vec<f32>>> = if tq.is_some() { NULLS.iter().filter_map(|n| enc(n)).collect() } else { vec![] };
+        let (p_names, alike): (HashMap<&str, f32>, std::collections::HashSet<&str>) = match &tq {
+            Some(t) => {
+                let c: Vec<f32> = vocab.iter().map(|(_, v)| cos(t, v)).collect();
+                let mut sorted = c.clone();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                let (best, median) = (sorted.first().copied().unwrap_or(0.0), sorted.get(sorted.len() / 2).copied().unwrap_or(0.0));
+                let conf = ((best - median - NAME_GAP_LO) / (NAME_GAP_HI - NAME_GAP_LO)).clamp(0.0, 1.0);
+                let near: HashMap<&str, f32> = vocab.iter().zip(&c).map(|((n, _), x)| (n.as_str(), ((x - best) / NAME_FALLOFF).exp())).collect();
+                let alike: std::collections::HashSet<&str> = vocab.iter().zip(&c).filter(|(_, x)| *x - median >= NAME_GAP_LO && ((*x - best) / NAME_FALLOFF).exp() >= 0.2).map(|((n, _), _)| n.as_str()).collect();
+                (near.into_iter().map(|(n, r)| (n, conf * r)).collect(), alike)
+            }
+            None => (HashMap::new(), Default::default()),
+        };
+        // names that stand out for the query and sit close to its closest name say the same thing as the query: they do not compete with it for a picture
+        let same = |n: &str| n == ql || alike.contains(n);
+        let mut hits: Vec<(f32, serde_json::Value)> = vec![];
+        for (o, nl) in objs.iter().zip(&names) {
+            if ql.is_empty() {
+                break;
+            }
+            let exact = !nl.is_empty() && (nl.contains(&ql) || ql.contains(nl.as_str()));
+            let p_name = if exact { 1.0 } else { p_names.get(nl.as_str()).copied().unwrap_or(0.0) };
+            let p_look = match (&tq, o["emb"].as_str().and_then(|p| read_emb(&root.join(p)))) {
+                (Some(t), Some(e)) => {
+                    let lq = SCALE * cos(t, &e);
+                    let z = lse(std::iter::once(lq).chain(vocab.iter().filter(|(n, _)| !same(n)).map(|(_, v)| SCALE * cos(v, &e))).chain(nulls.iter().map(|v| SCALE * cos(v, &e))));
+                    (lq - z).exp()
+                }
+                _ => 0.0,
+            };
+            let score = 1.0 - (1.0 - p_name) * (1.0 - p_look);
+            if score >= min {
+                let r3 = |x: f32| (x as f64 * 1000.0).round() / 1000.0;
+                hits.push((score, serde_json::json!({"id": o["id"], "name": o["name"], "state": o["state"], "pos": o["pos"],
+                    "score": r3(score), "by": if p_name >= p_look { "name" } else { "look" }, "p_name": r3(p_name), "p_look": r3(p_look)})));
+            }
+        }
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1["p_look"].as_f64().unwrap_or(0.0).total_cmp(&a.1["p_look"].as_f64().unwrap_or(0.0))));
+        hits.truncate(k);
+        // class names the query was read as, best first
+        let mut read: Vec<(&str, f32)> = p_names.iter().filter(|(_, p)| **p >= 0.2).map(|(n, p)| (*n, *p)).collect();
+        read.sort_by(|a, b| b.1.total_cmp(&a.1));
+        read.truncate(3);
+        serde_json::json!({"q": q, "names": read.iter().map(|(n, p)| serde_json::json!({"name": n, "p": (*p as f64 * 100.0).round() / 100.0})).collect::<Vec<_>>(), "semantic": tq.is_some(), "results": hits.into_iter().map(|h| h.1).collect::<Vec<_>>()})
+    }
+
+    fn rnd_unit(s: &mut u64) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..DIM).map(|_| { *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((*s >> 40) as f32) / (1u64 << 24) as f32 - 0.5 }).collect();
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= n);
+        v
+    }
+
+    /// memory with `n` objects and a vocabulary of `nv` names: (root, view, encoder table)
+    fn world(tag: &str, n: usize, nv: usize) -> (std::path::PathBuf, serde_json::Value, HashMap<String, Arc<Vec<f32>>>) {
+        let root = std::env::temp_dir().join(format!("sgview_pre_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        let mut s = 11u64;
+        let mut table: HashMap<String, Arc<Vec<f32>>> = HashMap::new();
+        let names: Vec<String> = (0..nv).map(|i| format!("name{i}")).collect();
+        for nm in &names {
+            table.insert(nm.clone(), Arc::new(rnd_unit(&mut s)));
+        }
+        for t in NULLS.iter().chain(["chair-ish", "something"].iter()) {
+            table.insert(t.to_string(), Arc::new(rnd_unit(&mut s)));
+        }
+        std::fs::write(root.join("vocab.json"), serde_json::to_vec(&names).unwrap()).unwrap();
+        crate::memfs::publish(&root.join("vocab.json"), Arc::new(serde_json::to_vec(&names).unwrap()));
+        let objs: Vec<serde_json::Value> = (0..n).map(|id| {
+            let rel = format!("objects/O{id}_emb.bin");
+            let bytes: Vec<u8> = rnd_unit(&mut s).iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(root.join(&rel), &bytes).unwrap();
+            crate::memfs::publish(&root.join(&rel), Arc::new(bytes)); // --serve: vector files live in memory
+            serde_json::json!({"id": id, "name": names[id % nv], "state": "present", "pos": [0, 0, 0], "emb": rel})
+        }).collect();
+        (root, serde_json::json!({"objects": objs}), table)
+    }
+
+    #[test]
+    fn same_as_per_query_scan() {
+        let (root, view, table) = world("same", 60, 200);
+        let enc = |t: &str| table.get(t).cloned().or_else(|| Some(Arc::new(vec![0.03; DIM])));
+        for q in ["name3", "chair-ish", "something", "name17 thing"] {
+            for _ in 0..2 {
+                // twice: the second query reads the memory table
+                assert_eq!(search(&root, &view, q, &enc, 50, 0.0), search_ref(&root, &view, q, &enc, 50, 0.0), "{q}");
+            }
+        }
+        // a changed vector file is computed again
+        let bytes: Vec<u8> = vec![0.05f32; DIM].iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(root.join("objects/O5_emb.bin"), bytes).unwrap();
+        assert_eq!(search(&root, &view, "something", &enc, 50, 0.0), search_ref(&root, &view, "something", &enc, 50, 0.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `cargo test -p sgview --release -- --ignored --nocapture query_time`: ms per query, objects 10 · 100 · 1000, vocabulary 1,225
+    #[test]
+    #[ignore]
+    fn query_time() {
+        crate::memfs::enable(); // the board runs the viewer in the same process (--serve): files from memory
+        for n in [10usize, 100, 1000] {
+            let (root, view, table) = world(&format!("t{n}"), n, 1225);
+            let enc = |t: &str| table.get(t).cloned().or_else(|| Some(Arc::new(vec![0.03; DIM])));
+            let time = |f: &dyn Fn() -> serde_json::Value| {
+                let c = std::time::Instant::now();
+                for _ in 0..5 {
+                    std::hint::black_box(f());
+                }
+                c.elapsed().as_secs_f64() * 1e3 / 5.0
+            };
+            let old = time(&|| search_ref(&root, &view, "something", &enc, 20, 0.0));
+            let first = { let c = std::time::Instant::now(); search(&root, &view, "chair-ish", &enc, 20, 0.0); c.elapsed().as_secs_f64() * 1e3 };
+            let new = time(&|| search(&root, &view, "something", &enc, 20, 0.0));
+            println!("objects {n}: per-query scan {old:.2} ms, memory table {new:.2} ms (first query after all vectors changed {first:.2} ms)");
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

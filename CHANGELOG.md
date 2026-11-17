@@ -21,6 +21,7 @@
 - `scripts/board_run.sh` 의 `SLAM_EXTRA`(위치 프로그램에 인자 더 주기).
 - IMU 모드 `--imu-max-rate`(기본 60 °/s) · `--imu-min-inliers`(60) · `--imu-min-ratio`(0.6): 빠르게 돌리거나 영상 근거가 약한 장면은 위치만 보내고 지도에 넣지 않는다.
 - 뷰어 `?metrics=1` 에 그린 점 수 · 올린 점 수.
+- 구조물(벽 · 바닥 · 천장) 판정용 8 낱말 표 `vocab/structural.voc` 와 단어장 없이 바로 찾는 검색의 비교 · 문턱 추천(`docs/search_direct.md`).
 
 ### Changed
 - 분할 NPU 호출이 스레드 셋 · 넷에서 둘(읽기 · 올리기, 받기 · 후처리)로 줄고, NPU 결과를 받을 버퍼에 바로 받아 장면마다 3.3 MB 출력 복사가 없어졌다.

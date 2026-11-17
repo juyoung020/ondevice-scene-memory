@@ -1,0 +1,8 @@
+floor
+wall
+ceiling
+baseboard
+object
+furniture
+window
+door

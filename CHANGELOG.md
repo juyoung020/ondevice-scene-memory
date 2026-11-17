@@ -17,6 +17,7 @@
 - `scripts/board_run.sh` 의 `SLAM_EXTRA`(위치 프로그램에 인자 더 주기).
 - IMU 모드 `--imu-max-rate`(기본 60 °/s) · `--imu-min-inliers`(60) · `--imu-min-ratio`(0.6): 빠르게 돌리거나 영상 근거가 약한 장면은 위치만 보내고 지도에 넣지 않는다.
 - 뷰어 `?metrics=1` 에 그린 점 수 · 올린 점 수.
+- 구조물(벽 · 바닥 · 천장) 판정용 8 낱말 표 `vocab/structural.voc` 와 단어장 없이 바로 찾는 검색의 비교 · 문턱 추천(`docs/search_direct.md`).
 
 ### Changed
 - 뷰어 화질을 v0.8.0 수준으로: 보드(약한 GPU)도 EDL 깊이 음영을 켜고(0.9.0 에서 꺼져 점 지도가 납작하게 보였다), 점 크기 상한을 다시 50 화소로(폰만 14).

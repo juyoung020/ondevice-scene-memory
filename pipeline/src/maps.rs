@@ -646,21 +646,34 @@ impl Obj {
 }
 
 /// 굵은 칸 → 그 칸을 지지하는 물체 id. 값 하나 = id 하나(위 비트 0) 또는 여러 id 목록 자리(위 비트 1):
-/// 칸 대부분은 물체 하나만 지지하므로 목록 할당 없이 u32 하나
-#[derive(Clone, Default)]
+/// 칸 대부분은 물체 하나만 지지하므로 목록 할당 없이 u32 하나. 표는 칸 좌표 아래 비트로 64 개로 나눔:
+/// 표가 두 배로 커질 때 옮기는 칸이 1/64 라 관측 한 번이 오래 멈추지 않는다(한 표일 때 물체 1,000 개에서 최대 8 ms)
+#[derive(Clone)]
 struct KeyIndex {
-    one: FastMap<u64, u32>,
+    one: Vec<FastMap<u64, u32>>,
     many: Vec<Vec<u32>>,
     free: Vec<u32>,
 }
 
 const MANY: u32 = 1 << 31;
 
+/// 칸 키 → 표 번호(x · y · z 아래 2 비트씩)
+#[inline]
+fn shard(k: u64) -> usize {
+    ((k & 3) | ((k >> 21) & 3) << 2 | ((k >> 42) & 3) << 4) as usize
+}
+
+impl Default for KeyIndex {
+    fn default() -> Self {
+        KeyIndex { one: (0..64).map(|_| FastMap::default()).collect(), many: vec![], free: vec![] }
+    }
+}
+
 impl KeyIndex {
     /// id 가 아직 이 칸에 없을 때만 부른다
     fn add(&mut self, k: u64, id: u32) {
         use std::collections::hash_map::Entry;
-        match self.one.entry(k) {
+        match self.one[shard(k)].entry(k) {
             Entry::Vacant(e) => {
                 e.insert(id);
             }
@@ -686,10 +699,10 @@ impl KeyIndex {
         }
     }
     fn remove(&mut self, k: u64, id: u32) {
-        let Some(v) = self.one.get_mut(&k) else { return };
+        let Some(v) = self.one[shard(k)].get_mut(&k) else { return };
         if *v & MANY == 0 {
             if *v == id {
-                self.one.remove(&k);
+                self.one[shard(k)].remove(&k);
             }
             return;
         }
@@ -706,7 +719,7 @@ impl KeyIndex {
     }
     #[inline]
     fn each(&self, k: u64, mut f: impl FnMut(u32)) {
-        if let Some(&v) = self.one.get(&k) {
+        if let Some(&v) = self.one[shard(k)].get(&k) {
             if v & MANY == 0 {
                 f(v)
             } else {
@@ -976,8 +989,8 @@ impl Memory {
         self.objs[i].id
     }
 
-    /// 관측 때 바로 합치기: 이 관측이 다른 물체와도 크게 겹치면(관측 칸의 25 % 이상 = find 가 같은 물체로 보는 겹침)
-    /// 같은 물체를 둘로 잡았다는 직접 증거 — 병합 규칙(same_thing)을 그 자리에서 보고 맞으면 합친다. 반환: 관측이 든 물체의 자리
+    /// 관측 때 바로 합치기: 이 관측이 다른 물체와도 크게 겹치면(관측 칸의 25 % 이상 = find 가 같은 물체로 보는 겹침) 같은 물체를
+    /// 둘로 잡았다는 직접 증거 — 주기 병합과 같은 규칙([`same_thing`])을 그 자리에서 보고 맞으면 합친다. 반환: 관측이 든 물체의 자리
     fn merge_at_obs(&mut self, mut i: usize, cnt: &FastMap<u32, u32>, nkeys: usize) -> usize {
         let me = self.objs[i].id;
         let mut cand: Vec<usize> = cnt.iter().filter(|&(&id, &n)| id != me && n as usize * 4 >= nkeys).map(|(id, _)| self.at[id] as usize).collect();
@@ -1450,8 +1463,9 @@ fn emb_cos(a: &Obj, b: &Obj) -> Option<f32> {
 /// 코사인 ≥ BOX_COS 면 같음. 벡터는 종류까지만 가려서(나란한 모니터 둘도 0.92) 겹침 없이 벡터만으로는 합치지 않는다
 fn same_thing(a: &Obj, b: &Obj, inter: usize, sup: f64) -> bool {
     let (frag_in, frag_ovl) = (0.7f32, 0.2f32); // 조각: 굳은 칸 70 % 가 상대 칸 안, 전체 칸 겹침 20 % 이상
-    let touch = || votes_cos(a, b) >= 0.5 && touching(a, b, sup);
-    let boxed = || emb_cos(a, b).is_some_and(|c| c >= BOX_COS) && box_overlap(a, b) >= 0.6;
+    // 싼 검사부터(결과는 같음): 전형 크기 있는 같은 이름인지 → 이름 투표, 상자 겹침 → 사진 벡터
+    let touch = || a.name == b.name && typical(&a.name).is_some() && votes_cos(a, b) >= 0.5 && touching(a, b, sup);
+    let boxed = || a.emb.is_some() && b.emb.is_some() && box_overlap(a, b) >= 0.6 && emb_cos(a, b).is_some_and(|c| c >= BOX_COS);
     if inter == 0 {
         return touch() || boxed();
     }
@@ -1619,7 +1633,7 @@ mod tests {
         }
         assert_eq!(m.at.len(), m.objs.len());
         assert_eq!(m.centers.0.values().map(|v| v.len()).sum::<usize>(), m.objs.len());
-        assert_eq!(m.index.one.len(), want.len());
+        assert_eq!(m.index.one.iter().map(|s| s.len()).sum::<usize>(), want.len());
         for (k, v) in &mut want {
             let mut got = vec![];
             m.index.each(*k, |id| got.push(id));

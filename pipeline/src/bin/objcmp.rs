@@ -135,7 +135,13 @@ fn main() {
         let y = load(Path::new(b));
         let (dy, uy) = dups(&y, true);
         println!("{b}: 물체 {} 개, 중복 짝 {dy} 개, 중복 묶음을 하나로 센 물체 {uy} 개", y.len());
-        let same = x.iter().filter(|o| y.iter().any(|p| same_place(o, p) && o.set.len().abs_diff(p.set.len()) * 10 <= o.set.len().max(p.set.len()))).count();
+        let alike = |o: &O, p: &O| same_place(o, p) && o.set.len().abs_diff(p.set.len()) * 10 <= o.set.len().max(p.set.len());
+        let same = x.iter().filter(|o| y.iter().any(|p| alike(o, p))).count();
+        // 거의 같은 짝이 없는 전 물체: 후에서 어느 물체에 들었는지(칸 50 % 이상 겹친 후 물체)
+        for o in x.iter().filter(|o| !y.iter().any(|p| alike(o, p))) {
+            let to: Vec<String> = y.iter().filter(|p| same_place(o, p)).map(|p| format!("O{} {} ({} 점)", p.id, p.name, p.pts.len())).collect();
+            println!("  바뀜 O{} {} ({} 점) → {}", o.id, o.name, o.pts.len(), if to.is_empty() { "없음".into() } else { to.join(" + ") });
+        }
         let m = more_merged(&y, &x, "후가 더 합침");
         let s = more_merged(&x, &y, "후가 더 갈라짐");
         println!("전후: 거의 같은 물체 {same} / {}, 후가 더 합친 물체 {m}, 후가 더 갈라진 물체 {s}", x.len());

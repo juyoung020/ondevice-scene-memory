@@ -373,6 +373,9 @@ fn seg_post_any(raw: &SegRaw, geom: LbGeom, w: usize, h: usize, conf: f32) -> Ve
 }
 
 /// 분할 실행기. 단계 셋(전처리 `seg_pre` → 추론 `infer` → 후처리 `seg_post`)으로 나뉘고, `run` 은 셋을 차례로 한다.
+/// 작업 끝 알림: 올릴 때 준 표(tag)를 받는다
+pub type Notify = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 pub trait Segmenter: Send {
     /// 추론만(NPU·모델 호출, 실행기 입력 형식 맞춤 포함). 결과는 raw 에 담는다.
     fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw);
@@ -382,15 +385,18 @@ pub trait Segmenter: Send {
     fn direct(&mut self, _rgb: &[u8], _w: usize, _h: usize, _conf: f32) -> Option<Vec<Det>> {
         None
     }
-    /// 추론을 올려만 두고 바로 돌아올 수 있으면 작업 번호를 준다. 결과는 raw 에 바로 쓰이고(NPU) `collector` 가 준 함수로 끝을 기다린다.
-    /// inp · raw 버퍼는 그 함수가 끝날 때까지 옮겨도 되지만(힙 자리 그대로) 크기를 바꾸면 안 된다
-    fn submit(&mut self, _inp: &SegIn, _raw: &mut SegRaw) -> Option<i32> {
+    /// 추론을 올려만 두고 바로 돌아올 수 있으면 작업 번호를 준다. 결과는 raw 에 바로 쓰이고(NPU) 끝나면 `set_notify` 로 단 함수가
+    /// notify(tag) 를 부른다(어느 스레드에서든). 알림을 받으면 `take` 로 결과를 맞춘다.
+    /// inp · raw 버퍼는 `take` 까지 옮겨도 되지만(힙 자리 그대로) 크기를 바꾸면 안 된다
+    fn submit(&mut self, _inp: &SegIn, _raw: &mut SegRaw, _tag: u64) -> Option<i32> {
         None
     }
-    /// `submit` 한 작업을 다른 스레드에서 기다려 raw 를 채우는 함수(올린 순서대로 부름). 실행기보다 먼저 없앤다.
-    fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
-        None
+    /// 작업 끝 알림을 단다(`submit` 한 작업마다 한 번). 비동기 실행기만 true
+    fn set_notify(&mut self, _n: Notify) -> bool {
+        false
     }
+    /// 끝 알림을 받은 작업의 결과를 raw 에 맞춘다(기다리지 않음)
+    fn take(&mut self, _id: i32, _raw: &mut SegRaw) {}
     /// 함께 올려 둘 수의 상한(NPU 는 --npu-jobs 그대로, 실행 스레드 하나인 PC ONNX 는 1: 더 올려도 줄만 길어져 장면 지연만 는다)
     fn max_jobs(&self) -> usize {
         usize::MAX
@@ -435,7 +441,8 @@ type Pools = std::sync::Arc<std::sync::Mutex<(Vec<Vec<f32>>, Vec<Vec<f32>>)>>;
 /// 입력(f32 NCHW)·출력 버퍼는 돌려쓴다
 #[cfg(feature = "onnx")]
 pub struct OnnxSeg {
-    tx: Option<std::sync::mpsc::Sender<(i32, Vec<f32>)>>,
+    tx: Option<std::sync::mpsc::Sender<(i32, u64, Vec<f32>)>>,
+    notify: std::sync::Arc<std::sync::OnceLock<Notify>>,
     rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<OnnxOut>>>,
     /// 입력 f32 버퍼 줄, 출력 버퍼 줄
     pool: Pools,
@@ -448,14 +455,16 @@ impl OnnxSeg {
     pub fn new(env: &ort::environment::Environment, path: &str) -> OnnxSeg {
         let _ = env;
         let mut sess = session(path);
-        let (tx, rx_in) = std::sync::mpsc::channel::<(i32, Vec<f32>)>();
+        let (tx, rx_in) = std::sync::mpsc::channel::<(i32, u64, Vec<f32>)>();
         let (tx_out, rx) = std::sync::mpsc::channel::<OnnxOut>();
         let pool: Pools = Default::default();
         let pool_w = pool.clone();
+        let notify: std::sync::Arc<std::sync::OnceLock<Notify>> = Default::default();
+        let notify_w = notify.clone();
         let th = std::thread::Builder::new().name("seg-onnx".into()).spawn(move || {
             crate::out::thread_role(crate::out::Role::Infer);
             common::prof::track_thread();
-            for (id, f) in rx_in {
+            for (id, tag, f) in rx_in {
                 let t = ort::value::TensorRef::from_array_view(([1usize, 3, SEG_S, SEG_S], &f[..])).unwrap();
                 let out = sess.run(ort::inputs![t]).expect("onnx run");
                 let (_, det) = out[0].try_extract_tensor::<f32>().unwrap();
@@ -471,9 +480,12 @@ impl OnnxSeg {
                 if tx_out.send(o).is_err() {
                     break;
                 }
+                if let Some(n) = notify_w.get() {
+                    n(tag);
+                }
             }
         }).unwrap();
-        OnnxSeg { tx: Some(tx), rx: std::sync::Arc::new(std::sync::Mutex::new(rx)), pool, th: Some(th), next: 0, scratch: Default::default() }
+        OnnxSeg { tx: Some(tx), notify, rx: std::sync::Arc::new(std::sync::Mutex::new(rx)), pool, th: Some(th), next: 0, scratch: Default::default() }
     }
 }
 /// 올린 순서대로 결과 하나를 받아 raw 에(버퍼를 바꿔 끼움: 복사 없음, 옛 버퍼는 줄로)
@@ -494,21 +506,25 @@ impl Segmenter for OnnxSeg {
         &mut self.scratch
     }
     fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw) {
-        let id = self.submit(inp, raw).unwrap();
+        let id = self.submit(inp, raw, 0).unwrap();
         onnx_take(&self.rx, &self.pool, id, raw);
     }
-    fn submit(&mut self, inp: &SegIn, _raw: &mut SegRaw) -> Option<i32> {
+    /// 실행 스레드가 끝나면 notify(표)
+    fn submit(&mut self, inp: &SegIn, _raw: &mut SegRaw, tag: u64) -> Option<i32> {
         let mut f = self.pool.lock().unwrap().0.pop().unwrap_or_default();
         nchw_f32(&inp.u8, SEG_S, &mut f);
         common::prof::copy(common::prof::C::SegNchw, f.len() * 4);
         let id = self.next;
         self.next = self.next.wrapping_add(1);
-        self.tx.as_ref().unwrap().send((id, f)).expect("분할 실행 스레드");
+        self.tx.as_ref().unwrap().send((id, tag, f)).expect("분할 실행 스레드");
         Some(id)
     }
-    fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
-        let (rx, pool) = (self.rx.clone(), self.pool.clone());
-        Some(Box::new(move |id, raw| onnx_take(&rx, &pool, id, raw)))
+    fn set_notify(&mut self, n: Notify) -> bool {
+        let _ = self.notify.set(n);
+        true
+    }
+    fn take(&mut self, id: i32, raw: &mut SegRaw) {
+        onnx_take(&self.rx, &self.pool, id, raw);
     }
     fn max_jobs(&self) -> usize {
         1
@@ -583,15 +599,19 @@ impl Segmenter for DxSeg {
         self.lay.apply(raw);
     }
     /// 올리면서 받을 버퍼(raw.buf)를 함께 넘김: NPU 결과가 거기에 바로 쓰인다(받을 때 DXRT 안 버퍼에서 3.3 MB 를 다시 복사하지 않음)
-    fn submit(&mut self, inp: &SegIn, raw: &mut SegRaw) -> Option<i32> {
-        Some(self.eng.submit(&inp.u8, &mut raw.buf))
+    fn submit(&mut self, inp: &SegIn, raw: &mut SegRaw, tag: u64) -> Option<i32> {
+        Some(self.eng.submit_tagged(&inp.u8, &mut raw.buf, tag))
     }
-    fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
-        let (w, lay) = (self.eng.waiter(), self.lay);
-        Some(Box::new(move |id, raw| {
-            w.wait(id);
-            lay.apply(raw);
-        }))
+    /// 끝 알림: `--npu-wake thread`(기본) = 기다림 스레드 npu-wait-seg, `callback` = DXRT 콜백
+    fn set_notify(&mut self, n: Notify) -> bool {
+        self.eng.on_done(dx::wake(), "seg", n);
+        true
+    }
+    fn take(&mut self, id: i32, raw: &mut SegRaw) {
+        if self.eng.callback_mode() {
+            self.eng.waiter().wait(id); // 이미 끝남: 작업 자리만 놓음
+        }
+        self.lay.apply(raw);
     }
 }
 

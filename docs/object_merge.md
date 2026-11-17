@@ -117,8 +117,8 @@ PC WSL(Ryzen 9 9950X, 다른 작업이 함께 돌던 때), 전 · 후를 번갈�
 
 ## 보드에서 잴 것(보드가 켜지면)
 
-`bash scripts/board_merge_check.sh [TUM 폴더] [횟수]` 하나로(결과 `/tmp/merge_check/report.txt`):
+`bash scripts/board_all.sh`(보드 통합 측정)의 단계로(결과 `~/board_all/<시각>/summary.md`):
 
-- 보드에서 `maps_bench.rs` 전 · 후: 물체 50 · 200 · 1,000 개의 관측 1 회 · 병합 1 회 평균 · 최대.
-- 같은 녹화를 최대 속도로 전 · 후 번갈아: 물체 · 사라짐 · 병합 수, kf/s, 물체 단계 ms/장, 병합 최대 ms.
-- 그다음 실시간 D435(`scripts/board_run.sh`) 전 · 후 75 초씩 번갈아 같은 항목.
+- 녹화 재생 단계 끝의 `maps_bench.rs`: 물체 50 · 200 · 1,000 개의 관측 1 회 · 병합 1 회 평균 · 최대(`merge_bench.txt`). 전 판 값은 위 PC 표와 견준다.
+- 사진 벡터 함께 올리기 단계(같은 녹화를 최대 속도로): 물체 · 사라짐 · 병합 수, kf/s, 물체 단계 ms/장, 병합 최대 ms(끝 요약 JSON).
+- 실시간 가만히 · 흔들기 단계: 같은 항목(끝 요약 JSON).

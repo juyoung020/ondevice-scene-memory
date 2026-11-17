@@ -25,8 +25,9 @@ impl RsDriverSource {
     }
 }
 
-impl FrameSource for RsDriverSource {
-    fn next(&mut self) -> Result<Option<Frame>, String> {
+impl RsDriverSource {
+    /// 버퍼를 맞추고 한 묶음(block = 쌍이 올 때까지 기다림, 아니면 준비된 쌍만)
+    fn read(&mut self, block: bool) -> Result<Option<Frame>, String> {
         let c0 = Instant::now();
         // 받는 쪽이 다 쓰고 돌려준 버퍼가 있으면 그것에 채움(길이가 맞아 0 으로 채우지 않음, 화소는 모두 덮어씀)
         let (cw, ch) = self.cam.cfg.color_size();
@@ -40,7 +41,14 @@ impl FrameSource for RsDriverSource {
         if self.out.gray.capacity() == 0 {
             self.out.gray = crate::bufpool::take_gray(n);
         }
-        let info = self.cam.next_into(&mut self.out)?;
+        let info = if block {
+            self.cam.next_into(&mut self.out)?
+        } else {
+            match self.cam.try_next_into(&mut self.out)? {
+                Some(i) => i,
+                None => return Ok(None),
+            }
+        };
         // 장치 버퍼에서 한 번 채운 컬러·깊이를 그대로 장면으로 넘김(다음 장면은 돌려받은 버퍼나 새 버퍼에: 앞 장면은 memmap 이 들고 있음)
         let color = std::mem::take(&mut self.out.rgb);
         let depth_raw = std::mem::take(&mut self.out.aligned);
@@ -61,6 +69,18 @@ impl FrameSource for RsDriverSource {
             depth_per_m: dpm,
             cam: Camera { fx: k.fx as f64, fy: k.fy as f64, cx: k.ppx as f64, cy: k.ppy as f64, width: cw, height: ch, local: optical_rotation(), oriented: false },
         }))
+    }
+}
+
+impl FrameSource for RsDriverSource {
+    fn next(&mut self) -> Result<Option<Frame>, String> {
+        self.read(true)
+    }
+    fn try_next(&mut self) -> Result<Option<Option<Frame>>, String> {
+        Ok(self.read(false)?.map(Some))
+    }
+    fn fds(&self) -> Vec<i32> {
+        self.cam.fds()
     }
     fn last_read_ms(&self) -> f64 {
         self.read_ms

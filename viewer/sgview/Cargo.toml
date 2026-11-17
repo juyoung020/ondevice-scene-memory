@@ -11,12 +11,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 ort = { version = "=2.0.0-rc.15", optional = true }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"], optional = true }
 common = { path = "../../common" }
-rayon = { version = "1", optional = true }
+rayon = "1"
 
 [features]
 default = ["search-onnx"]
 # 글 검색: SigLIP2 글 인코더(Rust, text_model_fp16.onnx 의 가중치) + 토크나이저(Rust)
-search = ["dep:tokenizers", "dep:rayon"]
+search = ["dep:tokenizers"]
 # PC: 글 인코더를 ONNX Runtime 으로(Rust 인코더보다 빠름)
 search-onnx = ["search", "dep:ort", "common/onnx"]
 # 보드 빌드(ONNX Runtime 없이 Rust 글 인코더)

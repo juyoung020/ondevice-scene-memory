@@ -19,6 +19,18 @@ pub trait FrameSource: Send {
     /// 장면 읽기에 쓴 시간(ms, 마지막 next 의 카메라 대기·파일 읽기·정렬)
     fn last_read_ms(&self) -> f64;
     fn describe(&self) -> String;
+    /// 장치 파일 기술자(카메라): 처리 루프 epoll 에 건다. 비었으면 파일 입력(풀에서 미리 풂)
+    fn fds(&self) -> Vec<i32> {
+        vec![]
+    }
+    /// 기다리지 않는 다음 장면(카메라): Ok(None) = 아직(장치 알림을 기다림). 기본은 next 그대로
+    fn try_next(&mut self) -> Result<Option<Option<Frame>>, String> {
+        self.next().map(Some)
+    }
+    /// 찍은 속도 재생(--rate R > 0): 잠들지 않게 하고 (배속, 재생 시계)를 돌려줌 — 부르는 쪽(처리 루프)이 장면을 제때까지 둠
+    fn caller_paces(&mut self) -> Option<(f64, Arc<std::sync::OnceLock<(f64, Instant)>>)> {
+        None
+    }
 }
 
 /// 카메라 광학 축(x 오른쪽, y 아래, z 앞) → 몸체 축(x 앞, y 왼쪽, z 위). RTAB-Map CameraModel::opticalRotation
@@ -88,6 +100,8 @@ pub struct TumSource {
     start: Option<(f64, Instant)>,
     /// 재생 시계(첫 장면 시각, 그때 벽시계): IMU 재생 스레드가 같은 시계로 표본을 넣음
     clock: Arc<std::sync::OnceLock<(f64, Instant)>>,
+    /// 찍은 속도 재생을 부르는 쪽이 맞춤(밀린 장면 버리기만 여기서, 잠들지 않음)
+    no_sleep: bool,
     id: i64,
     /// 끊김 시험: 이 구간(장면 시각)의 장면은 내지 않음
     pub drop: Vec<(f64, f64)>,
@@ -169,7 +183,7 @@ impl TumSource {
                 }
             }
         }
-        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, depth_per_m, read_ms: 0.0, start: None, clock: Default::default(), id: 0, drop: Vec::new(), n_drop: Default::default(), blur: None, n_blur: Default::default() })
+        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, depth_per_m, read_ms: 0.0, start: None, clock: Default::default(), no_sleep: false, id: 0, drop: Vec::new(), n_drop: Default::default(), blur: None, n_blur: Default::default() })
     }
     /// 재생 시계(첫 장면을 낼 때 정해짐)
     pub fn clock(&self) -> Arc<std::sync::OnceLock<(f64, Instant)>> {
@@ -201,6 +215,12 @@ impl TumSource {
 }
 
 impl FrameSource for TumSource {
+    fn caller_paces(&mut self) -> Option<(f64, Arc<std::sync::OnceLock<(f64, Instant)>>)> {
+        (self.rate > 0.0).then(|| {
+            self.no_sleep = true;
+            (self.rate, self.clock.clone())
+        })
+    }
     fn describe(&self) -> String {
         let r = if self.rate > 0.0 { format!("{:.6}배", self.rate) } else { "최대".into() };
         format!("TUM {} ({} 장, 속도 {r})", self.dir, self.rgb.len())
@@ -229,7 +249,7 @@ impl FrameSource for TumSource {
                             self.skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if ahead > 0.0 {
+                        if ahead > 0.0 && !self.no_sleep {
                             std::thread::sleep(Duration::from_secs_f64(ahead));
                         }
                     }
@@ -238,12 +258,8 @@ impl FrameSource for TumSource {
             let c0 = Instant::now();
             let j = self.pair(t);
             let (cp, dp) = (format!("{}/{}", self.dir, rel), format!("{}/{}", self.dir, self.depth[j].1));
-            // 컬러와 깊이 PNG 를 나란히 푼다
-            let (ci, di) = std::thread::scope(|s| {
-                let h = s.spawn(|| read_png(&dp));
-                let c = read_png(&cp);
-                (c, h.join().unwrap())
-            });
+            // 컬러와 깊이 PNG 를 나란히 푼다(작업 풀)
+            let (ci, di) = rayon::join(|| read_png(&cp), || read_png(&dp));
             let (ci, di) = (ci?, di?);
             let (w, h) = (ci.width(), ci.height());
             // 푼 RGB 그대로 둔다(스트림·memmap 이 RGB 를 씀). 회색조는 채널 차례만 맞춰 imread(BGR) + cvtColor 와 같은 값

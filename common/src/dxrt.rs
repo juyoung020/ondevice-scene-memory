@@ -109,6 +109,7 @@ unsafe extern "C" {
     fn dxrt_engine_run(e: *mut c_void, input: *const c_void, output: *mut c_void) -> c_int;
     fn dxrt_engine_run_async(e: *mut c_void, input: *const c_void, user_arg: *mut c_void, output: *mut c_void, job_id: *mut c_int) -> c_int;
     fn dxrt_engine_wait(e: *mut c_void, job_id: c_int, output: *mut c_void) -> c_int;
+    fn dxrt_engine_register_callback(e: *mut c_void, cb: DoneCb, user_data: *mut c_void) -> c_int;
     fn dxrt_engine_get_output_size(e: *mut c_void, size: *mut u64) -> c_int;
     fn dxrt_engine_get_output_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
     fn dxrt_engine_get_input_tensor_info(e: *mut c_void, infos: *mut TensorInfo, count: *mut c_int) -> c_int;
@@ -126,7 +127,49 @@ pub struct Engine {
     pub out_len: usize,
     pub tensors: Vec<(String, Vec<i64>, usize)>, // 이름, 모양, 바이트 오프셋
     pub input: String,                          // 첫 입력 텐서 이름
+    /// 첫 입력 텐서 바이트
+    pub in_len: usize,
+    /// 끝 알림(`on_done`): 얇은 기다림 스레드에 넘길 줄, 또는 콜백이 부를 함수(엔진보다 오래 삶)
+    done: Option<Done>,
 }
+
+/// NPU 작업 끝을 루프에 알리는 길(`--npu-wake`): 콜백 = DXRT 안 스레드가 부르는 함수가 알림(우리 스레드 0),
+/// 스레드 = 모델마다 `wait` 만 하는 얇은 스레드가 올린 차례대로 기다렸다 알림
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    Thread,
+    Callback,
+}
+static WAKE_CB: AtomicBool = AtomicBool::new(false);
+/// `--npu-wake callback|thread`(기본 thread: 보드 시험 `ondevice npu-test` 를 통과한 뒤 callback 으로 바꿈)
+pub fn set_wake(w: Wake) {
+    WAKE_CB.store(w == Wake::Callback, Relaxed);
+}
+pub fn wake() -> Wake {
+    if WAKE_CB.load(Relaxed) { Wake::Callback } else { Wake::Thread }
+}
+
+/// 작업 끝 알림: 올릴 때 준 표(token)를 그대로 받는다. 어느 스레드에서든 불린다
+pub type Notify = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+type DoneCb = unsafe extern "C" fn(outs: *mut c_void, n: c_int, user_arg: *mut c_void, user_data: *mut c_void) -> c_int;
+
+enum Done {
+    /// 얇은 스레드로 (작업 번호, 표)를 넘기는 줄
+    Thread(std::sync::mpsc::Sender<(c_int, u64)>, Option<std::thread::JoinHandle<()>>),
+    /// 콜백 user_data 로 넘긴 함수(엔진을 없앨 때 함께)
+    Callback(*mut Notify),
+}
+
+/// DXRT 가 작업 끝에 부르는 함수: user_arg = 올릴 때 준 표, user_data = 알림 함수
+unsafe extern "C" fn on_job_done(_outs: *mut c_void, _n: c_int, user_arg: *mut c_void, user_data: *mut c_void) -> c_int {
+    if !user_data.is_null() {
+        let f = unsafe { &*(user_data as *const Notify) };
+        f(user_arg as u64);
+    }
+    0
+}
+
 impl Engine {
     /// 분할 모델(`--seg-npu` 코어)
     pub fn new(path: &str) -> Engine {
@@ -164,7 +207,8 @@ impl Engine {
             let mut n: c_int = 16;
             dxrt_engine_get_input_tensor_info(e, infos.as_mut_ptr(), &mut n);
             let input = if n > 0 { CStr::from_ptr(infos[0].name.as_ptr()).to_string_lossy().into_owned() } else { String::new() };
-            Ok(Engine { e, out_len: sz as usize, tensors, input })
+            let in_len = if n > 0 { infos[0].size_in_bytes as usize } else { 0 };
+            Ok(Engine { e, out_len: sz as usize, tensors, input, in_len, done: None })
         }
     }
     /// 동기 실행: 결과를 받는 쪽 버퍼(f32, 모든 텐서 이어 붙임)에 바로 받기
@@ -188,6 +232,54 @@ impl Engine {
         }
         id
     }
+    /// 작업 끝 알림을 단다(`submit_tagged` 로 올린 작업마다 notify(표) 한 번). name = 기다림 스레드 이름 뒤에 붙일 모델 이름
+    pub fn on_done(&mut self, mode: Wake, name: &str, notify: Notify) {
+        match mode {
+            Wake::Callback => {
+                let p = Box::into_raw(Box::new(notify));
+                unsafe {
+                    if dxrt_engine_register_callback(self.e, on_job_done, p as *mut c_void) != 0 {
+                        panic!("dxrt register_callback: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
+                    }
+                }
+                self.done = Some(Done::Callback(p));
+            }
+            Wake::Thread => {
+                let (tx, rx) = std::sync::mpsc::channel::<(c_int, u64)>();
+                let w = self.waiter();
+                let th = std::thread::Builder::new()
+                    .name(format!("npu-wait-{name}"))
+                    .spawn(move || {
+                        crate::prof::track_thread();
+                        for (id, tag) in rx {
+                            w.wait(id);
+                            notify(tag);
+                        }
+                    })
+                    .expect("npu-wait 스레드");
+                self.done = Some(Done::Thread(tx, Some(th)));
+            }
+        }
+    }
+    /// 올리기(끝 알림 표 붙임): 결과는 out 에 바로. 끝나면 `on_done` 의 notify(tag).
+    /// 콜백 길이면 알림을 받은 뒤 `Waiter::wait(id)` 로 작업 자리를 놓는다(이미 끝나 바로 돌아옴)
+    pub fn submit_tagged(&mut self, input: &[u8], out: &mut Vec<f32>, tag: u64) -> i32 {
+        out.resize(self.out_len.div_ceil(4), 0.0);
+        let mut id: c_int = 0;
+        unsafe {
+            if dxrt_engine_run_async(self.e, input.as_ptr() as *const c_void, tag as *mut c_void, out.as_mut_ptr() as *mut c_void, &mut id) != 0 {
+                panic!("dxrt run_async: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
+            }
+        }
+        if let Some(Done::Thread(tx, _)) = &self.done {
+            let _ = tx.send((id, tag));
+        }
+        id
+    }
+    /// 끝 알림이 콜백 길인지(알림 뒤 `wait` 로 자리를 놓아야 함)
+    pub fn callback_mode(&self) -> bool {
+        matches!(self.done, Some(Done::Callback(_)))
+    }
     /// 올려 둔 작업의 끝을 다른 스레드에서 기다리는 손잡이. 엔진보다 먼저 없앤다.
     pub fn waiter(&self) -> Waiter {
         Waiter { e: self.e }
@@ -202,7 +294,18 @@ impl Engine {
 }
 impl Drop for Engine {
     fn drop(&mut self) {
+        // 기다림 스레드를 먼저 끝냄(줄을 닫으면 남은 작업을 다 기다리고 끝남)
+        if let Some(Done::Thread(tx, th)) = &mut self.done {
+            let (dead, _) = std::sync::mpsc::channel();
+            *tx = dead;
+            if let Some(t) = th.take() {
+                let _ = t.join();
+            }
+        }
         unsafe { dxrt_engine_destroy(self.e) }
+        if let Some(Done::Callback(p)) = self.done.take() {
+            drop(unsafe { Box::from_raw(p) });
+        }
     }
 }
 unsafe impl Send for Engine {}

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 static ON: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -78,9 +78,10 @@ pub fn read(p: &Path) -> Option<Arc<Vec<u8>>> {
     }
 }
 
-/// 판이 바뀔 때마다 늘어나는 번호(파일 걸기 · 지우기 · view 판 걸기): /stream 은 이것을 기다렸다 바뀐 것만 보낸다
-static CHANGE: Mutex<u64> = Mutex::new(0);
-static CHANGED: Condvar = Condvar::new();
+/// 판이 바뀔 때마다 늘어나는 번호(파일 걸기 · 지우기 · view 판 걸기): /stream 은 루프가 깰 때 이것이 바뀌었으면 바뀐 것만 보낸다
+static CHANGE: AtomicU64 = AtomicU64::new(0);
+/// 바뀌면 부를 함수(뷰어 서버가 도는 처리 루프 깨우기)
+static ON_CHANGE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
 /// pose.json 말고 다른 것이 바뀐 번호
 static OTHER: AtomicU64 = AtomicU64::new(0);
 /// 깨운 횟수(계측: 파일을 걸 때마다 깨우던 것을 묶은 효과)
@@ -101,15 +102,20 @@ pub fn bump() {
 /// pose.json 만 바뀜(장면 사이 위치 200 Hz): /stream 은 위치만 보내고 나머지 판은 보지 않음
 pub fn bump_pose() {
     BUMPS.fetch_add(1, Ordering::Relaxed);
-    *CHANGE.lock().unwrap() += 1;
-    CHANGED.notify_all();
+    CHANGE.fetch_add(1, Ordering::Release);
+    if let Some(f) = ON_CHANGE.get() {
+        f();
+    }
 }
 
-/// 번호가 seen 과 달라질 때까지(최대 timeout) 기다려 지금 번호를 돌려줌
-pub fn wait_change(seen: u64, timeout: std::time::Duration) -> u64 {
-    let g = CHANGE.lock().unwrap();
-    let (g, _) = CHANGED.wait_timeout_while(g, timeout, |c| *c == seen).unwrap();
-    *g
+/// 지금 바뀜 번호
+pub fn change() -> u64 {
+    CHANGE.load(Ordering::Acquire)
+}
+
+/// 바뀔 때 부를 함수(한 번)
+pub fn on_change(f: impl Fn() + Send + Sync + 'static) {
+    let _ = ON_CHANGE.set(Box::new(f));
 }
 
 /// 폴더 아래 걸린 파일 경로(기억 폴더를 디스크 대신 메모리에 둘 때 목록 보기)

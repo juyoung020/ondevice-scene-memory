@@ -34,8 +34,9 @@ mod walls;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Instant;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -156,7 +157,8 @@ struct State {
 
 /// An open /stream page and the versions it was last sent
 struct StreamClient {
-    s: TcpStream,
+    id: u64, // its connection
+
     vv: String,
     pv: String,
     bin: Option<delta::Client>, // /bstream: what this page has (sent only what is new for it)
@@ -447,6 +449,9 @@ struct ReqCtx {
     gzip: bool,                  // Accept-Encoding has gzip
     keep: bool,                  // keep the connection open after the reply (HTTP/1.1 default)
     if_none_match: Option<String>,
+    /// the reply is not written now: /stream · /bstream (Some(binary)) take over the connection, /api/search runs on the work pool
+    stream: Option<bool>,
+    search: Option<HashMap<String, String>>,
 }
 thread_local! { static REQ: std::cell::RefCell<ReqCtx> = std::cell::RefCell::new(ReqCtx::default()); }
 
@@ -477,7 +482,7 @@ fn gzip_cached(body: &[u8]) -> Arc<Vec<u8>> {
     z
 }
 
-fn respond(s: &mut TcpStream, code: u16, ctype: &str, extra: &str, body: &[u8]) {
+fn respond(s: &mut Vec<u8>, code: u16, ctype: &str, extra: &str, body: &[u8]) {
     let reason = match code {
         200 => "OK",
         204 => "No Content",
@@ -511,7 +516,7 @@ fn respond(s: &mut TcpStream, code: u16, ctype: &str, extra: &str, body: &[u8]) 
 }
 
 /// 200 with an ETag, or 304 when the browser already has this version
-fn respond_tagged<B: AsRef<[u8]>>(s: &mut TcpStream, ctype: &str, etag: &str, body: impl FnOnce() -> Option<B>) {
+fn respond_tagged<B: AsRef<[u8]>>(s: &mut Vec<u8>, ctype: &str, etag: &str, body: impl FnOnce() -> Option<B>) {
     let tag = format!("\"{}\"", etag);
     if REQ.with(|r| r.borrow().if_none_match.as_deref() == Some(tag.as_str())) {
         return respond(s, 304, ctype, &format!("ETag: {}\r\n", tag), b"");
@@ -523,7 +528,7 @@ fn respond_tagged<B: AsRef<[u8]>>(s: &mut TcpStream, ctype: &str, etag: &str, bo
 }
 
 /// Built-in page files: tag = content hash (computed once per asset)
-fn respond_static(s: &mut TcpStream, ctype: &str, body: &'static [u8]) {
+fn respond_static(s: &mut Vec<u8>, ctype: &str, body: &'static [u8]) {
     static TAGS: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
     let id = body.as_ptr() as usize;
     let tag = {
@@ -596,48 +601,7 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(p)
 }
 
-/// One connection: HTTP/1.1 keep-alive, so the page's requests (view on change, batched point files, object files) at
-/// load reuse one socket and one thread instead of a TCP handshake + thread spawn per request. Idle connections close after 5 s (a pool thread serves one connection at a time).
-fn handle(s: TcpStream, st: Arc<State>) {
-    let mut s = s;
-    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut rd = BufReader::new(s.try_clone().unwrap());
-    loop {
-        let mut line = String::new();
-        if rd.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let mut ctx = ReqCtx { keep: line.trim_end().ends_with("HTTP/1.1"), ..Default::default() };
-        loop {
-            let mut h = String::new();
-            if rd.read_line(&mut h).unwrap_or(0) <= 2 {
-                break;
-            }
-            let Some((k, v)) = h.split_once(':') else { continue };
-            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
-            match k.as_str() {
-                "accept-encoding" => ctx.gzip = v.split(',').any(|e| e.trim().split(';').next() == Some("gzip")),
-                "if-none-match" => ctx.if_none_match = Some(v.to_string()),
-                "connection" => {
-                    let v = v.to_ascii_lowercase();
-                    if v.contains("close") {
-                        ctx.keep = false;
-                    } else if v.contains("keep-alive") {
-                        ctx.keep = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        REQ.with(|r| *r.borrow_mut() = ctx);
-        handle_one(&mut s, &st, &line);
-        if !REQ.with(|r| r.borrow().keep) {
-            return;
-        }
-    }
-}
-
-fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
+fn handle_one(s: &mut Vec<u8>, st: &Arc<State>, line: &str) {
     let mut s = s;
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
@@ -671,7 +635,8 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
                 respond(&mut s, 200, "application/json", "", b"{\"ok\":false,\"why\":\"the folder is on disk already\"}")
             }
         }
-        "/api/search" => {
+        "/api/search" => REQ.with(|r| r.borrow_mut().search = Some(q)),
+        "/api/search-now" => {
             let Some(v) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") };
             let Some(view) = v.doc() else { return respond(&mut s, 500, "text/plain", "", b"view.json") };
             #[cfg(feature = "search")]
@@ -705,18 +670,8 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
             };
             respond(&mut s, 200, "application/json", "", body.as_bytes())
         }
-        "/bstream" => {
-            REQ.with(|r| r.borrow_mut().keep = false);
-            if let Ok(c) = s.try_clone() {
-                open_bstream(c, st);
-            }
-        }
-        "/stream" => {
-            REQ.with(|r| r.borrow_mut().keep = false); // the event stream owns this connection until the page goes away
-            if let Ok(c) = s.try_clone() {
-                open_stream(c, st);
-            }
-        }
+        "/bstream" => REQ.with(|r| r.borrow_mut().stream = Some(true)),
+        "/stream" => REQ.with(|r| r.borrow_mut().stream = Some(false)), // the event stream owns this connection until the page goes away
         "/api/view" => {
             let Some(v) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") }; // none yet or mid-write: next poll
             if q.get("v").is_some_and(|x| *x == v.ver) {
@@ -807,7 +762,7 @@ fn sse(event: &str, data: &str) -> String {
 }
 
 /// Button press: shared flag in one program, else a request file in the memory dir
-fn signal(s: &mut TcpStream, dir: &Path, req: &str, flag: fn()) {
+fn signal(s: &mut Vec<u8>, dir: &Path, req: &str, flag: fn()) {
     if common::control::wired() {
         flag();
         return respond(s, 200, "application/json", "", b"{\"ok\":true}");
@@ -818,137 +773,11 @@ fn signal(s: &mut TcpStream, dir: &Path, req: &str, flag: fn()) {
     }
 }
 
-fn open_stream(mut s: TcpStream, st: &Arc<State>) {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
-    if s.write_all(head.as_bytes()).is_err() {
-        return;
-    }
-    let _ = s.set_nodelay(true);
-    let _ = s.set_write_timeout(Some(Duration::from_secs(5))); // a stuck page is dropped instead of holding the others
-    st.streams.lock().unwrap().push(StreamClient { s, vv: String::new(), pv: String::new(), bin: None });
-    memfs::bump(); // the pusher sends the new page what it has now
-}
-
-/// Binary delta stream: no length, the body runs until the page goes away (read by the page's worker with fetch)
-fn open_bstream(mut s: TcpStream, st: &Arc<State>) {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n";
-    if s.write_all(head.as_bytes()).is_err() {
-        return;
-    }
-    let _ = s.set_nodelay(true);
-    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-    st.streams.lock().unwrap().push(StreamClient { s, vv: String::new(), pv: String::new(), bin: Some(delta::Client::default()) });
-    memfs::bump();
-}
-
 /// The current view version (the handed-over view, else view.json's)
 fn view_ver(st: &State) -> Option<String> {
     match live::current() {
         Some(v) => Some(v.ver.clone()),
         None => file_ver(&st.dir.join("view.json")),
-    }
-}
-
-fn stream_pusher(st: Arc<State>) {
-    let pp = st.dir.join("pose.json");
-    let mut seen = 0u64;
-    let mut quiet = std::time::Instant::now();
-    let mut last_other = u64::MAX;
-    loop {
-        // in one program every change bumps; a separate viewer also looks at the folder every 50 ms
-        let wait = if memfs::enabled() { Duration::from_secs(10) } else { Duration::from_millis(50) };
-        seen = memfs::wait_change(seen, wait);
-        let mut cl = st.streams.lock().unwrap();
-        if cl.is_empty() {
-            continue;
-        }
-        // pose.json 만 바뀜(장면 사이 위치 200 Hz): 위치만 보내고 view · 지도 · 점 목록은 보지 않음
-        let oth = memfs::other();
-        if memfs::enabled() && oth == last_other && quiet.elapsed() < Duration::from_secs(5) {
-            if let Some((v, b)) = memfs::get(&pp) {
-                let b = b.trim_ascii();
-                if b.starts_with(b"{") && b.ends_with(b"}") {
-                    let pose = Some((v.clone(), Arc::new(b.to_vec())));
-                    let e = std::str::from_utf8(b).ok().map(|t| sse("fpose", &t.replace('\n', " ")));
-                    cl.retain_mut(|c| match c.bin.as_mut() {
-                        Some(bc) => delta::pose_frame(bc, &pose).is_none_or(|f| c.s.write_all(&f).is_ok()),
-                        None => match &e {
-                            Some(e) if c.pv != v => {
-                                c.pv = v.clone();
-                                c.s.write_all(e.as_bytes()).is_ok()
-                            }
-                            _ => true,
-                        },
-                    });
-                }
-            }
-            continue;
-        }
-        last_other = oth;
-        let vv = view_ver(&st);
-        let pose = file_ver(&pp).and_then(|v| {
-            let t = read_file(&pp)?;
-            let t = std::str::from_utf8(t.trim_ascii()).ok()?;
-            // a half-written file is skipped; the next look sees it again
-            (t.starts_with('{') && t.ends_with('}')).then(|| (v, sse("fpose", &t.replace('\n', " "))))
-        });
-        let keep = quiet.elapsed() > Duration::from_secs(10);
-        let mut any = false;
-        // binary pages: the camera pose goes out first on its own (the view split / map / octree list below can take
-        // tens of ms when a new view arrives), then the view split once, the map and octree list read once, then a frame per page with only what it lacks
-        if cl.iter().any(|c| c.bin.is_some()) {
-            let pose = file_ver(&pp).and_then(|v| {
-                let t = read_file(&pp)?;
-                let b = t.trim_ascii();
-                (b.starts_with(b"{") && b.ends_with(b"}")).then(|| (v, Arc::new(b.to_vec())))
-            });
-            cl.retain_mut(|c| match c.bin.as_mut().and_then(|b| delta::pose_frame(b, &pose)) {
-                Some(f) => c.s.write_all(&f).is_ok(),
-                None => true,
-            });
-        }
-        let now = cl.iter().any(|c| c.bin.is_some()).then(|| {
-            let view = load_view(&st).and_then(|v| delta::parts(&st.parts, &v).map(|p| (v, p)));
-            let map = current_map(&st);
-            let oct = view.as_ref().and_then(|(_, p)| p.oct_ref()).and_then(|(run, path, ver)| delta::oct_idx(&st.octidx, &st.dir, run, &path, ver));
-            let pose = file_ver(&pp).and_then(|v| {
-                let t = read_file(&pp)?;
-                let b = t.trim_ascii();
-                (b.starts_with(b"{") && b.ends_with(b"}")).then(|| (v, Arc::new(b.to_vec())))
-            });
-            (view, map, oct, pose)
-        });
-        let hist = now.as_ref().map(|_| st.maps.lock().unwrap().vers.clone()).unwrap_or_default();
-        cl.retain_mut(|c| {
-            if let Some(b) = c.bin.as_mut() {
-                let (view, map, oct, pose) = now.as_ref().unwrap();
-                let n = delta::Now { view: view.clone(), map: map.clone(), map_hist: &hist, oct: oct.clone(), pose: pose.clone() };
-                let f = delta::frame(b, &n).or_else(|| keep.then(|| vec![0u8; 4]));
-                any |= f.is_some();
-                return f.is_none_or(|f| c.s.write_all(&f).is_ok());
-            }
-            let mut out = String::new();
-            if let Some(v) = &vv {
-                if *v != c.vv {
-                    out.push_str(&sse("vv", &serde_json::Value::String(v.clone()).to_string()));
-                    c.vv = v.clone();
-                }
-            }
-            if let Some((v, e)) = &pose {
-                if *v != c.pv {
-                    out.push_str(e);
-                    c.pv = v.clone();
-                }
-            }
-            if out.is_empty() && keep {
-                out.push_str(": keepalive\n\n");
-            }
-            any |= !out.is_empty();
-            out.is_empty() || c.s.write_all(out.as_bytes()).is_ok()
-        });
-        if any {
-            quiet = std::time::Instant::now();
-        }
     }
 }
 
@@ -982,79 +811,467 @@ impl Config {
     }
 }
 
-/// HTTP connection threads (the page opens up to 6 sockets per host)
-const HTTP_THREADS: usize = 8;
-
 /// 서버 실행(막힘): 뷰어 명령줄 인자(프로그램 이름 뺀 것, `ondevice view …`)
 pub fn run(args: Vec<String>) {
     serve(Config::parse(args))
 }
 
-/// 서버 실행(막힘): 읽어 둔 설정으로. `ondevice --serve` 는 이것을 스레드로 부른다
+/// 따로 띄운 뷰어(`ondevice view`): 서버 하나를 작은 루프로(스레드 없음). 폴더는 50 ms 마다 본다
 pub fn serve(c: Config) {
-    let Config { dir, port, bind, search_model, vocab, encode_vocab } = c;
-    #[cfg(not(feature = "search"))]
-    let _ = &vocab;
-    // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
-    if let Some((list, out)) = &encode_vocab {
-        #[cfg(feature = "search")]
-        match search_model.as_deref().ok_or("--encode-vocab needs --search-model <dir>".to_string()).and_then(|m| search::encode_vocab(Path::new(m), Path::new(list), Path::new(out))) {
-            Ok(n) => return eprintln!("{n} names → {out}"),
-            Err(e) => {
-                eprintln!("encode-vocab: {e}");
+    let mut poll = common::rt::Poll::new();
+    let w = poll.waker(0);
+    let Some(mut sv) = Server::new(c, w) else { return };
+    sv.register(&mut poll);
+    let mut toks = vec![];
+    loop {
+        poll.wait(&mut toks, Some(sv.timeout().unwrap_or(Duration::from_millis(50)).min(Duration::from_millis(50))));
+        for &t in &toks {
+            sv.event(t, &mut poll);
+        }
+        sv.tick(&mut poll);
+    }
+}
+
+/// 이 토큰부터는 뷰어 서버 몫(듣는 소켓, 그 위로 연결마다 하나)
+pub const TOKEN_BASE: u64 = 1 << 32;
+
+/// 연결 하나: 읽던 요청 바이트, 보낼 바이트(보낸 자리까지 버림), 마지막으로 무엇을 한 때
+struct Conn {
+    s: TcpStream,
+    inb: Vec<u8>,
+    out: Vec<u8>,
+    off: usize,
+    last: Instant,
+    keep: bool,
+    /// 이벤트 스트림(/stream · /bstream)이 쥔 연결
+    stream: bool,
+    /// 검색 답을 기다림(작업 풀)
+    busy: bool,
+    /// 쓸 자리를 기다리는 중(epoll 관심에 쓰기)
+    want_out: bool,
+}
+
+/// 뷰어 서버: 처리 루프의 epoll 에 듣는 소켓과 연결을 걸어 논블로킹으로 읽고 쓴다(스레드 없음).
+/// 요청 하나는 그 자리에서 답을 짓고(파일 바이트는 memfs 의 것), 글 검색(인코더)만 작업 풀에서 돌려 끝나면 루프를 깨운다.
+/// 이벤트 스트림(/stream · /bstream)은 memfs 가 바뀔 때(같은 프로세스: 걸 때 루프를 깨움, 따로 띄운 뷰어: 50 ms 마다 폴더) 페이지마다 새 것만 보낸다
+pub struct Server {
+    st: Arc<State>,
+    l: TcpListener,
+    conns: HashMap<u64, Conn>,
+    next: u64,
+    seen: u64,
+    last_other: u64,
+    quiet: Instant,
+    search: (std::sync::mpsc::Sender<(u64, Vec<u8>)>, std::sync::mpsc::Receiver<(u64, Vec<u8>)>),
+    waker: Arc<common::rt::Waker>,
+}
+
+impl Server {
+    /// 설정을 읽고 듣는 소켓을 연다. waker: 검색이 끝나거나 memfs 가 바뀌면 루프를 깨움. `--encode-vocab` 이면 그 일만 하고 None
+    pub fn new(c: Config, waker: Arc<common::rt::Waker>) -> Option<Server> {
+        let Config { dir, port, bind, search_model, vocab, encode_vocab } = c;
+        #[cfg(not(feature = "search"))]
+        let _ = &vocab;
+        // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>
+        if let Some((list, out)) = &encode_vocab {
+            #[cfg(feature = "search")]
+            match search_model.as_deref().ok_or("--encode-vocab needs --search-model <dir>".to_string()).and_then(|m| search::encode_vocab(Path::new(m), Path::new(list), Path::new(out))) {
+                Ok(n) => {
+                    eprintln!("{n} names → {out}");
+                    return None;
+                }
+                Err(e) => {
+                    eprintln!("encode-vocab: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "search"))]
+            {
+                eprintln!("encode-vocab {list} {out}: built without the search feature");
                 std::process::exit(1);
             }
         }
-        #[cfg(not(feature = "search"))]
-        {
-            eprintln!("encode-vocab {list} {out}: built without the search feature");
-            std::process::exit(1);
-        }
-    }
-    let dir = match dir {
-        Some(d) => PathBuf::from(d),
-        None => {
-            eprintln!("usage: sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <word vectors>]");
-            std::process::exit(2);
-        }
-    };
-    let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()),
-        parts: Mutex::new(None), octidx: Mutex::new(None),
-        #[cfg(feature = "search")]
-        text_src: search_model.clone().map(|m| (m, vocab.clone())),
-        #[cfg(feature = "search")]
-        text_enc: std::sync::OnceLock::new() });
-    let l = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {
-        eprintln!("cannot listen on {}:{}: {}", bind, port, e);
-        std::process::exit(1);
-    });
-    #[cfg(not(feature = "search"))]
-    if search_model.is_some() {
-        eprintln!("search: built without the search feature — searching by name only");
-    }
-    eprintln!("sgview: http://localhost:{}  (memory dir {})", port, st.dir.display());
-    {
-        let st2 = st.clone();
-        std::thread::Builder::new().name("sgview-stream".into()).spawn(move || stream_pusher(st2)).unwrap();
-    }
-    // a small fixed pool of connection threads: the page keeps a few keep-alive sockets (idle ones close after 5 s);
-    // /stream sockets go to the one pusher thread
-    let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
-    let rx = Arc::new(Mutex::new(rx));
-    for i in 0..HTTP_THREADS {
-        let (st, rx) = (st.clone(), rx.clone());
-        std::thread::Builder::new().name(format!("sgview-http{i}")).spawn(move || loop {
-            let c = rx.lock().unwrap().recv();
-            match c {
-                Ok(c) => handle(c, st.clone()),
-                Err(_) => return,
+        let dir = match dir {
+            Some(d) => PathBuf::from(d),
+            None => {
+                eprintln!("usage: sgview <memory_dir> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <word vectors>]");
+                std::process::exit(2);
             }
-        }).unwrap();
+        };
+        let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()),
+            parts: Mutex::new(None), octidx: Mutex::new(None),
+            #[cfg(feature = "search")]
+            text_src: search_model.clone().map(|m| (m, vocab.clone())),
+            #[cfg(feature = "search")]
+            text_enc: std::sync::OnceLock::new() });
+        let l = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {
+            eprintln!("cannot listen on {}:{}: {}", bind, port, e);
+            std::process::exit(1);
+        });
+        let _ = l.set_nonblocking(true);
+        #[cfg(not(feature = "search"))]
+        if search_model.is_some() {
+            eprintln!("search: built without the search feature — searching by name only");
+        }
+        eprintln!("sgview: http://localhost:{}  (memory dir {})", port, st.dir.display());
+        let w2 = waker.clone();
+        memfs::on_change(move || w2.wake());
+        Some(Server { st, l, conns: HashMap::new(), next: 0, seen: u64::MAX, last_other: u64::MAX, quiet: Instant::now(), search: std::sync::mpsc::channel(), waker })
     }
-    for c in l.incoming().flatten() {
-        let _ = c.set_nodelay(true);
-        let _ = tx.send(c);
+
+    /// 듣는 소켓을 루프 epoll 에 건다
+    pub fn register(&self, poll: &mut common::rt::Poll) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            poll.add_fd(self.l.as_raw_fd(), TOKEN_BASE, false);
+        }
+        let _ = poll;
     }
+
+    /// 다음에 봐야 할 때(쉬는 연결 닫기 5 초, 스트림 살아 있음 표시 10 초)
+    pub fn timeout(&self) -> Option<Duration> {
+        if self.conns.is_empty() {
+            return None;
+        }
+        let idle = self.conns.values().filter(|c| !c.stream && !c.busy).map(|c| Duration::from_secs(5).saturating_sub(c.last.elapsed())).min();
+        let keep = self.conns.values().any(|c| c.stream).then(|| Duration::from_secs(10).saturating_sub(self.quiet.elapsed()));
+        match (idle, keep) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// 루프가 받은 토큰 하나(이 서버 몫이 아니면 무시)
+    pub fn event(&mut self, tok: u64, poll: &mut common::rt::Poll) {
+        if tok < TOKEN_BASE {
+            return;
+        }
+        if tok == TOKEN_BASE {
+            self.accept(poll);
+            return;
+        }
+        let id = tok - TOKEN_BASE - 1;
+        self.read(id, poll);
+        self.flush(id, poll);
+    }
+
+    fn accept(&mut self, poll: &mut common::rt::Poll) {
+        while let Ok((c, _)) = self.l.accept() {
+            let _ = c.set_nonblocking(true);
+            let _ = c.set_nodelay(true);
+            let id = self.next;
+            self.next += 1;
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                poll.add_fd(c.as_raw_fd(), TOKEN_BASE + 1 + id, false);
+            }
+            self.conns.insert(id, Conn { s: c, inb: Vec::new(), out: Vec::new(), off: 0, last: Instant::now(), keep: true, stream: false, busy: false, want_out: false });
+        }
+        let _ = poll;
+    }
+
+    fn close(&mut self, id: u64, poll: &mut common::rt::Poll) {
+        if let Some(c) = self.conns.remove(&id) {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                poll.del_fd(c.s.as_raw_fd());
+            }
+            let _ = c;
+        }
+        let _ = poll;
+        self.st.streams.lock().unwrap().retain(|s| s.id != id);
+    }
+
+    /// 읽을 수 있는 만큼 읽고, 다 온 요청은 차례대로 답한다
+    fn read(&mut self, id: u64, poll: &mut common::rt::Poll) {
+        let Some(c) = self.conns.get_mut(&id) else { return };
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        loop {
+            match c.s.read(&mut buf) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => c.inb.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+        c.last = Instant::now();
+        if c.stream {
+            // 페이지가 스트림에 보내는 것은 없음: 닫혔는지만
+            c.inb.clear();
+            if eof {
+                self.close(id, poll);
+            }
+            return;
+        }
+        while !c.busy && c.keep {
+            let Some(end) = c.inb.windows(4).position(|w| w == b"\r\n\r\n") else { break };
+            let req: Vec<u8> = c.inb.drain(..end + 4).collect();
+            let text = String::from_utf8_lossy(&req);
+            let mut lines = text.split("\r\n");
+            let line = lines.next().unwrap_or("").to_string();
+            let mut ctx = ReqCtx { keep: line.trim_end().ends_with("HTTP/1.1"), ..Default::default() };
+            for h in lines {
+                let Some((k, v)) = h.split_once(':') else { continue };
+                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+                match k.as_str() {
+                    "accept-encoding" => ctx.gzip = v.split(',').any(|e| e.trim().split(';').next() == Some("gzip")),
+                    "if-none-match" => ctx.if_none_match = Some(v.to_string()),
+                    "connection" => {
+                        let v = v.to_ascii_lowercase();
+                        if v.contains("close") {
+                            ctx.keep = false;
+                        } else if v.contains("keep-alive") {
+                            ctx.keep = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            REQ.with(|r| *r.borrow_mut() = ctx);
+            let mut out = Vec::new();
+            handle_one(&mut out, &self.st, &line);
+            let ctx = REQ.with(|r| r.borrow().clone());
+            c.keep = ctx.keep;
+            if let Some(bin) = ctx.stream {
+                let head = if bin {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n"
+                };
+                c.out.extend_from_slice(head.as_bytes());
+                c.stream = true;
+                c.keep = true;
+                self.st.streams.lock().unwrap().push(StreamClient { id, vv: String::new(), pv: String::new(), bin: bin.then(delta::Client::default) });
+                self.seen = u64::MAX; // 새 페이지에 지금 있는 것을 보냄
+                break;
+            }
+            if let Some(q) = ctx.search {
+                // 글 인코더(보드 약 75 ms)는 작업 풀에서: 끝나면 답을 걸고 루프를 깨움
+                c.busy = true;
+                let (st, tx, w) = (self.st.clone(), self.search.0.clone(), self.waker.clone());
+                rayon::spawn(move || {
+                    REQ.with(|r| *r.borrow_mut() = ReqCtx { gzip: ctx.gzip, keep: ctx.keep, ..Default::default() });
+                    let mut out = Vec::new();
+                    let line = format!("GET /api/search-now?{} HTTP/1.1", q.iter().map(|(k, v)| format!("{k}={}", enc_uri(v))).collect::<Vec<_>>().join("&"));
+                    handle_one(&mut out, &st, &line);
+                    let _ = tx.send((id, out));
+                    w.wake();
+                });
+                break;
+            }
+            c.out.extend_from_slice(&out);
+        }
+        if eof && !c.busy {
+            c.keep = false;
+            if c.out.len() <= c.off {
+                self.close(id, poll);
+            }
+        }
+    }
+
+    /// 보낼 바이트를 쓸 수 있는 만큼(남으면 쓸 자리를 기다림, 다 썼고 닫을 연결이면 닫음)
+    fn flush(&mut self, id: u64, poll: &mut common::rt::Poll) {
+        let Some(c) = self.conns.get_mut(&id) else { return };
+        while c.off < c.out.len() {
+            match c.s.write(&c.out[c.off..]) {
+                Ok(0) => break,
+                Ok(n) => c.off += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.close(id, poll);
+                    return;
+                }
+            }
+        }
+        if c.off >= c.out.len() {
+            c.out.clear();
+            c.off = 0;
+        } else if c.off > (1 << 20) {
+            c.out.drain(..c.off);
+            c.off = 0;
+        }
+        let pending = !c.out.is_empty();
+        if pending != c.want_out {
+            c.want_out = pending;
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                poll.mod_fd(c.s.as_raw_fd(), TOKEN_BASE + 1 + id, pending);
+            }
+        }
+        if !pending && !c.keep && !c.busy {
+            self.close(id, poll);
+        }
+    }
+
+    /// 루프가 깰 때마다: 끝난 검색 답, 바뀐 것을 스트림 페이지에, 쉬는 연결 닫기
+    pub fn tick(&mut self, poll: &mut common::rt::Poll) {
+        while let Ok((id, out)) = self.search.1.try_recv() {
+            if let Some(c) = self.conns.get_mut(&id) {
+                c.out.extend_from_slice(&out);
+                c.busy = false;
+                c.last = Instant::now();
+                // 검색을 기다리는 동안 온 다음 요청
+                self.read(id, poll);
+                self.flush(id, poll);
+            }
+        }
+        let now = memfs::change();
+        let keepalive = self.quiet.elapsed() > Duration::from_secs(10);
+        let folder = !memfs::enabled(); // 따로 띄운 뷰어: 폴더를 볼 때마다
+        if now != self.seen || keepalive || folder {
+            self.seen = now;
+            self.push_streams(keepalive);
+        }
+        let idle: Vec<u64> = self.conns.iter().filter(|(_, c)| !c.stream && !c.busy && c.last.elapsed() > Duration::from_secs(5)).map(|(k, _)| *k).collect();
+        for id in idle {
+            self.close(id, poll);
+        }
+        // 스트림이 막힌 페이지(보낼 바이트 32 MB 넘게 쌓임)는 끊음: 다른 페이지를 붙잡지 않게
+        let stuck: Vec<u64> = self.conns.iter().filter(|(_, c)| c.out.len() - c.off > (32 << 20)).map(|(k, _)| *k).collect();
+        for id in stuck {
+            self.close(id, poll);
+        }
+        let ids: Vec<u64> = self.conns.iter().filter(|(_, c)| c.out.len() > c.off).map(|(k, _)| *k).collect();
+        for id in ids {
+            self.flush(id, poll);
+        }
+    }
+
+    /// 열린 스트림 페이지마다 새 것만: pose.json 만 바뀌었으면 위치만, 아니면 view 판 · 지도 · 점 목록까지
+    fn push_streams(&mut self, keepalive: bool) {
+        let st = self.st.clone();
+        let pp = st.dir.join("pose.json");
+        let mut cl = st.streams.lock().unwrap();
+        if cl.is_empty() {
+            return;
+        }
+        let conns = &mut self.conns;
+        let mut send = |id: u64, b: &[u8]| {
+            if let Some(c) = conns.get_mut(&id) {
+                c.out.extend_from_slice(b);
+            }
+        };
+        // pose.json 만 바뀜(장면 사이 위치 200 Hz): 위치만 보내고 view · 지도 · 점 목록은 보지 않음
+        let oth = memfs::other();
+        if memfs::enabled() && oth == self.last_other && !keepalive {
+            if let Some((v, b)) = memfs::get(&pp) {
+                let b = b.trim_ascii();
+                if b.starts_with(b"{") && b.ends_with(b"}") {
+                    let pose = Some((v.clone(), Arc::new(b.to_vec())));
+                    let e = std::str::from_utf8(b).ok().map(|t| sse("fpose", &t.replace('\n', " ")));
+                    for c in cl.iter_mut() {
+                        match c.bin.as_mut() {
+                            Some(bc) => {
+                                if let Some(f) = delta::pose_frame(bc, &pose) {
+                                    send(c.id, &f);
+                                }
+                            }
+                            None => {
+                                if let Some(e) = &e {
+                                    if c.pv != v {
+                                        c.pv = v.clone();
+                                        send(c.id, e.as_bytes());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.quiet = Instant::now();
+                }
+            }
+            return;
+        }
+        self.last_other = oth;
+        let vv = view_ver(&st);
+        let pose_t = file_ver(&pp).and_then(|v| {
+            let t = read_file(&pp)?;
+            let b = t.trim_ascii();
+            (b.starts_with(b"{") && b.ends_with(b"}")).then(|| (v, Arc::new(b.to_vec())))
+        });
+        let pose_sse = pose_t.as_ref().and_then(|(v, b)| std::str::from_utf8(b).ok().map(|t| (v.clone(), sse("fpose", &t.replace('\n', " ")))));
+        let mut any = false;
+        // binary pages: the camera pose goes out first on its own, then the view split once, the map and octree list read once, then a frame per page with only what it lacks
+        let has_bin = cl.iter().any(|c| c.bin.is_some());
+        if has_bin {
+            for c in cl.iter_mut() {
+                if let Some(f) = c.bin.as_mut().and_then(|b| delta::pose_frame(b, &pose_t)) {
+                    send(c.id, &f);
+                }
+            }
+        }
+        let now = has_bin.then(|| {
+            let view = load_view(&st).and_then(|v| delta::parts(&st.parts, &v).map(|p| (v, p)));
+            let map = current_map(&st);
+            let oct = view.as_ref().and_then(|(_, p)| p.oct_ref()).and_then(|(run, path, ver)| delta::oct_idx(&st.octidx, &st.dir, run, &path, ver));
+            (view, map, oct, pose_t.clone())
+        });
+        let hist = now.as_ref().map(|_| st.maps.lock().unwrap().vers.clone()).unwrap_or_default();
+        for c in cl.iter_mut() {
+            if let Some(b) = c.bin.as_mut() {
+                let (view, map, oct, pose) = now.as_ref().unwrap();
+                let n = delta::Now { view: view.clone(), map: map.clone(), map_hist: &hist, oct: oct.clone(), pose: pose.clone() };
+                if let Some(f) = delta::frame(b, &n).or_else(|| keepalive.then(|| vec![0u8; 4])) {
+                    any = true;
+                    send(c.id, &f);
+                }
+                continue;
+            }
+            let mut out = String::new();
+            if let Some(v) = &vv {
+                if *v != c.vv {
+                    out.push_str(&sse("vv", &serde_json::Value::String(v.clone()).to_string()));
+                    c.vv = v.clone();
+                }
+            }
+            if let Some((v, e)) = &pose_sse {
+                if *v != c.pv {
+                    out.push_str(e);
+                    c.pv = v.clone();
+                }
+            }
+            if out.is_empty() && keepalive {
+                out.push_str(": keepalive\n\n");
+            }
+            any |= !out.is_empty();
+            if !out.is_empty() {
+                send(c.id, out.as_bytes());
+            }
+        }
+        if any {
+            self.quiet = Instant::now();
+        }
+    }
+
+    /// 열린 연결 수(계측)
+    pub fn conns(&self) -> usize {
+        self.conns.len()
+    }
+}
+
+/// 검색어를 다시 요청 줄로(풀에서 같은 처리기를 부를 때)
+fn enc_uri(v: &str) -> String {
+    let mut o = String::new();
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
+    }
+    o
 }
 
 #[cfg(test)]

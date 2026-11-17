@@ -55,6 +55,19 @@ pub fn apply(nice: i32, mask: u64) {
     let _ = (nice, mask);
 }
 
+/// 지금 스레드의 nice 만 바꿈(코어 묶음은 그대로): 풀 일꾼이 긴 줄 일을 도는 동안만 낮출 때
+pub fn set_nice(nice: i32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+            fn gettid() -> i32;
+        }
+        setpriority(0, gettid() as u32, nice);
+    }
+    let _ = nice;
+}
+
 /// 지금 스레드 id(리눅스, 다른 곳은 0)
 pub fn tid() -> i32 {
     #[cfg(target_os = "linux")]

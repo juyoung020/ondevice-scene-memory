@@ -412,7 +412,8 @@ pub struct OdometryKlt {
     /// 마지막 키프레임 특징과 그때 위치(광류가 끊겼을 때 되찾기)
     kf: Option<(Features, Tf)>,
     kf_t: f64,
-    desc_tx: Option<std::sync::mpsc::Sender<DescJob>>,
+    /// 기술자 일(가장 새 것만 볼 줄)과 기술자 줄(작업 풀): 줄 상태 = (받는 쪽, 결과 보낼 곳)
+    desc_tx: Option<(std::sync::mpsc::Sender<DescJob>, common::rt::SharedLane<(std::sync::mpsc::Receiver<DescJob>, std::sync::mpsc::Sender<(Features, Tf)>)>)>,
     desc_rx: Option<std::sync::mpsc::Receiver<(Features, Tf)>>,
     /// 되찾기용 기술자를 새로 뽑는 최소 간격(초)
     desc_every: f64,
@@ -573,7 +574,8 @@ impl OdometryKlt {
             // 기술자는 일꾼 스레드에서(되찾기에만 쓰여 한두 장 늦어도 됨): 여기선 GFTT·3D 점만, 회색조 사본과 깊이(나눠 듦)를 넘김
             let kps = self.ext.detect(f);
             let pts3d = self.ext.keypoints_3d(f, &kps);
-            let _ = self.desc_tx.as_ref().unwrap().send(DescJob {
+            let (dtx, lane) = self.desc_tx.as_ref().unwrap();
+            let _ = dtx.send(DescJob {
                 gray: f.gray.clone(),
                 depth: f.depth_mm.clone(),
                 cam: f.cam.clone(),
@@ -581,6 +583,18 @@ impl OdometryKlt {
                 pose: self.pose,
                 min_depth: self.min_depth,
                 max_depth: self.max_depth,
+            });
+            lane.push(|(rx, rtx)| {
+                // 쌓였으면 가장 최근 것만
+                let Some(mut j) = rx.try_recv().ok() else { return };
+                while let Ok(n) = rx.try_recv() {
+                    j = n;
+                }
+                let (w, h) = (j.cam.width as usize, j.cam.height as usize);
+                let mut kps = j.kps;
+                let desc = crate::features::describe_oriented(&j.gray, w, h, &mut kps, j.cam.oriented);
+                let pts3d = keypoints_3d(&j.depth, &j.cam, &kps, j.min_depth, j.max_depth);
+                let _ = rtx.send((Features { kps, pts3d, desc }, j.pose));
             });
             self.kf_t = f.t;
             Features { kps, pts3d, desc: Vec::new() }
@@ -619,30 +633,15 @@ impl OdometryKlt {
         }
     }
 
-    /// 실시간 입력: 키프레임 기술자를 일꾼 스레드에서 뽑음(재생은 결정적이게 그 자리에서)
+    /// 실시간 입력: 키프레임 기술자를 작업 풀(기술자 줄)에서 뽑음(재생은 결정적이게 그 자리에서). 쌓였으면 가장 최근 것만
     pub fn set_async_desc(&mut self) {
         if self.desc_tx.is_some() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel::<DescJob>();
         let (rtx, rrx) = std::sync::mpsc::channel::<(Features, Tf)>();
-        std::thread::spawn(move || {
-            common::threads::apply(5, 0); // 위치 추적보다 뒤
-            while let Ok(mut j) = rx.recv() {
-                // 쌓였으면 가장 최근 것만
-                while let Ok(n) = rx.try_recv() {
-                    j = n;
-                }
-                let (w, h) = (j.cam.width as usize, j.cam.height as usize);
-                let mut kps = j.kps;
-                let desc = crate::features::describe_oriented(&j.gray, w, h, &mut kps, j.cam.oriented);
-                let pts3d = keypoints_3d(&j.depth, &j.cam, &kps, j.min_depth, j.max_depth);
-                if rtx.send((Features { kps, pts3d, desc }, j.pose)).is_err() {
-                    break;
-                }
-            }
-        });
-        self.desc_tx = Some(tx);
+        let lane = common::rt::SharedLane::new("desc", (rx, rtx), 5, None);
+        self.desc_tx = Some((tx, lane));
         self.desc_rx = Some(rrx);
     }
 

@@ -13,11 +13,14 @@ mod geom;
 mod graph;
 mod kfstore;
 mod maps;
+#[cfg(feature = "dxrt")]
+mod npu_test;
 mod out;
 mod rooms;
 mod seg;
 mod segsim;
 mod stream;
+mod thermal;
 mod tum;
 
 use depth::Depth;
@@ -46,9 +49,6 @@ struct Args {
     seg_cache: Option<PathBuf>, // --seg-cache DIR: 보드 흉내, 장면별 분할 결과를 폴더에 남기고 있으면 읽어 씀(추론이 코어를 쓰지 않음)
     seg_cpu_ms: f64,    // --seg-cpu-ms M: --seg-cache 로 읽어 온 장면마다 읽기 스레드가 M ms 코어를 붙잡음(보드 분할의 CPU 전·후처리 몫)
     stream_rate: f64,   // --stream-rate R: 스트림을 찍은 시각대로 R 배속으로 내보냄(0 = 최대 속도), 밀림(지연) 기록
-    seg_min_ms: f64,    // --seg-min-ms M: 분할 한 번(전처리 + 추론 + 후처리)이 적어도 M ms 걸린 것처럼, 모자란 만큼 추론 단계에서 기다림(보드 분할 97 ms 흉내)
-    infer_min_ms: f64,  // --infer-min-ms N: 분할 추론 단계만 적어도 N ms 걸린 것처럼 기다림(보드 NPU 추론 시간 흉내; 전·후처리는 --slow 배)
-    seg_pipe: bool,     // --seg-pipe off: 스트림 분할의 전처리 → 추론 → 후처리를 읽기 스레드 하나에서 차례로(기본: 단계마다 스레드를 두어 서로 겹침)
     seg_check: usize,   // --seg-check N: 지도는 만들지 않고, 스트림 분할 장면 N 장에 전·후처리를 기준 구현과 견줌(결과 같음 여부 + 시간)
     serve: Option<sgview::Config>, // --serve "<포트> [뷰어 인자...]": 뷰어 서버를 같은 프로세스에서(기억 폴더에 쓴 파일은 메모리로)
     save_every: f64,       // --save-every S: --serve 의 메모리 기억 폴더를 S 초마다 디스크에(0 = 끝에만, 뷰어 저장 버튼은 언제나)
@@ -68,6 +68,7 @@ struct Args {
     vocab: Option<String>,  // --vocab <글 벡터 파일>: 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(--embed 와 함께, 파일은 sgview --encode-vocab 이 만듦)
     structural: Option<String>, // --structural <글 벡터 파일>: 벽 · 바닥 · 천장 판정 표(기본 vocab/structural.voc, 사진 벡터가 있어야)
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
+    pool: usize,            // --pool N: 작업 풀 일꾼 수(기본 3, 펼치기 · 줄 일이 모두 여기서)
 }
 
 /// 명령줄을 처음에 한 번 읽는다: 물체 기억 설정 + 묶음 인자(--slam · --serve)는 각 프로그램의 설정으로 바로 읽어 둔다(잘못된 인자는 스레드를 띄우기 전에 멈춤)
@@ -91,11 +92,8 @@ fn args(v: &common::cli::Argv) -> Args {
         threads: get("--threads").unwrap_or("auto".into()),
         slow: get("--slow").map_or(1.0, |s| s.parse().unwrap()),
         stream_rate: get("--stream-rate").map_or(0.0, |s| s.parse().unwrap()),
-        seg_min_ms: get("--seg-min-ms").map_or(0.0, |s| s.parse().unwrap()),
         seg_cache: get("--seg-cache").map(Into::into),
         seg_cpu_ms: get("--seg-cpu-ms").map_or(0.0, |s| s.parse().unwrap()),
-        infer_min_ms: get("--infer-min-ms").map_or(0.0, |s| s.parse().unwrap()),
-        seg_pipe: get("--seg-pipe").is_none_or(|s| s != "off") && get("--seg-cache").is_none(), // --seg-cache 는 분할 한 번을 통째로 읽어 오므로 차례 실행
         seg_check: get("--seg-check").map_or(0, |s| s.parse().unwrap()),
         serve: v.group("--serve").map(|g| {
             let mut it = g.into_iter();
@@ -124,6 +122,7 @@ fn args(v: &common::cli::Argv) -> Args {
         no_level: v.flag("--no-level"),
         rebuild_every: if v.flag("--no-rebuild") { -1.0 } else { get("--rebuild-every").map_or(5.0, |s| s.parse().unwrap()) },
         kf_store_mb: get("--kf-store-mb").map_or_else(kf_store_default_mb, |s| s.parse().unwrap()),
+        pool: get("--pool").map_or(3, |s| s.parse().unwrap()),
     }
 }
 
@@ -443,12 +442,12 @@ struct Frame {
     no_map: bool,     // 스트림: 위치만(IMU 로 이어 붙인 구간 · 영상이 IMU 와 어긋난 뒤), 지도 · 물체 · 보관에 넣지 않음
     anchor: u32,      // 스트림: 기준 지도 노드 id(0 = 없음)
     graph: Vec<stream::Node>, // 스트림: 이 장면 앞에 온 그래프 블록 노드
-    t_in: Option<Instant>,    // 스트림: 읽기 스레드가 받은 때
+    t_in: Option<Instant>,    // 스트림: 루프가 받은 때
     t_ready: Option<Instant>, // 스트림: 분할 단계를 마친 때
 }
 
 /// 스트림 분할 단계별 걸린 시간 합(초)과 분할 횟수, 분할한 구간의 벽시계 길이(초).
-/// infer = 올린 때부터 결과까지(비동기면 NPU 에 있던 시간), sub = 올리기 호출, npu = 받기 스레드가 결과를 기다리며 멈춘 시간
+/// infer = 올린 때부터 결과까지(비동기면 NPU 에 있던 시간), sub = 올리기 호출, npu = 끝 알림을 받고 결과를 맞추는 데 쓴 시간
 #[derive(Default, Clone, Copy)]
 struct SegStages {
     pre: f64,
@@ -472,46 +471,12 @@ struct SegJob {
     t_front: f64, // 고른 뒤 전처리 끝까지(깊이 변환 + 전처리)
     t: [f64; 3],  // 전처리, 추론, 후처리
     t_sub: f64,   // 올리기 호출
-    t_npu: f64,   // 받기 스레드가 결과를 기다린 시간
-    t_in: Instant, // 읽기 스레드가 장면을 받은 때(장면 지연 재기)
-}
-
-/// 분할 단계 2 — 모델 호출: 분할 추론. 한 장씩 차례로 부른다(`--npu-jobs` 로 여러 장을 함께 올릴 때는 스트림 쪽에서 올리기·받기를 나눠 한다).
-struct InferStage {
-    seg: Box<dyn seg::Segmenter + Send>,
-    infer_min: f64, // --infer-min-ms(초)
-    seg_min: f64,   // --seg-min-ms(초)
-    conf: f32,
-    stats: std::sync::Arc<std::sync::Mutex<SegStages>>,
-}
-impl InferStage {
-    fn run(&mut self, j: &mut SegJob) {
-        if j.sf.lost() {
-            return;
-        }
-        let (rgb, w, h) = (&j.sf.rgb[..], j.sf.w, j.sf.h);
-        let seg = &mut self.seg;
-        // 흉내: 추론만 N ms, 또는 셋 합이 M ms 가 되게(후처리는 지금까지 평균으로 어림)
-        let post_est = { let s = common::prof::lock(&self.stats, common::prof::W::LockSegStats); if s.n > 0 { s.post / s.n as f64 } else { 0.0 } };
-        let want = self.infer_min.max(self.seg_min - j.t_front - post_est);
-        let (do_seg, bufs, direct, conf, c_all) = (j.do_seg, &mut j.bufs, &mut j.dets, self.conf, Instant::now());
-        if do_seg {
-                let c = Instant::now();
-                *direct = seg.direct(rgb, w, h, conf);
-                if direct.is_none() {
-                    seg.infer(&bufs.0, &mut bufs.1);
-                }
-                let pad = want - c.elapsed().as_secs_f64();
-                if pad > 0.0 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(pad));
-                }
-        }
-        j.t[1] = c_all.elapsed().as_secs_f64();
-    }
+    t_npu: f64,   // 끝 알림 뒤 결과 맞추기
+    t_in: Instant, // 루프가 장면을 받은 때(장면 지연 재기)
 }
 
 /// 분할 단계 3 — 후처리: 마스크 해독, 본 스레드에 넘길 장면으로 묶음. 버퍼는 돌려준다.
-fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>) -> (Frame, (seg::SegIn, seg::SegRaw)) {
+fn seg_stage_post(mut j: SegJob, conf: f32, s: &mut SegStages) -> (Frame, (seg::SegIn, seg::SegRaw)) {
     let (w, h, lost, held, gravity, no_map) = (j.sf.w, j.sf.h, j.sf.lost(), j.sf.held(), j.sf.gravity(), j.sf.no_map());
     let held_live = j.sf.held_live();
     let dets = j.do_seg.then(|| {
@@ -519,7 +484,6 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
         let d = j.dets.take().unwrap_or_else(|| seg::seg_post(&j.bufs.1, j.bufs.0.geom, w, h, conf));
         out::slow(c);
         j.t[2] = c.elapsed().as_secs_f64();
-        let mut s = common::prof::lock(stats, common::prof::W::LockSegStats);
         (s.pre, s.infer, s.post, s.sub, s.npu, s.n) = (s.pre + j.t[0], s.infer + j.t[1], s.post + j.t[2], s.sub + j.t_sub, s.npu + j.t_npu, s.n + 1);
         d
     });
@@ -529,13 +493,513 @@ fn seg_stage_post(mut j: SegJob, conf: f32, stats: &std::sync::Mutex<SegStages>)
     (f, j.bufs)
 }
 
-/// 본 스레드가 받아 간 장면 수(분할 단계가 다음 장면을 언제 고를지 정하는 데 씀)
-#[derive(Default)]
-struct Taken {
-    n: std::sync::Mutex<u64>,
-    cv: std::sync::Condvar,
-    dead: std::sync::atomic::AtomicBool, // 본 스레드가 끝나 더 받지 않음
+/// 처리 루프가 잠드는 곳 · 깨우개 · NPU 끝 줄 · 저장 시각(실행마다 같은 것: 리셋으로 run 을 다시 불러도 그대로)
+struct LoopIo {
+    poll: common::rt::Poll,
+    /// 장면 입력(같은 프로세스 위치 프로그램의 큐)이 깨움
+    w_in: std::sync::Arc<common::rt::Waker>,
+    /// 뷰어 버튼 · 뷰 줄이 깨움
+    w_misc: std::sync::Arc<common::rt::Waker>,
+    /// IMU 표본이 깨움(뷰어가 있는 IMU 모드 실시간)
+    w_imu: std::sync::Arc<common::rt::Waker>,
+    /// 장면 사이 위치를 낼 pose.json
+    fast_out: Option<PathBuf>,
+    /// 뷰어 서버(--serve): 듣는 소켓 · 연결이 이 루프 epoll 에
+    server: Option<sgview::Server>,
+    /// 비상 열 보호(선택 일만 줄임)
+    thermal: thermal::Thermal,
+    npu_tx: common::rt::DoneTx<u64>,
+    npu_rx: common::rt::DoneRx<u64>,
+    /// 분할 실행기가 비동기(올리고 끝 알림을 받음)인지
+    seg_async: bool,
+    toks: Vec<u64>,
+    out: PathBuf,
+    save_every: f64,
+    last_save: Instant,
+    /// 계측: 루프 한 바퀴(깬 뒤 다시 잠들 때까지) 시간
+    turns: u64,
+    turn_max: f32,
+    turn_sum: f64,
+    turn_t0: Option<Instant>,
 }
+
+const T_IN: u64 = 1;
+const T_NPU: u64 = 2;
+const T_MISC: u64 = 3;
+const T_IMU: u64 = 4;
+
+impl LoopIo {
+    fn new(a: &Args, argv: &common::cli::Argv) -> LoopIo {
+        let mut poll = common::rt::Poll::new();
+        let w_in = poll.waker(T_IN);
+        let w_npu = poll.waker(T_NPU);
+        let w_misc = poll.waker(T_MISC);
+        let w_imu = poll.waker(T_IMU);
+        let (npu_tx, npu_rx) = common::rt::done(w_npu);
+        let wm = w_misc.clone();
+        common::control::on_signal(move || wm.wake());
+        LoopIo { poll, w_in, w_misc, w_imu, fast_out: None, server: None, thermal: thermal::Thermal::from_args(argv), npu_tx, npu_rx, seg_async: false, toks: vec![], out: a.out.clone(), save_every: if a.serve.is_some() { a.save_every } else { 0.0 },
+                 last_save: Instant::now(), turns: 0, turn_max: 0.0, turn_sum: 0.0, turn_t0: None }
+    }
+    fn waker(&self) -> std::sync::Arc<common::rt::Waker> {
+        self.w_misc.clone()
+    }
+    /// 할 일이 생길 때까지 잠듦(timeout: 다음 마감). 저장 마감도 함께
+    fn sleep(&mut self, timeout: Option<std::time::Duration>) {
+        if let Some(c) = self.turn_t0.take() {
+            let ms = c.elapsed().as_secs_f32() * 1e3;
+            (self.turns, self.turn_sum, self.turn_max) = (self.turns + 1, self.turn_sum + ms as f64, self.turn_max.max(ms));
+        }
+        let save = (self.save_every > 0.0).then(|| std::time::Duration::from_secs_f64((self.save_every - self.last_save.elapsed().as_secs_f64()).max(0.0)));
+        let t = match (timeout, save) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let min = |a: Option<std::time::Duration>, b: Option<std::time::Duration>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let t = min(min(t, self.server.as_ref().and_then(|s| s.timeout())), self.thermal.timeout());
+        let mut toks = std::mem::take(&mut self.toks);
+        self.poll.wait(&mut toks, t);
+        if let Some(sv) = self.server.as_mut() {
+            for &k in &toks {
+                sv.event(k, &mut self.poll);
+            }
+        }
+        self.toks = toks;
+        self.turn_t0 = Some(Instant::now());
+    }
+    /// 뷰어 저장 버튼 · --save-every: 메모리 기억 폴더를 디스크에(기록 줄에서, 루프는 기다리지 않음)
+    fn misc(&mut self) {
+        if let Some(sv) = self.server.as_mut() {
+            sv.tick(&mut self.poll);
+        }
+        // 비상 열 보호: 1 단 = MegaLoc 간격 늘림(모듈이 들어오면), 2 단 = 사진 벡터 묶음 늦춤. 분할 · 위치 추적은 그대로
+        if let Some(l) = self.thermal.check() {
+            embed::throttle(l >= 2);
+            common::info!("열 보호 {l} 단: {}", self.thermal.json());
+        }
+        let due = self.save_every > 0.0 && self.last_save.elapsed().as_secs_f64() >= self.save_every;
+        if common::control::take_save() || due {
+            self.last_save = Instant::now();
+            let dir = self.out.clone();
+            let job = move || {
+                let c = Instant::now();
+                let n = out::save(&dir);
+                common::info!("기억 폴더 저장: 파일 {n} 개, {:.2} 초", c.elapsed().as_secs_f64());
+            };
+            match out::io_lane() {
+                Some(l) => l.push(move |_| job()),
+                None => job(),
+            }
+        }
+    }
+    fn json(&self) -> serde_json::Value {
+        json!({"turns": self.turns, "turn_ms_mean": self.turn_sum / self.turns.max(1) as f64, "turn_ms_max": self.turn_max, "sleeps": self.poll.sleeps, "thermal": self.thermal.json()})
+    }
+}
+
+/// 줄에 맡긴 일 하나의 결과(끝났는지 보기 · 기다려 받기)
+struct Pending<T> {
+    rx: std::sync::mpsc::Receiver<T>,
+    got: Option<T>,
+}
+impl<T: Send + 'static> Pending<T> {
+    fn on(lane: &mut common::rt::Lane<()>, f: impl FnOnce() -> T + Send + 'static) -> Pending<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        lane.push(move |_| {
+            let _ = tx.send(f());
+        });
+        Pending { rx, got: None }
+    }
+    fn is_finished(&mut self) -> bool {
+        if self.got.is_none() {
+            self.got = self.rx.try_recv().ok();
+        }
+        self.got.is_some()
+    }
+    fn join(mut self) -> T {
+        self.got.take().unwrap_or_else(|| self.rx.recv().expect("줄 일"))
+    }
+}
+
+/// 분할 길에 들어간 장면의 자리
+enum FlSt {
+    /// 분할 결과까지 다 있음(분할 안 함 · 동기 실행기)
+    Ready,
+    /// NPU 자리를 기다림
+    Wait,
+    /// NPU 에 올림: (작업 번호, 표, 올린 때)
+    Npu(i32, u64, Instant),
+    /// NPU 끝 알림을 받음
+    Done(i32, Instant),
+}
+
+/// 장면 입력 · 분할 올리기 · 받기를 처리 루프 안에서: 장면마다 (분할 차례면) 전처리해 NPU 자리가 나면 올리고, 끝 알림이 오면
+/// 올린 차례대로 후처리해 본 처리(물체 기억)에 넘긴다. NPU 를 기다리는 동안 루프는 잠들고(끝 알림 · 새 장면이 깨움) 다른 장면 일을 한다
+struct Driver {
+    seg: Box<dyn seg::Segmenter + Send>,
+    seg_async: bool,
+    rd: Option<stream::StreamReader>,
+    first: Option<stream::StreamFrame>,
+    /// --stream-rate: 아직 때가 안 된 장면
+    held: Option<stream::StreamFrame>,
+    ended: bool,
+    pace0: Instant,
+    pace_t0: f64,
+    rate: f64,
+    lag_on: bool,
+    drop_late: bool,
+    k0: [f64; 4],
+    pose_out: Option<PathBuf>,
+    n: usize,
+    n_corr: u32,
+    n_seg: usize,
+    dropped: u32,
+    graph: Vec<stream::Node>,
+    last_seg: Option<([f64; 3], [[f64; 3]; 3], usize)>,
+    bufs: Vec<(seg::SegIn, seg::SegRaw)>,
+    q: std::collections::VecDeque<(SegJob, FlSt)>,
+    jobs: usize,
+    busy: usize,
+    tag: u64,
+    stats: SegStages,
+    c_seg0: Option<Instant>,
+    t_got: Instant,
+    want: Option<Instant>,
+    read_s: f64,
+}
+
+impl Driver {
+    #[allow(clippy::too_many_arguments)]
+    fn new(a: &Args, seg: Box<dyn seg::Segmenter + Send>, rd: Option<stream::StreamReader>, first: Option<stream::StreamFrame>, pace0: Instant, pace_t0: f64, lag_on: bool, io: &LoopIo) -> Driver {
+        let jobs = if io.seg_async { a.npu_jobs.min(seg.max_jobs()).max(1) } else { 1 };
+        Driver {
+            seg_async: io.seg_async,
+            seg,
+            k0: first.as_ref().map_or([0.0; 4], |f| f.k),
+            rd,
+            first,
+            held: None,
+            ended: false,
+            pace0,
+            pace_t0,
+            rate: a.stream_rate,
+            lag_on,
+            drop_late: !a.no_drop,
+            pose_out: (a.live > 0.0).then(|| a.out.join("pose.json")),
+            n: 0,
+            n_corr: 0,
+            n_seg: 0,
+            dropped: 0,
+            graph: vec![],
+            last_seg: None,
+            bufs: vec![],
+            q: Default::default(),
+            jobs,
+            busy: 0,
+            tag: 0,
+            stats: SegStages::default(),
+            c_seg0: None,
+            t_got: Instant::now(),
+            want: None,
+            read_s: 0.0,
+        }
+    }
+
+    /// 루프: 입력이 끝나고 분할 길이 빌 때까지. 돌려줌: 분할 실행기(다음 실행 · 리셋이 이어 씀)
+    fn run(mut self, a: &Args, seq: &tum::Tum, io: &mut LoopIo, body: &mut dyn FnMut(Option<Frame>)) -> Box<dyn seg::Segmenter + Send> {
+        if self.rd.is_none() {
+            self.run_tum(a, seq, body);
+            return self.seg;
+        }
+        loop {
+            let mut progress = false;
+            // NPU 끝 알림
+            for tag in io.npu_rx.try_iter() {
+                if let Some(f) = self.q.iter_mut().find(|f| matches!(f.1, FlSt::Npu(_, t, _) if t == tag)) {
+                    if let FlSt::Npu(id, _, c) = f.1 {
+                        f.1 = FlSt::Done(id, c);
+                    }
+                }
+            }
+            // 앞 장면부터 차례로 본 처리(물체 기억)
+            while self.q.front().is_some_and(|f| matches!(f.1, FlSt::Ready | FlSt::Done(..))) {
+                let (job, st) = self.q.pop_front().unwrap();
+                let f = self.finish(job, st, a.conf);
+                body(Some(f));
+                progress = true;
+            }
+            self.submit_waiting(a.conf);
+            if let Some(rd) = self.rd.as_mut() {
+                rd.service(); // 실시간: 준비된 카메라 장면은 모두 위치 추적에
+            }
+            if !self.ended {
+                progress |= self.pull(a);
+            }
+            io.misc();
+            if let (Some(pp), Some(rd)) = (io.fast_out.as_ref(), self.rd.as_ref()) {
+                if let Some((t, ts, twc)) = rd.fast_pose() {
+                    fast_pose(pp, t, ts, &twc);
+                }
+            }
+            body(None);
+            if self.ended && self.q.is_empty() {
+                break;
+            }
+            if progress {
+                continue;
+            }
+            let timeout = self.held.as_ref().map(|sf| std::time::Duration::from_secs_f64(((sf.t - self.pace_t0) / self.rate - self.pace0.elapsed().as_secs_f64()).max(0.0)))
+                .or_else(|| self.rd.as_ref().and_then(|r| r.due()));
+            io.sleep(timeout);
+        }
+        // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
+        if let Some(rd) = self.rd.as_mut() {
+            self.graph.append(&mut rd.take_graph());
+        }
+        if !self.graph.is_empty() {
+            let graph = std::mem::take(&mut self.graph);
+            body(Some(Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, held_live: false, gravity: false, no_map: false, anchor: 0, graph, t_in: None, t_ready: None }));
+        }
+        let (n, n_corr, n_seg) = (self.n, self.n_corr, self.n_seg);
+        common::info!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
+        let st = &mut self.stats;
+        st.wall = self.c_seg0.map_or(0.0, |c| c.elapsed().as_secs_f64());
+        if st.n > 0 {
+            let m = 1e3 / st.n as f64;
+            common::info!("분할 단계({}) 평균 ms: 전처리 {:.2}, 추론 {:.1}(올리기 {:.2} · 결과 맞추기 {:.2}), 후처리 {:.2} · 분할 {:.2} 번/초", if self.seg_async { "비동기" } else { "동기" }, st.pre * m, st.infer * m, st.sub * m, st.npu * m, st.post * m,
+                          st.n as f64 / st.wall.max(1e-9));
+        }
+        DRV_STATS.with(|d| d.set((self.dropped, self.n_seg as u32, self.stats)));
+        self.seg
+    }
+
+    /// 분할 차례가 끝난 장면: 결과를 맞추고 후처리해 본 처리에 넘길 장면으로
+    fn finish(&mut self, mut job: SegJob, st: FlSt, conf: f32) -> Frame {
+        if let FlSt::Done(id, c) = st {
+            let c2 = Instant::now();
+            self.seg.take(id, &mut job.bufs.1);
+            job.t_npu = c2.elapsed().as_secs_f64();
+            job.t[1] = c.elapsed().as_secs_f64();
+            self.busy -= 1;
+        }
+        let (f, b) = seg_stage_post(job, conf, &mut self.stats);
+        self.bufs.push(b);
+        f
+    }
+
+    /// NPU 자리가 나는 대로 기다리던 장면을 차례대로 올림
+    fn submit_waiting(&mut self, conf: f32) {
+        for i in 0..self.q.len() {
+            if self.busy >= self.jobs {
+                return;
+            }
+            if !matches!(self.q[i].1, FlSt::Wait) {
+                continue;
+            }
+            self.tag += 1;
+            let tag = self.tag;
+            let job = &mut self.q[i].0;
+            let c = Instant::now();
+            match self.seg.submit(&job.bufs.0, &mut job.bufs.1, tag) {
+                Some(id) => {
+                    job.t_sub = c.elapsed().as_secs_f64();
+                    self.q[i].1 = FlSt::Npu(id, tag, c);
+                    self.busy += 1;
+                }
+                None => {
+                    Self::run_sync(self.seg.as_mut(), job, conf);
+                    self.q[i].1 = FlSt::Ready;
+                }
+            }
+        }
+    }
+
+    /// 동기 실행기(--seg-cache 분할 대역 · 올리기가 없는 실행기): 그 자리에서
+    fn run_sync(seg: &mut (dyn seg::Segmenter + Send), j: &mut SegJob, conf: f32) {
+        let c = Instant::now();
+        j.dets = seg.direct(&j.sf.rgb, j.sf.w, j.sf.h, conf);
+        if j.dets.is_none() {
+            seg.infer(&j.bufs.0, &mut j.bufs.1);
+        }
+        j.t[1] = c.elapsed().as_secs_f64();
+    }
+
+    /// 입력 장면 받기: 결과를 늘 같게(--no-drop)면 NPU 자리를 기다리는 장면이 있는 동안 다음 장면을 읽지 않고(위치 쪽 큐가 막음),
+    /// 실시간이면 늘 받되 자리를 기다리던 분할 장면은 새 장면이 이긴다(가장 새로 추적된 장면을 올림). 돌려줌: 받은 장면이 있었는지
+    fn pull(&mut self, a: &Args) -> bool {
+        let mut got = false;
+        loop {
+            let waiting = self.q.iter().any(|f| matches!(f.1, FlSt::Wait));
+            if (!self.drop_late && waiting) || self.q.len() >= self.jobs + if self.drop_late { 4 } else { 2 } {
+                return got;
+            }
+            let sf = match self.held.take().or_else(|| self.first.take()) {
+                Some(sf) => sf,
+                None => match self.rd.as_mut().unwrap().try_next() {
+                    stream::Next::Frame(sf) => {
+                        self.t_got = Instant::now();
+                        self.read_s = self.want.take().map_or(0.0, |c| c.elapsed().as_secs_f64());
+                        sf
+                    }
+                    stream::Next::Wait => {
+                        self.want.get_or_insert_with(Instant::now);
+                        return got;
+                    }
+                    stream::Next::End => {
+                        self.ended = true;
+                        return got;
+                    }
+                },
+            };
+            // --stream-rate: 찍은 시각(배속 R)보다 이르면 그때까지 둠(루프는 다른 일을 하거나 잠듦)
+            if self.rate > 0.0 && self.n % a.every == 0 {
+                let due = (sf.t - self.pace_t0) / self.rate - self.pace0.elapsed().as_secs_f64();
+                if due > 0.0 {
+                    self.held = Some(sf);
+                    return got;
+                }
+            }
+            got = true;
+            if let Some(job) = self.take(a, sf) {
+                self.push(job, a.conf);
+            }
+        }
+    }
+
+    /// 분할 길에 넣기: 분할 장면은 NPU 자리를 기다림(실시간이면 기다리던 장면을 이 장면이 대신함), 나머지는 바로 준비됨
+    fn push(&mut self, mut job: SegJob, conf: f32) {
+        if !(job.do_seg && !job.sf.lost()) {
+            self.q.push_back((job, FlSt::Ready));
+            return;
+        }
+        if !self.seg_async {
+            Self::run_sync(self.seg.as_mut(), &mut job, conf);
+            self.q.push_back((job, FlSt::Ready));
+            return;
+        }
+        if self.drop_late && self.q.back().is_some_and(|f| matches!(f.1, FlSt::Wait)) {
+            let (mut old, _) = self.q.pop_back().unwrap();
+            old.graph.append(&mut job.graph); // 버린 장면 앞 노드는 이 장면에 붙임(차례 그대로)
+            job.graph = std::mem::take(&mut old.graph);
+            self.bufs.push(std::mem::take(&mut old.bufs));
+            self.dropped += 1;
+        }
+        self.q.push_back((job, FlSt::Wait));
+    }
+
+    /// 장면 하나를 받아 분할 길 일감으로(실시간이면 위치를 바로 뷰어로). --every 차례가 아니거나 늦어 버리면 None
+    fn take(&mut self, a: &Args, mut sf: stream::StreamFrame) -> Option<SegJob> {
+        let every = a.every;
+        // 실시간: 받은 장면의 카메라 위치를 분할 · 지도 일을 기다리지 않고 바로 뷰어로(건너뛰는 장면도)
+        if let Some(pp) = &self.pose_out {
+            early_pose(pp, &sf);
+        }
+        // 지도 보정이 바뀐 장면(루프 클로저): 이후 장면은 새 보정으로 오고, 지난 장면은 그래프 블록의 노드 위치로 다시 쌓는다
+        self.n_corr += (sf.flags & stream::MAP_CORRECTED != 0) as u32;
+        self.graph.append(&mut sf.graph);
+        // 밀림: 찍은 시각(배속 R, 기본 1) 기준 DROP_LATE 초 넘게 늦은 장면은 버리고 다음(더 새) 장면으로. 그래프 노드는 위에서 이미 모아 다음 장면에 붙음
+        let late = self.pace0.elapsed().as_secs_f64() - (sf.t - self.pace_t0) / if self.rate > 0.0 { self.rate } else { 1.0 };
+        let n = self.n;
+        self.n += 1;
+        let skip = self.drop_late && n % every == 0 && n > 0 && late > DROP_LATE && !sf.lost();
+        if skip {
+            self.dropped += 1;
+        }
+        if n % every != 0 || skip {
+            return None;
+        }
+        if sf.k != self.k0 {
+            common::info!("스트림 장면 {}: 보정값이 바뀜 {:?} → {:?}(처음 값으로 계속)", sf.seq, self.k0, sf.k);
+        }
+        let c1 = Instant::now();
+        let lost = sf.lost();
+        if sf.flags & stream::NEW_MAP != 0 {
+            common::info!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
+        }
+        // 깊이는 u16 그대로 넘김(미터 값은 쓰는 곳에서 같은 식으로)
+        let depth = Depth::Raw { d: std::mem::take(&mut sf.depth), per_m: sf.depth_per_m };
+        // --seg-skip: 직전 분할 키프레임에서 조금만 움직였으면 화면이 거의 같으니 분할을 건너뜀(물체 기억은 그 장면을 안 본 것으로)
+        let want_seg = match (a.seg_skip, &self.last_seg) {
+            // 밀리지 않았으면(NPU 가 따라감) 늘 분할: 생략은 밀릴 때 지연을 줄이는 데만 쓴다(안 밀려도 건너뛰면 물체 관측만 줄어 물체를 잃음)
+            (Some((_, _, _, lmax)), Some(_)) if !self.lag_on || late <= lmax => true,
+            (Some((dm, ddeg, nmax, _)), Some((lp, lr, ns))) => {
+                let dp = ((sf.p[0] - lp[0]).powi(2) + (sf.p[1] - lp[1]).powi(2) + (sf.p[2] - lp[2]).powi(2)).sqrt();
+                let tr: f64 = (0..3).map(|i| (0..3).map(|j| lr[j][i] * sf.r[j][i]).sum::<f64>()).sum();
+                let ang = ((tr - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees();
+                dp > dm || ang > ddeg || ns + 1 >= nmax
+            }
+            _ => true,
+        };
+        let do_seg = want_seg && !lost && !sf.no_map();
+        if !lost {
+            if do_seg {
+                self.last_seg = Some((sf.p, sf.r, 0));
+                self.n_seg += 1;
+            } else if let Some(l) = self.last_seg.as_mut() {
+                l.2 += 1;
+            }
+        }
+        // 분할 전처리
+        let mut bufs = self.bufs.pop().unwrap_or_default();
+        let mut t = [0.0; 3];
+        if do_seg {
+            let c = Instant::now();
+            seg::seg_pre(&sf.rgb, sf.w, sf.h, &mut bufs.0);
+            out::slow(c);
+            t[0] = c.elapsed().as_secs_f64();
+            self.c_seg0.get_or_insert(c);
+        }
+        Some(SegJob { sf, depth, do_seg, load: self.read_s, graph: std::mem::take(&mut self.graph), bufs, dets: None, t_front: c1.elapsed().as_secs_f64(), t, t_sub: 0.0, t_npu: 0.0, t_in: self.t_got })
+    }
+
+    /// TUM 입력(--tum, 위치 = 정답 · --gt): 영상 · 깊이 읽기와 분할을 루프에서 차례로(--live 면 찍은 속도에 맞춤)
+    fn run_tum(&mut self, a: &Args, seq: &tum::Tum, body: &mut dyn FnMut(Option<Frame>)) {
+        let (mut t_start, mut w_start) = (None::<f64>, Instant::now());
+        for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
+            if fi % a.every != 0 {
+                continue;
+            }
+            let t = *t;
+            let Some((p, r)) = seq.pose(t) else { continue };
+            if a.live > 0.0 {
+                match t_start {
+                    None => {
+                        t_start = Some(t);
+                        w_start = Instant::now();
+                    }
+                    Some(ts) => {
+                        let ahead = (t - ts) / a.live - w_start.elapsed().as_secs_f64();
+                        if !a.no_skip && ahead < -0.1 {
+                            continue; // 처리가 밀렸으면 건너뛰어 실제 시간에 맞춤
+                        }
+                        if ahead > 0.0 {
+                            std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
+                        }
+                    }
+                }
+            }
+            let c0 = Instant::now();
+            let img = image::open(seq.dir.join(rel)).expect("rgb").into_rgb8();
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let rgb = img.into_raw();
+            let Some((dw, dh, kin)) = seq.kinect_depth(t) else { continue };
+            assert_eq!((dw as usize, dh as usize), (w, h));
+            let c1 = Instant::now();
+            let dets = Some(self.seg.run(&rgb, w, h, a.conf));
+            let c2 = Instant::now();
+            body(Some(Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, held_live: false, gravity: false, no_map: false, anchor: 0, graph: vec![], t_in: None, t_ready: None }));
+        }
+    }
+}
+
+thread_local! {
+    /// 끝난 실행의 입력 통계(버린 장면, 분할 수, 분할 단계 시간): 끝 요약용
+    static DRV_STATS: std::cell::Cell<(u32, u32, SegStages)> = std::cell::Cell::new((0, 0, SegStages { pre: 0.0, infer: 0.0, post: 0.0, sub: 0.0, npu: 0.0, n: 0, wall: 0.0 }));
+}
+
 
 /// --seg-check N: 스트림 앞쪽 분할 장면 N 장(--every 간격)에 전·후처리를 기준 구현과 지금 구현으로 각각 돌려, 결과가 같은지와 걸린 시간을 견준다.
 /// 모델은 장면마다 한 번 돌려 같은 출력을 두 후처리에 준다. 다른 장면 수(레터박스·검출)와 다른 화소 수가 모두 0 이면 같음.
@@ -597,7 +1061,7 @@ fn seg_check(a: &Args, seg: &mut dyn seg::Segmenter, n_max: usize) {
     }
 }
 
-fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter + Send> {
+fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dyn seg::Segmenter + Send> {
     // 새 실행(리셋): 받는 스레드가 위치를 바로 낼 회전 · 원점과 마지막 위치를 비움(본 스레드가 첫 장면에서 다시 정함)
     (*POSE_FIX.lock().unwrap(), *POSE_LAST.lock().unwrap()) = (None, None);
     // 스트림 입력이면 첫 장면의 보정값, 카메라 입력이면 빈 시퀀스(보정값만), 아니면 TUM
@@ -618,18 +1082,17 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     std::fs::create_dir_all(a.out.join("objects")).unwrap();
     let [fx, fy, cx, cy] = seq.k;
     let mut grid = Grid::new(0.05);
-    // 점 지도는 점 작업 스레드가(스트림은 밀리면 건너뛰고, TUM 입력·--no-drop 은 기다려 결과가 늘 같게)
+    // 점 지도는 점 줄이(스트림은 밀리면 건너뛰고, TUM 입력·--no-drop 은 기다려 결과가 늘 같게)
     let mut pw = Some({
         let mut s = SceneMap::new(a.scene_vox, 0.04);
         s.min_obs = a.pts_obs;
-        PtsWorker::spawn(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none() || a.no_drop) // --no-drop: 스트림도 기다림
+        PtsWorker::new(std::sync::Arc::new(a.clone()), seq.k, s, a.stream.is_none() || a.no_drop) // --no-drop: 스트림도 기다림
     });
     let mut mem = Memory::new(0.012, 0.04);
-    let mut view = ViewWorker::spawn(a.out.clone(), a.live > 0.0); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
+    let mut view = ViewWorker::new(a.out.clone(), a.live > 0.0, io.waker()); // 방 · 엣지 · view.json(방 번호를 실행 내내 잇는다)
     let mut traj: Vec<(f64, [f64; 3])> = vec![];
     let mut hist_h: Vec<f64> = vec![];
     let mut z0: Option<f64> = None;
-    let (mut t_start, mut w_start) = (None::<f64>, Instant::now());
     let mut clock = Clock::default();
     let mut nkf: u32 = 0;
     let mut cam_json = json!(null);
@@ -657,328 +1120,13 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     out::write_direct(&a.out.join("vocab.json"), serde_json::to_string(&names).unwrap().into_bytes());
     let mut last_pose = [0.0; 3];
     let t0 = Instant::now();
-    // 앞 단계(영상·깊이 읽기 + 분할)는 작업 스레드에서 한 장 앞서 돌린다 → NPU/GPU 분할과 CPU 지도 갱신이 겹친다.
-    // 실시간 재생의 속도 맞춤(앞서면 기다리고, 밀리면 건너뛰기)도 그쪽에서 한다.
     let seq = std::sync::Arc::new(seq);
-    // 장면 i 가 나올 시각 = pace0 + (t_i − t_첫) / R(R = 밀림 기준 배속). 본 스레드가 장면을 끝낸 시각과의 차이 = 밀림
+    // 장면 i 가 나올 시각 = pace0 + (t_i − t_첫) / R(R = 밀림 기준 배속). 장면을 끝낸 시각과의 차이 = 밀림
     let (pace0, pace_t0, rate) = (Instant::now(), stream_first.as_ref().map_or(0.0, |f| f.t), a.stream_rate);
     let drop_late = !a.no_drop;
     // 밀림 기준 배속: --stream-rate 없이 받는 스트림(연결 프로그램에서 바로 오는 실시간 입력)은 찍은 시각 그대로(1 배속). --stream-rate 없는 --no-drop 재생은 밀림을 재지 않고 늘 분할(결과가 늘 같게)
     let lag_rate = if rate > 0.0 { rate } else { 1.0 };
     let lag_on = rate > 0.0 || (a.stream.is_some() && drop_late);
-    let drop_n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let drop_r = drop_n.clone();
-    let seg_n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let seg_n_r = seg_n.clone();
-    // 분할 단계별 시간 합, 본 스레드가 받아 간 장면 수(스트림 입력의 분할 단계가 씀)
-    let seg_stats = std::sync::Arc::new(std::sync::Mutex::new(SegStages::default()));
-    let seg_stats_r = seg_stats.clone();
-    let taken = std::sync::Arc::new(Taken::default());
-    let taken_r = taken.clone();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(1);
-    let worker = {
-        let seq = seq.clone();
-        let (every, conf, live, no_skip) = (a.every, a.conf, a.live, a.no_skip);
-        let (seg_min, infer_min, seg_pipe, npu_jobs) = (a.seg_min_ms / 1e3, a.infer_min_ms / 1e3, a.seg_pipe, a.npu_jobs);
-        let seg_skip = a.seg_skip;
-        let pose_out = (a.live > 0.0).then(|| a.out.join("pose.json"));
-        std::thread::Builder::new().name("reader".into()).spawn(move || {
-            let mut seg = seg;
-            out::thread_role(out::Role::Reader);
-            common::prof::track_thread();
-            if let (Some(mut rd), Some(first)) = (stream_rd, stream_first) {
-                // 장면 스트림(bridge/): 위치·깊이는 받은 그대로, 분할만 여기서. --every N 장마다, 위치를 놓친 장면은 모델 없이 표시만 넘김.
-                // 분할은 세 단계: 전처리 → 추론(모델 호출) → 후처리(마스크 해독). 스레드는 둘: 이 스레드(읽기 · 전처리 · 올리기)와 받기 스레드(결과 기다리기 · 후처리 · 본 스레드에 넘기기).
-                // 비동기 실행기(NPU · PC ONNX 실행 스레드)는 이 스레드가 전처리 뒤 바로 올리고(--npu-jobs K 장까지 함께), 받기 스레드가 올린 순서대로 기다린다 — 추론이 도는 동안
-                // 앞 장면의 후처리와 다음 장면의 읽기 · 전처리가 겹친다. 동기 실행기(--seg-cache · 시간 흉내)는 받기 스레드가 추론까지 한다. --seg-pipe off 는 셋을 이 스레드에서 차례로.
-                use std::sync::atomic::Ordering::Relaxed;
-                use common::prof::{self, W};
-                let k0 = first.k;
-                let stage2 = InferStage { seg, infer_min, seg_min, conf, stats: seg_stats_r.clone() };
-                /// NPU 에 함께 올린 수의 남은 자리(올리기 전에 하나 잡고, 받기 스레드가 결과를 받으면 돌려줌)
-                type Slots = std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>;
-                enum Sink {
-                    Seq(InferStage),
-                    /// 받기 스레드로 가는 줄, 받기 스레드(동기 실행기면 실행기를 돌려줌), 이 스레드가 쥔 비동기 실행기, 자리
-                    Pipe(std::sync::mpsc::SyncSender<(SegJob, Option<i32>, Instant)>, std::thread::JoinHandle<Option<InferStage>>, Option<InferStage>, Slots),
-                }
-                let inf_ema = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)); // 추론 단계가 한 장에 걸린 시간(초, f64 비트)의 이동 평균
-                let mut in_flight = 1u64; // 추론 단계에 함께 들어가 있을 수 있는 장면 수(--npu-jobs)
-                let (buf_tx, buf_rx) = std::sync::mpsc::channel::<(seg::SegIn, seg::SegRaw)>();
-                let mut sink = if seg_pipe {
-                    let (ema, stage2) = (inf_ema.clone(), stage2);
-                    // 시간을 흉내 낼 때(--infer-min-ms · --seg-min-ms)는 동기로 한 장씩
-                    let mut wait_fn = (infer_min <= 0.0 && seg_min <= 0.0).then(|| stage2.seg.collector()).flatten();
-                    let jobs = if wait_fn.is_some() { npu_jobs.min(stage2.seg.max_jobs()).max(1) } else { 1 };
-                    in_flight = jobs as u64;
-                    let slots: Slots = std::sync::Arc::new((std::sync::Mutex::new(jobs), std::sync::Condvar::new()));
-                    // 비동기: 올린 장면이 줄에서 기다릴 자리(자리 수가 함께 올린 수를 막음). 동기: 받기 스레드가 앞 장면을 끝내야 넘김
-                    let (to_done, from_rd) = std::sync::mpsc::sync_channel::<(SegJob, Option<i32>, Instant)>(if wait_fn.is_some() { jobs } else { 0 });
-                    let (mut rd_stage, mut done_stage) = if wait_fn.is_some() { (Some(stage2), None) } else { (None, Some(stage2)) };
-                    let (tx, stats, taken, slots_d) = (tx.clone(), seg_stats_r.clone(), taken_r.clone(), slots.clone());
-                    let h_done = std::thread::Builder::new().name("seg-done".into()).spawn(move || {
-                        out::thread_role(out::Role::Reader);
-                        prof::track_thread();
-                        loop {
-                            let c_idle = Instant::now();
-                            let Ok((mut j, id, c)) = from_rd.recv() else { break };
-                            prof::wait(W::SegIdle, c_idle);
-                            if let Some(id) = id {
-                                let cw = Instant::now();
-                                (wait_fn.as_mut().unwrap())(id, &mut j.bufs.1);
-                                prof::wait(W::SegNpu, cw);
-                                j.t_npu = cw.elapsed().as_secs_f64();
-                                {
-                                    let mut n = slots_d.0.lock().unwrap();
-                                    *n += 1;
-                                    slots_d.1.notify_one();
-                                }
-                                j.t[1] = c.elapsed().as_secs_f64();
-                                // 한 장이 NPU 를 차지한 몫: 올려서 받기까지 걸린 시간 / 함께 올린 수
-                                let (d, e) = (j.t[1] / jobs as f64, f64::from_bits(ema.load(Relaxed)));
-                                ema.store((if e == 0.0 { d } else { 0.8 * e + 0.2 * d }).to_bits(), Relaxed);
-                            } else if let Some(s2) = done_stage.as_mut() {
-                                s2.run(&mut j);
-                                if j.do_seg {
-                                    let (d, e) = (j.t[1], f64::from_bits(ema.load(Relaxed)));
-                                    ema.store((if e == 0.0 { d } else { 0.8 * e + 0.2 * d }).to_bits(), Relaxed);
-                                }
-                            }
-                            let (f, b) = seg_stage_post(j, conf, &stats);
-                            let _ = buf_tx.send(b);
-                            let ch = Instant::now();
-                            if tx.send(f).is_err() {
-                                taken.dead.store(true, Relaxed);
-                                taken.cv.notify_all();
-                                break;
-                            }
-                            prof::wait(W::SegHand, ch);
-                        }
-                        drop(wait_fn); // 실행기보다 먼저
-                        done_stage
-                    }).unwrap();
-                    Sink::Pipe(to_done, h_done, rd_stage.take(), slots)
-                } else {
-                    Sink::Seq(stage2)
-                };
-                let (mut next, mut n, mut read_s, mut n_corr) = (Some(first), 0usize, 0.0f64, 0u32);
-                // 건너뛴 장면 앞에 온 그래프 노드는 다음에 보내는 장면에 붙임(노드 위치를 하나도 잃지 않게)
-                let mut graph: Vec<stream::Node> = vec![];
-                let mut last_seg: Option<([f64; 3], [[f64; 3]; 3], usize)> = None;
-                let mut n_seg = 0usize;
-                let mut pool: Vec<(seg::SegIn, seg::SegRaw)> = vec![];
-                // 겹쳐 돌릴 때 다음 장면을 고르는 때를 맞추는 데 쓰는 값: 넘긴 장면 수, 장면 하나를 넘기기까지 이 스레드가 쓴 시간(읽기 + 전처리, 속도 맞춤 잠 제외)
-                let (mut picked, mut front_ema, mut c_front, mut slept) = (0u64, 0.0f64, Instant::now(), 0.0f64);
-                let hold_on = rate > 0.0 || drop_late;
-                let mut c_seg0: Option<Instant> = None;
-                let mut t_got = Instant::now(); // 지금 장면을 받은 때
-                while let Some(mut sf) = next.take() {
-                    // 실시간: 받은 장면의 카메라 위치를 분할 · 지도 일을 기다리지 않고 바로 뷰어로(건너뛰는 장면도)
-                    if let Some(pp) = &pose_out {
-                        early_pose(pp, &sf);
-                    }
-                    // 지도 보정이 바뀐 장면(루프 클로저): 이후 장면은 새 보정으로 오고, 지난 장면은 그래프 블록의 노드 위치로 다시 쌓는다
-                    n_corr += (sf.flags & stream::MAP_CORRECTED != 0) as u32;
-                    graph.append(&mut sf.graph);
-                    // 밀림: 찍은 시각(배속 R, 기본 1) 기준 DROP_LATE 초 넘게 늦은 장면은 버리고 다음(더 새) 장면으로. 그래프 노드는 위에서 이미 모아 다음 장면에 붙음
-                    let late = pace0.elapsed().as_secs_f64() - (sf.t - pace_t0) / if rate > 0.0 { rate } else { 1.0 };
-                    let skip = drop_late && n % every == 0 && n > 0 && late > DROP_LATE && !sf.lost();
-                    if skip {
-                        drop_r.fetch_add(1, Relaxed);
-                    }
-                    if n % every == 0 && !skip {
-                        if rate > 0.0 {
-                            let due = (sf.t - pace_t0) / rate - pace0.elapsed().as_secs_f64();
-                            if due > 0.0 {
-                                std::thread::sleep(std::time::Duration::from_secs_f64(due));
-                                slept += due;
-                            }
-                        }
-                        if sf.k != k0 {
-                            common::info!("스트림 장면 {}: 보정값이 바뀜 {:?} → {:?}(처음 값으로 계속)", sf.seq, k0, sf.k);
-                        }
-                        let c1 = Instant::now();
-                        let lost = sf.lost();
-                        if sf.flags & stream::NEW_MAP != 0 {
-                            common::info!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
-                        }
-                        // 깊이는 u16 그대로 넘김(미터 값은 쓰는 곳에서 같은 식으로)
-                        let depth = Depth::Raw { d: std::mem::take(&mut sf.depth), per_m: sf.depth_per_m };
-                        // --seg-skip: 직전 분할 키프레임에서 조금만 움직였으면 화면이 거의 같으니 분할을 건너뜀(물체 기억은 그 장면을 안 본 것으로)
-                        let want_seg = match (seg_skip, &last_seg) {
-                            // 밀리지 않았으면(NPU 가 따라감) 늘 분할: 생략은 밀릴 때 지연을 줄이는 데만 쓴다(안 밀려도 건너뛰면 물체 관측만 줄어 물체를 잃음)
-                            (Some((_, _, _, lmax)), Some(_)) if !lag_on || late <= lmax => true,
-                            (Some((dm, ddeg, nmax, _)), Some((lp, lr, ns))) => {
-                                let dp = ((sf.p[0] - lp[0]).powi(2) + (sf.p[1] - lp[1]).powi(2) + (sf.p[2] - lp[2]).powi(2)).sqrt();
-                                let tr: f64 = (0..3).map(|i| (0..3).map(|j| lr[j][i] * sf.r[j][i]).sum::<f64>()).sum();
-                                let ang = ((tr - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees();
-                                dp > dm || ang > ddeg || ns + 1 >= nmax
-                            }
-                            _ => true,
-                        };
-                        let do_seg = want_seg && !lost && !sf.no_map();
-                        if !lost {
-                            if do_seg {
-                                last_seg = Some((sf.p, sf.r, 0));
-                                n_seg += 1;
-                            } else if let Some(l) = last_seg.as_mut() {
-                                l.2 += 1;
-                            }
-                        }
-                        // 단계 1 — 전처리
-                        let mut bufs = pool.pop().unwrap_or_default();
-                        let mut t = [0.0; 3];
-                        if do_seg {
-                            let c = Instant::now();
-                            seg::seg_pre(&sf.rgb, sf.w, sf.h, &mut bufs.0);
-                            out::slow(c);
-                            t[0] = c.elapsed().as_secs_f64();
-                            c_seg0.get_or_insert(c);
-                        }
-                        let mut job = SegJob { sf, depth, do_seg, load: read_s, graph: std::mem::take(&mut graph), bufs, dets: None, t_front: c1.elapsed().as_secs_f64(), t,
-                                               t_sub: 0.0, t_npu: 0.0, t_in: t_got };
-                        let front = c_front.elapsed().as_secs_f64() - slept;
-                        let alive = match &mut sink {
-                            Sink::Seq(s2) => {
-                                s2.run(&mut job);
-                                let (f, b) = seg_stage_post(job, conf, &seg_stats_r);
-                                pool.push(b);
-                                tx.send(f).is_ok()
-                            }
-                            Sink::Pipe(to_done, _, rd_stage, slots) => {
-                                // 비동기 실행기: NPU 자리가 나면(함께 올린 수 아래) 바로 올림. 결과는 받기 스레드가
-                                let (mut id, mut c_sub) = (None, Instant::now());
-                                if let Some(s2) = rd_stage.as_mut().filter(|_| job.do_seg && !job.sf.lost()) {
-                                    {
-                                        let mut free = slots.0.lock().unwrap();
-                                        if *free == 0 {
-                                            let cw = Instant::now();
-                                            while *free == 0 {
-                                                free = slots.1.wait(free).unwrap();
-                                            }
-                                            prof::wait(W::ReaderNpuSlot, cw);
-                                        }
-                                        *free -= 1;
-                                    }
-                                    c_sub = Instant::now();
-                                    id = s2.seg.submit(&job.bufs.0, &mut job.bufs.1);
-                                    job.t_sub = c_sub.elapsed().as_secs_f64();
-                                    if id.is_none() {
-                                        *slots.0.lock().unwrap() += 1;
-                                        s2.run(&mut job);
-                                    }
-                                }
-                                // 동기 실행기: 받기 스레드가 앞 장면을 끝낼 때까지 기다렸다 넘김
-                                let ch = Instant::now();
-                                let ok = to_done.send((job, id, c_sub)).is_ok();
-                                prof::wait(W::ReaderHand, ch);
-                                let t_hand = Instant::now();
-                                pool.extend(buf_rx.try_iter());
-                                picked += 1;
-                                // 다음 장면은 ① 앞앞 장면(여러 장을 함께 올리면 그 수만큼 더 앞)까지 본 스레드가 받아 간 뒤에 고른다: 본 스레드가 밀릴 때 끝난 장면이 차례 실행보다 더 쌓이지 않게
-                                let mut g = prof::lock(&taken_r.n, W::LockTaken);
-                                if ok && *g + in_flight < picked && !taken_r.dead.load(Relaxed) {
-                                    let cw = Instant::now();
-                                    while ok && *g + in_flight < picked && !taken_r.dead.load(Relaxed) {
-                                        g = taken_r.cv.wait_timeout(g, std::time::Duration::from_millis(20)).unwrap().0;
-                                    }
-                                    prof::wait(W::ReaderTaken, cw);
-                                }
-                                drop(g);
-                                // ② 지금 추론이 끝날 무렵 전처리가 끝나게 늦춰 고른다: 일찍 고르면 추론 한 번만큼 묵은 장면이 돼 밀림이 늘어남
-                                if ok && hold_on && do_seg {
-                                    front_ema = if front_ema == 0.0 { front } else { 0.8 * front_ema + 0.2 * front };
-                                    let hold = f64::from_bits(inf_ema.load(Relaxed)) - 1.2 * front_ema - 0.002 - t_hand.elapsed().as_secs_f64();
-                                    if hold > 0.0 {
-                                        std::thread::sleep(std::time::Duration::from_secs_f64(hold));
-                                        prof::wait_ns(W::ReaderHold, (hold * 1e9) as u64);
-                                    }
-                                }
-                                ok
-                            }
-                        };
-                        if !alive {
-                            break;
-                        }
-                        (c_front, slept) = (Instant::now(), 0.0);
-                    }
-                    n += 1;
-                    let c0 = Instant::now();
-                    next = rd.next();
-                    t_got = Instant::now();
-                    prof::wait(W::ReaderNext, c0);
-                    read_s = c0.elapsed().as_secs_f64();
-                }
-                // 단계에 남은 장면을 모두 내보낸 뒤 끝
-                let stage2 = match sink {
-                    Sink::Seq(s) => s,
-                    Sink::Pipe(to_done, h_done, rd_stage, _) => {
-                        drop(to_done);
-                        let s = h_done.join().expect("분할 받기 스레드");
-                        rd_stage.or(s).expect("분할 실행기")
-                    }
-                };
-                let st = {
-                    let mut s = seg_stats_r.lock().unwrap();
-                    s.wall = c_seg0.map_or(0.0, |c| c.elapsed().as_secs_f64());
-                    *s
-                };
-                // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
-                graph.append(&mut rd.take_graph());
-                if !graph.is_empty() {
-                    let f = Frame { t: 0.0, p: [0.0; 3], r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], rgb: vec![], w: 0, h: 0, depth: Depth::default(), dets: None, load: 0.0, seg: 0.0, lost: true, held: false, held_live: false, gravity: false, no_map: false, anchor: 0, graph, t_in: None, t_ready: None };
-                    let _ = tx.send(f);
-                }
-                common::info!("스트림 끝: 장면 {n} 개 받음, 지도 보정 바뀜 {n_corr} 번, 분할 {n_seg} 번");
-                if st.n > 0 {
-                    let m = 1e3 / st.n as f64;
-                    common::info!("분할 단계({}) 평균 ms: 전처리 {:.2}, 추론 {:.1}(올리기 {:.2} · 받기 기다림 {:.1}), 후처리 {:.2} · 분할 {:.2} 번/초", if seg_pipe { "겹침" } else { "차례" }, st.pre * m, st.infer * m, st.sub * m, st.npu * m, st.post * m,
-                              st.n as f64 / st.wall.max(1e-9));
-                }
-                seg_n_r.store(n_seg as u32, Relaxed);
-                return stage2.seg;
-            }
-            for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
-                if fi % every != 0 {
-                    continue;
-                }
-                let t = *t;
-                let Some((p, r)) = seq.pose(t) else { continue };
-                if live > 0.0 {
-                    match t_start {
-                        None => {
-                            t_start = Some(t);
-                            w_start = Instant::now();
-                        }
-                        Some(ts) => {
-                            let ahead = (t - ts) / live - w_start.elapsed().as_secs_f64();
-                            if !no_skip && ahead < -0.1 {
-                                continue; // 처리가 밀렸으면 건너뛰어 실제 시간에 맞춤
-                            }
-                            if ahead > 0.0 {
-                                std::thread::sleep(std::time::Duration::from_secs_f64(ahead));
-                            }
-                        }
-                    }
-                }
-                let c0 = Instant::now();
-                let img = image::open(seq.dir.join(rel)).expect("rgb").into_rgb8();
-                let (w, h) = (img.width() as usize, img.height() as usize);
-                let rgb = img.into_raw();
-                let Some((dw, dh, kin)) = seq.kinect_depth(t) else { continue };
-                assert_eq!((dw as usize, dh as usize), (w, h));
-                let c1 = Instant::now();
-                let dets = Some(seg.run(&rgb, w, h, conf));
-                let c2 = Instant::now();
-                let f = Frame { t, p, r, rgb, w, h, depth: Depth::M(kin), dets, load: (c1 - c0).as_secs_f64(), seg: (c2 - c1).as_secs_f64(), lost: false, held: false, held_live: false, gravity: false, no_map: false, anchor: 0, graph: vec![], t_in: None, t_ready: None };
-                if tx.send(f).is_err() {
-                    break;
-                }
-            }
-            seg
-        }).unwrap()
-    };
-    let _ = (&mut t_start, &mut w_start);
     let mut est_traj: Vec<(f64, V3, M3)> = vec![]; // 추정 위치(시각, 위치, 자세) → poses_est.txt(TUM 형식)
     // 수평 합의(웹캠·녹화): 처음 장면들의 수평면 법선(세계 좌표)을 모아 다수결로 '위'를 정하면 세계를 한 번 바로 세운다
     let mut grav_obs: Vec<V3> = vec![];
@@ -1010,369 +1158,373 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut lag_rb = (0u32, 0f32); // 다시 쌓기가 도는 동안 끝낸 장면 수·그중 밀림 최대
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
-    let mut rb_job: Option<std::thread::JoinHandle<Rebuilt>> = None;
+    let mut rb_lane = common::rt::Lane::new("rebuild", (), 10); // 다시 쌓기 · 이어 넣기(긴 일: 도는 동안 nice 10)
+    let mut rb_job: Option<Pending<Rebuilt>> = None;
     let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
     let mut lat: Vec<[f32; 4]> = vec![]; // 장면 지연(ms): 받음→분할 끝, 분할 끝→본 스레드가 받음, 본 스레드 처리, 받음→본 스레드 끝
-    loop {
-        let c_wait = Instant::now();
-        let Ok(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, held_live, gravity, no_map, anchor, graph, t_in, t_ready }) = rx.recv() else { break };
-        common::prof::wait(common::prof::W::MainFrame, c_wait);
-        // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
-        let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
-        *common::prof::lock(&taken.n, common::prof::W::LockTaken) += 1;
-        taken.cv.notify_all();
-        let c_top = Instant::now();
-        clock.part = [0.0; NPART];
-        let view_late = std::mem::take(&mut view_due); // 앞 장면에서 미룬 view.json
-        // 밀림: 장면이 나올 시각보다 LAG_DEGRADE 초 넘게 늦으면 가볍게 — 점 격자 일부만, 새 다시 쌓기 미룸, view.json 15 장마다
-        let behind = lag_on && pace0.elapsed().as_secs_f64() - (t - pace_t0) / lag_rate > LAG_DEGRADE;
-        n_behind += behind as u32;
-        let (write_late, scene_late) = (std::mem::take(&mut write_due), std::mem::take(&mut scene_due));
-        let mut busy = false; // 이 장면에서 갈아 끼우기 일을 했으면 정기 기록은 다음 장면으로
-        kfs.settle(false); // 앞 장면 압축이 끝났으면 예산 맞추기(덜 끝났어도 예산 안이면 기다리지 않음)
-        let c_g = Instant::now();
-        if !graph.is_empty() {
-            kfs.apply_graph(&graph);
-        }
-        clock.add(P::Graph, c_g);
-        let c_in = Instant::now();
-        if rb_t0.is_nan() && w > 0 {
-            rb_t0 = t;
-        }
-        if let Some(job) = rb_job.take_if(|j| if det_rb { w > 0 && t >= rb_due } else { j.is_finished() }) {
-            let mut rb = job.join().expect("다시 쌓기 스레드");
-            let newer = newer_than(&kfs, &stream_fix, z0.unwrap_or(0.0), rb.last_seq);
-            if newer.len() > CATCH_UP_MAX {
-                // 쌓는 동안 들어온 장면이 많으면 작업 스레드가 먼저 이어 넣고 다시 옴(그사이 들어온 몇 장만 본 스레드가)
-                rb_due = t + a.rebuild_every;
-                let (ar, k) = (a_rb.clone(), seq.k);
-                rb_job = Some(std::thread::spawn(move || {
-                    out::thread_role(out::Role::Rebuild);
-                    let c = Instant::now();
-                    catch_up(&ar, k, &mut rb, newer);
-                    out::slow(c);
-                    rb
-                }));
-            } else {
-            let i1 = Instant::now();
-            rb_cache = Some(rb.cache.clone());
-            install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
-            view.traj_replaced();
-            let i2 = Instant::now();
-            (n_rebuild, last_merge) = (n_rebuild + 1, nkf);
-            // view.json 은 다음 장면(한 장면에 몰리지 않게)
-            scene_json = fresh_outputs(&mut run_id, a.scene_vox, pw.as_ref());
-            view_due = true;
-            let i3 = Instant::now();
-            mem.prune(t);
-            mem.merge_pass();
-            busy = true;
-            if std::env::var_os("MEMMAP_PARTS").is_some() {
-                common::info!("갈아 끼우기 나눔: 지도·물체 {:.0} · 출력 {:.0} · 병합 {:.0} ms", (i2 - i1).as_secs_f64() * 1e3, (i3 - i2).as_secs_f64() * 1e3, i3.elapsed().as_secs_f64() * 1e3);
+    // 장면 하나를 지도 · 물체 기억에(None = 장면 없이 뒤처리만: 뷰 판 밀어 넣기)
+    let mut body = |f: Option<Frame>| {
+            let Some(Frame { t, mut p, mut r, rgb, w, h, depth, dets, load, seg: seg_s, lost, held, held_live, gravity, no_map, anchor, graph, t_in, t_ready }) = f else {
+                view.tick();
+                return;
+            };
+            // 이 장면의 컬러·깊이: 어느 길로 끝나든(놓침·맡김·지도 밖) 다 쓰면 카메라 입력에 돌려줌
+            let (mut rgb, mut depth) = (Recycle(rgb), Recycle(depth));
+            let c_top = Instant::now();
+            clock.part = [0.0; NPART];
+            let view_late = std::mem::take(&mut view_due); // 앞 장면에서 미룬 view.json
+            // 밀림: 장면이 나올 시각보다 LAG_DEGRADE 초 넘게 늦으면 가볍게 — 점 격자 일부만, 새 다시 쌓기 미룸, view.json 15 장마다
+            let behind = lag_on && pace0.elapsed().as_secs_f64() - (t - pace_t0) / lag_rate > LAG_DEGRADE;
+            n_behind += behind as u32;
+            let (write_late, scene_late) = (std::mem::take(&mut write_due), std::mem::take(&mut scene_due));
+            let mut busy = false; // 이 장면에서 갈아 끼우기 일을 했으면 정기 기록은 다음 장면으로
+            kfs.settle(false); // 앞 장면 압축이 끝났으면 예산 맞추기(덜 끝났어도 예산 안이면 기다리지 않음)
+            let c_g = Instant::now();
+            if !graph.is_empty() {
+                kfs.apply_graph(&graph);
             }
-            prune_objs = true; // 옛 id 파일은 다음 기록 때 지움(뷰어가 지금 view.json 을 받기 전 옛 것을 읽는 동안은 남겨 둠)
+            clock.add(P::Graph, c_g);
+            let c_in = Instant::now();
+            if rb_t0.is_nan() && w > 0 {
+                rb_t0 = t;
             }
-        }
-        clock.add(P::Install, c_in);
-        let c_rs = Instant::now();
-        if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && (force_rb || if det_rb { t - rb_t0 >= a.rebuild_every } else { last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every }) {
-            force_rb = false;
-            UPS.lock().unwrap().retain(|s, _| kfs.kfs().iter().any(|k| k.seq == *s));
-            let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
-            let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
-            kfs.clear_dirty();
-            let cache = rb_cache.clone();
-            rb_job = Some(std::thread::spawn(move || { out::thread_role(out::Role::Rebuild); let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved, cache); out::slow(c_rb); r }));
-            last_rebuild = Instant::now();
-            (rb_t0, rb_due) = (t, t + a.rebuild_every);
-        }
-        clock.add(P::RbStart, c_rs);
-        let raw = (r, p); // 받은 위치(수평 맞춤 전): 다시 쌓기용 보관
-        if lost {
-            stream_lost += (w > 0) as u32; // w = 0: 끝에 남은 그래프 노드만 담은 장면
-            if w == 0 {
-                continue;
-            }
-            if a.live > 0.0 && POSE_FIX.lock().unwrap().is_none() {
-                // 뷰어: 마지막 위치 그대로, 놓침 표시(손카메라 빨간색)
-                out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
-            }
-            continue;
-        }
-        if held && no_map {
-            continue; // 위치만 장면은 맡아 두지도 않음
-        }
-        if held {
-            // 맡아 둘 장면: 믿는 지도와 이어지지 않은 새 지도의 위치라 지금 지도에는 넣지 않고 보관만 한다.
-            // 기준 노드가 믿는 노드로 바뀌면(루프 클로저로 이어짐) 다시 쌓기가 고친 위치로 넣는다
-            stream_held += 1;
-            if leveled && a.rebuild_every >= 0.0 && kfs.holds(anchor) {
-                let keep = kfs.push_lazy(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, dets, true);
-                match (pw.as_mut(), keep) {
-                    (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut *depth), std::mem::take(&mut *rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김(압축은 점 작업 스레드)
-                    (None, Some(kf)) => { kf.fill(&rgb, &depth); let _ = kf.pts.set(None); }
-                    _ => {}
-                }
-            }
-            if a.live > 0.0 && !held_live && POSE_FIX.lock().unwrap().is_none() {
-                out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
-            }
-            continue;
-        }
-        // 깊이를 미터로 한 번에(수평 · 바닥 높이 · 점유 격자 · 물체 · 점 고르기가 같은 칸을 읽음)
-        common::prof::copy(common::prof::C::DepthMeters, w * h * 4);
-        depth.to_meters();
-        // 뷰어의 수평 버튼(한 프로그램이면 공유 신호, 따로 띄운 뷰어면 level.req): 지금 카메라 자세를 수평으로 삼는다. 받은 위치에 곱하는 회전을 '카메라의 위 = 세계의 위'가 되게 바꾸고,
-        // 보관한 장면을 그 회전으로 다시 쌓아 이미 만든 지도·물체도 함께 바로 세운다(쌓는 중이면 끝난 뒤에)
-        if a.stream.is_some() && a.live > 0.0 && rb_job.is_none() && level_requested(a) {
-            let up_raw = [-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]]; // 카메라 좌표의 위(−y)를 받은 좌표로
-            let fix = rot_between(&up_raw, &[0.0, 0.0, 1.0]);
-            let old_t: M3 = [[stream_fix[0][0], stream_fix[1][0], stream_fix[2][0]], [stream_fix[0][1], stream_fix[1][1], stream_fix[2][1]], [stream_fix[0][2], stream_fix[1][2], stream_fix[2][2]]];
-            let delta = mm(&fix, &old_t); // 지금까지의 좌표 → 새 좌표
-            for e in est_traj.iter_mut() {
-                (e.1, e.2) = (mv(&delta, &e.1), mm(&delta, &e.2));
-            }
-            let tilt = delta[2][2].clamp(-1.0, 1.0).acos().to_degrees();
-            stream_fix = fix;
-            leveled = true;
-            z0 = Some(mv(&stream_fix, &raw.1)[2] - cam_height(&hist_h)); // 바닥 높이 원점도 새 좌표로
-            kfs.dirty = true;
-            force_rb = true;
-            common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
-        }
-        // 위치 쪽이 IMU 로 지도를 중력 수평으로 맞춰 보냄: 받은 그대로 수평(첫 장면 가정 · 바닥 합의 없음, 수평 버튼은 그대로 됨)
-        if gravity && !leveled && a.stream.is_some() && !a.no_level {
-            (leveled, upright, refine) = (true, false, false);
-            common::info!("수평: 위치 추적이 IMU 중력으로 맞춘 지도를 그대로 씀");
-        }
-        if std::mem::take(&mut upright) && !leveled {
-            stream_fix = rot_between(&[-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]], &[0.0, 0.0, 1.0]);
-            (leveled, refine) = (true, true);
-            common::info!("수평: 첫 장면 카메라를 똑바로 선 것으로 보고 시작(바닥 합의가 나오면 고침)");
-        }
-        if a.stream.is_some() {
-            r = mm(&stream_fix, &r);
-            p = mv(&stream_fix, &p);
-        }
-        let c_vo = Instant::now();
-        // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
-        if (!leveled || refine) && a.stream.is_some() {
-            if let Some(n) = up_normal(&depth, w, h, seq.k, &r, refine) {
-                grav_obs.push(n);
-            }
-            if grav_obs.len() >= 15 {
-                let mean = |v: &[V3]| {
-                    let s = v.iter().fold([0.0; 3], |a, b| add(&a, b));
-                    let l = norm(&s).max(1e-9);
-                    s.map(|x| x / l)
-                };
-                let m0 = mean(&grav_obs);
-                let inl: Vec<V3> = grav_obs.iter().copied().filter(|n| dot(n, &m0) > 10f64.to_radians().cos()).collect();
-                if inl.len() * 10 >= grav_obs.len() * 6 {
-                    'lv: {
-                    let up = mean(&inl);
-                    let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
-                    let tilt = up[2].clamp(-1.0, 1.0).acos().to_degrees();
-                    if refine && tilt > 70.0 {
-                        // 첫 장면이 똑바르다는 가정과 70° 넘게 다르면 믿지 않음(세계를 뒤집지 않음, 천장은 floor_only 로 이미 빠짐 · 녹화 첫 장면은 46° 숙여 있기도 함): 모은 것을 버리고 계속
-                        common::info!("수평 맞춤: 바닥 합의가 처음 가정과 {tilt:.1}° 달라 버림");
-                        grav_obs.clear();
-                        break 'lv;
-                    }
-                    if std::mem::take(&mut refine) {
-                        // 처음 가정(첫 장면이 똑바름)을 바닥 합의로 고침: 지난 위치 · 바닥 높이 원점도 새 좌표로, 지도는 다시 쌓음
-                        for e in est_traj.iter_mut() {
-                            (e.1, e.2) = (mv(&fix, &e.1), mm(&fix, &e.2));
-                        }
-                        // 바닥 높이는 기울어진 채 잰 값이라 버리고, 이 장면에서 새 좌표로 다시 잰다(바닥 = z 0)
-                        hist_h.clear();
-                        z0 = None;
-                        (kfs.dirty, force_rb) = (true, true);
-                    }
-                    r = mm(&fix, &r);
-                    p = mv(&fix, &p);
-                    stream_fix = mm(&fix, &stream_fix);
-                    leveled = true;
-                    common::info!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
-                    }
-                } else if grav_obs.len() > 60 {
-                    grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
-                }
-            }
-        }
-        if a.stream.is_some() && leveled {
-            est_traj.push((t, p, r));
-            // 바닥으로 기울기 고침: 세 장마다 바닥 면 법선을 재 고침 회전을 반씩 다가가게(잡음은 누름), 자세에 곱함
-            r = mm(&tilt_c, &r);
-            if nkf % 3 == 0 && !no_map {
-                if let Some(n) = up_normal(&depth, w, h, seq.k, &r, true) {
-                    let n = { let l = norm(&n).max(1e-9); n.map(|x| x / l) };
-                    if n[2] > 25f64.to_radians().cos() {
-                        let half = { let m = add(&n, &[0.0, 0.0, 1.0]); let l = norm(&m).max(1e-9); m.map(|x| x / l) };
-                        let step = rot_between(&n, &half);
-                        tilt_c = orthonormal(&mm(&step, &tilt_c)); // 곱이 쌓여도 회전으로 남게
-                        r = mm(&step, &r);
-                    }
-                }
-            }
-        }
-        let c2 = Instant::now();
-        clock.load += load;        clock.seg += seg_s;
-
-        // 바닥 높이: 화면 아래쪽 점이 카메라 아래로 얼마나 떨어졌나(95 %) → 카메라 높이, 짧게 평활
-        let back = |u: usize, v: usize| -> Option<V3> {
-            let z = depth.at(v * w + u) as f64;
-            (z > 0.2 && z < 6.0).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
-        };
-        let mut below = vec![];
-        let up_c = [r[2][0], r[2][1], r[2][2]]; // 세계 z 를 카메라 좌표로(Rᵀ·ẑ)
-        for v in (h / 2..h).step_by(16) {
-            for u in (8..w).step_by(16) {
-                if let Some(pc) = back(u, v) {
-                    below.push(-dot(&pc, &up_c));
-                }
-            }
-        }
-        if below.len() > 50 {
-            let k95 = (below.len() as f64 * 0.95) as usize;
-            let ch = *below.select_nth_unstable_by(k95, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
-            if (0.5..2.5).contains(&ch) && !no_map {
-                hist_h.push(ch);
-            }
-        }
-        let h_now = cam_height(&hist_h);
-        let z0v = if leveled { *z0.get_or_insert(p[2] - h_now) } else { p[2] - h_now };
-        // 실시간 스트림: 받는 스레드가 다음 장면부터 이 회전 · 원점으로 위치를 바로 냄(이 장면은 아직 아무도 안 냈으면 아래에서)
-        let pose_first = early_pose_on && POSE_FIX.lock().unwrap().replace((stream_fix, z0v)).is_none();
-        let pwc = [p[0], p[1], p[2] - z0v];
-        let floor_z = pwc[2] - h_now;
-        // 위치가 확인된 장면만 지도·물체에 넣는다(실패해 예측 위치뿐인 장면은 지도를 어긋나게 함)
-        let map_ok = leveled && !no_map;
-        let (c3, c4) = map_frame(a, seq.k, t, &r, &pwc, floor_z, &depth, &rgb, w, h, &dets, map_ok, &mut grid, &mut mem, &mut traj, &mut map_traj);
-        clock.part[P::Vo as usize] += (c2 - c_vo).as_secs_f64();
-        clock.part[P::Map as usize] += (c3 - c2).as_secs_f64();
-        clock.part[P::Obj as usize] += (c4 - c3).as_secs_f64();
-        let c_pt = Instant::now();
-        // 보관(줄인 보관이어도 점 지도는 점 작업 스레드가 붙이는 점 격자로 다시 쌓음)
-        let keep = (map_ok && a.stream.is_some() && a.rebuild_every >= 0.0)
-            .then(|| kfs.push_lazy(t, anchor, raw.0, raw.1, h_now, w, h, dets, true))
-            .flatten();
-        // 보관 장면에 이때 고친 카메라 자세의 위(카메라 좌표)를 붙여 둠: 다시 쌓을 때 노드가 움직여도 같은 기울기 고침을 다시 함
-        if let Some(kf) = &keep {
-            UPS.lock().unwrap().insert(kf.seq, [r[2][0], r[2][1], r[2][2]]); // Rᵀ·ẑ
-        }
-        if let (Some(p), true) = (pw.as_mut(), map_ok) {
-            // 깊이·사진은 이 뒤 본 스레드가 쓰지 않으므로 복사 없이 넘김
-            let rgb_pts = std::mem::take(&mut *rgb);
-            p.frame(nkf, r, pwc, std::mem::take(&mut *depth), rgb_pts, w, h, keep, behind);
-        } else if let Some(kf) = keep {
-            kf.fill(&rgb, &depth);
-        }
-        clock.add(P::Pts, c_pt);
-        last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
-        cam_json = json!({"pos": pwc, "R": r});
-        nkf += 1;
-        // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(스트림은 받는 스레드가 받자마자 냄, 여기서는 첫 장면과 TUM · 카메라 입력만),
-        // 지도·물체·그래프(view.json)는 0.4 초마다
-        if a.live > 0.0 && (!early_pose_on || pose_first) {
-            out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true, "wall": wall_ms()})));
-        }
-        // 메모리 기억 폴더(--serve): 받은 장면마다 바로 뷰어에(view 판은 뷰 스레드가 짜고 밀리면 마지막 것만, 점 노드는 점 작업 스레드가 한가할 때마다). 디스크 기록이면 0.4 · 1 초 간격
-        let write_now = write_late || if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= view_gap || nkf == 1 } else { nkf % (if behind { 15 } else { 5 }) == 0 || nkf == 1 };
-        // 3D 점 지도: 실시간은 1 초마다(전에는 장면 번호가 기록 시점과 우연히 맞을 때만 나가 몇 초씩 비었다), 아니면 장면 수로
-        let scene_now = write_now && (scene_late || if a.live > 0.0 { last_scene.elapsed().as_secs_f64() >= scene_gap && pw.as_ref().is_none_or(|p| p.idle()) } else { nkf % 50 == 0 || nkf % a.scene_every == 1 || a.scene_every == 1 });
-        // 갈아 끼우기 일을 한 장면이면 정기 기록을 다음 장면으로
-        let write_now = if busy && write_now {
-            (write_due, scene_due) = (true, scene_now);
-            false
-        } else {
-            write_now
-        };
-        if !write_now && nkf >= last_merge + 15 {
-            let c_m = Instant::now();
-            last_merge = nkf;
-            mem.prune(t);
-            mem.merge_pass();
-            clock.add(P::Merge, c_m);
-        }
-        if write_now || view_late {
-            let c_sc = Instant::now();
-            let mut scene_done = false;
-            if write_now {
-            last_view = Instant::now();
-            if scene_now || nkf == 1 {
-                last_scene = Instant::now();
-                scene_done = true;
-                // 새로 확정된 칸만 조각 파일로: 뷰어는 아직 안 받은 조각만 받는다(원격 접속에서 지도 전체를 매번 받지 않게)
-                scene_json = json!({"run": run_id, "voxel": a.scene_vox});
-                if let Some(p) = pw.as_ref() {
-                    p.write(PTS_BUDGET);
-                    scene_json["octree"] = p.json();
-                }
-            }
-            }
-            // 병합 후처리는 키프레임 15 장마다(물체 쌍을 매번 다 보지 않게, 중복이 자라기 전에 합침)
-            let merge = write_now && nkf >= last_merge + 15;
-            if merge {
-                last_merge = nkf;
-            }
-            clock.add(P::Scene, c_sc);
-            let c_v = Instant::now();
-            // 점 노드를 쓴 장면은 view.json 을 다음 장면으로 미룸(한 장면에 몰리지 않게). 병합은 제때(결과가 같게)
-            if scene_done && nkf > 1 && !(out::memory_only() && a.live > 0.0) { // 메모리 기억 폴더는 같은 장면에서(미루면 실시간에선 장면마다 다시 미뤄져 판이 안 나감)
-                if merge {
-                    mem.prune(t);
-                    mem.merge_pass();
-                }
+            if let Some(job) = rb_job.take_if(|j| if det_rb { w > 0 && t >= rb_due } else { j.is_finished() }) {
+                let mut rb = job.join();
+                let newer = newer_than(&kfs, &stream_fix, z0.unwrap_or(0.0), rb.last_seq);
+                if newer.len() > CATCH_UP_MAX {
+                    // 쌓는 동안 들어온 장면이 많으면 작업 스레드가 먼저 이어 넣고 다시 옴(그사이 들어온 몇 장만 본 스레드가)
+                    rb_due = t + a.rebuild_every;
+                    let (ar, k) = (a_rb.clone(), seq.k);
+                    rb_job = Some(Pending::on(&mut rb_lane, move || {
+                        let c = Instant::now();
+                        catch_up(&ar, k, &mut rb, newer);
+                        out::slow(c);
+                        rb
+                    }));
+                } else {
+                let i1 = Instant::now();
+                rb_cache = Some(rb.cache.clone());
+                install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
+                view.traj_replaced();
+                let i2 = Instant::now();
+                (n_rebuild, last_merge) = (n_rebuild + 1, nkf);
+                // view.json 은 다음 장면(한 장면에 몰리지 않게)
+                scene_json = fresh_outputs(&mut run_id, a.scene_vox, pw.as_ref());
                 view_due = true;
+                let i3 = Instant::now();
+                mem.prune(t);
+                mem.merge_pass();
+                busy = true;
+                if std::env::var_os("MEMMAP_PARTS").is_some() {
+                    common::info!("갈아 끼우기 나눔: 지도·물체 {:.0} · 출력 {:.0} · 병합 {:.0} ms", (i2 - i1).as_secs_f64() * 1e3, (i3 - i2).as_secs_f64() * 1e3, i3.elapsed().as_secs_f64() * 1e3);
+                }
+                prune_objs = true; // 옛 id 파일은 다음 기록 때 지움(뷰어가 지금 view.json 을 받기 전 옛 것을 읽는 동안은 남겨 둠)
+                }
+            }
+            clock.add(P::Install, c_in);
+            let c_rs = Instant::now();
+            if rb_job.is_none() && !behind && kfs.dirty && a.rebuild_every > 0.0 && (force_rb || if det_rb { t - rb_t0 >= a.rebuild_every } else { last_rebuild.elapsed().as_secs_f64() >= a.rebuild_every }) {
+                force_rb = false;
+                UPS.lock().unwrap().retain(|s, _| kfs.kfs().iter().any(|k| k.seq == *s));
+                let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
+                let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
+                kfs.clear_dirty();
+                let cache = rb_cache.clone();
+                rb_job = Some(Pending::on(&mut rb_lane, move || { let c_rb = Instant::now(); let r = rebuild_maps(&ar, k, &snap, next, moved, cache); out::slow(c_rb); r }));
+                last_rebuild = Instant::now();
+                (rb_t0, rb_due) = (t, t + a.rebuild_every);
+            }
+            clock.add(P::RbStart, c_rs);
+            let raw = (r, p); // 받은 위치(수평 맞춤 전): 다시 쌓기용 보관
+            if lost {
+                stream_lost += (w > 0) as u32; // w = 0: 끝에 남은 그래프 노드만 담은 장면
+                if w == 0 {
+                    return;
+                }
+                if a.live > 0.0 && POSE_FIX.lock().unwrap().is_none() {
+                    // 뷰어: 마지막 위치 그대로, 놓침 표시(손카메라 빨간색)
+                    out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
+                }
+                return;
+            }
+            if held && no_map {
+                return; // 위치만 장면은 맡아 두지도 않음
+            }
+            if held {
+                // 맡아 둘 장면: 믿는 지도와 이어지지 않은 새 지도의 위치라 지금 지도에는 넣지 않고 보관만 한다.
+                // 기준 노드가 믿는 노드로 바뀌면(루프 클로저로 이어짐) 다시 쌓기가 고친 위치로 넣는다
+                stream_held += 1;
+                if leveled && a.rebuild_every >= 0.0 && kfs.holds(anchor) {
+                    let keep = kfs.push_lazy(t, anchor, raw.0, raw.1, cam_height(&hist_h), w, h, dets, true);
+                    match (pw.as_mut(), keep) {
+                        (Some(pw), Some(kf)) => pw.hold(std::mem::take(&mut *depth), std::mem::take(&mut *rgb), w, h, kf), // 이 장면은 여기서 끝: 복사 없이 넘김(압축은 점 작업 스레드)
+                        (None, Some(kf)) => { kf.fill(&rgb, &depth); let _ = kf.pts.set(None); }
+                        _ => {}
+                    }
+                }
+                if a.live > 0.0 && !held_live && POSE_FIX.lock().unwrap().is_none() {
+                    out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": false, "wall": wall_ms()})));
+                }
+                return;
+            }
+            // 깊이는 받은 u16 그대로: 읽는 자리마다 같은 식(v × (1 / per_m))으로 미터(장면마다 1.2 MB 미터 칸을 만들지 않음, 같은 비트)
+            // 뷰어의 수평 버튼(한 프로그램이면 공유 신호, 따로 띄운 뷰어면 level.req): 지금 카메라 자세를 수평으로 삼는다. 받은 위치에 곱하는 회전을 '카메라의 위 = 세계의 위'가 되게 바꾸고,
+            // 보관한 장면을 그 회전으로 다시 쌓아 이미 만든 지도·물체도 함께 바로 세운다(쌓는 중이면 끝난 뒤에)
+            if a.stream.is_some() && a.live > 0.0 && rb_job.is_none() && level_requested(a) {
+                let up_raw = [-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]]; // 카메라 좌표의 위(−y)를 받은 좌표로
+                let fix = rot_between(&up_raw, &[0.0, 0.0, 1.0]);
+                let old_t: M3 = [[stream_fix[0][0], stream_fix[1][0], stream_fix[2][0]], [stream_fix[0][1], stream_fix[1][1], stream_fix[2][1]], [stream_fix[0][2], stream_fix[1][2], stream_fix[2][2]]];
+                let delta = mm(&fix, &old_t); // 지금까지의 좌표 → 새 좌표
+                for e in est_traj.iter_mut() {
+                    (e.1, e.2) = (mv(&delta, &e.1), mm(&delta, &e.2));
+                }
+                let tilt = delta[2][2].clamp(-1.0, 1.0).acos().to_degrees();
+                stream_fix = fix;
+                leveled = true;
+                z0 = Some(mv(&stream_fix, &raw.1)[2] - cam_height(&hist_h)); // 바닥 높이 원점도 새 좌표로
+                kfs.dirty = true;
+                force_rb = true;
+                common::info!("수평 버튼: 지금 카메라 자세를 수평으로 삼음(지도를 {tilt:.1}° 돌려 다시 쌓음)");
+            }
+            // 위치 쪽이 IMU 로 지도를 중력 수평으로 맞춰 보냄: 받은 그대로 수평(첫 장면 가정 · 바닥 합의 없음, 수평 버튼은 그대로 됨)
+            if gravity && !leveled && a.stream.is_some() && !a.no_level {
+                (leveled, upright, refine) = (true, false, false);
+                common::info!("수평: 위치 추적이 IMU 중력으로 맞춘 지도를 그대로 씀");
+            }
+            if std::mem::take(&mut upright) && !leveled {
+                stream_fix = rot_between(&[-raw.0[0][1], -raw.0[1][1], -raw.0[2][1]], &[0.0, 0.0, 1.0]);
+                (leveled, refine) = (true, true);
+                common::info!("수평: 첫 장면 카메라를 똑바로 선 것으로 보고 시작(바닥 합의가 나오면 고침)");
+            }
+            if a.stream.is_some() {
+                r = mm(&stream_fix, &r);
+                p = mv(&stream_fix, &p);
+            }
+            let c_vo = Instant::now();
+            // 수평 합의: 위치가 확인된 장면마다 수평면 법선(세계)을 모으고, 15 장 이상이 10° 안에서 합의하면 세계를 한 번 바로 세운다
+            if (!leveled || refine) && a.stream.is_some() {
+                if let Some(n) = up_normal(&depth, w, h, seq.k, &r, refine) {
+                    grav_obs.push(n);
+                }
+                if grav_obs.len() >= 15 {
+                    let mean = |v: &[V3]| {
+                        let s = v.iter().fold([0.0; 3], |a, b| add(&a, b));
+                        let l = norm(&s).max(1e-9);
+                        s.map(|x| x / l)
+                    };
+                    let m0 = mean(&grav_obs);
+                    let inl: Vec<V3> = grav_obs.iter().copied().filter(|n| dot(n, &m0) > 10f64.to_radians().cos()).collect();
+                    if inl.len() * 10 >= grav_obs.len() * 6 {
+                        'lv: {
+                        let up = mean(&inl);
+                        let fix = rot_between(&up, &[0.0, 0.0, 1.0]);
+                        let tilt = up[2].clamp(-1.0, 1.0).acos().to_degrees();
+                        if refine && tilt > 70.0 {
+                            // 첫 장면이 똑바르다는 가정과 70° 넘게 다르면 믿지 않음(세계를 뒤집지 않음, 천장은 floor_only 로 이미 빠짐 · 녹화 첫 장면은 46° 숙여 있기도 함): 모은 것을 버리고 계속
+                            common::info!("수평 맞춤: 바닥 합의가 처음 가정과 {tilt:.1}° 달라 버림");
+                            grav_obs.clear();
+                            break 'lv;
+                        }
+                        if std::mem::take(&mut refine) {
+                            // 처음 가정(첫 장면이 똑바름)을 바닥 합의로 고침: 지난 위치 · 바닥 높이 원점도 새 좌표로, 지도는 다시 쌓음
+                            for e in est_traj.iter_mut() {
+                                (e.1, e.2) = (mv(&fix, &e.1), mm(&fix, &e.2));
+                            }
+                            // 바닥 높이는 기울어진 채 잰 값이라 버리고, 이 장면에서 새 좌표로 다시 잰다(바닥 = z 0)
+                            hist_h.clear();
+                            z0 = None;
+                            (kfs.dirty, force_rb) = (true, true);
+                        }
+                        r = mm(&fix, &r);
+                        p = mv(&fix, &p);
+                        stream_fix = mm(&fix, &stream_fix);
+                        leveled = true;
+                        common::info!("수평 맞춤: 처음 가정이 {:.1}° 기울어져 있었음({} / {} 장 합의)", up[2].clamp(-1.0, 1.0).acos().to_degrees(), inl.len(), grav_obs.len());
+                        }
+                    } else if grav_obs.len() > 60 {
+                        grav_obs.drain(..30); // 합의가 안 되면 오래된 것부터 버리고 계속
+                    }
+                }
+            }
+            if a.stream.is_some() && leveled {
+                est_traj.push((t, p, r));
+                // 바닥으로 기울기 고침: 세 장마다 바닥 면 법선을 재 고침 회전을 반씩 다가가게(잡음은 누름), 자세에 곱함
+                r = mm(&tilt_c, &r);
+                if nkf % 3 == 0 && !no_map {
+                    if let Some(n) = up_normal(&depth, w, h, seq.k, &r, true) {
+                        let n = { let l = norm(&n).max(1e-9); n.map(|x| x / l) };
+                        if n[2] > 25f64.to_radians().cos() {
+                            let half = { let m = add(&n, &[0.0, 0.0, 1.0]); let l = norm(&m).max(1e-9); m.map(|x| x / l) };
+                            let step = rot_between(&n, &half);
+                            tilt_c = orthonormal(&mm(&step, &tilt_c)); // 곱이 쌓여도 회전으로 남게
+                            r = mm(&step, &r);
+                        }
+                    }
+                }
+            }
+            let c2 = Instant::now();
+            clock.load += load;        clock.seg += seg_s;
+
+            // 바닥 높이: 화면 아래쪽 점이 카메라 아래로 얼마나 떨어졌나(95 %) → 카메라 높이, 짧게 평활
+            let back = |u: usize, v: usize| -> Option<V3> {
+                let z = depth.at(v * w + u) as f64;
+                (z > 0.2 && z < 6.0).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
+            };
+            let mut below = vec![];
+            let up_c = [r[2][0], r[2][1], r[2][2]]; // 세계 z 를 카메라 좌표로(Rᵀ·ẑ)
+            for v in (h / 2..h).step_by(16) {
+                for u in (8..w).step_by(16) {
+                    if let Some(pc) = back(u, v) {
+                        below.push(-dot(&pc, &up_c));
+                    }
+                }
+            }
+            if below.len() > 50 {
+                let k95 = (below.len() as f64 * 0.95) as usize;
+                let ch = *below.select_nth_unstable_by(k95, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
+                if (0.5..2.5).contains(&ch) && !no_map {
+                    hist_h.push(ch);
+                }
+            }
+            let h_now = cam_height(&hist_h);
+            let z0v = if leveled { *z0.get_or_insert(p[2] - h_now) } else { p[2] - h_now };
+            // 실시간 스트림: 받는 스레드가 다음 장면부터 이 회전 · 원점으로 위치를 바로 냄(이 장면은 아직 아무도 안 냈으면 아래에서)
+            let pose_first = early_pose_on && POSE_FIX.lock().unwrap().replace((stream_fix, z0v)).is_none();
+            let pwc = [p[0], p[1], p[2] - z0v];
+            let floor_z = pwc[2] - h_now;
+            // 위치가 확인된 장면만 지도·물체에 넣는다(실패해 예측 위치뿐인 장면은 지도를 어긋나게 함)
+            let map_ok = leveled && !no_map;
+            let (c3, c4) = map_frame(a, seq.k, t, &r, &pwc, floor_z, &depth, &rgb, w, h, &dets, map_ok, &mut grid, &mut mem, &mut traj, &mut map_traj);
+            clock.part[P::Vo as usize] += (c2 - c_vo).as_secs_f64();
+            clock.part[P::Map as usize] += (c3 - c2).as_secs_f64();
+            clock.part[P::Obj as usize] += (c4 - c3).as_secs_f64();
+            let c_pt = Instant::now();
+            // 보관(줄인 보관이어도 점 지도는 점 작업 스레드가 붙이는 점 격자로 다시 쌓음)
+            let keep = (map_ok && a.stream.is_some() && a.rebuild_every >= 0.0)
+                .then(|| kfs.push_lazy(t, anchor, raw.0, raw.1, h_now, w, h, dets, true))
+                .flatten();
+            // 보관 장면에 이때 고친 카메라 자세의 위(카메라 좌표)를 붙여 둠: 다시 쌓을 때 노드가 움직여도 같은 기울기 고침을 다시 함
+            if let Some(kf) = &keep {
+                UPS.lock().unwrap().insert(kf.seq, [r[2][0], r[2][1], r[2][2]]); // Rᵀ·ẑ
+            }
+            if let (Some(p), true) = (pw.as_mut(), map_ok) {
+                // 깊이·사진은 이 뒤 본 스레드가 쓰지 않으므로 복사 없이 넘김
+                let rgb_pts = std::mem::take(&mut *rgb);
+                p.frame(nkf, r, pwc, std::mem::take(&mut *depth), rgb_pts, w, h, keep, behind);
+            } else if let Some(kf) = keep {
+                kf.fill(&rgb, &depth);
+            }
+            clock.add(P::Pts, c_pt);
+            last_pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
+            cam_json = json!({"pos": pwc, "R": r});
+            nkf += 1;
+            // 실시간: 카메라 위치만 담은 작은 pose.json 은 장면마다(스트림은 받는 스레드가 받자마자 냄, 여기서는 첫 장면과 TUM · 카메라 입력만),
+            // 지도·물체·그래프(view.json)는 0.4 초마다
+            if a.live > 0.0 && (!early_pose_on || pose_first) {
+                out::write_direct(&a.out.join("pose.json"), out::json_bytes(&json!({"t": t, "cam": cam_json, "pose": last_pose, "ok": true, "wall": wall_ms()})));
+            }
+            // 메모리 기억 폴더(--serve): 받은 장면마다 바로 뷰어에(view 판은 뷰 스레드가 짜고 밀리면 마지막 것만, 점 노드는 점 작업 스레드가 한가할 때마다). 디스크 기록이면 0.4 · 1 초 간격
+            let write_now = write_late || if a.live > 0.0 { last_view.elapsed().as_secs_f64() >= view_gap || nkf == 1 } else { nkf % (if behind { 15 } else { 5 }) == 0 || nkf == 1 };
+            // 3D 점 지도: 실시간은 1 초마다(전에는 장면 번호가 기록 시점과 우연히 맞을 때만 나가 몇 초씩 비었다), 아니면 장면 수로
+            let scene_now = write_now && (scene_late || if a.live > 0.0 { last_scene.elapsed().as_secs_f64() >= scene_gap && pw.as_ref().is_none_or(|p| p.idle()) } else { nkf % 50 == 0 || nkf % a.scene_every == 1 || a.scene_every == 1 });
+            // 갈아 끼우기 일을 한 장면이면 정기 기록을 다음 장면으로
+            let write_now = if busy && write_now {
+                (write_due, scene_due) = (true, scene_now);
+                false
             } else {
-                write_view(&a.out, &grid, &mut mem, &mut view, &traj, t, last_pose, &cam_json, &scene_json, merge, VIEW_REFRESH);
+                write_now
+            };
+            if !write_now && nkf >= last_merge + 15 {
+                let c_m = Instant::now();
+                last_merge = nkf;
+                mem.prune(t);
+                mem.merge_pass();
+                clock.add(P::Merge, c_m);
             }
-            clock.add(if merge { P::Merge } else { P::View }, c_v);
-            let c_p = Instant::now();
-            if !view_late && !view_due && std::mem::take(&mut prune_objs) {
-                prune_object_files(&a.out, &mem);
+            if write_now || view_late {
+                let c_sc = Instant::now();
+                let mut scene_done = false;
+                if write_now {
+                last_view = Instant::now();
+                if scene_now || nkf == 1 {
+                    last_scene = Instant::now();
+                    scene_done = true;
+                    // 새로 확정된 칸만 조각 파일로: 뷰어는 아직 안 받은 조각만 받는다(원격 접속에서 지도 전체를 매번 받지 않게)
+                    scene_json = json!({"run": run_id, "voxel": a.scene_vox});
+                    if let Some(p) = pw.as_mut() {
+                        p.write(PTS_BUDGET);
+                        scene_json["octree"] = p.json();
+                    }
+                }
+                }
+                // 병합 후처리는 키프레임 15 장마다(물체 쌍을 매번 다 보지 않게, 중복이 자라기 전에 합침)
+                let merge = write_now && nkf >= last_merge + 15;
+                if merge {
+                    last_merge = nkf;
+                }
+                clock.add(P::Scene, c_sc);
+                let c_v = Instant::now();
+                // 점 노드를 쓴 장면은 view.json 을 다음 장면으로 미룸(한 장면에 몰리지 않게). 병합은 제때(결과가 같게)
+                if scene_done && nkf > 1 && !(out::memory_only() && a.live > 0.0) { // 메모리 기억 폴더는 같은 장면에서(미루면 실시간에선 장면마다 다시 미뤄져 판이 안 나감)
+                    if merge {
+                        mem.prune(t);
+                        mem.merge_pass();
+                    }
+                    view_due = true;
+                } else {
+                    write_view(&a.out, &grid, &mut mem, &mut view, &traj, t, last_pose, &cam_json, &scene_json, merge, VIEW_REFRESH);
+                }
+                clock.add(if merge { P::Merge } else { P::View }, c_v);
+                let c_p = Instant::now();
+                if !view_late && !view_due && std::mem::take(&mut prune_objs) {
+                    prune_object_files(&a.out, &mem);
+                }
+                clock.add(P::Prune, c_p);
             }
-            clock.add(P::Prune, c_p);
-        }
-        let c5 = Instant::now();
-        clock.vo += (c2 - c_vo).as_secs_f64();
-        clock.map += (c3 - c2).as_secs_f64();
-        clock.obj += (c4 - c3).as_secs_f64();
-        clock.write += (c5 - c4).as_secs_f64();
-        clock.n += 1;
-        out::slow(c_top);
-        clock.end_frame(c_top.elapsed().as_secs_f32() * 1e3, nkf);
-        if let (Some(ti), Some(tr)) = (t_in, t_ready) {
-            let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f32() * 1e3;
-            let now = Instant::now();
-            lat.push([ms(ti, tr), ms(tr, c_top), ms(c_top, now), ms(ti, now)]);
-        }
-        if clock.t_span.0 == 0.0 { clock.t_span.0 = t; }
-        clock.t_span.1 = t;
-        if lag_on {
-            let l = (pace0.elapsed().as_secs_f64() - (t - pace_t0) / lag_rate) as f32;
-            clock.lag.push(l);
-            if rb_job.is_some() {
-                lag_rb = (lag_rb.0 + 1, lag_rb.1.max(l));
+            let c5 = Instant::now();
+            clock.vo += (c2 - c_vo).as_secs_f64();
+            clock.map += (c3 - c2).as_secs_f64();
+            clock.obj += (c4 - c3).as_secs_f64();
+            clock.write += (c5 - c4).as_secs_f64();
+            clock.n += 1;
+            out::slow(c_top);
+            clock.end_frame(c_top.elapsed().as_secs_f32() * 1e3, nkf);
+            if let (Some(ti), Some(tr)) = (t_in, t_ready) {
+                let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f32() * 1e3;
+                let now = Instant::now();
+                lat.push([ms(ti, tr), ms(tr, c_top), ms(c_top, now), ms(ti, now)]);
             }
-        }
-        if nkf % 25 == 0 {
-            let n = clock.n as f64;
-            println!("kf {nkf} objects {} ({} gone) | ms/kf wait {:.0} seg {:.0} vo {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | pos ({:.2},{:.2},{:.2})",
-                     mem.objs.len(), mem.objs.iter().filter(|o| o.state == "gone").count(),
-                     clock.load / n * 1e3, clock.seg / n * 1e3, clock.vo / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
-                     n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);
-            // 메모리: 프로세스 RSS · 메모리 기억 폴더(파일 수 · MB) · 보관 장면(MB)
-            let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches(" kB").trim().parse::<f64>().ok())).unwrap_or(0.0) / 1024.0;
-            let (mf, mb) = sgview::memfs::usage();
-            println!("mem kf {nkf} t {:.1} rss_mb {rss:.0} memfs_files {mf} memfs_mb {:.1} kfstore_mb {:.1}", t, mb as f64 / 1048576.0, kfs.bytes() as f64 / 1048576.0);
-        }
-    }
+            if clock.t_span.0 == 0.0 { clock.t_span.0 = t; }
+            clock.t_span.1 = t;
+            if lag_on {
+                let l = (pace0.elapsed().as_secs_f64() - (t - pace_t0) / lag_rate) as f32;
+                clock.lag.push(l);
+                if rb_job.is_some() {
+                    lag_rb = (lag_rb.0 + 1, lag_rb.1.max(l));
+                }
+            }
+            if nkf % 25 == 0 {
+                let n = clock.n as f64;
+                println!("kf {nkf} objects {} ({} gone) | ms/kf wait {:.0} seg {:.0} vo {:.0} map {:.0} obj {:.0} write {:.0} | {:.1} kf/s | pos ({:.2},{:.2},{:.2})",
+                         mem.objs.len(), mem.objs.iter().filter(|o| o.state == "gone").count(),
+                         clock.load / n * 1e3, clock.seg / n * 1e3, clock.vo / n * 1e3, clock.map / n * 1e3, clock.obj / n * 1e3, clock.write / n * 1e3,
+                         n / t0.elapsed().as_secs_f64(), p[0], p[1], p[2]);
+                // 메모리: 프로세스 RSS · 메모리 기억 폴더(파일 수 · MB) · 보관 장면(MB)
+                let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches(" kB").trim().parse::<f64>().ok())).unwrap_or(0.0) / 1024.0;
+                let (mf, mb) = sgview::memfs::usage();
+                println!("mem kf {nkf} t {:.1} rss_mb {rss:.0} memfs_files {mf} memfs_mb {:.1} kfstore_mb {:.1}", t, mb as f64 / 1048576.0, kfs.bytes() as f64 / 1048576.0);
+            }
+        };
+    // ---------------------------------------------------------------- 처리 루프
+    // 입력(스트림 · TUM) → 분할(NPU 비동기 · 동기) → 장면 차례대로 물체 기억. 스레드 넘김 없이 한 루프에서, 무거운 뒤 일은 줄(점 · 뷰 · 기록 · 사진 벡터 · 다시 쌓기)이 작업 풀에서
+    let drv = Driver::new(a, seg, stream_rd, stream_first, pace0, pace_t0, lag_on, io);
+    let seg = drv.run(a, &seq, io, &mut body);
+    drop(body);
+    let (drv_dropped, drv_seg, drv_stats) = DRV_STATS.with(|d| d.get());
     // 끝: 마지막 다시 쌓기 뒤에 노드가 또 움직였으면 끝난 그래프로 한 번 더(결과 지도·물체·poses_map.txt 가 최종 위치를 따름)
     let mut installed = false;
     if let Some(job) = rb_job.take() {
-        let rb = job.join().expect("다시 쌓기 스레드");
+        let rb = job.join();
         rb_cache = Some(rb.cache.clone());
         install(a, seq.k, rb, &kfs, &stream_fix, z0.unwrap_or(0.0), &mut grid, pw.as_mut(), &mut mem, &mut traj, &mut map_traj);
         view.traj_replaced();
@@ -1411,7 +1563,6 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         }
         let _ = std::fs::write(a.out.join("poses_map.txt"), s);
     }
-    let seg = worker.join().expect("worker");
     scene_json = json!({"run": run_id, "voxel": a.scene_vox});
     // 점 지도: 남은 노드를 모두 쓰고 점 작업 스레드를 끝냄
     let (n_pts, scene_mb, pts_dropped) = match pw.as_mut() {
@@ -1475,17 +1626,17 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     }
     summary["frame_parts"] = clock.parts_json();
     summary["degraded_frames"] = json!(n_behind);
-    summary["dropped_late"] = json!(drop_n.load(std::sync::atomic::Ordering::Relaxed));
-    summary["seg_runs"] = json!(seg_n.load(std::sync::atomic::Ordering::Relaxed));
+    summary["dropped_late"] = json!(drv_dropped);
+    summary["seg_runs"] = json!(drv_seg);
     {
-        let s = *seg_stats.lock().unwrap();
+        let s = drv_stats;
         if s.n > 0 {
             let m = 1e3 / s.n as f64;
-            summary["seg_stage_ms"] = json!({ "pre": s.pre * m, "infer": s.infer * m, "post": s.post * m, "submit": s.sub * m, "npu_wait": s.npu * m });
+            summary["seg_stage_ms"] = json!({ "pre": s.pre * m, "infer": s.infer * m, "post": s.post * m, "submit": s.sub * m, "npu_take": s.npu * m });
             summary["seg_per_s"] = json!(s.n as f64 / s.wall.max(1e-9));
-            summary["seg_pipe"] = json!(a.seg_pipe);
         }
     }
+    summary["loop"] = io.json();
     let span = (clock.t_span.1 - clock.t_span.0).max(1e-6);
     summary["stream_kf_per_s"] = json!(clock.n as f64 / span);
     if !clock.lag.is_empty() {
@@ -1676,12 +1827,13 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     let mut dec: std::collections::VecDeque<(Depth, Vec<u8>, Option<Vec<seg::Det>>)> = Default::default();
     // 시험용 MEMMAP_CKPT_EVERY(15 의 배수)
     let ck_every = std::env::var("MEMMAP_CKPT_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0 && v % 15 == 0).unwrap_or(CKPT_EVERY);
-    // 점 지도는 점유 격자·물체와 서로 상관없음: 따로 도는 스레드가 같은 장면 순서로 쌓는다(각자 차례대로라 결과 같음, 시간은 둘 중 긴 쪽)
+    // 점 지도는 점유 격자·물체와 서로 상관없음: 작업 풀의 다른 일꾼이 같은 장면 순서로 쌓는다(각자 차례대로라 결과 같음, 시간은 둘 중 긴 쪽)
     let mut main_ck: Vec<(usize, Grid, Memory, Vec<(f64, [f64; 3])>, Vec<(f64, V3, M3)>)> = vec![];
-    let (scene, scene_ck, t_pts, pts, t_exp) = std::thread::scope(|sc| {
+    let mut pts_out = None;
+    rayon::in_place_scope(|sc| {
         let mut scene = scene;
-        let h = sc.spawn(move || {
-            out::thread_role(out::Role::Rebuild);
+        let pts_slot = &mut pts_out;
+        sc.spawn(move |_| {
             let mut cks: Vec<(usize, SceneMap)> = vec![];
             let mut t = 0.0f64;
             for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
@@ -1690,14 +1842,14 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
                 }
                 let cp = Instant::now();
                 // 점 작업 스레드가 보관해 둔 점 격자(온 장면을 풀지 않음)
-                if let Some(g) = kf.pts.wait().as_ref().map(PtsGrid::from_z) {
+                if let Some(g) = kf.pts_wait().as_ref().map(PtsGrid::from_z) {
                     grid_points(k, &g, r, pwc, &mut scene, i as u32);
                 }
                 t += cp.elapsed().as_secs_f64();
             }
             let ce = Instant::now();
             let pts = Some(export_points(&mut scene)); // 점 지도 옥트리 노드 파일도 작업 스레드에서
-            (scene, cks, t, pts, ce.elapsed().as_secs_f64())
+            *pts_slot = Some((scene, cks, t, pts, ce.elapsed().as_secs_f64()));
         });
         for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
             if i > start && i % ck_every == 0 {
@@ -1723,8 +1875,8 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
                 mem.merge_pass();
             }
         }
-        h.join().expect("점 지도 다시 쌓기 스레드")
     });
+    let (scene, scene_ck, t_pts, pts, t_exp) = pts_out.expect("점 지도 다시 쌓기");
     for ((i, g, m, tr, mt), (j, sc)) in main_ck.into_iter().zip(scene_ck) {
         debug_assert_eq!(i, j);
         ckpts.push(std::sync::Arc::new(Ckpt { i, grid: g, scene: sc, mem: m, traj: tr, map_traj: mt }));
@@ -1949,29 +2101,29 @@ fn give_back(rgb: Vec<u8>, depth: Depth) {
     }
 }
 
-enum PtsMsg {
-    /// 실시간 장면: 점을 고르고(보관 장면이면 점 격자를 압축해 붙임) 지도에 넣음
-    Frame { kf: u32, r: M3, pwc: V3, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, part: Option<usize> },
-    /// 맡아 둘 장면: 점 격자만 만들어 붙임(지도에는 이어진 뒤 다시 쌓기가 넣음)
-    Hold { depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf> },
-    /// 보관 장면(다시 쌓은 뒤 이어 넣기): 붙여 둔 점 격자로
-    Stored { kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf> },
-    /// 노드 파일 쓰기(점 수 상한, 0 = 모두), 다 쓰면 알림(기다리는 모드)
-    Write(usize, Option<std::sync::mpsc::Sender<()>>),
-    /// 다시 쌓은 지도로 갈아 끼우고 노드 파일 전부를 새 판 폴더에
-    Replace(Box<SceneMap>, PtsFiles),
+/// 점 줄의 상태: 점 지도와 그 시간 계측
+struct PtsSt {
+    a: std::sync::Arc<Args>,
+    k: [f64; 4],
+    scene: SceneMap,
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>, // view.json 에 실은 판(이 판 폴더는 지우지 않음)
+    json_tx: std::sync::mpsc::Sender<serde_json::Value>,
+    t_grid: f64,
+    t_add: f64,
+    t_write: f64,
+    nf: u32,
 }
 
-/// 점 작업 스레드: 점 고르기·지도 넣기·옥트리 노드 쓰기를 모두 맡아 본 스레드는 장면을 넘기기만 한다.
-/// 노드 목록 JSON 은 쓰기가 끝난 뒤에야 바뀌므로 view.json 은 늘 다 쓴 판만 가리킨다
+/// 점 줄: 점 고르기·지도 넣기·옥트리 노드 쓰기를 작업 풀에서 차례대로(스레드 없음). 루프는 장면을 넘기기만 한다.
+/// 노드 목록 JSON 은 쓰기가 끝난 뒤에야 바뀌므로(완료 줄로 돌아옴) view.json 은 늘 다 쓴 판만 가리킨다
 struct PtsWorker {
-    tx: Option<std::sync::mpsc::Sender<PtsMsg>>,
-    json: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
-    published: std::sync::Arc<std::sync::atomic::AtomicU64>, // view.json 에 실은 판(이 판 폴더는 지우지 않음)
-    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    handle: Option<std::thread::JoinHandle<SceneMap>>,
+    lane: common::rt::Lane<PtsSt>,
+    json_rx: std::sync::mpsc::Receiver<serde_json::Value>,
+    json: std::cell::RefCell<serde_json::Value>,
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>,
     wait: bool, // 밀려도 기다림(TUM 입력: 결과가 늘 같게)
     out: PathBuf,
+    vox: f64,
     gap: (f64, f64), // 이만큼(m, 라디안) 안 움직인 장면은 점 격자 일부만
     last: Option<(M3, V3)>, // 마지막으로 다 넣은 장면 위치
     skipped: u32, // 점 격자 일부만 넣은 가까운 자리 장면 수
@@ -1979,83 +2131,19 @@ struct PtsWorker {
 }
 
 impl PtsWorker {
-    fn spawn(a: std::sync::Arc<Args>, k: [f64; 4], mut scene: SceneMap, wait: bool) -> PtsWorker {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (tx, rx) = std::sync::mpsc::channel::<PtsMsg>();
-        let json = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+    fn new(a: std::sync::Arc<Args>, k: [f64; 4], scene: SceneMap, wait: bool) -> PtsWorker {
         let published = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(scene.run));
-        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let out = a.out.clone();
-        let gap = (PTS_GAP_M, PTS_GAP_DEG.to_radians());
-        let (j2, p2, q2) = (json.clone(), published.clone(), queued.clone());
-        let handle = std::thread::spawn(move || {
-            out::thread_role(out::Role::Points);
-            let (mut t_grid, mut t_add, mut t_write, mut nf) = (0f64, 0f64, 0f64, 0u32);
-            for m in rx {
-                match m {
-                    PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep, part } => {
-                        let c0 = Instant::now();
-                        if let Some(s) = &keep {
-                            s.fill(&rgb, &depth); // 보관 장면 압축(본 스레드 대신)
-                        }
-                        let g = pts_grid(&a, k, &depth, &rgb, w, h, part);
-                        give_back(rgb, depth);
-                        if let Some(s) = keep {
-                            let _ = s.pts.set(Some(g.pack()));
-                        }
-                        let c1 = Instant::now();
-                        grid_points(k, &g, &r, &pwc, &mut scene, kf);
-                        (t_grid, t_add, nf) = (t_grid + (c1 - c0).as_secs_f64(), t_add + c1.elapsed().as_secs_f64(), nf + 1);
-                        out::slow(c0);
-                        q2.fetch_sub(1, Relaxed);
-                    }
-                    PtsMsg::Hold { depth, rgb, w, h, keep } => {
-                        let c0 = Instant::now();
-                        keep.fill(&rgb, &depth);
-                        let _ = keep.pts.set(Some(pts_grid(&a, k, &depth, &rgb, w, h, None).pack()));
-                        give_back(rgb, depth);
-                        out::slow(c0);
-                        q2.fetch_sub(1, Relaxed);
-                    }
-                    PtsMsg::Stored { kf, r, pwc, store } => {
-                        if let Some(g) = store.pts.wait().as_ref().map(PtsGrid::from_z) {
-                            grid_points(k, &g, &r, &pwc, &mut scene, kf);
-                        }
-                    }
-                    PtsMsg::Write(budget, ack) => {
-                        let c0 = Instant::now();
-                        let j = write_points(&a.out, &mut scene, budget, None, p2.load(Relaxed));
-                        out::slow(c0);
-                        t_write += c0.elapsed().as_secs_f64();
-                        *j2.lock().unwrap() = j;
-                        if let Some(t) = ack {
-                            let _ = t.send(());
-                        }
-                    }
-                    PtsMsg::Replace(s, files) => {
-                        scene = *s;
-                        let j = write_points(&a.out, &mut scene, PTS_BUDGET, Some(files), p2.load(Relaxed));
-                        *j2.lock().unwrap() = j;
-                    }
-                }
-            }
-            if std::env::var("MEMMAP_PTS_LOG").is_ok() {
-                let n = nf.max(1) as f64;
-                common::info!("점 작업 스레드: 장면 {nf} 개, 점 고르기 {:.1} ms/장 + 지도 넣기 {:.1} ms/장, 노드 쓰기 합 {t_write:.2} 초", t_grid / n * 1e3, t_add / n * 1e3);
-            }
-            scene
-        });
-        PtsWorker { tx: Some(tx), json, published, queued, handle: Some(handle), wait, out, dropped: 0, gap, last: None, skipped: 0 }
-    }
-    fn send(&self, m: PtsMsg) {
-        self.tx.as_ref().unwrap().send(m).expect("점 작업 스레드");
+        let (json_tx, json_rx) = std::sync::mpsc::channel();
+        let (out, vox) = (a.out.clone(), scene.vox);
+        let st = PtsSt { a, k, scene, published: published.clone(), json_tx, t_grid: 0.0, t_add: 0.0, t_write: 0.0, nf: 0 };
+        PtsWorker { lane: common::rt::Lane::new("pts", st, 0), json_rx, json: std::cell::RefCell::new(serde_json::Value::Null), published, wait, out, vox,
+                    dropped: 0, gap: (PTS_GAP_M, PTS_GAP_DEG.to_radians()), last: None, skipped: 0 }
     }
     /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게.
     /// 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면은 점 격자 일부만(어긋남을 돌려 가며) 넣음: 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
     #[allow(clippy::too_many_arguments)]
     fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, thin: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
+        if !self.wait && self.lane.pending() as usize >= PTS_QUEUE {
             self.dropped += 1;
             if let Some(s) = &keep {
                 s.fill(&rgb, &depth); // 밀려 건너뛰어도 보관 장면은 압축(드묾)
@@ -2066,7 +2154,6 @@ impl PtsWorker {
             }
             return;
         }
-        self.queued.fetch_add(1, Relaxed);
         let near = thin || self.last.as_ref().is_some_and(|(lr, lp)| norm(&sub(&pwc, lp)) < self.gap.0 && rot_angle(&r, lr) < self.gap.1);
         let part = if near {
             self.skipped += 1;
@@ -2075,54 +2162,94 @@ impl PtsWorker {
             self.last = Some((r, pwc));
             None
         };
-        self.send(PtsMsg::Frame { kf, r, pwc, depth, rgb, w, h, keep, part });
+        self.lane.push(move |s: &mut PtsSt| {
+            let c0 = Instant::now();
+            if let Some(z) = &keep {
+                z.fill(&rgb, &depth); // 보관 장면 압축(루프 대신)
+            }
+            let g = pts_grid(&s.a, s.k, &depth, &rgb, w, h, part);
+            give_back(rgb, depth);
+            if let Some(z) = keep {
+                let _ = z.pts.set(Some(g.pack()));
+            }
+            let c1 = Instant::now();
+            grid_points(s.k, &g, &r, &pwc, &mut s.scene, kf);
+            (s.t_grid, s.t_add, s.nf) = (s.t_grid + (c1 - c0).as_secs_f64(), s.t_add + c1.elapsed().as_secs_f64(), s.nf + 1);
+            out::slow(c0);
+        });
     }
     /// 맡아 둘 장면: 점 격자만 만들어 붙이게 넘김(밀렸으면 빈 점 격자로 표시)
     fn hold(&mut self, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if !self.wait && self.queued.load(Relaxed) >= PTS_QUEUE {
+        if !self.wait && self.lane.pending() as usize >= PTS_QUEUE {
             self.dropped += 1;
             keep.fill(&rgb, &depth);
             give_back(rgb, depth);
             let _ = keep.pts.set(None);
             return;
         }
-        self.queued.fetch_add(1, Relaxed);
-        self.send(PtsMsg::Hold { depth, rgb, w, h, keep });
+        self.lane.push(move |s: &mut PtsSt| {
+            let c0 = Instant::now();
+            keep.fill(&rgb, &depth);
+            let _ = keep.pts.set(Some(pts_grid(&s.a, s.k, &depth, &rgb, w, h, None).pack()));
+            give_back(rgb, depth);
+            out::slow(c0);
+        });
     }
-    fn stored(&self, kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf>) {
-        self.send(PtsMsg::Stored { kf, r, pwc, store });
+    /// 보관 장면(다시 쌓은 뒤 이어 넣기): 붙여 둔 점 격자로
+    fn stored(&mut self, kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf>) {
+        self.lane.push(move |s: &mut PtsSt| {
+            if let Some(g) = store.pts_wait().as_ref().map(PtsGrid::from_z) {
+                grid_points(s.k, &g, &r, &pwc, &mut s.scene, kf);
+            }
+        });
     }
     /// 밀린 장면 없음(실시간 점 노드 쓰기를 장면마다 해도 줄이 늘지 않을 때)
     fn idle(&self) -> bool {
-        self.queued.load(std::sync::atomic::Ordering::Relaxed) <= 1
+        self.lane.pending() <= 1
     }
     /// 노드 쓰기 요청(기다리는 모드면 다 쓸 때까지 기다려 바로 뒤 json() 이 이번 판)
-    fn write(&self, budget: usize) {
+    fn write(&mut self, budget: usize) {
+        self.lane.push(move |s: &mut PtsSt| {
+            let c0 = Instant::now();
+            let j = write_points(&s.a.out, &mut s.scene, budget, None, s.published.load(std::sync::atomic::Ordering::Relaxed));
+            out::slow(c0);
+            s.t_write += c0.elapsed().as_secs_f64();
+            let _ = s.json_tx.send(j);
+        });
         if self.wait {
-            let (t, r) = std::sync::mpsc::channel();
-            self.send(PtsMsg::Write(budget, Some(t)));
-            let _ = r.recv();
-        } else {
-            self.send(PtsMsg::Write(budget, None));
+            self.lane.wait_idle();
         }
     }
-    fn replace(&self, scene: SceneMap, files: PtsFiles) {
-        self.send(PtsMsg::Replace(Box::new(scene), files));
+    /// 다시 쌓은 지도로 갈아 끼우고 노드 파일 전부를 새 판 폴더에
+    fn replace(&mut self, scene: SceneMap, files: PtsFiles) {
+        self.lane.push(move |s: &mut PtsSt| {
+            s.scene = scene;
+            let j = write_points(&s.a.out, &mut s.scene, PTS_BUDGET, Some(files), s.published.load(std::sync::atomic::Ordering::Relaxed));
+            let _ = s.json_tx.send(j);
+        });
     }
     /// 다 쓴 마지막 노드 목록(view.json 용) — 이 판을 실었다고 표시
     fn json(&self) -> serde_json::Value {
-        let j = self.json.lock().unwrap().clone();
-        if let Some(run) = j["run"].as_u64() {
+        let mut cur = self.json.borrow_mut();
+        while let Ok(j) = self.json_rx.try_recv() {
+            *cur = j;
+        }
+        if let Some(run) = cur["run"].as_u64() {
             self.published.store(run, std::sync::atomic::Ordering::Relaxed);
         }
-        j
+        cur.clone()
     }
     /// 남은 노드를 모두 쓰고 끝냄: (지도, 노드 목록)
     fn finish(&mut self) -> (SceneMap, serde_json::Value) {
         self.write(0);
-        self.tx.take();
-        let scene = self.handle.take().unwrap().join().expect("점 작업 스레드");
+        let vox = self.vox;
+        let scene = self.lane.with(|s| {
+            if std::env::var("MEMMAP_PTS_LOG").is_ok() {
+                let n = s.nf.max(1) as f64;
+                common::info!("점 줄: 장면 {} 개, 점 고르기 {:.1} ms/장 + 지도 넣기 {:.1} ms/장, 노드 쓰기 합 {:.2} 초", s.nf, s.t_grid / n * 1e3, s.t_add / n * 1e3, s.t_write);
+            }
+            std::mem::replace(&mut s.scene, SceneMap::new(vox, 0.04))
+        });
         // 지금 판이 아닌 판 폴더(갈아 끼우기 전 판)를 지움
         let a_out = self.out.clone();
         for (name, is_dir) in out::list_dir(&a_out.join("scene")) {
@@ -2351,6 +2478,8 @@ const WALL_H: f64 = 1.3;
 
 fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, traj: &[(f64, [f64; 3])], stamp: f64, pose: [f64; 3],
               cam: &serde_json::Value, scene: &serde_json::Value, merge: bool, refresh: usize) {
+    // 재생(결과를 늘 같게): 앞 회차에 맡긴 사진 벡터를 이 회차 앞에서 차례대로 반영(실시간은 끝나는 대로 반영됨)
+    embed::sync_round();
     let mut left = refresh;
     if merge {
         mem.prune(stamp);
@@ -2437,81 +2566,72 @@ struct ViewJob {
     wall: f64, // 실시간: 이 판을 낸 장면의 벽시계(ms) — 뷰어(?metrics=1)가 지도 → 화면 지연을 잼. 재생은 0(view.json 에 안 실음)
 }
 
-enum ViewMsg {
-    Job(Box<ViewJob>),
-    Flush(std::sync::mpsc::Sender<()>),
+/// 뷰 줄의 상태: 방 번호 잇기 · 지나온 길 기록
+struct ViewSt {
+    dir: PathBuf,
+    tr: rooms::Tracker,
+    log: std::sync::Arc<sgview::live::TrajLog>,
+    n: u64,
 }
 
-/// 뷰 스레드: 방 나누기 · 엣지(graph::build), map.pgm, view.json(디스크) 또는 같은 프로세스 뷰어에 구조 그대로 건 판(--serve).
-/// 받은 차례대로 하므로 방 번호 잇기 · 파일 차례는 본 스레드에서 하던 것과 같다
-/// 지도 → 뷰 넘김은 common::slot::Latest 한 칸: 실시간(메모리 기억 폴더)은 덮어써 가장 새 판만(본 스레드는 기다리지 않음,
-/// 덮어쓴 판의 길 점은 새 판 앞에 이어 붙여 하나도 잃지 않음), 디스크 기록 · 재생은 exact(하나도 건너뛰지 않음 — 결과가 늘 같게)
+/// 뷰 한 판 짜기: 방 나누기 · 엣지(graph::build), map.pgm, view.json(디스크) 또는 같은 프로세스 뷰어에 구조 그대로 건 판(--serve)
+fn view_job(st: &mut ViewSt, j: ViewJob) {
+    match &j.traj {
+        TrajUpd::Append(v) => st.log.extend(v),
+        TrajUpd::Reset(v) => {
+            st.log = sgview::live::TrajLog::new();
+            st.log.extend(v);
+        }
+    }
+    let dir = &st.dir;
+    let (grid_j, rooms, doors, edges) = match j.gi {
+        Some(mut g) => {
+            let ol: Vec<_> = j.ol.iter().map(|o| (o.0, o.1, o.2, o.3, o.4.as_str())).collect();
+            let (rj, dj, ej) = graph::build(&mut st.tr, &g, j.res, &ol);
+            let pgm = std::mem::take(&mut g.pgm); // 머리까지 짜 둔 바이트 그대로(복사 없음)
+            if out::memory_only() {
+                out::write_direct(&dir.join("map.pgm"), pgm); // 메모리: 판보다 먼저 걸림
+            } else {
+                out::write_owned(&dir.join("map.pgm"), pgm);
+            }
+            (json!({"width": g.w, "height": g.h, "resolution": j.res, "origin": [g.x0 as f64 * j.res, g.y0 as f64 * j.res]}), rj, dj, ej)
+        }
+        None => (json!(null), json!([]), json!([]), json!([])),
+    };
+    // view.json 에서 graph.nodes(지나온 길)만 뺀 값: 길은 로그에서 짤 때 끼움(같은 바이트)
+    let mut head = json!({"stamp": j.stamp, "pose": j.pose, "grid": grid_j, "objects": j.objs, "rooms": rooms, "doors": doors,
+        "graph": {"edges": edges}, "robot": "handheld camera", "cam": j.cam});
+    if !j.scene.is_null() {
+        head["scene_points"] = j.scene;
+    }
+    if j.wall > 0.0 {
+        head["wall"] = json!(j.wall);
+    }
+    st.n += 1;
+    let len = st.log.len();
+    if out::memory_only() {
+        sgview::live::publish(sgview::live::View::live(st.n, head, st.log.clone(), len));
+    } else {
+        out::write_owned(&dir.join("view.json"), st.log.view_bytes(&head, len));
+    }
+}
+
+/// 뷰 줄: 받은 차례대로 하므로 방 번호 잇기 · 파일 차례는 루프에서 하던 것과 같다.
+/// 실시간(메모리 기억 폴더)은 줄이 바쁘면 가장 새 판 하나만 맡아 두었다가(덮어쓴 판의 길 점은 새 판 앞에 이어 붙여 하나도 잃지 않음)
+/// 줄이 비면 넘긴다(루프는 기다리지 않음). 디스크 기록 · 재생은 하나도 건너뛰지 않음(결과가 늘 같게)
 struct ViewWorker {
-    slot: std::sync::Arc<common::slot::Latest<ViewMsg>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    lane: common::rt::Lane<ViewSt>,
+    stash: Option<ViewJob>,
     sent: usize,   // 넘긴 길 점 수
     fresh: bool,   // 길이 새로 만들어짐(다시 쌓기 갈아 끼우기)
     live: bool,    // 실시간 입력(판에 벽시계를 실음)
 }
 
 impl ViewWorker {
-    fn spawn(dir: PathBuf, live: bool) -> ViewWorker {
-        let slot = std::sync::Arc::new(common::slot::Latest::<ViewMsg>::new(!out::memory_only()));
-        let rx = slot.clone();
-        let handle = std::thread::Builder::new().name("view".into()).spawn(move || {
-            out::thread_role(out::Role::Writer);
-            let mut tr = rooms::Tracker::default();
-            let mut log = sgview::live::TrajLog::new();
-            let mut n = 0u64;
-            let apply = |log: &mut std::sync::Arc<sgview::live::TrajLog>, t: &TrajUpd| match t {
-                TrajUpd::Append(v) => log.extend(v),
-                TrajUpd::Reset(v) => {
-                    *log = sgview::live::TrajLog::new();
-                    log.extend(v);
-                }
-            };
-            while let Some((_, m)) = rx.take() {
-                let j = match m {
-                    ViewMsg::Flush(t) => {
-                        let _ = t.send(());
-                        continue;
-                    }
-                    ViewMsg::Job(j) => *j,
-                };
-                apply(&mut log, &j.traj);
-                let (grid_j, rooms, doors, edges) = match j.gi {
-                    Some(mut g) => {
-                        let ol: Vec<_> = j.ol.iter().map(|o| (o.0, o.1, o.2, o.3, o.4.as_str())).collect();
-                        let (rj, dj, ej) = graph::build(&mut tr, &g, j.res, &ol);
-                        let pgm = std::mem::take(&mut g.pgm); // 머리까지 짜 둔 바이트 그대로(복사 없음)
-                        if out::memory_only() {
-                            out::write_direct(&dir.join("map.pgm"), pgm); // 메모리: 판보다 먼저 걸림
-                        } else {
-                            out::write_owned(&dir.join("map.pgm"), pgm);
-                        }
-                        (json!({"width": g.w, "height": g.h, "resolution": j.res, "origin": [g.x0 as f64 * j.res, g.y0 as f64 * j.res]}), rj, dj, ej)
-                    }
-                    None => (json!(null), json!([]), json!([]), json!([])),
-                };
-                // view.json 에서 graph.nodes(지나온 길)만 뺀 값: 길은 로그에서 짤 때 끼움(같은 바이트)
-                let mut head = json!({"stamp": j.stamp, "pose": j.pose, "grid": grid_j, "objects": j.objs, "rooms": rooms, "doors": doors,
-                    "graph": {"edges": edges}, "robot": "handheld camera", "cam": j.cam});
-                if !j.scene.is_null() {
-                    head["scene_points"] = j.scene;
-                }
-                if j.wall > 0.0 {
-                    head["wall"] = json!(j.wall);
-                }
-                n += 1;
-                let len = log.len();
-                if out::memory_only() {
-                    sgview::live::publish(sgview::live::View::live(n, head, log.clone(), len));
-                } else {
-                    out::write_owned(&dir.join("view.json"), log.view_bytes(&head, len));
-                }
-            }
-        }).unwrap();
-        ViewWorker { slot, handle: Some(handle), sent: 0, fresh: true, live }
+    /// waker: 줄이 비면 깨울 루프(맡아 둔 판을 넘기게)
+    fn new(dir: PathBuf, live: bool, waker: std::sync::Arc<common::rt::Waker>) -> ViewWorker {
+        let st = ViewSt { dir, tr: rooms::Tracker::default(), log: sgview::live::TrajLog::new(), n: 0 };
+        ViewWorker { lane: common::rt::Lane::with_idle("view", st, 0, move || waker.wake()), stash: None, sent: 0, fresh: true, live }
     }
     fn traj_update(&mut self, traj: &[(f64, [f64; 3])]) -> TrajUpd {
         let u = if std::mem::take(&mut self.fresh) || traj.len() < self.sent { TrajUpd::Reset(traj.to_vec()) } else { TrajUpd::Append(traj[self.sent..].to_vec()) };
@@ -2523,13 +2643,13 @@ impl ViewWorker {
     fn traj_replaced(&mut self) {
         self.fresh = true;
     }
-    fn send(&self, mut j: ViewJob) {
-        // 실시간: 뷰 스레드가 아직 안 꺼낸 판은 이 판으로 바꾸되 그 판의 길 점을 앞에 붙임(넣는 쪽은 이 스레드 하나라 put 은 덮어쓰지 않음)
+    fn send(&mut self, mut j: ViewJob) {
         if !out::memory_only() {
-            self.slot.put(0, ViewMsg::Job(Box::new(j)));
+            self.lane.push(move |s: &mut ViewSt| view_job(s, j));
             return;
         }
-        if let Some((_, ViewMsg::Job(old))) = self.slot.try_take() {
+        // 실시간: 아직 안 넘긴 판은 이 판으로 바꾸되 그 판의 길 점을 앞에 붙임
+        if let Some(old) = self.stash.take() {
             j.traj = match (old.traj, j.traj) {
                 (_, TrajUpd::Reset(v)) => TrajUpd::Reset(v),
                 (TrajUpd::Reset(mut a), TrajUpd::Append(b)) => {
@@ -2542,23 +2662,23 @@ impl ViewWorker {
                 }
             };
         }
-        self.slot.put(0, ViewMsg::Job(Box::new(j)));
+        self.stash = Some(j);
+        self.tick();
+    }
+    /// 줄이 비었으면 맡아 둔 판을 넘김(루프가 깰 때마다)
+    fn tick(&mut self) {
+        if self.lane.idle() {
+            if let Some(j) = self.stash.take() {
+                self.lane.push(move |s: &mut ViewSt| view_job(s, j));
+            }
+        }
     }
     /// 넘긴 판을 모두 짤 때까지 기다림
-    fn flush(&self) {
-        let (t, r) = std::sync::mpsc::channel();
-        self.slot.wait_empty(); // 덮어쓰는 칸: 남은 판이 꺼내진 뒤 끝 표시(판을 덮어쓰지 않게)
-        self.slot.put(0, ViewMsg::Flush(t));
-        let _ = r.recv();
-    }
-}
-
-impl Drop for ViewWorker {
-    fn drop(&mut self) {
-        self.slot.close();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+    fn flush(&mut self) {
+        if let Some(j) = self.stash.take() {
+            self.lane.push(move |s: &mut ViewSt| view_job(s, j));
         }
+        self.lane.wait_idle();
     }
 }
 
@@ -2670,6 +2790,11 @@ fn main() {
     // DXRT 설정(NPU 코어 묶기 · 버퍼 · NFH 스레드 · 프로파일러, common::dxrt::Config): 하위 명령(view)에도
     #[cfg(feature = "dxrt")]
     common::dxrt::Config::from_args(|k| argv.get(k), |k| argv.flag(k)).apply();
+    // NPU 끝 알림: thread(기본, 모델마다 기다림 스레드) | callback(DXRT 콜백 → 루프 깨움, 보드 `ondevice npu-test` 통과 뒤)
+    #[cfg(feature = "dxrt")]
+    if argv.get("--npu-wake").as_deref() == Some("callback") {
+        common::dxrt::set_wake(common::dxrt::Wake::Callback);
+    }
     match argv.0.get(1).map(String::as_str) {
         Some("slam") => {
             let code = slam::app::run(&argv.0[1..]).unwrap_or_else(|e| {
@@ -2679,6 +2804,9 @@ fn main() {
             std::process::exit(code);
         }
         Some("view") => return sgview::run(argv.0[2..].to_vec()),
+        // NPU 끝 알림 시험(보드): 콜백 · 기다림 스레드 길의 비트 같음 · 지연 · 콜백 스레드
+        #[cfg(feature = "dxrt")]
+        Some("npu-test") => return npu_test::run(&argv),
         _ => {}
     }
     limit_malloc_arenas();
@@ -2689,53 +2817,57 @@ fn main() {
         return embed::check(g(1), g(2), g(3));
     }
     let a = args(&argv);
+    // 결과를 늘 같게 하는 입력(밀림을 재지 않음: TUM, --stream-rate 없는 --no-drop 스트림): 사진 벡터는 기록 회차 앞에서 차례대로 반영
+    let det = !(a.stream_rate > 0.0 || (a.stream.is_some() && !a.no_drop));
+    out::set_layout(&a.threads);
+    out::start_pools(a.pool);
     if let Some(m) = &a.embed {
         if let Some(k) = argv.get("--embed-jobs").and_then(|s| s.parse().ok()) {
             embed::set_jobs(k);
         }
-        embed::start(m);
+        embed::start(m, det);
     }
-    out::set_layout(&a.threads);
-    out::start_pools();
     out::set_slow(a.slow);
     out::thread_role(out::Role::Main);
     if a.live > 0.0 || a.stream.is_some() {
-        out::start_writer(); // 실시간·스트림: 파일 쓰기(PLY·PNG 짜기 포함)는 기록 스레드가
+        out::start_writer(); // 실시간·스트림: 파일 쓰기(PLY·PNG 짜기 포함)는 기록 줄이
     }
+    let mut io = LoopIo::new(&a, &argv);
     // 분할 모델(ORT 스레드)은 추론 스레드 역할의 코어에서 만든다(ORT 스레드가 만든 스레드의 코어 묶음을 물려받음)
     out::thread_role(out::Role::Infer);
     let mut seg = match &a.seg_cache {
         Some(dir) => { let path = a.seg.clone(); Box::new(segsim::CachedSeg::new(dir, a.seg_cpu_ms, Box::new(move || make_seg(&path)))) as Box<dyn seg::Segmenter + Send> }
         None => make_seg(&a.seg),
     };
+    // NPU(PC 는 ONNX 실행 스레드) 작업 끝 → 루프 깨움
+    let ntx = io.npu_tx.clone();
+    io.seg_async = seg.set_notify(std::sync::Arc::new(move |tag| ntx.send(tag)));
     out::thread_role(out::Role::Main);
-    // --serve: 뷰어 서버(sgview)를 같은 프로세스의 스레드로. 기억 폴더에 쓰는 파일은 쓴 바이트를 메모리로 넘겨받는다(디스크에서 다시 읽지 않음)
-    let serve_th = a.serve.clone().map(|cfg| {
-        // 기억 폴더는 메모리에만(끝에 · --save-every 초마다 · 뷰어 저장 버튼으로 디스크에), 뷰어 버튼은 공유 신호로
+    // --serve: 뷰어 서버(sgview)를 이 처리 루프에서(듣는 소켓 · 연결이 루프 epoll 에, 스레드 없음). 기억 폴더에 쓰는 파일은 쓴 바이트를 메모리로 넘겨받는다(디스크에서 다시 읽지 않음)
+    let serving = a.serve.clone().map(|cfg| {
+        // 기억 폴더는 메모리에만(끝에 · --save-every 초마다 · 뷰어 저장 버튼으로 디스크에, 저장은 루프가 기록 줄에 맡김), 뷰어 버튼은 공유 신호로
         sgview::memfs::enable();
         out::set_memory_only();
         common::control::wire();
-        saver(a.out.clone(), a.save_every);
-        out::thread_free(); // 서버 스레드도 따로 된 프로세스처럼 코어 전부에서(띄운 뒤 본 스레드 역할로 돌아감)
-        let th = std::thread::Builder::new().name("sgview".into()).spawn(move || sgview::serve(cfg)).unwrap();
-        out::thread_role(out::Role::Main);
-        th
-    });
-    // --slam: 위치 프로그램을 같은 프로세스의 스레드로(장면은 메모리 큐로 넘어와 --stream 과 같은 경로를 탄다)
-    let slam_th = a.slam.clone().map(|sa| {
-        // 위치 프로그램 스레드는 물체 기억 역할 묶음(앞 코어 둘 등)을 물려받지 않게 프로세스 코어 전부에서 띄우고(따로 된 프로세스와 같은 자리),
-        // 나눠 돌리기는 `slam` 역할 풀(기본 코어 전부, --threads slam=nice:코어 로 묶음)에서
-        // IMU 모드 실시간: 장면 사이 위치(200 Hz)를 pose.json 으로(뷰어가 메모리에서 읽음, 디스크에는 장면마다 쓰는 위치만)
-        if a.live > 0.0 {
-            let pp = a.out.join("pose.json");
-            let _ = slam::imu::FAST_SINK.set(Box::new(move |t, ts, twc| fast_pose(&pp, t, ts, twc)));
+        if let Some(sv) = sgview::Server::new(cfg, io.waker()) {
+            sv.register(&mut io.poll);
+            io.server = Some(sv);
         }
-        out::thread_free();
-        let (rx, th) = slam::app::spawn(sa, out::slam_pool()).unwrap_or_else(|e| panic!("--slam: {e}"));
-        out::thread_role(out::Role::Main);
-        stream::hand_slam(rx);
-        th
     });
+    // --slam: 위치 프로그램을 같은 처리 루프에서(장면은 줄로 넘어와 --stream 과 같은 경로를 탄다, 스레드 없음).
+    // 카메라 장치 fd 는 루프 epoll 에, 녹화 재생은 작업 풀이 한 장 앞서 풂
+    if let Some(sa) = a.slam.clone() {
+        let side = stream::SlamSide::new(sa, io.w_in.clone()).unwrap_or_else(|e| panic!("--slam: {e}"));
+        // IMU 모드 실시간 + 뷰어: 표본이 올 때마다(200 Hz) 루프가 장면 사이 위치를 pose.json(메모리)으로
+        if a.live > 0.0 && a.serve.is_some() && side.set_imu_waker(io.w_imu.clone()) {
+            io.fast_out = Some(a.out.join("pose.json"));
+        }
+        #[cfg(target_os = "linux")]
+        for fd in side.fds() {
+            io.poll.add_fd(fd, T_IN, false);
+        }
+        stream::hand_slam(side);
+    }
     // --mlock: 모델·스레드를 다 띄운 뒤 그때 있는 메모리만 묶는다(뒤에 늘어나는 장면 보관·지도는 묶지 않음)
     if argv.flag("--mlock") && !common::threads::mlock_all() {
         common::info!("--mlock: 권한이 없어 메모리를 묶지 못함(그대로 진행)");
@@ -2744,7 +2876,7 @@ fn main() {
         return seg_check(&a, seg.as_mut(), a.seg_check);
     }
     loop {
-        seg = run(&a, seg);
+        seg = run(&a, seg, &mut io);
         // 리셋 블록으로 끝났으면 같은 스트림을 이어 읽어 빈 지도에서 다시 시작
         if stream::reset_pending() {
             common::info!("리셋: 지도를 비우고 다시 시작");
@@ -2755,18 +2887,18 @@ fn main() {
         }
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
-    if let Some(th) = slam_th {
-        let _ = th.join();
-    }
-    // 입력이 끝나도 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄). --serve-exit 이면 바로 끝냄(측정·검증용)
-    if let Some(th) = serve_th {
+    // 입력이 끝나도 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄, 저장 버튼 · --save-every 는 루프가 받음). --serve-exit 이면 바로 끝냄(측정·검증용)
+    if serving.is_some() {
         out::flush_writer();
         let c = Instant::now();
         let n = out::save(&a.out);
         common::info!("기억 폴더 저장: 파일 {n} 개, {:.2} 초", c.elapsed().as_secs_f64());
         if !a.serve_exit {
             common::info!("입력 끝: 뷰어는 계속 띄워 둠(Ctrl-C 로 끝냄)");
-            let _ = th.join();
+            loop {
+                io.sleep(None);
+                io.misc();
+            }
         }
     }
 }
@@ -2774,26 +2906,6 @@ fn main() {
 /// 뷰어 수평 버튼: 한 프로그램(--serve)이면 공유 신호, 따로 띄운 뷰어면 기억 폴더의 level.req
 fn level_requested(a: &Args) -> bool {
     common::control::take_level() || (a.serve.is_none() && std::fs::remove_file(a.out.join("level.req")).is_ok())
-}
-
-/// --serve 저장 스레드: 뷰어 저장 버튼(공유 신호)이나 --save-every 초가 되면 메모리 기억 폴더를 디스크에
-fn saver(dir: PathBuf, every: f64) {
-    std::thread::Builder::new().name("save".into()).spawn(move || {
-        out::thread_role(out::Role::Writer);
-        let mut last = Instant::now();
-        loop {
-            // 저장 버튼(공유 신호)이 오거나 --save-every 가 될 때까지 잠듦(폴링 없음)
-            let left = (every > 0.0).then(|| std::time::Duration::from_secs_f64((every - last.elapsed().as_secs_f64()).max(0.0)));
-            let asked = common::control::wait_save(left);
-            let due = every > 0.0 && last.elapsed().as_secs_f64() >= every;
-            if asked || due {
-                let c = Instant::now();
-                let n = out::save(&dir);
-                common::info!("기억 폴더 저장: 파일 {n} 개, {:.2} 초", c.elapsed().as_secs_f64());
-                last = Instant::now();
-            }
-        }
-    }).unwrap();
 }
 
 /// 보관 장면 중 seq 뒤의 것(지금 노드 위치로)

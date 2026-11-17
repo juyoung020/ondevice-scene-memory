@@ -479,39 +479,55 @@ impl Camera {
         &self.color.s.node
     }
 
-    /// 다음 묶음: 시각이 맞는 컬러·깊이 한 쌍을 mmap 버퍼에서 바로 out 으로(컬러 YUYV → RGB8, 깊이 → 컬러 격자 정렬)
-    pub fn next_into(&mut self, out: &mut Output) -> Result<FrameInfo, String> {
-        let t0 = Instant::now();
+    /// 장치 파일 기술자(컬러 · 깊이 · 메타데이터): 처리 루프의 epoll 에 걸어 장면이 오면 깸
+    pub fn fds(&self) -> Vec<i32> {
+        let mut v = vec![self.color.s.node.fd, self.depth.s.node.fd];
+        for m in [&self.color.md, &self.depth.md].into_iter().flatten() {
+            v.push(m.node.fd);
+        }
+        v
+    }
+
+    /// 시각이 맞는 컬러 · 깊이 한 쌍을 쥐었는가(기다리지 않음: 안 된 쪽은 다음 장치 알림에서). 엇갈린 장면은 여기서 버림
+    fn pair_ready(&mut self) -> Result<bool, String> {
         let fps = self.cfg.fps as f64;
         loop {
             let c = self.color.take()?;
             let d = self.depth.take()?;
             if !(c && d) {
-                if t0.elapsed() > Duration::from_secs(5) {
-                    return Err("5 초 동안 장면이 오지 않음".into());
-                }
-                let mut fds = Vec::new();
-                if !c {
-                    fds.push(self.color.s.node.fd);
-                    if let Some(m) = &self.color.md {
-                        fds.push(m.node.fd);
-                    }
-                }
-                if !d {
-                    fds.push(self.depth.s.node.fd);
-                    if let Some(m) = &self.depth.md {
-                        fds.push(m.node.fd);
-                    }
-                }
-                v4l2::poll(&fds, 100).map_err(|e| format!("poll: {e}"))?;
-                continue;
+                return Ok(false);
             }
             match sync::decide(self.color.hw_ms, self.depth.hw_ms, fps) {
                 Decision::DropColor => self.color.release()?,
                 Decision::DropDepth => self.depth.release()?,
-                Decision::Pair => break,
+                Decision::Pair => return Ok(true),
             }
         }
+    }
+
+    /// 다음 묶음(기다리지 않음): 쌍이 준비됐으면 out 으로 채워 Some, 아니면 None(장치 fd 가 읽을 수 있게 되면 다시)
+    pub fn try_next_into(&mut self, out: &mut Output) -> Result<Option<FrameInfo>, String> {
+        let t0 = Instant::now();
+        if !self.pair_ready()? {
+            return Ok(None);
+        }
+        self.convert(out, t0).map(Some)
+    }
+
+    /// 다음 묶음: 시각이 맞는 컬러·깊이 한 쌍을 mmap 버퍼에서 바로 out 으로(컬러 YUYV → RGB8, 깊이 → 컬러 격자 정렬)
+    pub fn next_into(&mut self, out: &mut Output) -> Result<FrameInfo, String> {
+        let t0 = Instant::now();
+        while !self.pair_ready()? {
+            if t0.elapsed() > Duration::from_secs(5) {
+                return Err("5 초 동안 장면이 오지 않음".into());
+            }
+            v4l2::poll(&self.fds(), 100).map_err(|e| format!("poll: {e}"))?;
+        }
+        self.convert(out, t0)
+    }
+
+    /// 쥔 쌍을 out 으로(컬러 YUYV → RGB8 · 회색, 깊이 → 컬러 격자 정렬) 바꾸고 장치 버퍼를 돌려줌
+    fn convert(&mut self, out: &mut Output, t0: Instant) -> Result<FrameInfo, String> {
         let t1 = Instant::now();
         // (w, h) = 컬러(출력·정렬 격자), (dw, dh) = 깊이
         let (w, h) = { let (a, b) = self.cfg.color_size(); (a as usize, b as usize) };

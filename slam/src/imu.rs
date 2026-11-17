@@ -36,8 +36,10 @@ pub struct Ring {
     /// 읽기 단에서 버린 표본 수(Bad 순서: 무효 값 · 포화 · 튐 · 같은 값 반복 · 느린 읽기)
     pub bad: [AtomicU64; 5],
     pub closed: AtomicBool,
-    /// 장면 사이 200 Hz 위치: 읽기 스레드가 표본마다 넣고 위치 내기 스레드가 꺼냄
-    pub fast: FastPose,
+    /// 장면 사이 200 Hz 위치(소비자 = 처리 루프만 만짐)
+    fast: UnsafeCell<FastPose>,
+    /// 뷰어가 있을 때만: 표본을 넣을 때마다 처리 루프를 깨움(장면 사이 위치를 그 자리에서 냄)
+    pub waker: std::sync::OnceLock<Arc<common::rt::Waker>>,
 }
 
 /// 장면 사이 위치를 채우는 기준: 마지막으로 보낸 장면의 위치(지도 좌표 몸체 · 광학 변환) · 지도 좌표 속도 · 그때 IMU 상태
@@ -55,11 +57,13 @@ pub struct Anchor {
     shift: f64,
 }
 
-/// 읽기 스레드 → 위치 내기 스레드: 최근 표본(1.28 초)과 기준. 위치 = 기준 위치 × 기준 이후 자이로 회전, 이동은 등속(0.1 초까지) 뒤 유지
+/// 장면 사이 위치(처리 루프가 가짐): 위치 = 기준 위치 × 기준 이후 자이로 회전, 이동은 등속(0.1 초까지) 뒤 유지.
+/// 표본은 링에서 바로 읽고(링의 소비자 = 처리 루프), 회전은 지난번 끝에서 새 표본까지만 이어 적분한다(표본마다 O(1))
 #[derive(Default)]
 pub struct FastPose {
-    st: std::sync::Mutex<(std::collections::VecDeque<Sample>, Option<Anchor>, u64)>,
-    cv: std::sync::Condvar,
+    anchor: Option<Anchor>,
+    /// 기준 뒤 이어 적분한 회전과 그 끝 시각(IMU 시계)
+    acc: Option<(M34, f64)>,
 }
 
 /// 기준 이후 이만큼(초) 지나면 IMU 만으로 위치를 내지 않음(자이로 치우침이 쌓임)
@@ -68,35 +72,26 @@ pub const FAST_MAX: f64 = 1.0;
 const FAST_VEL_MAX: f64 = 0.1;
 
 impl FastPose {
-    pub fn push(&self, s: Sample) {
-        let mut g = self.st.lock().unwrap();
-        if g.0.len() >= 256 {
-            g.0.pop_front();
-        }
-        g.0.push_back(s);
-        g.2 += 1;
-        drop(g);
-        self.cv.notify_one();
+    pub fn set_anchor(&mut self, a: Anchor) {
+        self.acc = Some((M34_I, a.t + a.shift));
+        self.anchor = Some(a);
     }
 
-    pub fn set_anchor(&self, a: Anchor) {
-        self.st.lock().unwrap().1 = Some(a);
-    }
-
-    /// 새 표본을 기다려(최대 timeout) 그 시각의 (카메라 시계 시각, 표본 시각(IMU 시계), 카메라 광학 → 지도). 기준이 없거나 낡았으면 None
-    pub fn next(&self, seen: &mut u64, timeout: std::time::Duration) -> Option<(f64, f64, Tf)> {
-        let g = self.st.lock().unwrap();
-        let (g, _) = self.cv.wait_timeout_while(g, timeout, |s| s.2 == *seen).unwrap();
-        *seen = g.2;
-        let a = g.1.as_ref()?;
-        let s = *g.0.back()?;
+    /// 가장 새 표본 시각의 (카메라 시계 시각, 표본 시각(IMU 시계), 카메라 광학 → 지도). 기준이 없거나 낡았거나 새 표본이 없으면 None
+    pub fn next(&mut self, s0: &[Sample], s1: &[Sample]) -> Option<(f64, f64, Tf)> {
+        let a = self.anchor.as_ref()?;
+        let s = *s1.last().or(s0.last())?;
         let t = s.t - a.shift;
         let dt = t - a.t;
         if !(0.0..=FAST_MAX).contains(&dt) {
             return None;
         }
-        let (s0, s1) = g.0.as_slices();
-        let r = if dt > 0.0 { integrate(s0, s1, a.t + a.shift, s.t, &a.bias, gyro_step)? } else { M34_I };
+        let (r0, t0) = self.acc?;
+        if s.t <= t0 {
+            return None; // 새 표본 없음(이미 낸 위치)
+        }
+        let r = m34_mul(&r0, &integrate(s0, s1, t0, s.t, &a.bias, gyro_step)?);
+        self.acc = Some((r, s.t));
         let rb = m34_mul(&m34_mul(&a.m, &r), &a.mt);
         let mut b = a.body.mul(&tf_of(&rb, [0.0; 3]));
         let k = dt.min(FAST_VEL_MAX) as f32;
@@ -121,7 +116,8 @@ impl Ring {
             read_fail: AtomicU64::new(0),
             bad: Default::default(),
             closed: AtomicBool::new(false),
-            fast: FastPose::default(),
+            fast: UnsafeCell::new(FastPose::default()),
+            waker: std::sync::OnceLock::new(),
         })
     }
 
@@ -151,6 +147,23 @@ impl Ring {
     }
 
     /// 소비자: from 앞 칸은 다 씀(생산자가 다시 씀)
+    /// 장면 사이 위치 기준(소비자 = 처리 루프)
+    pub fn set_fast_anchor(&self, a: Anchor) {
+        // SAFETY: fast 는 소비자(처리 루프)만 만진다
+        unsafe { (*self.fast.get()).set_anchor(a) }
+    }
+
+    /// 가장 새 표본까지의 장면 사이 위치(소비자 = 처리 루프). 돌려줌: (카메라 시계 시각, IMU 시각, 카메라 광학 → 지도)
+    pub fn fast_next(&self) -> Option<(f64, f64, Tf)> {
+        let (_, a, b) = self.view(0);
+        // SAFETY: fast 는 소비자(처리 루프)만 만진다
+        let r = unsafe { (*self.fast.get()).next(a, b) };
+        if r.is_some() {
+            FAST_N.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
     fn release(&self, upto: u64) {
         let t = self.tail.load(Ordering::Relaxed);
         if upto > t {
@@ -579,6 +592,7 @@ impl CsvReplay {
 
     /// IMU 시각 t 까지의 표본을 링(과 장면 사이 위치 칸)에 넣는다. t − 2 초보다 오래된 표본은 건너뜀(위치 추적이 보는 범위는 최대 1.3 초 전)
     pub fn feed(&mut self, ring: &Ring, t: f64) {
+        let mut pushed = false;
         while self.i < self.s.len() && self.s[self.i].t <= t {
             let s = self.s[self.i];
             self.i += 1;
@@ -586,7 +600,10 @@ impl CsvReplay {
                 continue;
             }
             ring.push(s);
-            ring.fast.push(s);
+            pushed = true;
+        }
+        if let (true, Some(w)) = (pushed, ring.waker.get()) {
+            w.wake();
         }
     }
 
@@ -624,25 +641,8 @@ impl CsvReplay {
     }
 }
 
-/// 장면 사이 위치를 받는 곳(한 프로그램: 물체 기억 쪽이 pose.json 으로 냄). 인자 = (카메라 시계 시각, 표본을 읽은 시각(UNIX), 카메라 광학 → 지도)
-pub static FAST_SINK: std::sync::OnceLock<Box<dyn Fn(f64, f64, &Tf) + Send + Sync>> = std::sync::OnceLock::new();
 /// 낸 장면 사이 위치 수
 pub static FAST_N: AtomicU64 = AtomicU64::new(0);
-
-/// 위치 내기 스레드: IMU 표본마다(200 Hz) 기준 위치 × 자이로 회전을 FAST_SINK 로
-pub fn spawn_fast(ring: Arc<Ring>) {
-    let _ = std::thread::Builder::new().name("imu-pose".into()).spawn(move || {
-        let mut seen = 0u64;
-        while !ring.closed.load(Ordering::Relaxed) {
-            if let Some((t, ts, p)) = ring.fast.next(&mut seen, std::time::Duration::from_millis(100)) {
-                if let Some(f) = FAST_SINK.get() {
-                    f(t, ts, &p);
-                    FAST_N.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    });
-}
 
 /// ICM-42688-P 레지스터 변환 배율(±16 g, ±2000 °/s)
 pub const ACC_S: f32 = (16.0 * 9.80665 / 32768.0) as f32;
@@ -716,7 +716,9 @@ pub fn spawn_reader(dev: &str, ring: Arc<Ring>) -> Result<std::thread::JoinHandl
                             (prev, jumps, t_last) = (Some(v), 0, t);
                             let (a, w) = crate::simd::imu_raw(&b, ACC_S, GYR_S);
                             ring.push(Sample { w, a, t });
-                            ring.fast.push(Sample { w, a, t });
+                            if let Some(wk) = ring.waker.get() {
+                                wk.wake(); // 뷰어가 있으면 처리 루프가 이 표본까지의 장면 사이 위치를 냄
+                            }
                         }
                         Err(k) => {
                             jumps += (k == Bad::Jump) as u32;
@@ -795,22 +797,25 @@ mod tests {
         assert!(integrate(a, b, tl - 0.1, tl + 0.05, &[0.0; 4], gyro_step).is_none());
     }
 
-    /// 장면 사이 위치: 기준 위치 × 그 뒤 자이로 회전, 이동은 등속 0.1 초까지, 1 초 넘으면 멈춤
+    /// 장면 사이 위치: 기준 위치 × 그 뒤 자이로 회전(이어 적분), 이동은 등속 0.1 초까지, 1 초 넘으면 멈춤
     #[test]
     fn fast_pose_between_frames() {
-        let fp = FastPose::default();
+        let ring = Ring::new();
         let w = [0.0, 0.0, 1.0, 0.0]; // z 축 1 rad/s
-        let (mut seen, d) = (0u64, std::time::Duration::from_millis(1));
-        let mut push = |i: usize| fp.push(Sample { w, a: [0.0, 0.0, 9.80665, 0.0], t: 100.0 + i as f64 * 0.005 });
+        let push = |i: usize| assert!(ring.push(Sample { w, a: [0.0, 0.0, 9.80665, 0.0], t: 100.0 + i as f64 * 0.005 }));
         for i in 0..20 {
             push(i);
         }
-        assert!(fp.next(&mut seen, d).is_none()); // 기준 없음
-        fp.set_anchor(Anchor { t: 100.0, body: Tf::IDENTITY, optical: Tf::IDENTITY, vel: [1.0, 0.0, 0.0], m: M34_I, mt: M34_I, bias: [0.0; 4], shift: 0.0 });
-        for i in 20..41 {
+        assert!(ring.fast_next().is_none()); // 기준 없음
+        ring.set_fast_anchor(Anchor { t: 100.0, body: Tf::IDENTITY, optical: Tf::IDENTITY, vel: [1.0, 0.0, 0.0], m: M34_I, mt: M34_I, bias: [0.0; 4], shift: 0.0 });
+        for i in 20..30 {
             push(i);
         }
-        let (t, _, p) = fp.next(&mut seen, d).unwrap();
+        assert!(ring.fast_next().is_some()); // 중간에 한 번(이어 적분)
+        for i in 30..41 {
+            push(i);
+        }
+        let (t, _, p) = ring.fast_next().unwrap();
         assert!((t - 100.2).abs() < 1e-9);
         let yaw = p.0[4].atan2(p.0[0]);
         assert!((yaw - 0.2).abs() < 2e-3, "{yaw}");
@@ -818,7 +823,7 @@ mod tests {
         for i in 41..241 {
             push(i);
         }
-        assert!(fp.next(&mut seen, d).is_none()); // 기준 뒤 1.2 초
+        assert!(ring.fast_next().is_none()); // 기준 뒤 1.2 초
     }
 
     /// 가득 차면 새 표본을 버린다(읽지 않은 칸을 덮어쓰지 않음)

@@ -164,9 +164,23 @@ impl Kf {
     fn z(&self) -> &KfZ {
         self.z.wait()
     }
-    /// 압축이 끝날 때까지 기다림(점 작업 스레드가 채움)
+    /// 압축이 끝났는가
+    pub fn ready(&self) -> bool {
+        self.z.get().is_some()
+    }
+    /// 압축이 끝날 때까지 기다림(점 줄이 채움). 작업 풀 일꾼이면 기다리는 동안 풀의 다른 일(점 줄 포함)을 대신 돈다(일꾼을 붙잡아 생기는 교착 막기)
     pub fn wait_ready(&self) {
+        if rayon::current_thread_index().is_some() {
+            common::rt::wait_until(|| self.ready());
+        }
         let _ = self.z();
+    }
+    /// 점 격자(점 줄이 채움): wait_ready 와 같은 규칙으로 기다림
+    pub fn pts_wait(&self) -> &Option<PtsZ> {
+        if rayon::current_thread_index().is_some() {
+            common::rt::wait_until(|| self.pts.get().is_some());
+        }
+        self.pts.wait()
     }
     /// 보관 바이트: 아직 압축 전이면 None
     fn bytes(&self) -> Option<usize> {

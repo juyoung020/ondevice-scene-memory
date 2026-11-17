@@ -12,71 +12,27 @@ pub fn replace(tmp: &Path, dst: &Path) {
     std::fs::rename(tmp, dst).expect("replace");
 }
 
-/// 기록할 내용: 바로 쓸 바이트, 또는 기록 스레드에서 만들 바이트(PLY 짜기·PNG 압축 등 무거운 것)
+/// 기록할 내용: 바로 쓸 바이트, 또는 기록 줄에서 만들 바이트(PLY 짜기·PNG 압축 등 무거운 것)
 type Job = Box<dyn FnOnce() -> Vec<u8> + Send>;
 
-/// 비동기 기록: 켜 두면 파일 쓰기(와 PNG 압축)를 기록 스레드가 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜).
-/// 줄이 WRITE_Q 개 차면 작업 스레드(점·다시 쌓기)는 자리가 날 때까지 기다리고, 본 스레드는 기다림 없이 줄 끝에 넣는다
-static WRITER: std::sync::OnceLock<WriteQ> = std::sync::OnceLock::new();
-const WRITE_Q: usize = 256;
-
-struct WriteQ {
-    q: std::sync::Mutex<std::collections::VecDeque<(std::path::PathBuf, Job)>>,
-    item: std::sync::Condvar,
-    space: std::sync::Condvar,
-}
-
-impl WriteQ {
-    fn send(&self, p: std::path::PathBuf, job: Job, wait: bool) {
-        let mut q = common::prof::lock(&self.q, common::prof::W::LockWriteQ);
-        while wait && q.len() >= WRITE_Q {
-            q = self.space.wait(q).unwrap();
-        }
-        q.push_back((p, job));
-        self.item.notify_one();
-    }
-    /// 다음 일과, 그 뒤에 줄이 더 남았는지
-    fn recv(&self) -> (std::path::PathBuf, Job, bool) {
-        let mut q = common::prof::lock(&self.q, common::prof::W::LockWriteQ);
-        loop {
-            if let Some(x) = q.pop_front() {
-                self.space.notify_one();
-                return (x.0, x.1, !q.is_empty());
-            }
-            q = self.item.wait(q).unwrap();
-        }
-    }
-}
+/// 비동기 기록: 켜 두면 파일 쓰기(와 PNG 압축)를 기록 줄(작업 풀에서 차례대로 도는 일, 스레드 없음)이 맡는다(보낸 순서대로 → view.json 은 그 앞 파일들 뒤에 바뀜).
+/// 줄에 이어 온 파일(물체 사진 3 장 + 점, 점 지도 노드 수십 개)은 걸기만 하고, 줄이 빌 때 뷰어(/stream)를 한 번만 깨움
+static IO: std::sync::OnceLock<common::rt::SharedLane<()>> = std::sync::OnceLock::new();
+static OWE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn start_writer() {
-    let mut first = false;
-    let w = WRITER.get_or_init(|| {
-        first = true;
-        WriteQ { q: Default::default(), item: std::sync::Condvar::new(), space: std::sync::Condvar::new() }
-    });
-    if first {
-        std::thread::spawn(move || {
-            thread_role(Role::Writer);
-            // 줄에 이어 온 파일(물체 사진 3 장 + 점, 점 지도 노드 수십 개)은 걸기만 하고, 줄이 빌 때 뷰어(/stream)를 한 번만 깨움
-            let mut owe = false;
-            loop {
-                let (p, job, more) = w.recv();
-                if p.as_os_str().is_empty() {
-                    if std::mem::take(&mut owe) {
-                        sgview::memfs::bump();
-                    }
-                    job(); // flush_writer 표시
-                    continue;
-                }
-                run_job(&p, job, true);
-                owe = true;
-                if !more {
-                    sgview::memfs::bump();
-                    owe = false;
-                }
+    IO.get_or_init(|| {
+        common::rt::SharedLane::new("io", (), 5, Some(Box::new(|| {
+            if OWE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                sgview::memfs::bump();
             }
-        });
-    }
+        })))
+    });
+}
+
+/// 기록 줄(저장처럼 긴 일도 이 줄에서 차례대로)
+pub fn io_lane() -> Option<&'static common::rt::SharedLane<()>> {
+    IO.get()
 }
 
 /// 이미 만든 바이트를 그대로 넘겨 쓴다(복사 없이)
@@ -84,10 +40,16 @@ pub fn write_owned(dst: &Path, bytes: Vec<u8>) {
     write_lazy(dst, Box::new(move || bytes));
 }
 
-/// 바이트를 기록 스레드에서 만들어 쓴다(기록 스레드가 없으면 바로)
+/// 바이트를 기록 줄에서 만들어 쓴다(기록 줄이 없으면 바로)
 fn write_lazy(dst: &Path, job: Job) {
-    match WRITER.get() {
-        Some(w) => w.send(dst.to_path_buf(), job, BG.with(|b| b.get())),
+    match IO.get() {
+        Some(l) => {
+            let p = dst.to_path_buf();
+            l.push(move |_| {
+                run_job(&p, job, true);
+                OWE.store(true, std::sync::atomic::Ordering::Release);
+            })
+        }
         None => run_job(dst, job, false),
     }
 }
@@ -273,12 +235,10 @@ pub mod stats {
 }
 
 
-/// 기록 스레드에 밀린 파일을 모두 쓸 때까지 기다림(끝낼 때)
+/// 기록 줄에 밀린 파일을 모두 쓸 때까지 기다림(끝낼 때)
 pub fn flush_writer() {
-    if let Some(w) = WRITER.get() {
-        let (dt, dr) = std::sync::mpsc::channel::<()>();
-        w.send(std::path::PathBuf::new(), Box::new(move || { let _ = dt.send(()); vec![] }), false);
-        let _ = dr.recv();
+    if let Some(l) = IO.get() {
+        l.wait_idle();
     }
 }
 
@@ -286,6 +246,7 @@ pub fn flush_writer() {
 /// 한 프로세스의 풀 배치: 전역 rayon 풀(본 스레드 역할), 뒤쪽 풀(점 역할), 위치 프로그램 풀(`slam` 역할, `--slam`),
 /// ONNX Runtime 세션 스레드(추론 역할의 스레드에서 만들어 그 묶음을 물려받음)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // --threads 이름표(reader · rebuild · writer · slam 은 지금 쓰는 자리가 없어 받기만 함)
 pub enum Role { Main, Reader, Points, Rebuild, Writer, Infer, Slam }
 pub const ROLES: usize = 7;
 pub const ROLE_NAMES: [&str; ROLES] = ["main", "reader", "pts", "rebuild", "writer", "infer", "slam"];
@@ -341,7 +302,6 @@ pub fn set_layout(spec: &str) {
 /// 지금 스레드를 역할에 맞게(우선순위·코어). 리눅스만, 실패해도 그대로 진행
 pub fn thread_role(r: Role) {
     let (nice, mask) = layout(r);
-    BG.with(|b| b.set(matches!(r, Role::Points | Role::Rebuild | Role::Writer)));
     #[cfg(target_os = "linux")]
     cpu::enter(common::threads::tid(), r as usize);
     common::threads::apply(nice, mask);
@@ -350,33 +310,16 @@ pub fn thread_role(r: Role) {
     common::prof::track_thread();
 }
 
-thread_local! {
-    /// 이 스레드가 뒤쪽 역할(점·다시 쌓기·기록)인지
-    static BG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-static BG_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-
-/// 나눠 돌리는 스레드 풀 둘: 기본 풀은 본 스레드 역할의 우선순위·코어(장면 넣기·면 뽑기·분할 전후처리),
-/// 뒤쪽 풀은 점 역할의 우선순위·코어(점 고르기·다시 합치기). 뒤쪽 일은 뒤쪽 풀에서만 줄 선다.
-/// `set_layout` 뒤에 한 번 부른다
-pub fn start_pools() {
-    let ((n0, m0), (n1, m1)) = (layout(Role::Main), layout(Role::Points));
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(common::threads::count(m0)).start_handler(move |_| common::threads::apply(n0, m0)).build_global();
-    let _ = BG_POOL.set(common::threads::pool("pts", n1, m1));
+/// 작업 풀(rayon 전역 풀 하나, `--pool N` 일꾼, 기본 3): 펼치기(par_iter)와 줄 일(점 · 뷰 · 기록 · 사진 벡터 · 다시 쌓기)이 모두 여기서.
+/// 코어는 점 역할 묶음(기본: 처리 루프 코어를 뺀 나머지), nice 0(긴 줄 일은 그 일 동안만 낮춤). `set_layout` 뒤에 한 번 부른다
+pub fn start_pools(n: usize) {
+    let (_, mask) = layout(Role::Points);
+    common::rt::start_pool(n, 0, mask);
 }
 
-/// 위치 프로그램(`--slam`) 풀: `slam` 역할의 우선순위·코어(기본 프로세스 코어 전부, 그 코어 수만큼 스레드)
-pub fn slam_pool() -> rayon::ThreadPool {
-    let (nice, mask) = layout(Role::Slam);
-    common::threads::pool("slam", nice, mask)
-}
-
-/// 나눠 돌리는 일(rayon)을 부르는 스레드의 역할에 맞는 풀에서 돌린다
+/// 나눠 돌리는 일(rayon): 작업 풀에서
 pub fn par<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    match BG_POOL.get() {
-        Some(p) if BG.with(|b| b.get()) => p.install(f),
-        _ => f(),
-    }
+    f()
 }
 
 /// 보드 흉내(`--slow F`): 이 구간이 F 배 걸린 것처럼 코어를 붙잡고 기다림(잠들지 않아 코어 다툼도 그대로)
@@ -456,12 +399,6 @@ pub mod cpu {
         }
         (ns.map(|v| v as f64 * 1e-9), clock_ns(2) as f64 * 1e-9)
     }
-}
-
-/// 지금 스레드를 어느 역할에도 묶지 않음(nice 0, 프로세스 코어 전부): 같은 프로세스에서 도는 다른 프로그램(--slam)을 띄울 때
-pub fn thread_free() {
-    BG.with(|b| b.set(false));
-    common::threads::apply(0, 0);
 }
 
 /// JSON → 바이트(문자열과 같은 바이트). 버퍼를 알맞은 크기로 한 번 잡아 늘림 복사 없이

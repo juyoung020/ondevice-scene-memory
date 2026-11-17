@@ -263,8 +263,8 @@ pub fn layout(r: Role) -> (i32, u64) {
     LAYOUT.get().copied().unwrap_or(NICE)[r as usize]
 }
 
-/// `--threads` 해석. 기본(auto): 코어 4 개 이상이면 nice 는 본 스레드·읽기·추론 0, 점 +5, 기록 +5, 다시 쌓기 +10.
-/// 코어 4 개 이상이면 본 스레드·읽기(분할 전·후처리)를 앞 코어 둘에, 점·다시 쌓기·기록을 나머지 코어에 묶는다. 추론은 보드(NPU)면 앞 코어 둘, ONNX(CPU)면 나머지 코어(ONNX Runtime 스레드 포함).
+/// `--threads` 해석. 기본(auto): 코어 4 개 이상이면 처리 루프(main)는 마지막 코어 혼자, 작업 풀(pts 역할) · 추론은 나머지 코어(nice 0).
+/// IMU 읽기 스레드는 따로 SCHED_FIFO 50. 보드 인터럽트 자리(USB · NPU)는 `scripts/board_tune.sh`.
 /// 위치 프로그램(`slam`)은 프로세스 코어 전부(따로 된 프로세스와 같은 자리).
 /// 코어 3 개 이하는 묶지 않는다(nice 로만 나눔: 점·기록 +10, 다시 쌓기 +19). 직접 주기: `main=0:0,pts=5:2-3,rebuild=10:2-3,slam=0:2-3` (역할=nice[:코어 목록]), `none` = 모두 nice 0·묶지 않음
 pub fn set_layout(spec: &str) {
@@ -275,10 +275,10 @@ pub fn set_layout(spec: &str) {
         "none" => l = [(0, 0); ROLES],
         "auto" => {
             if cpus.len() >= 4 {
-                let (fg, bg) = (bits(&cpus[..2]), bits(&cpus[2..]));
-                // 추론: 보드는 NPU 가 하므로 부르는 스레드만 앞 코어에, ONNX(CPU) 는 모델 계산이 무거우니 나머지 코어 전부에
-                let inf = if cfg!(feature = "onnx") { bg } else { fg };
-                l = [(0, fg), (0, fg), (5, bg), (10, bg), (5, bg), (0, inf), (0, 0)];
+                // 처리 루프는 마지막 코어 혼자(보드 코어 3: 인터럽트 기본 자리 코어 0 을 피함), 작업 풀 · IMU · 추론 · DXRT 는 나머지 코어
+                let n = cpus.len();
+                let (fg, bg) = (bits(&cpus[n - 1..]), bits(&cpus[..n - 1]));
+                l = [(0, fg), (0, fg), (0, bg), (10, bg), (5, bg), (0, bg), (0, 0)];
             }
         }
         s => {

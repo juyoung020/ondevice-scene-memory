@@ -697,6 +697,8 @@ pub fn spawn_reader(dev: &str, ring: Arc<Ring>) -> Result<std::thread::JoinHandl
             if unsafe { sched_setscheduler(0, 1, &prio) } != 0 {
                 common::threads::apply(-10, 0);
             }
+            // 코어 0(I2C 인터럽트 자리): 처리 루프 코어(마지막)에서 띄워도 따로
+            common::threads::pin(1);
             // 시각: 단조 시계 + 시작 때 고정한 UNIX 오프셋(카메라 시각과 같은 방식, NTP 가 시스템 시계를 옮겨도 뒤로 가거나 튀지 않음)
             let (base_unix, base) = (unix_now(), std::time::Instant::now());
             let now_s = || base_unix + base.elapsed().as_secs_f64();

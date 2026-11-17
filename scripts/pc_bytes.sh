@@ -80,6 +80,7 @@ cmp_all() {
     echo "$n: $r"
   done
   for d in "$A"/desk_* "$A"/long_*; do
+    [ -d "$d" ] || continue
     local n; n=$(basename "$d")
     [ -d "$B/$n/mem" ] || { echo "$n: MISSING"; bad=1; continue; }
     norm_mem "$d/mem" "$T/a"; norm_mem "$B/$n/mem" "$T/b"

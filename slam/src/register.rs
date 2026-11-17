@@ -691,7 +691,7 @@ pub(crate) mod tests {
         // 광학 회전: 몸체(x 앞, y 왼, z 위) 의 광학 축(x 오른, y 아래, z 앞)
         let m = nalgebra::Matrix3::new(0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0);
         let q = UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(m));
-        Camera { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5, width: 640, height: 480, local: Pose::from_parts(Translation3::new(0.0, 0.0, 0.0), q) }
+        Camera { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5, width: 640, height: 480, local: Pose::from_parts(Translation3::new(0.0, 0.0, 0.0), q), oriented: false }
     }
 
     /// 몸체 축 3D 점들을 두 위치에서 본 특징. 설명자는 무작위, to 쪽은 8 비트 뒤집음.

@@ -33,6 +33,8 @@ pub struct Camera {
     pub width: u32,
     pub height: u32,
     pub local: Pose,
+    /// BRIEF 를 점마다 방향(밝기 무게중심)으로 돌려 뽑음(IMU 모드: 굴려도 같은 설명자, `features::describe_oriented`). false = 원본 그대로
+    pub oriented: bool,
 }
 
 /// 한 장면: 회색조(특징점용), 컬러(스트림용, BGR 또는 RGB), 깊이(mm, 컬러 격자에 맞춤)

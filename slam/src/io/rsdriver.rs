@@ -59,7 +59,7 @@ impl FrameSource for RsDriverSource {
             depth_mm,
             depth_raw,
             depth_per_m: dpm,
-            cam: Camera { fx: k.fx as f64, fy: k.fy as f64, cx: k.ppx as f64, cy: k.ppy as f64, width: cw, height: ch, local: optical_rotation() },
+            cam: Camera { fx: k.fx as f64, fy: k.fy as f64, cx: k.ppx as f64, cy: k.ppy as f64, width: cw, height: ch, local: optical_rotation(), oriented: false },
         }))
     }
     fn last_read_ms(&self) -> f64 {

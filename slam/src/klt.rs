@@ -635,7 +635,7 @@ impl OdometryKlt {
                 }
                 let (w, h) = (j.cam.width as usize, j.cam.height as usize);
                 let mut kps = j.kps;
-                let desc = crate::features::describe(&j.gray, w, h, &mut kps);
+                let desc = crate::features::describe_oriented(&j.gray, w, h, &mut kps, j.cam.oriented);
                 let pts3d = keypoints_3d(&j.depth, &j.cam, &kps, j.min_depth, j.max_depth);
                 if rtx.send((Features { kps, pts3d, desc }, j.pose)).is_err() {
                     break;

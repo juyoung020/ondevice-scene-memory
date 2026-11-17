@@ -1,5 +1,5 @@
 //! 위치 · 지도 품질 지표(재생 벤치): 같은 녹화를 카메라 전용 · IMU 모드로 돌린 결과를 같은 잣대로 잰다.
-//!   slam_eval --gt <정답 TUM> --poses <보낸 위치 TUM> [--final <최적화된 노드 TUM>] [--stats <통계 CSV>]
+//!   slam_eval [--gt <정답 TUM>] [--poses <보낸 위치 TUM>] [--final <최적화된 노드 TUM>] [--stats <통계 CSV>]
 //!             [--imu <imu0.csv> [--calib <yaml>]] [--stream <장면 스트림>] [--every 2] [--tag 이름]
 //! 지표
 //!  - ATE: 보낸 위치(믿는 위치만) · 최종 노드 · 화면에 보낸 위치(스트림, 임시 · 맡김 포함)를 정답에 SE3(· Sim3)으로 맞춘 위치 오차 RMSE(cm), 위치를 낸 장면 비율
@@ -279,13 +279,14 @@ fn backproject(f: &slam::stream::OutFrame, pose: &T34, out: &mut Vec<[f32; 3]>) 
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let Some(gt_path) = arg(&a, "--gt") else {
-        eprintln!("slam_eval --gt <정답> --poses <보낸 위치> [--final <노드>] [--stats <csv>] [--imu <imu0.csv> [--calib yaml]] [--stream <스트림>] [--every 2] [--tag 이름]");
+    if a.len() < 3 {
+        eprintln!("slam_eval [--gt <정답>] [--poses <보낸 위치>] [--final <노드>] [--stats <csv>] [--imu <imu0.csv> [--calib yaml]] [--stream <스트림>] [--every 2] [--tag 이름]");
         std::process::exit(2);
-    };
+    }
     let tag = arg(&a, "--tag").unwrap_or("-");
     let every: usize = arg(&a, "--every").map(|s| s.parse().unwrap()).unwrap_or(2);
-    let gt = Gt(read_tum(gt_path).into_iter().filter_map(|(t, p, q)| Some((t, p, quat_m(q?)))).collect());
+    // 정답이 없으면(보드 실시간 · 보정 녹화) ATE · 정답 비교 칸은 빠지고 놓침 · 튐(IMU 대비) · 겹 어긋남 · 시간만
+    let gt = Gt(arg(&a, "--gt").map(read_tum).unwrap_or_default().into_iter().filter_map(|(t, p, q)| Some((t, p, quat_m(q?)))).collect());
     let mut js: Vec<(String, String)> = vec![("tag".into(), format!("\"{tag}\""))];
     macro_rules! put {
         ($k:expr, $v:expr) => {
@@ -526,15 +527,15 @@ fn main() {
                 put!("map_err_p90_cm", format!("{:.2}", q(0.9)));
                 put!("ghost_pct", format!("{:.2}", 100.0 * errs.iter().filter(|e| **e > 0.05).count() as f64 / errs.len() as f64));
             }
-            // 겹 어긋남: 5 cm 칸마다 2 초 묶음별 평균 위치를 칸 법선 방향으로 비교(다시 본 면이 처음 쌓인 면과 떨어져 있으면 두 겹). 전체 맞춤과 상관없음
-            let (g2, gm, gv) = layer_gap(&est_pts, &est_seg);
             let (h2, hm, _) = layer_gap(&gt_pts, &gt_seg);
-            put!("layer2_pct", format!("{g2:.1}"));
-            put!("layer_gap_cm", format!("{gm:.2}"));
             put!("gt_layer2_pct", format!("{h2:.1}"));
             put!("gt_layer_gap_cm", format!("{hm:.2}"));
-            put!("layer_vox", gv.to_string());
         }
+        // 겹 어긋남: 5 cm 칸마다 2 초 묶음별 평균 위치를 칸 법선 방향으로 비교(다시 본 면이 처음 쌓인 면과 떨어져 있으면 두 겹). 전체 맞춤 · 정답과 상관없음
+        let (g2, gm, gv) = layer_gap(&est_pts, &est_seg);
+        put!("layer2_pct", format!("{g2:.1}"));
+        put!("layer_gap_cm", format!("{gm:.2}"));
+        put!("layer_vox", gv.to_string());
     }
     let body: Vec<String> = js.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
     println!("{{{}}}", body.join(","));

@@ -130,7 +130,7 @@ impl Extractor {
     /// 특징점 → 설명자(가장자리 점은 빠짐) → 3D 점. RegistrationVis 와 같은 순서
     pub fn extract(&self, f: &Frame) -> Features {
         let mut kps = self.detect(f);
-        let desc = describe(&f.gray, f.cam.width as usize, f.cam.height as usize, &mut kps);
+        let desc = describe_oriented(&f.gray, f.cam.width as usize, f.cam.height as usize, &mut kps, f.cam.oriented);
         let pts3d = self.keypoints_3d(f, &kps);
         Features { kps, pts3d, desc }
     }
@@ -727,6 +727,74 @@ pub fn describe(gray: &[u8], w: usize, h: usize, kps: &mut Vec<KeyPoint>) -> Vec
     })
 }
 
+/// 방향 BRIEF(IMU 모드, ORB 식): 점마다 둘레 반지름 15 화소 밝기 무게중심 방향(intensity centroid)을 재고, 비교 쌍을 그 방향(11.25° 칸 32 개)으로 돌려 뽑는다.
+/// 카메라를 굴려도(roll) 같은 자리의 설명자가 비슷하게 나와 다시 잡기 · 지도 잇기 검증이 시점 변화에 버틴다. oriented = false 면 [`describe`] 그대로(비트 같음).
+/// 돌린 쌍이 중심에서 최대 약 33 화소라 가장자리 37 화소 안 점은 뺀다
+pub fn describe_oriented(gray: &[u8], w: usize, h: usize, kps: &mut Vec<KeyPoint>, oriented: bool) -> Vec<[u8; 32]> {
+    if !oriented {
+        return describe(gray, w, h, kps);
+    }
+    const B: i32 = 37;
+    const BINS: usize = 32;
+    const R: i32 = 15;
+    let (wi, hi) = (w as i32, h as i32);
+    if hi <= B * 2 || wi <= B * 2 {
+        kps.clear();
+        return Vec::new();
+    }
+    kps.retain(|k| {
+        let (x, y) = (k.x.round_ties_even() as i32, k.y.round_ties_even() as i32);
+        x >= B && x < wi - B && y >= B && y < hi - B
+    });
+    if kps.is_empty() {
+        return Vec::new();
+    }
+    // 방향 칸마다 돌린 쌍(칸 거리)
+    let offs: Vec<Vec<[isize; 2]>> = (0..BINS)
+        .map(|b| {
+            let (s, c) = (b as f32 * std::f32::consts::TAU / BINS as f32).sin_cos();
+            let rot = |y: i8, x: i8| -> isize {
+                let (x, y) = (x as f32, y as f32);
+                (s * x + c * y).round() as isize * w as isize + (c * x - s * y).round() as isize
+            };
+            BRIEF32.iter().map(|p| [rot(p[0], p[1]), rot(p[2], p[3])]).collect()
+        })
+        .collect();
+    with_buf(&BOX_BUF, |bx| {
+        box9(gray, w, h, bx);
+        let bx = &bx[..];
+        kps.par_iter()
+            .with_min_len(128)
+            .map(|k| {
+                let (cx, cy) = ((k.x as f64 + 0.5) as isize, (k.y as f64 + 0.5) as isize);
+                // 원 안 밝기 모멘트 m10 · m01 → 방향
+                let (mut m10, mut m01) = (0i64, 0i64);
+                for dy in -R..=R {
+                    let dx_max = ((R * R - dy * dy) as f32).sqrt() as i32;
+                    let row = (cy + dy as isize) as usize * w;
+                    for dx in -dx_max..=dx_max {
+                        let v = gray[row + (cx + dx as isize) as usize] as i64;
+                        m10 += dx as i64 * v;
+                        m01 += dy as i64 * v;
+                    }
+                }
+                let ang = (m01 as f32).atan2(m10 as f32).rem_euclid(std::f32::consts::TAU);
+                let off = &offs[((ang / std::f32::consts::TAU * BINS as f32).round() as usize) % BINS];
+                let base = cy * w as isize + cx;
+                let mut d = [0u8; 32];
+                for (byte, o8) in d.iter_mut().zip(off.chunks_exact(8)) {
+                    let mut v = 0u8;
+                    for (b, o) in o8.iter().enumerate() {
+                        v |= ((bx[(base + o[0]) as usize] < bx[(base + o[1]) as usize]) as u8) << (7 - b);
+                    }
+                    *byte = v;
+                }
+                d
+            })
+            .collect()
+    })
+}
+
 /// 9×9 상자 합 그림: out[y·w + x] = Σ gray[y-4..=y+4][x-4..=x+4] (4 ≤ y < h-4, 4 ≤ x < w-4 만, 나머지는 쓰지 않음)
 fn box9(gray: &[u8], w: usize, h: usize, out: &mut Vec<i32>) {
     out.resize(w * h, 0);
@@ -864,7 +932,7 @@ mod tests {
             depth_mm: depth.into(),
             depth_raw: Default::default(),
             depth_per_m: 1000.0,
-            cam: Camera { fx: 500.0, fy: 500.0, cx: 159.5, cy: 119.5, width: w, height: h, local: crate::io::optical_rotation() },
+            cam: Camera { fx: 500.0, fy: 500.0, cx: 159.5, cy: 119.5, width: w, height: h, local: crate::io::optical_rotation(), oriented: false },
         }
     }
 
@@ -912,6 +980,33 @@ mod tests {
         assert_eq!(d.len(), 4);
         // 평평한 그림: 모든 비교가 같음 → 비트 0
         assert!(d.iter().all(|x| x.iter().all(|&b| b == 0)));
+    }
+
+    /// 방향 BRIEF: 끄면 원래 설명자와 같고, 그림을 30° 돌려도 방향 BRIEF 는 돌리기 전과 가깝다(원래 BRIEF 는 멀다)
+    #[test]
+    fn oriented_brief_rotation_invariant() {
+        let (w, h) = (160usize, 160usize);
+        // 부드러운 무늬(9×9 상자 합 기준으로 비교가 회전 보간에 덜 흔들리게)
+        let pat = |x: f32, y: f32| (128.0 + 50.0 * (x * 0.21).sin() * (y * 0.13).cos() + 40.0 * ((x * 0.07 - y * 0.17).sin())).clamp(0.0, 255.0);
+        let g: Vec<u8> = (0..w * h).map(|i| pat((i % w) as f32, (i / w) as f32) as u8).collect();
+        let k = || vec![KeyPoint { x: 80.0, y: 80.0, size: 3.0, angle: -1.0, response: 1.0, octave: 0 }];
+        let d0 = describe(&g, w, h, &mut k())[0];
+        assert_eq!(describe_oriented(&g, w, h, &mut k(), false)[0], d0);
+        let o0 = describe_oriented(&g, w, h, &mut k(), true)[0];
+        let th = 30f32.to_radians();
+        // 그림을 중심(80, 80) 둘레로 θ 돌림: 새 그림 (x, y) = 원래 그림의 R(−θ)(x − c) + c
+        let (s, c) = th.sin_cos();
+        let gr: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32 - 80.0, (i / w) as f32 - 80.0);
+                pat(c * x + s * y + 80.0, -s * x + c * y + 80.0) as u8
+            })
+            .collect();
+        let ham = |a: &[u8; 32], b: &[u8; 32]| a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>();
+        let steered = describe_oriented(&gr, w, h, &mut k(), true)[0];
+        let plain = describe(&gr, w, h, &mut k())[0];
+        assert!(ham(&steered, &o0) < 40, "방향 BRIEF {} · 그대로 {}", ham(&steered, &o0), ham(&plain, &d0));
+        assert!(ham(&plain, &d0) > ham(&steered, &o0) + 30, "방향 BRIEF {} · 그대로 {}", ham(&steered, &o0), ham(&plain, &d0));
     }
 
     /// 비트 배치: 바이트 i 의 비트 7-b = 쌍 8i+b. 9×9 합을 직접 세어 모든 비트를 맞춰 봄

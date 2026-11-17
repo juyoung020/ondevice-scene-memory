@@ -413,7 +413,7 @@ mod engine {
         pub geo_link: Option<(i32, Tf)>,
         /// 이어 붙인 구간 시작 노드 id(0 = 없음): 이 앞 노드들에서만 제자리 후보를 찾고, 루프가 이 구간을 옮기는 것은 허용
         pub prov_from: i32,
-        /// 지도 잇기 후보 가운데 PnP 로 맞춰 볼 수(IMU 모드 2, 그 밖 1)
+        /// 지도 잇기 후보 가운데 PnP 로 맞춰 볼 수(IMU 모드 5, 그 밖 1). 지도 전체 다시 잡기는 이것과 2 중 큰 수
         pub merge_top: usize,
         /// 다시 잡기 · 지도 잇기 후보를 지금 위치 추적 자세에서 가까운 노드부터(IMU 모드: 놓친 사이 자세를 자이로로 이어 가 위치 추적 좌표가 이어짐)
         pub near_first: bool,
@@ -678,7 +678,7 @@ mod engine {
                 eprintln!("global db {} q {} top {:?}", self.kf_db.len(), q.len(), &scores[..scores.len().min(3)]);
             }
             let cam = f.cam.clone();
-            for &(hits, i) in scores.iter().take(2) {
+            for &(hits, i) in scores.iter().take(self.merge_top.max(2)) {
                 if hits < 10 {
                     break;
                 }
@@ -958,7 +958,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-rate °/s] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--no-geo]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--no-geo]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
     );
 }
 
@@ -1011,8 +1011,10 @@ pub struct Args {
     imu_calib: String,
     /// 영상이 다 실패한 구간을 IMU 회전으로 이어 붙이는 최대 시간(초)
     imu_bridge: f64,
-    /// IMU 모드: 자이로 회전이 이보다 빠른(°/s) 장면은 위치만(지도에 안 넣음)
-    imu_max_rate: f64,
+    /// IMU 모드: 번짐(자이로 각속도 × 노출 × 초점 거리, 화소)이 이보다 큰 장면은 위치만(지도에 안 넣음) · 다시 잡기 · 지도 잇기도 건너뜀
+    imu_max_blur: f64,
+    /// 번짐 계산에 쓰는 노출(초)
+    imu_exposure: f64,
     /// IMU 모드: 광류 맞은 점이 이보다 적거나 맞은 비율이 이보다 낮은 장면은 위치만
     imu_min_inliers: f64,
     imu_min_ratio: f64,
@@ -1070,7 +1072,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         imu: String::new(),
         imu_calib: String::new(),
         imu_bridge: 1.0,
-        imu_max_rate: 60.0,
+        imu_max_blur: 15.0,
+        imu_exposure: 0.03,
         imu_min_inliers: 60.0,
         imu_min_ratio: 0.6,
         imu_hold_wait: 2.0,
@@ -1151,7 +1154,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--imu" => a.imu = val()?,
             "--imu-calib" => a.imu_calib = val()?,
             "--imu-bridge" => a.imu_bridge = num(&val()?)?,
-            "--imu-max-rate" => a.imu_max_rate = num(&val()?)?,
+            "--imu-max-blur" => a.imu_max_blur = num(&val()?)?,
+            "--imu-exposure" => a.imu_exposure = num(&val()?)?,
             "--imu-min-inliers" => a.imu_min_inliers = num(&val()?)?,
             "--imu-min-ratio" => a.imu_min_ratio = num(&val()?)?,
             "--imu-hold-wait" => a.imu_hold_wait = num(&val()?)?,
@@ -1353,7 +1357,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     let klt_path = params.get("Odom/Strategy", 0i32) == 9;
     if let Some(f) = imu_fusion {
         eng.set_imu(f)?;
-        eng.merge_top = 2;
+        eng.merge_top = 5;
         eng.near_first = true;
     }
     // 실시간(카메라·찍은 속도 재생)이면 지도 갱신을 따로 도는 스레드로(--map-inline 으로 끔). 최대 속도 재생은 결정적이게 그대로
@@ -1460,6 +1464,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         if let (Some(r), Some(ring)) = (imu_replay.as_mut(), imu_ring.as_ref()) {
             r.feed(ring, fr.t + calib.shift + crate::imu::REPLAY_LEAD);
         }
+        // IMU 모드: BRIEF 를 점마다 방향으로 돌려 뽑음(ORB 식) → 굴려도 같은 설명자, 다시 잡기 · 지도 잇기 · 루프 검증이 시점 변화에 버팀
+        fr.cam.oriented = imu_on && klt_path;
         fr.id = n + 1;
         // 리셋 요청(뷰어의 Reset 버튼: 한 프로그램이면 common::control 신호, 따로 띄운 뷰어면 --reset-file 파일): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
         // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다
@@ -1497,6 +1503,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
 
         let c1 = Instant::now();
         let mut info = eng.odom_process(&fr, src.take_prepped());
+        // IMU 모드 번짐(화소): 이 장면 앞 구간 자이로 각속도 × 노출 × 초점 거리. 크면 다시 잡기 · 잇기 · 지도 넣기를 건너뜀(번진 사진은 어떤 특징으로도 검증되지 않음)
+        let blurred = imu_on && (eng.imu_rate() as f64).to_radians() * a.imu_exposure * fr.cam.fx > a.imu_max_blur;
         let mut pose = info.pose;
         let mut relocalized = false;
         if pose.is_none() || info.lost {
@@ -1535,7 +1543,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
             // 최근 기준 장면으로 못 잡으면 지도 전체에서(광류 경로, 놓친 동안 장면마다)
             // 장면당 예산: 이 장면에서 위치 추적이 이미 20 ms 넘게 썼으면 다음 장면으로 미룸(추적 스레드가 40 ms 넘게 막히지 않게)
             // 빈틈 바로 뒤 첫 장면은 예산과 상관없이 한 번 꼭 해 봄(이어 붙이기 전에 제자리 찾기)
-            if !relocalized && klt_path && (ms_since(c1) < 20.0 || !global_tried) {
+            if !relocalized && klt_path && (ms_since(c1) < 20.0 || !global_tried) && !blurred {
                 global_tried = true;
                 if let Some((p, inl, cov)) = eng.global_reloc(&fr, reloc_min as usize).filter(|r| {
                     let ok = eng.imu_pose_plausible(&r.0);
@@ -1568,7 +1576,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
                 }
                 lost_since = -1.0;
             }
-        } else if imu_on && klt_path && anchored && eng.klt_diag().is_some_and(|d| d.method == 5) && ms_since(c1) < 20.0 {
+        } else if imu_on && klt_path && anchored && !blurred && eng.klt_diag().is_some_and(|d| d.method == 5) && ms_since(c1) < 20.0 {
             // IMU 로 이어 붙이는 동안(영상이 다 실패, 위치 = 마지막 성공 × 자이로 회전 · 이동 0)도 지도 전체에서 다시 잡아 본다:
             // 잡히면 이어 붙인 자세 대신 영상 위치로(이어 붙이기가 1 초 한도를 다 쓰고 새 지도를 여는 일을 줄임)
             let cr = Instant::now();
@@ -1602,8 +1610,8 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
         let imu_rej = imu_on && eng.imu_rejected();
         n_imu_reject += imu_rej as i64;
         since_imu = if imu_on && pose.is_some() && (dg.method == 5 || imu_rej) { 0 } else { since_imu.saturating_add(1) };
-        // 지도에 넣지 않을 장면(IMU 모드): 빠른 회전(흐림 · 말림) · 영상 근거가 약한 광류 결과
-        let fast_rot = imu_on && pose.is_some() && eng.imu_rate() as f64 > a.imu_max_rate;
+        // 지도에 넣지 않을 장면(IMU 모드): 번진 장면(각속도 × 노출 × 초점 거리 > --imu-max-blur 화소) · 영상 근거가 약한 광류 결과
+        let fast_rot = imu_on && pose.is_some() && blurred;
         let weak = imu_on && pose.is_some() && dg.method == 0 && !relocalized && ((dg.q.inliers as f64) < a.imu_min_inliers || (dg.q.ratio as f64) < a.imu_min_ratio);
         n_fast_rot += fast_rot as i64;
         n_weak += (weak && !fast_rot) as i64;
@@ -2039,7 +2047,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     common::info!("위치 질: 좋음 {} · 불확실 {} · 놓침 {}", nq[0], nq[1], nq[2]);
     if let Some(s) = eng.imu_summary() {
         common::info!("{s}");
-        common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함, 빠른 회전 {n_fast_rot} · 영상 근거 약함 {n_weak}), 이어지지 않은 새 지도라 맡겨 둔 장면 {n_map_held}, 기다리다 받아들인 새 지도 {n_accept}");
+        common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함, 번짐 {n_fast_rot} · 영상 근거 약함 {n_weak}), 이어지지 않은 새 지도라 맡겨 둔 장면 {n_map_held}, 기다리다 받아들인 새 지도 {n_accept}");
         common::info!("IMU: 보낸 위치 기준 지도 기울기 마지막 {tilt_map:.1}° · 최대 {tilt_map_max:.1}°, 장면 사이 위치 {} 개({:.0} 개/초)", crate::imu::FAST_N.load(Ordering::Relaxed), crate::imu::FAST_N.load(Ordering::Relaxed) as f64 / wall.max(1e-9));
         if let Some((ng, gd)) = eng.imu_grav() {
             common::info!("IMU: 가만히 있을 때 기울기를 중력 쪽으로 고친 장면 {ng}(합 {gd:.1}°), 중력과 어긋나 버린 다시 잡기 {n_reloc_tilt}");

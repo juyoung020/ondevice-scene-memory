@@ -275,7 +275,7 @@ impl FrameSource for TumSource {
                 depth_mm,
                 depth_raw,
                 depth_per_m: self.depth_per_m,
-                cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h, local: optical_rotation() },
+                cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h, local: optical_rotation(), oriented: false },
             };
             self.read_ms = c0.elapsed().as_secs_f64() * 1e3;
             return Ok(Some(f));

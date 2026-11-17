@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### Added
+- 모델 릴리스 `models-v2`: 보드가 쓰는 NPU 만 도는 `siglip2-vision_npu.dxnn` · `objectsam-416_640.dxnn`(`board-npu-v2`), 사진 벡터 dxnn 의 원본 ONNX · 컴파일 기록 · 진단(`siglip2-npu-src`), 이름 표(`vocab`). `scripts/setup.sh --board` 가 받아 `~/models` 에도 둔다, `--yolo` 로 YOLO26 ONNX. 목록 `docs/models.md`.
 - 뷰어 `?metrics=1` 에 센서→화면 지연(`camera→screen`) · 받은 위치 수(`pose updates`), `?c_blend=1` · `?c_edl=0` 으로 점 섞기 · EDL 고르기.
 - IMU 융합 모드 `--imu /dev/i2c-1`(ICM-42688-P): 자이로 회전 예측으로 광류를 시작하고, 첫 장면 지도를 중력으로 수평 맞추고, 영상이 끊긴 1 초 안은 IMU 회전으로 이어 붙인다. `--imu` 없으면 카메라 전용(결과 그대로).
 - 장면 스트림 `GRAVITY` 표시: 물체 기억이 IMU 로 수평 맞춘 지도를 바닥 합의 없이 그대로 쓴다.

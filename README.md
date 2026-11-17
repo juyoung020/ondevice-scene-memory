@@ -57,6 +57,8 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
 | `ObjectSAM-416_640.onnx` | 물체 자르기(분할, 이름 없는 물체 1 클래스) | `train/ObjectSAM` 에서 내보냄 |
 | `siglip2-base-patch32-256/` | 물체 사진 → 이름 · 검색 벡터(SigLIP2) | Hugging Face `google/siglip2-base-patch32-256` 을 ONNX 로 |
 
+`bash scripts/setup.sh`(윈도우 `scripts\setup.ps1`, 보드 `--board`)가 GitHub 릴리스 [models-v1](https://github.com/juyoung020/ondevice-scene-memory/releases/tag/models-v1) · [models-v2](https://github.com/juyoung020/ondevice-scene-memory/releases/tag/models-v2)(보드 NPU 모델 · 컴파일 재료 · 이름 표)에서 받아 sha256 을 확인하고 풉니다. 파일 · 라이선스 · sha256 은 [docs/models.md](docs/models.md).
+
 물체는 ObjectSAM 으로 자르고, 이름은 SigLIP2 사진 벡터가 가장 닮은 실내 낱말(`vocab/indoor.voc`, 104 개)로 붙습니다. 이 셋이 `--seg` · `--embed` · `--vocab` 의 기본값이라 따로 주지 않아도 됩니다(모델 폴더는 `ONDEVICE_MODELS`, 기본 PC `models/` · 보드 `~/models`, `--embed off` 로 이름 붙이기 끔). 분할은 클래스 없는 ObjectSAM 만 받습니다(클래스를 내는 모델은 첫 검출에서 멈춤).
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).

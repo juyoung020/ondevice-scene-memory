@@ -4,6 +4,8 @@
 
 두 모델 모두 NPU 작업 하나로만 돈다(CPU 작업 없음, `parse_model -m <파일>` 로 확인). 모델 안에 CPU 작업이 남으면 DXRT 가 ONNX Runtime 으로 그 부분을 돌리며 CPU 를 쓴다.
 
+만든 두 파일은 릴리스 [`models-v2`](https://github.com/juyoung020/ondevice-scene-memory/releases/tag/models-v2) 의 `board-npu-v2.tar.gz` 에 있다(`siglip2-vision_npu.dxnn` sha256 `2c9f0bcc…`, `objectsam-416_640.dxnn` `b3579a4b…`, 전체 값은 [models.md](models.md)). 사진 벡터 dxnn 을 컴파일한 원본 ONNX · 컴파일 기록 · 진단 리포트는 같은 릴리스의 `siglip2-npu-src.tar.gz`. `scripts/setup.sh --board` 가 받는다.
+
 ONNX 손질은 `tools` 의 `npu_prep`(Rust)으로 한다.
 
 ```bash

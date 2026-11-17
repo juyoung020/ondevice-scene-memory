@@ -66,6 +66,7 @@ struct Args {
     rebuild_every: f64,     // --rebuild-every S: 지도 노드가 움직이면(루프 클로저) S 초에 한 번까지 보관한 장면을 고친 위치로 다시 쌓음(0 = 끝에만, --no-rebuild = 안 함)
     embed: Option<String>,  // --embed <vision_model.onnx | .dxnn>: 물체 사진마다 검색용 벡터(SigLIP2 영상 인코더)를 남김
     vocab: Option<String>,  // --vocab <글 벡터 파일>: 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(--embed 와 함께, 파일은 sgview --encode-vocab 이 만듦)
+    structural: Option<String>, // --structural <글 벡터 파일>: 벽 · 바닥 · 천장 판정 표(기본 vocab/structural.voc, 사진 벡터가 있어야)
     kf_store_mb: usize,     // --kf-store-mb: 다시 쌓기용 장면 보관 예산(넘으면 하나 걸러 버림)
 }
 
@@ -78,6 +79,7 @@ fn args(v: &common::cli::Argv) -> Args {
         seg: get("--seg").unwrap_or_else(|| models::seg()),
         embed: models::opt(get("--embed"), models::embed),
         vocab: models::opt(get("--vocab"), models::vocab).filter(|_| get("--embed").is_none_or(|e| e != "off" && e != "none")), // 이름은 사진 벡터가 있어야
+        structural: models::opt(get("--structural"), models::structural).filter(|_| get("--embed").is_none_or(|e| e != "off" && e != "none")),
         every: get("--every").map_or(5, |s| s.parse().unwrap()),
         conf: get("--conf").map_or(0.35, |s| s.parse().unwrap()),
         live: get("--live").map_or(0.0, |s| s.parse().unwrap()),
@@ -383,13 +385,20 @@ mod models {
         let onnx = d.join("siglip2-base-patch32-256").join("vision_model.onnx");
         if cfg!(feature = "dxrt") { first(vec![d.join("siglip2-vision_npu.dxnn"), onnx]) } else { first(vec![onnx]) }
     }
-    pub fn vocab() -> String {
-        let mut c = vec![PathBuf::from("vocab/indoor.voc"), dir().join("indoor.voc")];
+    /// 저장소 vocab/ 의 글 벡터 파일(작업 폴더 · 모델 폴더 · 실행 파일 옆 순)
+    fn voc(file: &str) -> String {
+        let mut c = vec![PathBuf::from("vocab").join(file), dir().join(file)];
         if let Some(e) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
-            c.push(e.join("vocab/indoor.voc"));
-            c.push(e.join("../../vocab/indoor.voc"));
+            c.push(e.join("vocab").join(file));
+            c.push(e.join("../../vocab").join(file));
         }
         first(c)
+    }
+    pub fn vocab() -> String {
+        voc("indoor.voc")
+    }
+    pub fn structural() -> String {
+        voc("structural.voc")
     }
     /// 인자를 안 주면 기본, "off" 면 끔
     pub fn opt(v: Option<String>, def: fn() -> String) -> Option<String> {
@@ -639,6 +648,11 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
         names.extend(embed::load_vocab(f));
         names.sort();
         names.dedup();
+    }
+    match &a.structural {
+        Some(f) if Path::new(f).exists() => embed::load_structural(f),
+        Some(f) => common::info!("--structural {f} 없음: 벽 · 바닥 · 천장 판정 없이"),
+        None => {}
     }
     out::write_direct(&a.out.join("vocab.json"), serde_json::to_string(&names).unwrap().into_bytes());
     let mut last_pose = [0.0; 3];
@@ -1437,7 +1451,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>) -> Box<dyn seg::Segmenter 
     let mut by: std::collections::BTreeMap<String, u32> = Default::default();
     for o in &mem.objs {
         let n = embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0);
-        if n != "ceiling" {
+        if embed::structure(o.id) != Some("ceiling") {
             *by.entry(n).or_default() += 1;
         }
     }
@@ -2371,12 +2385,12 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");
-        // 사진이 천장인 물체는 기억에 넣지 않음(위에서 볼 때 지도를 가림)
-        if look.as_ref().is_some_and(|l| l.0 == "ceiling") {
+        // 천장 면은 기억에 넣지 않음(위에서 볼 때 지도를 가림): 구조물 판정 표(--structural)로
+        if embed::structure(o.id) == Some("ceiling") {
             continue;
         }
-        // 이름 없는 분할 모델이 자른 벽·바닥·천장 면: 사진 이름이 구조물이면 구조물로 표시(뷰어가 따로 끄고 켬)
-        let structural = o.name == "object" && look.as_ref().is_some_and(|l| embed::STRUCTURAL.contains(&l.0.as_str()));
+        // 이름 없는 분할 모델이 자른 벽 · 바닥 · 천장 면: 구조물 판정 표가 구조물로 본 물체(뷰어가 따로 끄고 켬)
+        let structural = o.name == "object" && embed::structure(o.id).is_some();
         let mut e = json!({"id": o.id, "name": look.as_ref().map_or(&o.name, |l| &l.0), "seg_name": o.name, "state": o.state, "pos": o.pos, "first_pos": o.first_pos, "extent": o.extent,
             "n_obs": o.n_obs, "score": o.score, "last_seen": o.last_seen, "structural": structural,
             "points": {"path": format!("{base}_points.ply"), "stamp": o.stamp, "voxel": mem.vox, "n": o.n_pts}});
@@ -2393,7 +2407,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
     }
     embed::submit(dir, to_embed);
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
-    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).filter(|o| o.4 != "ceiling").collect();
+    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).filter(|o| embed::structure(o.0) != Some("ceiling")).collect();
     let traj = view.traj_update(traj);
     let wall = if view.live { wall_ms() } else { 0.0 };
     view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });

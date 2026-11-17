@@ -1441,24 +1441,23 @@ function drawHighlight() {
   invalidate();
 }
 // ---------------- search ----------------
-// The box asks /api/search (text → class names and object pictures, see sgview search.rs); matches get a green outline and a label on the map.
+// The box asks /api/search (query vector × object pictures, see sgview search.rs); matches get a green outline and a label on the map.
 function flyTo(o) {   // keep the compass direction, look down from at least 40°, stay far enough to see what stands around the object
   const dir = camera.position.clone().sub(controls.target).normalize(), d = Math.max(2.5, Math.max(...o.extent) * 5);
   if (dir.z < 0.64) { const h = Math.hypot(dir.x, dir.y) || 1; dir.set(dir.x / h * 0.77, dir.y / h * 0.77, 0.64); }
   const target = new THREE.Vector3(...o.pos);
   autoFit = false; camGoal = { pos:target.clone().addScaledVector(dir, d), target }; invalidate();
 }
-function findShow(r) {
+function findShow(r) {   // r.results: letter matches first (score 1, by "name"), then pictures by cosine (score = p = sigmoid(111.83·cos − 16.77), by "look")
   find.hits = r.results.filter(h => objs.has(h.id)); find.ids = new Set(find.hits.map(h => h.id));
   find.key = find.hits.map(h => h.id + ":" + h.score).join(",");
   const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
-  const read = (r.names || []).map(n => esc(n.name)).join(", ");
+  const top = Math.max(1e-6, ...find.hits.map(h => h.score)), pct = p => (p * 100).toFixed(p < 0.1 ? 1 : 0) + "%";
   $("f_note").innerHTML = !r.semantic ? "No text model loaded: matching the letters of the stored names only."
-    : find.hits.length ? `${find.hits.length} match${find.hits.length > 1 ? "es" : ""}${read ? " · read as <b>" + read + "</b>" : " · matched by look"}`
-    : `Nothing in the memory matches${read ? " (read as <b>" + read + "</b>)" : ""}.`;
+    : find.hits.length ? `${find.hits.length} match${find.hits.length > 1 ? "es" : ""}` : "Nothing in the memory matches.";
   $("f_list").innerHTML = find.hits.map(h => { const o = objs.get(h.id), img = o.rgbd && o.rgbd.rgb ? `<img src="/file/${o.rgbd.rgb}?v=${o.rgbd.v ?? o.last_seen}" alt="">` : "<img alt=''>";
-    return `<div class="hit${h.id === selected ? " on" : ""}" data-id="${h.id}">${img}<div class="nm"><b>${esc(o.name)}</b> <span>#${h.id} · ${esc(o.state)}</span><div class="bar"><i style="width:${Math.round(h.score * 100)}%"></i></div></div>` +
-      `<span class="by" title="name: the query means this class name (${h.p_name}) · look: the query describes this object's picture (${h.p_look})">${h.by}</span><span class="pc">${Math.round(h.score * 100)}%</span></div>`; }).join("");
+    return `<div class="hit${h.id === selected ? " on" : ""}" data-id="${h.id}">${img}<div class="nm"><b>${esc(o.name)}</b> <span>#${h.id} · ${esc(o.state)}</span><div class="bar"><i style="width:${Math.round(h.score / top * 100)}%"></i></div></div>` +
+      `<span class="by" title="name: the stored name holds the query · look: the picture matches the query (p ${h.score}, cos ${h.cos})">${h.by}</span><span class="pc">${pct(h.score)}</span></div>`; }).join("");
   $("f_out").style.display = "block";
   drawHighlight(); invalidate();
 }

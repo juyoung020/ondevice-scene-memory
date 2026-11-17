@@ -86,33 +86,63 @@ pub const NAME_MIN_UNNAMED: f32 = 0.15;
 /// 몫 0.15 만 쓸 때 맞은 이름 비율 0.52, 차 0.003 을 더하면 0.67(이름 붙은 물체 15 개)
 pub const NAME_MARGIN: f32 = 0.003;
 
-/// 물체가 아닌 면의 이름(이름 목록에 함께 넣어 둠)
+/// 구조물 낱말(가장 닮은 구조물 표 낱말이 이 넷 중 하나면 벽 · 바닥 · 천장 면)
 pub const STRUCTURAL: [&str; 4] = ["floor", "wall", "ceiling", "baseboard"];
+/// SigLIP2 의 글 · 사진 한 쌍 확률 p = sigmoid(SCALE · cos + LOGIT_BIAS) (체크포인트 logit_bias)
+pub const LOGIT_BIAS: f32 = -16.766876;
+/// 구조물로 보는 가장 낮은 p(docs/search_direct.md "구조물 판정용 최소 단어": 바닥 · 벽 조각 0.87 맞춤, 물체 59 개 중 0 개를 구조물로)
+pub const STRUCT_MIN_P: f32 = 0.003;
 
 /// 이름 목록과 그 글 벡터(`--vocab`): PC 에서 `sgview --encode-vocab` 로 한 번 만들어 둔 파일이라 글 인코더 없이 쓴다
 static VOCAB: std::sync::OnceLock<(Vec<String>, Vec<f32>)> = std::sync::OnceLock::new();
+/// 구조물 판정 표(`--structural`, 기본 vocab/structural.voc: floor wall ceiling baseboard object furniture window door)
+static STRUCT_VOCAB: std::sync::OnceLock<(Vec<String>, Vec<f32>)> = std::sync::OnceLock::new();
 /// 물체 번호 → 사진이 가장 닮은 이름과 그 몫
 static NAMES: std::sync::Mutex<Option<std::collections::HashMap<u32, (String, f32)>>> = std::sync::Mutex::new(None);
+/// 물체 번호 → 구조물 낱말(벽 · 바닥 · 천장 면이면)
+static STRUCTS: std::sync::Mutex<Option<std::collections::HashMap<u32, &'static str>>> = std::sync::Mutex::new(None);
 
-/// 글 벡터 파일(첫 줄 `SGVOC 1 <n> <차원>`, 이름 n 줄, 이어서 f32 n·차원 개)을 읽어 둔다. 이름 목록을 돌려준다
-pub fn load_vocab(path: &str) -> Vec<String> {
-    let b = std::fs::read(path).unwrap_or_else(|e| panic!("--vocab {path}: {e}"));
+/// 글 벡터 파일(첫 줄 `SGVOC 1 <n> <차원>`, 이름 n 줄, 이어서 f32 n·차원 개): (이름, 벡터)
+fn read_voc(path: &str, opt: &str) -> (Vec<String>, Vec<f32>) {
+    let b = std::fs::read(path).unwrap_or_else(|e| panic!("{opt} {path}: {e}"));
     let mut pos = 0;
     let mut line = || {
-        let end = pos + b[pos..].iter().position(|c| *c == b'\n').unwrap_or_else(|| panic!("--vocab {path}: 글 벡터 파일이 아님"));
-        let s = std::str::from_utf8(&b[pos..end]).unwrap_or_else(|_| panic!("--vocab {path}: 글 벡터 파일이 아님")).to_string();
+        let end = pos + b[pos..].iter().position(|c| *c == b'\n').unwrap_or_else(|| panic!("{opt} {path}: 글 벡터 파일이 아님"));
+        let s = std::str::from_utf8(&b[pos..end]).unwrap_or_else(|_| panic!("{opt} {path}: 글 벡터 파일이 아님")).to_string();
         pos = end + 1;
         s
     };
     let head = line();
     let h: Vec<&str> = head.split(' ').collect();
-    assert!(h.len() == 4 && h[0] == "SGVOC" && h[1] == "1" && h[3].parse() == Ok(DIM), "--vocab {path}: 글 벡터 파일이 아님");
-    let n: usize = h[2].parse().unwrap_or_else(|_| panic!("--vocab {path}: 글 벡터 파일이 아님"));
+    assert!(h.len() == 4 && h[0] == "SGVOC" && h[1] == "1" && h[3].parse() == Ok(DIM), "{opt} {path}: 글 벡터 파일이 아님");
+    let n: usize = h[2].parse().unwrap_or_else(|_| panic!("{opt} {path}: 글 벡터 파일이 아님"));
     let names: Vec<String> = (0..n).map(|_| line()).collect();
-    assert_eq!(b.len(), pos + n * DIM * 4, "--vocab {path}: 벡터 수가 이름 수와 다름");
-    let v: Vec<f32> = b[pos..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    assert_eq!(b.len(), pos + n * DIM * 4, "{opt} {path}: 벡터 수가 이름 수와 다름");
+    (names, b[pos..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// 지도 이름표용 이름 목록(`--vocab`)을 읽어 둔다. 이름 목록을 돌려준다
+pub fn load_vocab(path: &str) -> Vec<String> {
+    let (names, v) = read_voc(path, "--vocab");
     let _ = VOCAB.set((names.clone(), v));
     names
+}
+
+/// 구조물 판정 표(`--structural`)를 읽어 둔다
+pub fn load_structural(path: &str) {
+    let _ = STRUCT_VOCAB.set(read_voc(path, "--structural"));
+}
+
+/// 구조물 판정: 표에서 가장 닮은 낱말이 STRUCTURAL 중 하나이고 p ≥ STRUCT_MIN_P 이면 그 낱말
+fn look_structure(names: &[String], vecs: &[f32], e: &[f32]) -> Option<&'static str> {
+    let (i, c) = vecs.chunks(DIM).map(|t| t.iter().zip(e).map(|(a, b)| a * b).sum::<f32>()).enumerate().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let p = 1.0 / (1.0 + (-(SCALE * c + LOGIT_BIAS)).exp());
+    STRUCTURAL.iter().find(|s| **s == names[i]).copied().filter(|_| p >= STRUCT_MIN_P)
+}
+
+/// 그 물체가 벽 · 바닥 · 천장 면이면 그 낱말(`--structural` 표, 사진 벡터 평균으로 판정). 표가 없거나 벡터 계산 전이면 None
+pub fn structure(id: u32) -> Option<&'static str> {
+    common::prof::lock(&STRUCTS, common::prof::W::LockEmbed).as_ref()?.get(&id).copied()
 }
 
 /// 사진 벡터(길이 1)가 가장 닮은 이름과 그 몫: 이름 전체에 대한 softmax(SCALE · 코사인). 1 등과 2 등의 코사인 차가 NAME_MARGIN 보다
@@ -148,6 +178,14 @@ fn put(id: u32, v: Vec<f32>) {
             common::prof::lock(&NAMES, common::prof::W::LockEmbed).get_or_insert_with(Default::default).insert(id, n);
         }
     }
+    if let Some((names, vecs)) = STRUCT_VOCAB.get() {
+        let mut g = common::prof::lock(&STRUCTS, common::prof::W::LockEmbed);
+        let m = g.get_or_insert_with(Default::default);
+        match look_structure(names, vecs, &mean) {
+            Some(s) => m.insert(id, s),
+            None => m.remove(&id),
+        };
+    }
     common::prof::lock(&LATEST, common::prof::W::LockEmbed).get_or_insert_with(Default::default).insert(id, v);
 }
 
@@ -156,6 +194,7 @@ pub fn clear() {
     *SUMS.lock().unwrap() = None;
     *LATEST.lock().unwrap() = None;
     *NAMES.lock().unwrap() = None;
+    *STRUCTS.lock().unwrap() = None;
     *NCOUNT.lock().unwrap() = None;
 }
 
@@ -565,6 +604,20 @@ mod tests {
             std::hint::black_box(look_name(&names, &vecs, e));
         }
         println!("이름 붙이기(낱말 104 개): {:.1} µs/물체", c.elapsed().as_secs_f64() * 1e6 / es.len() as f64);
+    }
+
+    #[test]
+    fn structure_needs_closest_structural_word_and_p() {
+        // 낱말 셋이 축 0 · 1 · 2 를 가리킴: floor, wall, furniture
+        let names: Vec<String> = ["floor", "wall", "furniture"].iter().map(|s| s.to_string()).collect();
+        let mut vecs = vec![0.0; 3 * DIM];
+        for i in 0..3 {
+            vecs[i * DIM + i] = 1.0;
+        }
+        let pic = |ax: usize, c: f32| { let mut e = vec![0.0; DIM]; e[ax] = c; e[9] = (1.0 - c * c).sqrt(); e };
+        assert_eq!(look_structure(&names, &vecs, &pic(1, 0.2)), Some("wall")); // p = 0.99
+        assert_eq!(look_structure(&names, &vecs, &pic(2, 0.2)), None); // 가장 닮은 낱말이 가구
+        assert_eq!(look_structure(&names, &vecs, &pic(0, 0.05)), None); // floor 이지만 p < 0.003
     }
 
     #[test]

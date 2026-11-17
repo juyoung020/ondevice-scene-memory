@@ -79,7 +79,7 @@ target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sy
 
 검색 모델은 Hugging Face 의 SigLIP2 base patch32-256 을 ONNX 로 내보낸 것으로, `models/siglip2-base-patch32-256/` 에 `vision_model.onnx`(물체 기억이 물체 사진에), `text_model_fp16.onnx`·`tokenizer.json`(뷰어가 검색어에) 을 둡니다. `--embed`·`--search-model` 을 빼면 검색창은 저장된 이름의 글자만 비교합니다.
 
-`vocab/names.voc` 는 이름 1,225 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 · 바닥 · 벽 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. 물체 기억은 기본으로 더 작은 실내 표 `vocab/indoor.voc` 를 쓰고, `--vocab vocab/names.voc` 로 이 큰 표를 줄 수 있습니다. 물체 기억은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 물체 이름으로 쓰고(tv → monitor, 몫 0.3 이상일 때), 뷰어는 같은 파일로 이름들의 글 벡터 계산을 건너뜁니다. 목록을 바꾸면 `ondevice view --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
+`vocab/names.voc` 는 이름 1,225 개(LVIS v1 의 범주 이름(CC BY 4.0) · COCO, ObjectSAM 라벨에 쓴 문 · 창 · 계단 · 바닥 · 벽 등, 목록 `vocab/names.txt`)의 글 벡터를 PC 에서 미리 계산해 둔 파일입니다. 물체 기억은 기본으로 더 작은 실내 표 `vocab/indoor.voc` 를 쓰고, `--vocab vocab/names.voc` 로 이 큰 표를 줄 수 있습니다. 물체 기억은 `--vocab` 으로 물체 사진이 가장 닮은 이름을 지도 이름표로 쓰고(tv → monitor), 뷰어는 같은 파일을 검색어 글 벡터 캐시로 씁니다(검색어가 그 낱말이면 글 인코더를 건너뜀). 목록을 바꾸면 `ondevice view --search-model models/siglip2-base-patch32-256 --encode-vocab vocab/names.txt vocab/names.voc` 로 다시 만듭니다.
 
 ## 보드에서 실행 — Raspberry Pi 5 + DX-M1 + D435
 
@@ -115,6 +115,7 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 | `--seg <모델>` / `--conf 0.35` | ObjectSAM 분할 모델(기본 PC `models/ObjectSAM-416_640.onnx`, 보드 `~/models/objectsam-416_640.dxnn`) / 물체로 인정할 확신도 |
 | `--embed <vision_model.onnx \| .dxnn \| off>` | 물체 사진마다 이름·검색용 SigLIP2 벡터(기본 켬: PC `models/siglip2-base-patch32-256/vision_model.onnx`, 보드 `~/models/siglip2-vision_npu.dxnn`) |
 | `--vocab <글 벡터 파일>` | 물체 사진이 가장 닮은 이름을 물체 이름으로 씀(기본 `vocab/indoor.voc`, 큰 표 `vocab/names.voc`) |
+| `--structural <글 벡터 파일>` | 벽 · 바닥 · 천장 면 판정 표(기본 `vocab/structural.voc`, 8 낱말: 가장 닮은 낱말이 floor · wall · ceiling · baseboard 이고 p ≥ 0.003 이면 구조물, 천장은 기억에서 뺌) |
 | `--max-depth` | 지도에 넣을 최대 거리(m) |
 | `--every N` | 받은 장면 N장마다 처리 |
 | `--live 1` / `--loop` | 실제 속도로 재생하며 뷰어에 계속 갱신 / 끝나면 반복 |
@@ -124,7 +125,7 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 
 - **마우스:** 끌면 돌리기, 휠은 확대·축소, 오른쪽 끌기는 이동.
 - **오른쪽 위 도구줄:** `Fit`(전체 맞추기) · `Top`(위에서 보기) · `Demo`(천천히 자동 회전) · `High/Low`(화질) · `Settings`(설정 패널).
-- **위쪽 검색창(`/` 키):** 찾을 물체를 아무 말로나 칩니다. 맞는 물체가 점수 순으로 왼쪽에 뜨고 지도에 초록 윤곽으로 표시됩니다. Enter 는 가장 맞는 물체로 이동.
+- **위쪽 검색창(`/` 키):** 찾을 물체를 아무 말로나(한국어 · 영어) 칩니다. 사진이 맞을 확률이 문턱을 넘는 물체가 닮은 순으로 왼쪽에 뜨고 지도에 초록 윤곽으로 표시됩니다(본 적 없는 것은 대개 아무것도 안 뜸). Enter 는 가장 맞는 물체로 이동.
 - **오른쪽 아래 새로고침 아이콘:** 리셋. 위치를 다시 잡고 지도를 처음부터 쌓습니다.
 - **화질:** High는 PC용(점 섞기로 가까이서도 면처럼 보임), Low는 보드·폰용입니다. Low는 돌리는 동안 절반 해상도로 가볍게 그리고 멈추면 0.2초 뒤 원래 화질로 다시 그립니다.
 - **화면 구성:** 색 점이 3D 점 지도, 파란 원뿔이 지금 카메라(위치를 놓친 동안은 빨간색), 위쪽 층이 물체와 방 노드입니다.

@@ -681,7 +681,7 @@ fn handle_one(s: &mut TcpStream, st: &Arc<State>, line: &str) {
             #[cfg(not(feature = "search"))]
             let enc = |_: &str| None;
             let k = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(20);
-            let min = q.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.2);
+            let min = q.get("min").and_then(|v| v.parse().ok()); // 없으면 질의 글자로 정한 문턱(search::default_min)
             let body = search::search(&st.dir, view, q.get("q").map_or("", |v| v.as_str()), &enc, k, min).to_string();
             respond(&mut s, 200, "application/json", "", body.as_bytes())
         }
@@ -961,12 +961,10 @@ pub struct Config {
     pub search_model: Option<String>,
     pub vocab: Option<String>,
     pub encode_vocab: Option<(String, String)>,
-    /// `--search-direct <logit_bias>`: 검색을 질의 · 물체 사진 sigmoid(SCALE · cos + bias) 한 단계로(단어장 · NULLS 를 쓰지 않음)
-    pub search_direct: Option<f32>,
 }
 
 impl Config {
-    /// 뷰어 인자(프로그램 이름 뺀 것): `<기억 폴더> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <파일>] [--search-direct <logit_bias>]`
+    /// 뷰어 인자(프로그램 이름 뺀 것): `<기억 폴더> [--port 8080] [--bind 0.0.0.0] [--search-model <dir>] [--vocab <파일>]`
     pub fn parse(args: Vec<String>) -> Config {
         let mut c = Config { port: 8080, bind: "0.0.0.0".into(), ..Default::default() };
         let mut it = args.into_iter();
@@ -977,7 +975,6 @@ impl Config {
                 "--search-model" => c.search_model = it.next(),
                 "--vocab" => c.vocab = it.next(),
                 "--encode-vocab" => c.encode_vocab = it.next().zip(it.next()),
-                "--search-direct" => c.search_direct = it.next().and_then(|v| v.parse().ok()),
                 _ => c.dir = Some(a),
             }
         }
@@ -995,10 +992,7 @@ pub fn run(args: Vec<String>) {
 
 /// 서버 실행(막힘): 읽어 둔 설정으로. `ondevice --serve` 는 이것을 스레드로 부른다
 pub fn serve(c: Config) {
-    let Config { dir, port, bind, search_model, vocab, encode_vocab, search_direct } = c;
-    if let Some(b) = search_direct {
-        search::set_direct(b);
-    }
+    let Config { dir, port, bind, search_model, vocab, encode_vocab } = c;
     #[cfg(not(feature = "search"))]
     let _ = &vocab;
     // word vectors for a name list, made once (on a PC): sgview --search-model <dir> --encode-vocab <names.txt> <out>

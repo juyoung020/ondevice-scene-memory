@@ -66,12 +66,26 @@ pub fn normalize(v: &mut [f32]) {
 /// 물체 번호 → 지금까지 계산한 사진 벡터의 합(이름 고르기용)
 static SUMS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
 
-/// 물체 번호 → 가장 새 벡터. 계산 스레드가 채우고 물체 병합(maps::merge_pass)이 읽는다
-static LATEST: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
+/// 물체 번호 → 그 물체 사진 벡터들의 평균 방향(길이 1) · 바뀐 물체 기록((순번, 물체 번호), 순번은 차례로 늘고 리셋해도 이어 감).
+/// 계산 스레드가 채우고 물체 병합(maps::Memory::merge_pass)이 지난번 뒤에 바뀐 것만 가져간다
+type Fresh = (std::collections::HashMap<u32, std::sync::Arc<[f32]>>, Vec<(u64, u32)>);
+static MEANS: std::sync::Mutex<Option<Fresh>> = std::sync::Mutex::new(None);
+/// 마지막 순번(바뀐 것이 없으면 잠그지 않고 끝내려고 따로 둠)
+static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 그 물체의 가장 새 사진 벡터(길이 1). 아직 계산 전이면 None
-pub fn get(id: u32) -> Option<Vec<f32>> {
-    LATEST.lock().unwrap().as_ref()?.get(&id).cloned()
+/// 순번 since 뒤에 평균 벡터가 바뀐 물체와 그 벡터(물체마다 하나, 나눠 쓰는 Arc). 반환: (지금 순번, 목록)
+pub fn fresh_since(since: u64) -> (u64, Vec<(u32, std::sync::Arc<[f32]>)>) {
+    if GEN.load(std::sync::atomic::Ordering::Acquire) == since {
+        return (since, vec![]);
+    }
+    let g = MEANS.lock().unwrap();
+    let now = GEN.load(std::sync::atomic::Ordering::Acquire);
+    let Some((means, log)) = g.as_ref() else { return (now, vec![]) };
+    let from = log.partition_point(|x| x.0 <= since);
+    let mut ids: Vec<u32> = log[from..].iter().map(|x| x.1).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    (now, ids.into_iter().filter_map(|id| Some((id, means.get(&id)?.clone()))).collect())
 }
 
 /// SigLIP2 base patch32-256: 로짓 = SCALE · 코사인 (체크포인트의 logit_scale = e^4.717)
@@ -148,13 +162,19 @@ fn put(id: u32, v: Vec<f32>) {
             NAMES.lock().unwrap().get_or_insert_with(Default::default).insert(id, n);
         }
     }
-    LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
+    // 병합도 같은 평균 방향을 본다(한 장의 흔들림에 덜 휘둘림)
+    let mut g = MEANS.lock().unwrap();
+    let (means, log) = g.get_or_insert_with(Default::default);
+    means.insert(id, mean.into());
+    let s = GEN.load(std::sync::atomic::Ordering::Acquire) + 1; // 리셋해도 이어 감(기억이 가진 순번이 거꾸로 가지 않게)
+    log.push((s, id));
+    GEN.store(s, std::sync::atomic::Ordering::Release);
 }
 
 /// 리셋: 물체 id 가 처음부터 다시 쓰이므로 id 별 이름·벡터 합을 비운다
 pub fn clear() {
     *SUMS.lock().unwrap() = None;
-    *LATEST.lock().unwrap() = None;
+    *MEANS.lock().unwrap() = None;
     *NAMES.lock().unwrap() = None;
     *NCOUNT.lock().unwrap() = None;
 }

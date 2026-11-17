@@ -6,10 +6,9 @@
 //!  - 놓침: 놓친 장면 수 · 놓친 횟수(놓침이 시작된 수), 새 지도 수(통계 CSV), 다시 붙기(새 지도를 연 뒤 믿는 위치가 다시 나오기까지 초, 끝까지 못 붙은 수)
 //!  - 튐: 화면에 보낸 위치(스트림, 임시 · 맡김 포함)의 장면 사이 움직임이 IMU 회전(없으면 정답)과 3° + 회전의 20 % 넘게,
 //!        또는 정답 이동과 3 cm + 이동의 20 % 넘게 다른 장면 수
-//!  - 지도 두께: 스트림을 물체 기억과 같은 규칙으로 쌓은 최종 점 지도(놓침 · 위치만 장면 빼고, 노드 기준 상대 위치 × 최종 노드)를
-//!        정답 지도에서 찾은 큰 평면 3 개(책상 · 바닥 · 벽) 위 10 cm 칸마다 칸 중앙값 ±5 cm 안 점의 평면 거리 p90 − p10, 그 중앙값(cm). 두 겹이면 커진다.
-//!  - 겹 어긋남: 5 cm 칸마다 2 초 묶음별 평균 위치의 법선 방향 차(다시 본 면이 처음 면과 떨어진 정도). 2 cm 넘는 칸 비율 · 평균(cm), 정답 위치 지도 값과 비교
-//!        같은 장면을 정답 위치로 쌓은 지도의 두께 · 두 겹 비율(깊이 잡음 · 물건 몫)을 함께 낸다
+//!  - 겹 어긋남: 스트림을 물체 기억과 같은 규칙으로 쌓은 최종 점 지도(놓침 · 위치만 장면 빼고, 노드 기준 상대 위치 × 최종 노드)에서
+//!        5 cm 칸마다 2 초 묶음별 평균 위치의 칸 법선 방향 차(다시 본 면이 처음 쌓인 면과 떨어진 정도: 두 겹). 2 cm 넘는 칸 비율 · 평균(cm).
+//!        전체 맞춤과 상관없고, 같은 장면을 정답 위치로 쌓은 지도의 값(깊이 잡음 · 정답 시각 어긋남 몫)을 함께 낸다
 //!  - 지도 오차: 쌓인 점에서 같은 장면을 정답 위치로 쌓은 지도까지 거리 p50 · p90(cm), 5 cm 넘게 떨어진 점 비율(%, 두 겹 · 어긋난 면)
 //!  - 처리 시간: 통계 CSV 의 위치 추적 · 지도 갱신 ms
 #[path = "../horn.rs"]
@@ -209,130 +208,6 @@ fn smallest_eig(c: [[f64; 3]; 3]) -> V3 {
     }
     let k = (0..3).min_by(|&x, &y| a[x][x].partial_cmp(&a[y][y]).unwrap()).unwrap();
     [v[0][k], v[1][k], v[2][k]]
-}
-
-/// 평면(n·x = d)
-#[derive(Clone, Copy)]
-struct Plane {
-    n: V3,
-    d: f64,
-}
-
-/// 점 무리에서 큰 평면 k 개(RANSAC 2 cm → 안쪽 점으로 다시 맞춤). 찾은 평면의 안쪽 점(3 cm)은 다음 평면 찾기에서 뺌
-fn find_planes(pts: &[[f32; 3]], k: usize) -> Vec<(Plane, usize)> {
-    let mut rng = 0x2545F4914F6CDD1Du64;
-    let mut rnd = |m: usize| {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        (rng % m as u64) as usize
-    };
-    let step = (pts.len() / 60_000).max(1);
-    let mut sub: Vec<V3> = pts.iter().step_by(step).map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
-    let mut out = vec![];
-    for _ in 0..k {
-        if sub.len() < 1000 {
-            break;
-        }
-        let mut best = (0usize, Plane { n: [0.0, 0.0, 1.0], d: 0.0 });
-        for _ in 0..400 {
-            let (a, b, c) = (sub[rnd(sub.len())], sub[rnd(sub.len())], sub[rnd(sub.len())]);
-            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-            let l = norm(&n);
-            if l < 1e-6 {
-                continue;
-            }
-            let n = n.map(|x| x / l);
-            let d = n[0] * a[0] + n[1] * a[1] + n[2] * a[2];
-            let cnt = sub.iter().filter(|p| (n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - d).abs() < 0.02).count();
-            if cnt > best.0 {
-                best = (cnt, Plane { n, d });
-            }
-        }
-        // 안쪽 점으로 다시 맞춤(주성분)
-        let mut pl = best.1;
-        for _ in 0..2 {
-            let ins: Vec<&V3> = sub.iter().filter(|p| (pl.n[0] * p[0] + pl.n[1] * p[1] + pl.n[2] * p[2] - pl.d).abs() < 0.02).collect();
-            let m = ins.len() as f64;
-            let c0: V3 = std::array::from_fn(|i| ins.iter().map(|p| p[i]).sum::<f64>() / m);
-            let mut cv = [[0.0; 3]; 3];
-            for p in &ins {
-                for i in 0..3 {
-                    for j in 0..3 {
-                        cv[i][j] += (p[i] - c0[i]) * (p[j] - c0[j]);
-                    }
-                }
-            }
-            let n = smallest_eig(cv);
-            pl = Plane { n, d: n[0] * c0[0] + n[1] * c0[1] + n[2] * c0[2] };
-        }
-        let cnt = sub.iter().filter(|p| (pl.n[0] * p[0] + pl.n[1] * p[1] + pl.n[2] * p[2] - pl.d).abs() < 0.02).count();
-        out.push((pl, cnt * step));
-        sub.retain(|p| (pl.n[0] * p[0] + pl.n[1] * p[1] + pl.n[2] * p[2] - pl.d).abs() >= 0.03);
-    }
-    out
-}
-
-/// 평면 위 10 cm 칸마다(평면 ±band 점 300 개 이상: 추정 지도는 전체 맞춤 뒤 남은 어긋남을 넘게 25 cm, 그 절반 이상이 칸 중앙값 ±2 cm) 칸 중앙값 ±5 cm 안 점의 평면 거리 p90 − p10.
-/// (칸 두께 중앙값 cm, 칸 수, 두 겹 칸 비율 %)
-fn thickness(pts: &[[f32; 3]], pl: &Plane, band: f64) -> (f64, usize, f64) {
-    let n = pl.n;
-    let u0 = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
-    let u = {
-        let c = [n[1] * u0[2] - n[2] * u0[1], n[2] * u0[0] - n[0] * u0[2], n[0] * u0[1] - n[1] * u0[0]];
-        let l = norm(&c);
-        c.map(|x| x / l)
-    };
-    let v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
-    let mut cells: BTreeMap<(i32, i32), Vec<f32>> = BTreeMap::new();
-    for p in pts {
-        let q = [p[0] as f64, p[1] as f64, p[2] as f64];
-        let d = n[0] * q[0] + n[1] * q[1] + n[2] * q[2] - pl.d;
-        if d.abs() < band {
-            let (a, b) = (u[0] * q[0] + u[1] * q[1] + u[2] * q[2], v[0] * q[0] + v[1] * q[1] + v[2] * q[2]);
-            cells.entry(((a / 0.1).floor() as i32, (b / 0.1).floor() as i32)).or_default().push(d as f32);
-        }
-    }
-    let (mut sp, mut far, mut tot) = (vec![], 0usize, 0usize);
-    let (mut n_dbl, mut n_plane) = (0usize, 0usize);
-    for (_, mut ds) in cells {
-        if ds.len() < 300 {
-            continue;
-        }
-        // 두 겹 칸: 1 cm 칸 히스토그램에서 주 봉우리(3 칸 합, 점의 40 % 이상)와 3 cm 넘게 떨어진 둘째 봉우리가 주 봉우리의 25 % 이상
-        let nb = (2.0 * band / 0.01).ceil() as usize + 1;
-        let mut hist = vec![0usize; nb];
-        for d in &ds {
-            hist[(((*d as f64) + band) / 0.01).floor().clamp(0.0, (nb - 1) as f64) as usize] += 1;
-        }
-        let tri = |i: usize| hist[i.saturating_sub(1)] + hist[i] + if i + 1 < nb { hist[i + 1] } else { 0 };
-        let main = (0..nb).max_by_key(|&i| (tri(i), usize::MAX - i)).unwrap();
-        if tri(main) * 10 >= ds.len() * 4 {
-            n_plane += 1;
-            let second = (0..nb).filter(|&i| i.abs_diff(main) >= 3).map(tri).max().unwrap_or(0);
-            n_dbl += (second * 4 >= tri(main)) as usize;
-        }
-        ds.sort_by(|a, b| a.total_cmp(b));
-        let med = ds[ds.len() / 2];
-        let near = ds.iter().filter(|d| (*d - med).abs() < 0.02).count();
-        if near * 2 < ds.len() {
-            continue;
-        }
-        // 칸 중앙값 ±5 cm 안(그 밖은 책상 위 물건 등 다른 면)
-        let band: Vec<f32> = ds.iter().copied().filter(|d| (*d - med).abs() < 0.05).collect();
-        let q = |f: f64| band[((band.len() - 1) as f64 * f) as usize];
-        sp.push((q(0.9) - q(0.1)) as f64 * 100.0);
-        far += band.iter().filter(|d| (*d - med).abs() > 0.015).count();
-        tot += band.len();
-    }
-    let _ = (far, tot);
-    if sp.is_empty() {
-        return (f64::NAN, 0, f64::NAN);
-    }
-    sp.sort_by(|a, b| a.total_cmp(b));
-    (sp[sp.len() / 2], sp.len(), 100.0 * n_dbl as f64 / n_plane.max(1) as f64)
 }
 
 /// 겹 어긋남: 5 cm 칸(점 40 개 이상, 평평함)마다 2 초 묶음(점 8 개 이상)별 평균을 칸 법선에 투영해 최대 − 최소.
@@ -659,30 +534,6 @@ fn main() {
             put!("gt_layer2_pct", format!("{h2:.1}"));
             put!("gt_layer_gap_cm", format!("{hm:.2}"));
             put!("layer_vox", gv.to_string());
-            let planes = find_planes(&gt_pts, 3);
-            let (mut se, mut sg, mut sd, mut sdg, mut wsum) = (0.0, 0.0, 0.0, 0.0, 0.0);
-            let mut desc = vec![];
-            for (i, (pl, cnt)) in planes.iter().enumerate() {
-                let (te, ce_, de) = thickness(&est_pts, pl, 0.25);
-                let (tg, _, dg) = thickness(&gt_pts, pl, 0.25);
-                if te.is_finite() && tg.is_finite() {
-                    let w = *cnt as f64;
-                    se += w * te;
-                    sg += w * tg;
-                    sd += w * de;
-                    sdg += w * dg;
-                    wsum += w;
-                }
-                desc.push(format!("{{\"n\":[{:.2},{:.2},{:.2}],\"pts\":{cnt},\"cells\":{ce_},\"thick_cm\":{te:.2},\"gt_thick_cm\":{tg:.2},\"double_pct\":{de:.1},\"gt_double_pct\":{dg:.1}}}", pl.n[0], pl.n[1], pl.n[2]));
-                let _ = i;
-            }
-            if wsum > 0.0 {
-                put!("thick_cm", format!("{:.2}", se / wsum));
-                put!("gt_thick_cm", format!("{:.2}", sg / wsum));
-                put!("double_pct", format!("{:.1}", sd / wsum));
-                put!("gt_double_pct", format!("{:.1}", sdg / wsum));
-            }
-            put!("planes", format!("[{}]", desc.join(",")));
         }
     }
     let body: Vec<String> = js.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();

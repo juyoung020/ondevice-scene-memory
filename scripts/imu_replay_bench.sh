@@ -2,14 +2,14 @@
 # 재생 벤치: 녹화(TUM · rsd_rec) + IMU(imu0.csv)를 최대 속도로 재생해 카메라 전용 · IMU 모드를 같은 잣대(slam_eval)로 잰다.
 #   scripts/imu_replay_bench.sh <태그> <cam|imu> [ondevice slam 추가 인자 ...]
 # 환경 변수
-#   B      빌드 폴더(기본 ~/tgt-x86-imu/release: ondevice · slam_eval · imu_synth), SLAM 위치 프로그램만 다른 빌드로(전후 비교)
+#   B      빌드 폴더(기본 ~/tgt-imu-dev/release: ondevice · slam_eval · imu_synth), SLAM 위치 프로그램만 다른 빌드로(전후 비교)
 #   SEQS   "이름=폴더 ..."(기본 TUM fr1 desk room 360 rpy floor)
 #   IMUDIR 시퀀스별 IMU 파일 폴더(<이름>.csv, 없으면 imu_synth 로 정답에서 만듦: TUM fr1 정답 → 영상 시계 차이 SYNTH_OFFSET 기본 0.015 초)
 #   OUT    결과 폴더(기본 ~/imubench/<태그>/<모드>), 큰 장면 스트림은 /dev/shm 에 쓰고 재고 나서 지움
 # 끊김 · 흐림 시험은 추가 인자로: --stress-gap 4:0.6 --stress-imu-gap · --stress-blur 0.02 (흐림 각속도는 같은 IMU 파일, 카메라 전용도 같은 영상)
 set -e
 T=$1; M=$2; shift 2
-B=${B:-~/tgt-x86-imu/release}
+B=${B:-~/tgt-imu-dev/release}
 SLAM=${SLAM:-$B/ondevice}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 CAL=$REPO/docs/imu_cam_calib.yaml

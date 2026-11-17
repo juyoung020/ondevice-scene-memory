@@ -123,11 +123,21 @@ fn backproj(depth: &[u16], k: &[[f32; 2]]) -> Vec<Option<V3>> {
     k.iter().map(|&p| lcverify::backproject(depth, 640, 480, 5000.0, &K, p, 0.1, 4.0)).collect()
 }
 
+/// 검증 설정(시험용 환경 변수 LC_ITERS · LC_TOL · LC_BASE 로 바꿈, 기본 = lcverify 기본)
+fn vparams() -> VParams {
+    let mut p = VParams::default();
+    let e = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+    if let Some(v) = e("LC_ITERS") { p.iters = v as u32; }
+    if let Some(v) = e("LC_TOL") { p.len_tol = v; }
+    if let Some(v) = e("LC_BASE") { p.min_base = v; }
+    p
+}
+
 /// 짝 + 깊이 → (4 자유도 검증 성공, 6 자유도 PnP(RTAB-Map 이식) 성공)
 fn judge(p: &Pair, kq: &[[f32; 2]], kd: &[[f32; 2]], dq: &[u16], dd: &[u16]) -> (bool, bool, Option<lcverify::Verdict>) {
     let xq = backproj(dq, kq);
     let xd = backproj(dd, kd);
-    let v = lcverify::verify(kq, &xq, &xd, p.gq, p.gd, &K, &VParams::default());
+    let v = lcverify::verify(kq, &xq, &xd, p.gq, p.gd, &K, &vparams());
     let ok4 = v.as_ref().is_some_and(|v| v.accepted && correct(p, &v.r, &v.t));
     // 6 자유도 PnP RANSAC(100 회, 2 화소), 대상 3D → 질의 2D
     let (mut op, mut ip) = (Vec::new(), Vec::new());
@@ -333,7 +343,8 @@ fn verify(vb: &str, onnx: Option<&str>) {
     let mut rows: Vec<(String, u32, f64, f64)> = Vec::new();
     let mut bit = (0usize, 0usize, 0f64, 0usize);
     let mut times: std::collections::BTreeMap<&str, (f64, usize)> = Default::default();
-    for &l in &BL {
+    let bl: Vec<u32> = std::env::var("LC_BLUR").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(BL.to_vec());
+    for &l in &bl {
         let mut res: std::collections::BTreeMap<&str, (Vec<bool>, Vec<bool>)> = Default::default();
         let dm: Vec<(&str, (Vec<[f32; 2]>, Vec<[f32; 2]>, Vec<i64>))> = ["orb", "xf32", "xf8"].iter().map(|m| (*m, matches(vb, &format!("{m}_L{l}")))).collect();
         let refp = npy(&format!("{vb}/ref_xf32_L{l}.npy")).f64();
@@ -376,8 +387,12 @@ fn verify(vb: &str, onnx: Option<&str>) {
                     }
                 }
             }
-            // 지금 BRIEF · 방향 BRIEF: 이식된 RTAB-Map 경로(GFTT + BRIEF → 짝 → PnP) 그대로
+            // 지금 BRIEF · 방향 BRIEF: 이식된 RTAB-Map 경로(GFTT + BRIEF → 짝 → PnP) 그대로(LC_DUMPS_ONLY=1 이면 건너뜀)
+            let dumps_only = std::env::var("LC_DUMPS_ONLY").is_ok();
             for (name, ori) in [("brief", false), ("brief_ori", true)] {
+                if dumps_only {
+                    continue;
+                }
                 let t0 = Instant::now();
                 let fq = brief_frame(&query_png(vb, p, l), &p.q_depth, ori);
                 let fd = brief_frame(&p.d_rgb, &p.d_depth, ori);

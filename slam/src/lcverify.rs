@@ -26,6 +26,9 @@ pub struct Params {
     pub iters: u32,
     /// 맞은 점 재투영 오차(화소)
     pub px: f64,
+    /// 가설 평가 · 4 자유도 다듬기의 오차(화소): 중력 1° 오차는 화면에서 약 f·0.017 ≈ 9 화소라 가설은 넓게 보고,
+    /// 6 자유도 다듬기에서 px_hyp → 2·px → px 로 좁힌다
+    pub px_hyp: f64,
     /// 받아들일 맞은 점 수(RTAB-Map Vis/MinInliers)
     pub min_inliers: usize,
     /// 깊이 유효 범위(m)
@@ -42,7 +45,7 @@ pub struct Params {
 }
 impl Default for Params {
     fn default() -> Self {
-        Params { iters: 200, px: 2.0, min_inliers: 20, zmin: 0.1, zmax: 4.0, min_base: 0.05, len_tol: 0.05, gn_iters: 5, refine6: true, seed: 0x5eed }
+        Params { iters: 200, px: 2.0, px_hyp: 8.0, min_inliers: 20, zmin: 0.1, zmax: 4.0, min_base: 0.05, len_tol: 0.05, gn_iters: 5, refine6: true, seed: 0x5eed }
     }
 }
 
@@ -315,6 +318,7 @@ pub fn verify(kq: &[[f32; 2]], xq: &[Option<V3>], xd: &[Option<V3>], gq: V3, gd:
         return None;
     }
     let px2 = p.px * p.px;
+    let ph2 = p.px_hyp * p.px_hyp;
     let mut rng = Lcg(p.seed);
     let nc = cand.len() as u64;
     let mut best: Option<(usize, f64, V3)> = None;
@@ -338,18 +342,18 @@ pub fn verify(kq: &[[f32; 2]], xq: &[Option<V3>], xd: &[Option<V3>], gq: V3, gd:
         let tp = [((pq[a][0] - ra[0]) + (pq[b][0] - rb[0])) * 0.5, ((pq[a][1] - ra[1]) + (pq[b][1] - rb[1])) * 0.5, ((pq[a][2] - ra[2]) + (pq[b][2] - rb[2])) * 0.5];
         let r = mm(&aq_t, &mm(&rzm, &ad));
         let t = mv(&aq_t, &tp);
-        let c = count(&r, &t, xd, kq, k, px2, None);
+        let c = count(&r, &t, xd, kq, k, ph2, None);
         if best.as_ref().is_none_or(|b| c > b.0) {
             best = Some((c, th, tp));
         }
     }
     let (hyp, mut th, mut tp) = best?;
-    // 4 자유도 다듬기: 맞은 점으로 GN → 맞은 점 다시 → GN
+    // 4 자유도 다듬기: 가설 문턱의 맞은 점으로 GN → 맞은 점 다시 → GN
     let mut inl = Vec::new();
     let pose = |th: f64, tp: &V3| (mm(&aq_t, &mm(&rz(th), &ad)), mv(&aq_t, tp));
     for _ in 0..2 {
         let (r, t) = pose(th, &tp);
-        count(&r, &t, xd, kq, k, px2, Some(&mut inl));
+        count(&r, &t, xd, kq, k, ph2, Some(&mut inl));
         if inl.len() < 3 {
             break;
         }
@@ -360,15 +364,21 @@ pub fn verify(kq: &[[f32; 2]], xq: &[Option<V3>], xd: &[Option<V3>], gq: V3, gd:
         }
     }
     let (mut r, mut t) = pose(th, &tp);
-    let mut ninl = count(&r, &t, xd, kq, k, px2, Some(&mut inl));
-    if p.refine6 && inl.len() >= 6 {
-        let xs: Vec<V3> = inl.iter().map(|&i| xd[i].unwrap()).collect();
-        let obs: Vec<[f32; 2]> = inl.iter().map(|&i| kq[i]).collect();
-        for _ in 0..p.gn_iters {
-            gn6(&mut r, &mut t, &xs, &obs, k);
+    if p.refine6 {
+        // 6 자유도: 문턱 px_hyp → 2·px → px 로 좁히며 맞은 점으로 GN
+        for th2 in [ph2, 4.0 * px2, px2] {
+            count(&r, &t, xd, kq, k, th2, Some(&mut inl));
+            if inl.len() < 6 {
+                break;
+            }
+            let xs: Vec<V3> = inl.iter().map(|&i| xd[i].unwrap()).collect();
+            let obs: Vec<[f32; 2]> = inl.iter().map(|&i| kq[i]).collect();
+            for _ in 0..p.gn_iters {
+                gn6(&mut r, &mut t, &xs, &obs, k);
+            }
         }
-        ninl = count(&r, &t, xd, kq, k, px2, Some(&mut inl));
     }
+    let ninl = count(&r, &t, xd, kq, k, px2, Some(&mut inl));
     Some(Verdict { r, t, inliers: ninl, hyp_inliers: hyp, accepted: ninl >= p.min_inliers })
 }
 

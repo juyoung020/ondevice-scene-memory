@@ -30,15 +30,46 @@ pub struct Kf {
 }
 
 struct KfZ {
-    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 비어 있음)
+    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 검출 상자 합집합 안 화소만, 줄마다 구간을 이어 한 줄로)
     depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4(줄인 보관이면 4 화소 간격)
-    crops: Vec<Crop>, // 줄인 보관: 검출 상자 안 컬러·깊이
+    box_depth_z: Vec<u8>, // 줄인 보관: 검출 상자 합집합 안 깊이 mm(rgb_z 와 같은 화소 차례)
 }
 
 impl KfZ {
     fn bytes(&self) -> usize {
-        self.rgb_z.len() + self.depth_z.len() + self.crops.iter().map(|c| c.rgb_z.len() + c.depth_z.len()).sum::<usize>()
+        self.rgb_z.len() + self.depth_z.len() + self.box_depth_z.len()
     }
+}
+
+/// 검출 상자들의 합집합을 줄마다 겹치지 않는 구간으로: [(y, x0, x1)](줄 차례, 줄 안 왼쪽부터). 겹친 상자의 화소를 한 번만 보관한다
+fn box_spans(dets: &[DetZ], w: usize, h: usize) -> Vec<(usize, usize, usize)> {
+    let boxes: Vec<[usize; 4]> = dets.iter().filter_map(|d| {
+        let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
+        let (x2, y2) = (x2.min(w), y2.min(h));
+        (x2 > x1 && y2 > y1).then_some([x1, y1, x2, y2])
+    }).collect();
+    let mut out = vec![];
+    let mut iv: Vec<(usize, usize)> = vec![];
+    for y in 0..h {
+        iv.clear();
+        iv.extend(boxes.iter().filter(|b| b[1] <= y && y < b[3]).map(|b| (b[0], b[2])));
+        iv.sort_unstable();
+        let mut cur: Option<(usize, usize)> = None;
+        for &(a, b) in &iv {
+            cur = match cur {
+                Some((c0, c1)) if a <= c1 => Some((c0, c1.max(b))),
+                Some((c0, c1)) => {
+                    out.push((y, c0, c1));
+                    Some((a, b))
+                }
+                None => Some((a, b)),
+            };
+        }
+        if let Some((c0, c1)) = cur {
+            out.push((y, c0, c1));
+        }
+    }
+    out
 }
 
 /// 점 격자 압축본: gw×gh(장면 화소 off + step 간격), 깊이 0 = 점 없음
@@ -84,16 +115,6 @@ impl DetZ {
     }
 }
 
-/// 검출 상자 안 화소(줄인 보관)
-struct Crop {
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    rgb_z: Vec<u8>,
-    depth_z: Vec<u8>,
-}
-
 const Q: usize = 4; // 줄인 보관의 깊이 화소 간격
 
 impl Kf {
@@ -119,15 +140,23 @@ impl Kf {
                 d.copy_within(src..src + w, y * w);
             }
         }
-        for c in &self.z().crops {
-            let z = unpack_depth(&c.depth_z, c.w, c.h);
-            for y in 0..c.h {
-                for x in 0..c.w {
-                    d[(c.y + y) * self.w + c.x + x] = z[y * c.w + x] as f32 * 1e-3;
+        let spans = self.spans();
+        let n: usize = spans.iter().map(|s| s.2 - s.1).sum();
+        if n > 0 {
+            let z = unpack_depth(&self.z().box_depth_z, n, 1);
+            let mut i = 0;
+            for &(y, x0, x1) in &spans {
+                for (dv, &zv) in d[y * w + x0..y * w + x1].iter_mut().zip(&z[i..i + x1 - x0]) {
+                    *dv = zv as f32 * 1e-3;
                 }
+                i += x1 - x0;
             }
         }
         d
+    }
+    /// 검출 상자 합집합 구간(줄인 보관의 화소 차례)
+    fn spans(&self) -> Vec<(usize, usize, usize)> {
+        self.dets.as_deref().map_or_else(Vec::new, |d| box_spans(d, self.w, self.h))
     }
     /// 보관한 검출(받은 것과 같은 값)
     pub fn dets(&self) -> Option<Vec<Det>> {
@@ -138,11 +167,15 @@ impl Kf {
             return unpack_rgb(&self.z().rgb_z, self.w, self.h);
         }
         let mut rgb = vec![0u8; self.w * self.h * 3];
-        for c in &self.z().crops {
-            let z = unpack_rgb(&c.rgb_z, c.w, c.h);
-            for y in 0..c.h {
-                let o = ((c.y + y) * self.w + c.x) * 3;
-                rgb[o..o + c.w * 3].copy_from_slice(&z[y * c.w * 3..(y + 1) * c.w * 3]);
+        let spans = self.spans();
+        let n: usize = spans.iter().map(|s| s.2 - s.1).sum();
+        if n > 0 {
+            let z = unpack_rgb(&self.z().rgb_z, n, 1);
+            let mut i = 0;
+            for &(y, x0, x1) in &spans {
+                let o = (y * self.w + x0) * 3;
+                rgb[o..o + (x1 - x0) * 3].copy_from_slice(&z[i * 3..(i + x1 - x0) * 3]);
+                i += x1 - x0;
             }
         }
         rgb
@@ -170,23 +203,19 @@ impl Kf {
         let z = if self.sparse {
             let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
             let q: Vec<u16> = (0..qw * qh).map(|i| depth.mm_round((i / qw) * Q * w + (i % qw) * Q)).collect();
-            let crops = self.dets.iter().flatten().filter_map(|d| {
-                let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
-                let (x2, y2) = (x2.min(w), y2.min(h));
-                (x2 > x1 && y2 > y1).then(|| {
-                    let (cw, ch) = (x2 - x1, y2 - y1);
-                    let mut cr = Vec::with_capacity(cw * ch * 3);
-                    let mut cd = Vec::with_capacity(cw * ch);
-                    for y in y1..y2 {
-                        cr.extend_from_slice(&rgb[(y * w + x1) * 3..(y * w + x2) * 3]);
-                        cd.extend((y * w + x1..y * w + x2).map(|i| depth.mm_round(i)));
-                    }
-                    Crop { x: x1, y: y1, w: cw, h: ch, rgb_z: pack_rgb(&cr, cw, ch), depth_z: pack_depth(&cd, cw, ch) }
-                })
-            }).collect();
-            KfZ { rgb_z: vec![], depth_z: pack_depth(&q, qw, qh), crops }
+            // 검출 상자 합집합 안 화소만(겹친 상자 화소를 한 번), 줄마다 구간을 이어 한 줄로 압축
+            let spans = self.spans();
+            let n: usize = spans.iter().map(|s| s.2 - s.1).sum();
+            let mut cr = Vec::with_capacity(n * 3);
+            let mut cd = Vec::with_capacity(n);
+            for &(y, x0, x1) in &spans {
+                cr.extend_from_slice(&rgb[(y * w + x0) * 3..(y * w + x1) * 3]);
+                cd.extend((y * w + x0..y * w + x1).map(|i| depth.mm_round(i)));
+            }
+            let (rgb_z, box_depth_z) = if n > 0 { (pack_rgb(&cr, n, 1), pack_depth(&cd, n, 1)) } else { (vec![], vec![]) };
+            KfZ { rgb_z, depth_z: pack_depth(&q, qw, qh), box_depth_z }
         } else {
-            KfZ { rgb_z: pack_rgb(rgb, w, h), depth_z: pack_depth_it((0..w * h).map(|i| depth.mm_round(i)), w, h), crops: vec![] }
+            KfZ { rgb_z: pack_rgb(rgb, w, h), depth_z: pack_depth_it((0..w * h).map(|i| depth.mm_round(i)), w, h), box_depth_z: vec![] }
         };
         let _ = self.z.set(z);
     }

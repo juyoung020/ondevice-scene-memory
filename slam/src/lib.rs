@@ -16,6 +16,7 @@ pub mod app;
 pub mod bufpool;
 pub mod simd;
 pub mod imu;
+pub mod georeg;
 
 use nalgebra::{Isometry3, Point3};
 

@@ -86,7 +86,49 @@ pub struct TumSource {
     depth_per_m: f32,
     read_ms: f64,
     start: Option<(f64, Instant)>,
+    /// 재생 시계(첫 장면 시각, 그때 벽시계): IMU 재생 스레드가 같은 시계로 표본을 넣음
+    clock: Arc<std::sync::OnceLock<(f64, Instant)>>,
     id: i64,
+    /// 끊김 시험: 이 구간(장면 시각)의 장면은 내지 않음
+    pub drop: Vec<(f64, f64)>,
+    pub n_drop: Arc<AtomicUsize>,
+    /// 흐림 시험: 노출(초) 동안 각속도만큼 번진 영상(각속도 = 장면 시각 → 카메라 광학 축 rad/s)
+    pub blur: Option<(f64, Box<dyn Fn(f64) -> Option<[f32; 4]> + Send>)>,
+    pub n_blur: Arc<AtomicUsize>,
+}
+
+/// 흐림 시험: 화면 중심 점이 노출 동안 움직이는 선(각속도 ω(광학 축) × 초점 거리 × 노출) 위 화소를 고르게 평균(RGB)
+pub fn motion_blur(rgb: &[u8], w: usize, h: usize, fx: f64, fy: f64, w_cam: [f32; 4], exp: f64) -> Option<Vec<u8>> {
+    // 광학 축 회전: y 축 회전 → 화면 가로, x 축 회전 → 세로
+    let (vx, vy) = (-(w_cam[1] as f64) * fx * exp, (w_cam[0] as f64) * fy * exp);
+    let len = (vx * vx + vy * vy).sqrt();
+    if len < 1.0 {
+        return None;
+    }
+    let n = len.ceil() as usize + 1;
+    let taps: Vec<(isize, isize)> = (0..n).map(|k| {
+        let s = k as f64 / (n - 1) as f64 - 0.5;
+        ((s * vx).round() as isize, (s * vy).round() as isize)
+    }).collect();
+    let mut out = vec![0u8; rgb.len()];
+    let (wi, hi) = (w as isize, h as isize);
+    out.chunks_exact_mut(w * 3).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let mut acc = [0u32; 3];
+            for &(dx, dy) in &taps {
+                let xx = (x as isize + dx).clamp(0, wi - 1) as usize;
+                let yy = (y as isize + dy).clamp(0, hi - 1) as usize;
+                let p = &rgb[(yy * w + xx) * 3..];
+                acc[0] += p[0] as u32;
+                acc[1] += p[1] as u32;
+                acc[2] += p[2] as u32;
+            }
+            for c in 0..3 {
+                row[x * 3 + c] = ((acc[c] + n as u32 / 2) / n as u32) as u8;
+            }
+        }
+    });
+    Some(out)
 }
 
 impl TumSource {
@@ -127,7 +169,15 @@ impl TumSource {
                 }
             }
         }
-        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, depth_per_m, read_ms: 0.0, start: None, id: 0 })
+        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, depth_per_m, read_ms: 0.0, start: None, clock: Default::default(), id: 0, drop: Vec::new(), n_drop: Default::default(), blur: None, n_blur: Default::default() })
+    }
+    /// 재생 시계(첫 장면을 낼 때 정해짐)
+    pub fn clock(&self) -> Arc<std::sync::OnceLock<(f64, Instant)>> {
+        self.clock.clone()
+    }
+    /// 첫 장면 시각
+    pub fn t_first(&self) -> f64 {
+        self.rgb[0].0
     }
     pub fn len(&self) -> usize {
         self.rgb.len()
@@ -162,9 +212,16 @@ impl FrameSource for TumSource {
         while self.i < self.rgb.len() {
             let (t, rel) = self.rgb[self.i].clone();
             self.i += 1;
+            if self.drop.iter().any(|&(a, b)| t >= a && t < b) {
+                self.n_drop.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if self.rate > 0.0 {
                 match self.start {
-                    None => self.start = Some((t, Instant::now())),
+                    None => {
+                        self.start = Some((t, Instant::now()));
+                        let _ = self.clock.set((t, Instant::now()));
+                    }
                     Some((t0, w0)) => {
                         let ahead = (t - t0) / self.rate - w0.elapsed().as_secs_f64();
                         if ahead < -0.1 {
@@ -190,10 +247,16 @@ impl FrameSource for TumSource {
             let (ci, di) = (ci?, di?);
             let (w, h) = (ci.width(), ci.height());
             // 푼 RGB 그대로 둔다(스트림·memmap 이 RGB 를 씀). 회색조는 채널 차례만 맞춰 imread(BGR) + cvtColor 와 같은 값
-            let color = match ci {
+            let mut color = match ci {
                 image::DynamicImage::ImageRgb8(b) => b.into_raw(),
                 o => o.to_rgb8().into_raw(),
             };
+            if let Some((exp, gyro)) = &self.blur {
+                if let Some(b) = gyro(t).and_then(|wc| motion_blur(&color, w as usize, h as usize, self.k[0], self.k[1], wc, *exp)) {
+                    color = b;
+                    self.n_blur.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let depth_raw = match di {
                 image::DynamicImage::ImageLuma16(b) if b.width() == w && b.height() == h => b.into_raw(),
                 _ => return Err(format!("장면 읽기 실패: {rel}")),
@@ -212,7 +275,7 @@ impl FrameSource for TumSource {
                 depth_mm,
                 depth_raw,
                 depth_per_m: self.depth_per_m,
-                cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h, local: optical_rotation() },
+                cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h, local: optical_rotation(), oriented: false },
             };
             self.read_ms = c0.elapsed().as_secs_f64() * 1e3;
             return Ok(Some(f));

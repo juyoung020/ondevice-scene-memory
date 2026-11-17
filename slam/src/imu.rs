@@ -201,6 +201,9 @@ impl Calib {
     }
 }
 
+/// 놓친 뒤 다시 시작할 때 마지막 성공 장면부터 자이로 회전으로 자세를 이어 가는 최대 빈틈(초). 치우침 0.01 rad/s 가 남아도 1.7° 안
+pub const RESTART_MAX: f64 = 3.0;
+
 /// 적분 구간 안에서 허용하는 표본 간격(초, 200 Hz 의 4 칸)
 pub const MAX_GAP: f64 = 0.02;
 
@@ -402,7 +405,7 @@ impl Fusion {
         }
         self.seen = h;
         // 놓아 줄 자리: 위치 추적이 다음에 적분을 시작할 시각(마지막 성공 장면)과 지금 − 이어 붙이기 한도 중 늦은 쪽 − 0.1 초
-        let t_rel = keep_from.max(now - self.bridge_max - 0.2) + self.calib.shift - 0.1;
+        let t_rel = keep_from.max(now - self.bridge_max.max(RESTART_MAX) - 0.2) + self.calib.shift - 0.1;
         let (_, a, b) = self.ring.view(0);
         let k = a.partition_point(|s| s.t < t_rel) + if a.last().is_some_and(|s| s.t < t_rel) { b.partition_point(|s| s.t < t_rel) } else { 0 };
         let tail = self.ring.tail.load(Ordering::Relaxed);
@@ -496,6 +499,128 @@ impl Fusion {
             }
             None => -1.0,
         }
+    }
+}
+
+/// 재생: 카메라 장면 시각보다 이만큼(초) 앞선 IMU 표본까지 링에 있다고 본다(실시간은 장면이 찍힌 뒤 받기 · 처리까지 약 20 ms 걸리는 동안 IMU 는 계속 들어옴)
+pub const REPLAY_LEAD: f64 = 0.02;
+
+/// 녹화 IMU 재생(Kalibr imu0.csv: 시각 ns, 자이로 rad/s xyz, 가속도 m/s² xyz[, 그 밖 칸]). 읽기 단 거르기(같은 값 반복 · 시각 역행 · 튐)를
+/// 실시간 읽기 스레드와 같은 규칙으로 하고, 남은 표본을 같은 링 · 장면 사이 위치 칸에 넣는다(Fusion 이하 경로는 실시간과 같음)
+pub struct CsvReplay {
+    s: Arc<Vec<Sample>>,
+    i: usize,
+    /// 버린 표본(Bad 순서): 무효 0 · 포화 0 · 튐 · 같은 값 반복 · 시각 역행(느린 읽기 칸)
+    pub bad: [u64; 5],
+    /// 이 구간(카메라 시각)의 표본은 넣지 않음(끊김 시험)
+    pub drop: Vec<(f64, f64)>,
+    shift: f64,
+}
+
+impl CsvReplay {
+    pub fn load(path: &str, shift: f64) -> Result<CsvReplay, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut s = Vec::new();
+        let mut bad = [0u64; 5];
+        let (mut prev, mut jumps) = (None::<[f32; 6]>, 0u32);
+        for l in text.lines() {
+            let v: Vec<f64> = l.split(',').map_while(|x| x.trim().parse().ok()).collect();
+            if v.len() < 7 {
+                continue; // 머리 줄 · 빈 줄
+            }
+            let t = v[0] * 1e-9;
+            let x = [v[1] as f32, v[2] as f32, v[3] as f32, v[4] as f32, v[5] as f32, v[6] as f32];
+            if s.last().is_some_and(|p: &Sample| t <= p.t) {
+                bad[Bad::Slow as usize] += 1;
+                continue;
+            }
+            if let Some(p) = prev {
+                if p == x {
+                    bad[Bad::Repeat as usize] += 1;
+                    continue;
+                }
+                // 실시간 check_raw 와 같은 한도: 5 ms 사이 자이로 15 rad/s · 가속도 8 g 넘는 변화는 3 번까지 버림
+                let big = (0..3).any(|i| (x[i] - p[i]).abs() > 15.0) || (3..6).any(|i| (x[i] - p[i]).abs() > 8.0 * 9.80665);
+                if big && jumps < 3 {
+                    jumps += 1;
+                    bad[Bad::Jump as usize] += 1;
+                    continue;
+                }
+            }
+            (prev, jumps) = (Some(x), 0);
+            s.push(Sample { w: [x[0], x[1], x[2], 0.0], a: [x[3], x[4], x[5], 0.0], t });
+        }
+        if s.len() < 40 {
+            return Err(format!("{path}: IMU 표본이 모자람({} 개)", s.len()));
+        }
+        Ok(CsvReplay { s: Arc::new(s), i: 0, bad, drop: Vec::new(), shift })
+    }
+
+    pub fn len(&self) -> usize {
+        self.s.len()
+    }
+
+    /// (첫, 마지막) 표본 시각(IMU 시계)
+    pub fn span(&self) -> (f64, f64) {
+        (self.s[0].t, self.s[self.s.len() - 1].t)
+    }
+
+    /// 읽기 단 거른 수를 링 집계에 더함(끝 요약 줄에 실시간과 같은 꼴로 나옴)
+    pub fn count_into(&self, ring: &Ring) {
+        for (k, &n) in self.bad.iter().enumerate() {
+            ring.bad[k].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    fn dropped(&self, t_imu: f64) -> bool {
+        let t = t_imu - self.shift;
+        self.drop.iter().any(|&(a, b)| t >= a && t < b)
+    }
+
+    /// IMU 시각 t 까지의 표본을 링(과 장면 사이 위치 칸)에 넣는다. t − 2 초보다 오래된 표본은 건너뜀(위치 추적이 보는 범위는 최대 1.3 초 전)
+    pub fn feed(&mut self, ring: &Ring, t: f64) {
+        while self.i < self.s.len() && self.s[self.i].t <= t {
+            let s = self.s[self.i];
+            self.i += 1;
+            if s.t < t - 2.0 || self.dropped(s.t) {
+                continue;
+            }
+            ring.push(s);
+            ring.fast.push(s);
+        }
+    }
+
+    /// 장면 시각(카메라 시계) t 의 각속도(카메라 광학 축, rad/s): 끊김 시험의 흐림 길이용. r_ci = IMU → 카메라
+    pub fn gyro_at(samples: &[Sample], r_ci: &M34, shift: f64, t: f64) -> Option<[f32; 4]> {
+        let ti = t + shift;
+        let k = samples.partition_point(|s| s.t < ti);
+        let s = samples.get(k).or(samples.get(k.wrapping_sub(1)))?;
+        ((s.t - ti).abs() < 0.02).then(|| m34_vec(r_ci, &s.w))
+    }
+
+    pub fn samples(&self) -> Arc<Vec<Sample>> {
+        self.s.clone()
+    }
+
+    /// 찍은 속도 재생(--rate R): 장면 재생 시계(첫 장면 시각, 그때 벽시계)에 맞춰 표본을 넣는 스레드(실시간 읽기 스레드 자리)
+    pub fn spawn_timed(mut self, ring: Arc<Ring>, clock: Arc<std::sync::OnceLock<(f64, std::time::Instant)>>, rate: f64) {
+        let _ = std::thread::Builder::new().name("imu".into()).spawn(move || {
+            let (t0, w0) = loop {
+                if let Some(c) = clock.get() {
+                    break *c;
+                }
+                if ring.closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            while self.i < self.s.len() && !ring.closed.load(Ordering::Relaxed) {
+                // 카메라 시각 τ 의 표본은 벽시계 (τ − t0 − 앞섬) / 배속 에 들어온다
+                let now = t0 + REPLAY_LEAD + w0.elapsed().as_secs_f64() * rate;
+                self.feed(&ring, now + self.shift);
+                std::thread::sleep(std::time::Duration::from_micros(2500));
+            }
+        });
     }
 }
 
@@ -747,6 +872,32 @@ mod tests {
         let j = [10, -20, 2048, 20000, -4, 5];
         assert_eq!(check_raw(&enc(j), Some(&p), 0), Err(Bad::Jump));
         assert_eq!(check_raw(&enc(j), Some(&p), 3), Ok(j));
+    }
+
+    /// 녹화 재생: 같은 여섯 값 · 시각 역행은 버리고, 넣을 시각까지만 링에 넣음(끊김 구간은 뺌)
+    #[test]
+    fn csv_replay_filter_and_feed() {
+        let p = std::env::temp_dir().join(format!("imu_csv_{}.csv", std::process::id()));
+        let mut s = String::from("#timestamp [ns],wx,wy,wz,ax,ay,az\n");
+        for i in 0..100u64 {
+            let t = 1_000_000_000_000 + i * 5_000_000;
+            let v = if (50..53).contains(&i) { 49 } else { i }; // 50 – 52 는 49 와 같은 값(밀려 반복 기록)
+            s += &format!("{t},{},0,0,0,0,9.8,{}\n", v as f64 * 0.001, t as f64 * 1e-9);
+        }
+        s += "1000000100000,1,1,1,1,1,1\n"; // 시각 역행
+        std::fs::write(&p, s).unwrap();
+        let mut r = CsvReplay::load(p.to_str().unwrap(), 0.0).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(r.len(), 97);
+        assert_eq!(r.bad[Bad::Repeat as usize], 3);
+        assert_eq!(r.bad[Bad::Slow as usize], 1);
+        r.drop = vec![(1000.0975, 1000.1975)];
+        let ring = Ring::new();
+        r.feed(&ring, 1000.301);
+        let (_, a, b) = ring.view(0);
+        // 0 – 60 번 표본(1000.0 – 1000.3), 반복 3 개 · 끊김 구간 20 개 뺌
+        assert_eq!(a.len() + b.len(), 61 - 3 - 20);
+        assert!(a.iter().all(|s| !(1000.0975..1000.1975).contains(&s.t)));
     }
 
     /// 구간 안 표본 간격이 벌어지면 적분하지 않음

@@ -125,6 +125,8 @@ pub struct NodeInput {
     pub image_size: (u32, u32),
     /// 이 id 부터의 노드는 이어 붙인(임시) 구간: 루프 보정 크기 검사에서 빼서 루프가 그 구간을 제자리로 옮길 수 있게(0 = 없음)
     pub prov_from: i32,
+    /// 깊이 점 지도 정합으로 찾은 잇기(IMU 모드): (기존 지도 노드 id, 이 노드 → 그 노드 변환). 시각 루프가 없을 때 이 링크로 최적화
+    pub geo_link: Option<(i32, Tf)>,
 }
 
 /// 한 번의 결과 요약(검증·통계용)
@@ -421,6 +423,21 @@ impl Slam {
         self.forced_hyp = 0;
         self.info.highest = self.highest;
         let mut added: Vec<(i32, i32)> = Vec::new();
+        // 깊이 정합 잇기: 시각 루프 후보가 없을 때만, 정합이 낸 상대 변환을 그대로 루프 링크로(1 cm · 0.6° 불확실)
+        let mut geo = false;
+        if let (0, Some((to, t))) = (self.loop_hyp.0, inp.geo_link) {
+            if to != sid && self.mem.sig(to).is_some() {
+                let mut inf = [0.0; 36];
+                for i in 0..6 {
+                    inf[i * 7] = 1e4;
+                }
+                if self.mem.add_link(Link::new(sid, to, LinkType::GlobalClosure, t, inf)) {
+                    added.push((sid, to));
+                    self.loop_hyp = (to, 1.0);
+                    geo = true;
+                }
+            }
+        }
         let mut last_prox = 0;
         let mut suppressed = 0;
         if self.p.local_radius > 0.0 && s.weight >= 0 && self.opt.iterations() != 0 && (!small || !loc_prev) {
@@ -526,7 +543,7 @@ impl Slam {
                 }
             }
         }
-        if self.loop_hyp.0 > 0 {
+        if self.loop_hyp.0 > 0 && !geo {
             if suppressed == 0 {
                 let r = self.compute_transform(self.loop_hyp.0, sid, Tf::NULL);
                 rejected = r.t.is_null();
@@ -995,6 +1012,6 @@ mod refdump;
 
 impl Default for NodeInput {
     fn default() -> Self {
-        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0 }
+        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0, geo_link: None }
     }
 }

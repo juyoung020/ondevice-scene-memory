@@ -472,6 +472,10 @@ pub struct OdometryKlt {
     pub imu_rate: f32,
     /// 영상 결과를 IMU 와 어긋나 연달아 버린 장면 수(IMU_TRUST_MAX 에 닿으면 IMU 쪽을 의심: 치우침 되돌리고 영상을 받음)
     imu_streak: u32,
+    /// 같은 자리에서 다시 시작(놓친 뒤)할 때 마지막 성공 장면 시각: 첫 장면에서 그 뒤 자이로 회전으로 자세를 이어 감(0 = 없음)
+    restart_t: f64,
+    /// IMU: 다시 시작한 첫 장면 자세를 자이로 회전으로 이어 간 수
+    pub imu_restarts: usize,
 }
 
 impl OdometryKlt {
@@ -520,6 +524,8 @@ impl OdometryKlt {
             imu_rejected: false,
             imu_rate: 0.0,
             imu_streak: 0,
+            restart_t: 0.0,
+            imu_restarts: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
@@ -544,6 +550,7 @@ impl OdometryKlt {
         if !same_place {
             self.prev_sub.clear();
         }
+        self.restart_t = if same_place { self.prev_t } else { 0.0 };
         self.velocity = Tf::NULL;
         self.prev_t = 0.0;
     }
@@ -628,7 +635,7 @@ impl OdometryKlt {
                 }
                 let (w, h) = (j.cam.width as usize, j.cam.height as usize);
                 let mut kps = j.kps;
-                let desc = crate::features::describe(&j.gray, w, h, &mut kps);
+                let desc = crate::features::describe_oriented(&j.gray, w, h, &mut kps, j.cam.oriented);
                 let pts3d = keypoints_3d(&j.depth, &j.cam, &kps, j.min_depth, j.max_depth);
                 if rtx.send((Features { kps, pts3d, desc }, j.pose)).is_err() {
                     break;
@@ -805,8 +812,15 @@ impl OdometryKlt {
             // 이어 붙이기: 마지막 성공 장면 깊이가 남아 있으면 움직임 없음에서 시작하는 ICP 로 그사이 움직임을 바로잡음
             self.bridge_verified = false;
             // IMU: 원점에서 시작하는 첫 장면이면 지도 z 를 중력 위로(가장 작은 회전, 방향은 그대로)
+            let restart_t = std::mem::take(&mut self.restart_t);
+            // IMU: 놓친 뒤 같은 자리에서 다시 시작하면 마지막 성공 장면 → 이 장면 자이로 회전(몸체)으로 자세를 이어 간다
+            // (방향 · 중력 맞춤이 그대로 이어지고, 깊이 ICP 도 그 회전에서 시작해 그사이 움직임을 잡기 쉬움)
+            let mut imu_rot = None;
             if let Some(u) = self.imu.as_mut() {
-                u.poll(&local, f.t, f.t);
+                u.poll(&local, f.t, if restart_t > 0.0 { restart_t } else { f.t });
+                if restart_t > 0.0 && f.t - restart_t <= crate::imu::RESTART_MAX {
+                    imu_rot = u.rotation(restart_t, f.t);
+                }
                 if std::mem::take(&mut self.level_pending) && self.pose == Tf::IDENTITY {
                     if let Some(up) = u.up_body() {
                         self.pose = crate::imu::tf_of(&crate::imu::rot_between(&up, &[0.0, 0.0, 1.0, 0.0]), [0.0; 3]);
@@ -815,13 +829,19 @@ impl OdometryKlt {
                     }
                 }
             }
+            let rot_b = imu_rot.map(|r| crate::imu::tf_of(&r, [0.0; 3]));
             if !self.prev_sub.is_empty() && !f.depth_mm.is_empty() && sub_depth(&f.depth_mm, w, h, &mut self.cur_sub) > 1000 {
                 // 확인용이라 엄격하게: 점 절반 이상이 짝, 바닥·벽 하나처럼 미끄러지는 장면은 확인 안 된 것으로
-                if let Some(tpo) = icp_q(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &Tf::IDENTITY, 0.5, 1e-2) {
+                let init = rot_b.map(|r| local.inverse().mul(&r).mul(&local)).unwrap_or(Tf::IDENTITY);
+                if let Some(tpo) = icp_q(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &init, 0.5, 1e-2).filter(|tpo| !imu_disagree(&imu_rot, &local.mul(tpo).mul(&local.inverse()))) {
                     self.pose = self.pose.mul(&local.mul(&tpo).mul(&local.inverse()));
                     self.bridge_verified = true;
                     self.bridges_verified += 1;
                 }
+            }
+            if let (false, Some(r)) = (self.bridge_verified, rot_b) {
+                self.pose = self.pose.mul(&r);
+                self.imu_restarts += 1;
             }
             self.top_up(f);
             let nd = if f.depth_mm.is_empty() { 0 } else { sub_depth(&f.depth_mm, w, h, &mut self.prev_sub) };

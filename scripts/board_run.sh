@@ -2,7 +2,7 @@
 # 보드(Raspberry Pi 5 + D435 + DX-M1) 실시간 실행: D435 → 위치 추적 → 물체 기억 → 뷰어(:8091) 한 프로세스.
 #   bash scripts/board_run.sh [--tum <TUM 폴더>(녹화 속도 그대로, RATE=0 이면 최대 속도)] [ondevice 에 더 넘길 인자...]
 # 물체 기억에 넘기는 장면 간격: SEND_EVERY(기본 1 = 카메라 장면 모두, 2026-11-15 보드 23 kf/s 에서 장면 기다림 39 ms/kf 로 여유)
-# IMU 융합 모드: IMU=/dev/i2c-1 bash scripts/board_run.sh (--imu 는 위치 인자 묶음 안에 들어가야 함)
+# IMU 융합 모드가 기본(IMU=/dev/i2c-1, 장치가 없으면 카메라 전용). 카메라 전용으로: IMU= bash scripts/board_run.sh
 # 위치 프로그램에 더 줄 인자: SLAM_EXTRA(예: "--stats /tmp/st.csv")
 # 기본 모델(MODELS=~/models):
 #   - 분할: objectsam-416_640.dxnn (클래스 없는 "object", NPU). 이름은 SigLIP2 사진 벡터 → 실내 낱말 표(vocab/indoor.voc, 104 개)로 붙는다.
@@ -18,6 +18,7 @@ M=${MODELS:-$HOME/models}
 SEG=${SEG:-$M/objectsam-416_640.dxnn}
 EMB=${EMB:-$M/siglip2-vision_npu.dxnn}
 OUT=${OUT:-data/memory/live}
+IMU=${IMU-/dev/i2c-1}; [ -n "$IMU" ] && [ ! -e "$IMU" ] && IMU=
 SRC="--realsense ${IMU:+--imu $IMU} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1} --reset-file $OUT/reset.req ${SLAM_EXTRA:-}"
 if [ "${1:-}" = "--tum" ]; then SRC="--tum $2 --rate ${RATE:-1} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1}"; shift 2; fi
 RT=${RT:-auto}

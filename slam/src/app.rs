@@ -958,7 +958,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--no-geo]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--geo]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
     );
 }
 
@@ -986,8 +986,8 @@ pub struct Args {
     /// 지도 갱신을 위치 추적 스레드에서 바로(시험·비교용)
     map_inline: bool,
     no_boost: bool,
-    /// IMU 모드 깊이 서브맵 정합을 끔(--no-geo)
-    no_geo: bool,
+    /// IMU 모드 깊이 서브맵 정합(--geo, 기본 끔: 보드 · 합성 재생 11 번 중 이음 0 번)
+    geo: bool,
     reset_at: i64,
     stride: usize,
     block: i32,
@@ -1054,7 +1054,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         bridge_gap: 0.0, // 이어 붙이기는 깊이 ICP 로 자리가 확인될 때만(확인 안 된 이어 붙이기는 어긋난 위치를 감춤). 못 찾으면 새 지도(임시 위치, 불확실 표시) → 루프로 합침
         map_inline: false,
         no_boost: false,
-        no_geo: false,
+        geo: false,
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
@@ -1164,7 +1164,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
             "--no-bridge" => a.bridge = false,
             "--no-provisional" => a.provisional = false,
-            "--no-geo" => a.no_geo = true,
+            "--geo" => a.geo = true,
             "--bridge-gap" => a.bridge_gap = num(&val()?)?,
             "--map-inline" => a.map_inline = true,
             "--no-boost" => a.no_boost = true,
@@ -1390,7 +1390,7 @@ fn run_in(a: Args, to_mem: Option<std::sync::mpsc::Sender<stream::Receiver>>, po
     // 놓칠 때마다 한 번, 따로 도는 스레드에서 맞춘다(최대 속도 재생은 다음 장면에서 기다려 결정적)
     const GEO_OLD_S: f64 = 3.0;
     const GEO_NEW_S: f64 = 1.0;
-    let geo_on = imu_on && klt_path && !a.no_geo;
+    let geo_on = imu_on && klt_path && a.geo;
     let mut geo_old: VecDeque<(f64, Vec<crate::georeg::P3>)> = VecDeque::new();
     let mut geo_new: Vec<crate::georeg::P3> = Vec::new();
     let (mut geo_t0, mut geo_prov, mut geo_tried) = (f64::MIN, Tf::IDENTITY, false);

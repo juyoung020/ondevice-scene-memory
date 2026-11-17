@@ -26,17 +26,23 @@ pub fn enabled() -> bool {
     ON.load(Ordering::Acquire)
 }
 
-/// 파일을 다 쓴 뒤 같은 바이트를 건다(판 = 걸 때마다 늘어나는 번호 + 길이)
+/// 파일을 다 쓴 뒤 같은 바이트를 건다(판 = 걸 때마다 늘어나는 번호 + 길이). /stream 을 깨움
 pub fn publish(p: &Path, bytes: Arc<Vec<u8>>) {
-    let ver = format!("m{}-{}", SEQ.fetch_add(1, Ordering::Relaxed) + 1, bytes.len());
-    if let Some(m) = FILES.lock().unwrap().as_mut() {
-        m.insert(key(p), (ver, bytes));
-    }
-    if p.file_name().is_some_and(|f| f == "pose.json") {
+    let pose = publish_quiet(p, bytes);
+    if pose {
         bump_pose();
     } else {
         bump();
     }
+}
+
+/// 걸기만 하고 /stream 은 깨우지 않음(여러 파일을 잇달아 걸고 끝에 [`bump`] 한 번). 돌려줌: pose.json 인지
+pub fn publish_quiet(p: &Path, bytes: Arc<Vec<u8>>) -> bool {
+    let ver = format!("m{}-{}", SEQ.fetch_add(1, Ordering::Relaxed) + 1, bytes.len());
+    if let Some(m) = FILES.lock().unwrap().as_mut() {
+        m.insert(key(p), (ver, bytes));
+    }
+    p.file_name().is_some_and(|f| f == "pose.json")
 }
 
 /// 파일 하나를 내림
@@ -77,6 +83,11 @@ static CHANGE: Mutex<u64> = Mutex::new(0);
 static CHANGED: Condvar = Condvar::new();
 /// pose.json 말고 다른 것이 바뀐 번호
 static OTHER: AtomicU64 = AtomicU64::new(0);
+/// 깨운 횟수(계측: 파일을 걸 때마다 깨우던 것을 묶은 효과)
+static BUMPS: AtomicU64 = AtomicU64::new(0);
+pub fn bumps() -> u64 {
+    BUMPS.load(Ordering::Relaxed)
+}
 
 pub fn other() -> u64 {
     OTHER.load(Ordering::Relaxed)
@@ -89,6 +100,7 @@ pub fn bump() {
 
 /// pose.json 만 바뀜(장면 사이 위치 200 Hz): /stream 은 위치만 보내고 나머지 판은 보지 않음
 pub fn bump_pose() {
+    BUMPS.fetch_add(1, Ordering::Relaxed);
     *CHANGE.lock().unwrap() += 1;
     CHANGED.notify_all();
 }

@@ -33,7 +33,7 @@ impl Depth {
     pub fn to_meters(&mut self) {
         if let Depth::Raw { d, per_m } = self {
             let (d, per_m) = (std::mem::take(d), *per_m);
-            let mut m = POOL.lock().unwrap().pop().unwrap_or_default();
+            let mut m = common::prof::lock(&POOL, common::prof::W::LockDepthPool).pop().unwrap_or_default();
             m.clear();
             let inv = 1.0 / per_m;
             m.extend(d.iter().map(|&v| v as f32 * inv));
@@ -104,7 +104,7 @@ impl Depth {
         match self {
             Depth::Raw { d, .. } => Some(d),
             Depth::Both { d, m, .. } => {
-                let mut p = POOL.lock().unwrap();
+                let mut p = common::prof::lock(&POOL, common::prof::W::LockDepthPool);
                 if p.len() < 8 {
                     p.push(m);
                 }

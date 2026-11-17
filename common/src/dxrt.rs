@@ -117,10 +117,13 @@ unsafe extern "C" {
     fn dxrt_config_set_attribute(item: c_int, attr: c_int, value: *const c_char) -> c_int;
 }
 
-/// NPU 모델 하나: 입력 바이트 그대로(u8 NHWC 또는 f32), 출력은 모든 텐서를 이어 붙인 버퍼
+/// NPU 모델 하나: 입력 바이트 그대로(u8 NHWC 또는 f32), 출력은 모든 텐서를 이어 붙인 f32 버퍼.
+/// 출력은 받을 쪽 버퍼를 올릴 때(`run_into` · `submit`) 함께 넘겨 DXRT 가 거기에 바로 쓴다(DXRT 안 버퍼 → 우리 버퍼 memcpy 없음:
+/// `dxrt_engine_wait` 는 출력 포인터가 있으면 텐서마다 memcpy, NULL 이면 건너뜀 — libdxrt 3.4.0 디스어셈블로 확인, docs/threads_npu.md)
 pub struct Engine {
     e: *mut c_void,
-    pub out: Vec<u8>,
+    /// 출력 전체 바이트(텐서를 이어 붙임)
+    pub out_len: usize,
     pub tensors: Vec<(String, Vec<i64>, usize)>, // 이름, 모양, 바이트 오프셋
     pub input: String,                          // 첫 입력 텐서 이름
 }
@@ -161,38 +164,33 @@ impl Engine {
             let mut n: c_int = 16;
             dxrt_engine_get_input_tensor_info(e, infos.as_mut_ptr(), &mut n);
             let input = if n > 0 { CStr::from_ptr(infos[0].name.as_ptr()).to_string_lossy().into_owned() } else { String::new() };
-            Ok(Engine { e, out: vec![0u8; sz as usize], tensors, input })
+            Ok(Engine { e, out_len: sz as usize, tensors, input })
         }
     }
-    pub fn run(&mut self, input: &[u8]) {
-        unsafe {
-            if dxrt_engine_run(self.e, input.as_ptr() as *const c_void, self.out.as_mut_ptr() as *mut c_void) != 0 {
-                panic!("dxrt run: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
-            }
-        }
-    }
-    /// 결과를 받는 쪽 버퍼(f32, 모든 텐서 이어 붙임)에 바로 받기
+    /// 동기 실행: 결과를 받는 쪽 버퍼(f32, 모든 텐서 이어 붙임)에 바로 받기
     pub fn run_into(&mut self, input: &[u8], out: &mut Vec<f32>) {
-        out.resize(self.out.len().div_ceil(4), 0.0);
+        out.resize(self.out_len.div_ceil(4), 0.0);
         unsafe {
             if dxrt_engine_run(self.e, input.as_ptr() as *const c_void, out.as_mut_ptr() as *mut c_void) != 0 {
                 panic!("dxrt run: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
             }
         }
     }
-    /// 추론 하나를 NPU 에 올려 두고 바로 돌아옴(작업 번호). 입력 버퍼는 `Waiter::wait_into` 가 끝날 때까지 그대로 둔다.
-    pub fn submit(&mut self, input: &[u8]) -> i32 {
+    /// 추론 하나를 NPU 에 올려 두고 바로 돌아옴(작업 번호). 결과는 out 에 바로 쓰인다.
+    /// 입력 버퍼와 out 은 `Waiter::wait` 가 끝날 때까지 그대로 둔다(옮기지도 크기를 바꾸지도 않음 — Vec 를 옮기는 것은 괜찮음, 힙 자리는 그대로).
+    pub fn submit(&mut self, input: &[u8], out: &mut Vec<f32>) -> i32 {
+        out.resize(self.out_len.div_ceil(4), 0.0);
         let mut id: c_int = 0;
         unsafe {
-            if dxrt_engine_run_async(self.e, input.as_ptr() as *const c_void, std::ptr::null_mut(), std::ptr::null_mut(), &mut id) != 0 {
+            if dxrt_engine_run_async(self.e, input.as_ptr() as *const c_void, std::ptr::null_mut(), out.as_mut_ptr() as *mut c_void, &mut id) != 0 {
                 panic!("dxrt run_async: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
             }
         }
         id
     }
-    /// 올려 둔 작업의 결과를 다른 스레드에서 받는 손잡이. 엔진보다 먼저 없앤다.
+    /// 올려 둔 작업의 끝을 다른 스레드에서 기다리는 손잡이. 엔진보다 먼저 없앤다.
     pub fn waiter(&self) -> Waiter {
-        Waiter { e: self.e, len: self.out.len() }
+        Waiter { e: self.e }
     }
     /// 텐서 i 의 (f32 시작, 길이)
     pub fn f32_span(&self, i: usize) -> (usize, usize) {
@@ -200,11 +198,6 @@ impl Engine {
         let n: i64 = shape.iter().product();
         assert!(*off % 4 == 0, "dxrt 출력 텐서 {i} 의 시작이 4 바이트 경계가 아님");
         (*off / 4, n as usize)
-    }
-    pub fn f32_at(&self, i: usize) -> &[f32] {
-        let (_, shape, off) = &self.tensors[i];
-        let n: i64 = shape.iter().product();
-        unsafe { std::slice::from_raw_parts(self.out.as_ptr().add(*off) as *const f32, n as usize) }
     }
 }
 impl Drop for Engine {
@@ -216,14 +209,12 @@ unsafe impl Send for Engine {}
 
 pub struct Waiter {
     e: *mut c_void,
-    len: usize,
 }
 impl Waiter {
-    /// 작업이 끝날 때까지 기다려 결과(f32, 모든 텐서 이어 붙임)를 받음
-    pub fn wait_into(&self, id: i32, out: &mut Vec<f32>) {
-        out.resize(self.len.div_ceil(4), 0.0);
+    /// 작업이 끝날 때까지 기다림. 결과는 `Engine::submit` 에 준 버퍼에 이미 쓰여 있다(출력 포인터 NULL = DXRT 가 다시 복사하지 않음)
+    pub fn wait(&self, id: i32) {
         unsafe {
-            if dxrt_engine_wait(self.e, id, out.as_mut_ptr() as *mut c_void) != 0 {
+            if dxrt_engine_wait(self.e, id, std::ptr::null_mut()) != 0 {
                 panic!("dxrt wait: {}", CStr::from_ptr(dxrt_last_error_message()).to_string_lossy());
             }
         }

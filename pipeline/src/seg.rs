@@ -345,8 +345,10 @@ pub fn heads_to_det(buf: &[f32], heads: &[[usize; 3]; 3], pc: usize, s: usize, c
 
 /// 전처리 단계: 레터박스. 추론과 다른 스레드에서 돌려도 된다.
 pub fn seg_pre(rgb: &[u8], w: usize, h: usize, inp: &mut SegIn) {
-    inp.geom = letterbox_keep(rgb, w, h, SEG_S, &mut inp.u8, inp.lb_wh == Some((w, h)));
+    let keep = inp.lb_wh == Some((w, h));
+    inp.geom = letterbox_keep(rgb, w, h, SEG_S, &mut inp.u8, keep);
     inp.lb_wh = Some((w, h));
+    common::prof::copy(common::prof::C::SegLetterbox, if keep { (SEG_S - 2 * inp.geom.px) * (SEG_S - 2 * inp.geom.py) * 3 } else { SEG_S * SEG_S * 3 });
 }
 
 /// 후처리 단계: 마스크 해독. 추론과 다른 스레드에서 돌려도 된다.
@@ -380,13 +382,18 @@ pub trait Segmenter: Send {
     fn direct(&mut self, _rgb: &[u8], _w: usize, _h: usize, _conf: f32) -> Option<Vec<Det>> {
         None
     }
-    /// 추론을 올려만 두고 돌아올 수 있으면 작업 번호를 준다(NPU 코어 여럿에 여러 장을 함께 올림, `--npu-jobs`). 결과는 `collector` 가 준 함수로 받는다.
-    fn submit(&mut self, _inp: &SegIn) -> Option<i32> {
+    /// 추론을 올려만 두고 바로 돌아올 수 있으면 작업 번호를 준다. 결과는 raw 에 바로 쓰이고(NPU) `collector` 가 준 함수로 끝을 기다린다.
+    /// inp · raw 버퍼는 그 함수가 끝날 때까지 옮겨도 되지만(힙 자리 그대로) 크기를 바꾸면 안 된다
+    fn submit(&mut self, _inp: &SegIn, _raw: &mut SegRaw) -> Option<i32> {
         None
     }
-    /// `submit` 한 작업의 결과를 다른 스레드에서 받는 함수. 실행기보다 먼저 없앤다.
+    /// `submit` 한 작업을 다른 스레드에서 기다려 raw 를 채우는 함수(올린 순서대로 부름). 실행기보다 먼저 없앤다.
     fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
         None
+    }
+    /// 함께 올려 둘 수의 상한(NPU 는 --npu-jobs 그대로, 실행 스레드 하나인 PC ONNX 는 1: 더 올려도 줄만 길어져 장면 지연만 는다)
+    fn max_jobs(&self) -> usize {
+        usize::MAX
     }
     fn run(&mut self, rgb: &[u8], w: usize, h: usize, conf: f32) -> Vec<Det> {
         let (mut inp, mut raw) = std::mem::take(self.scratch());
@@ -413,18 +420,73 @@ fn session(path: &str) -> ort::session::Session {
     b.commit_from_file(path).unwrap_or_else(|e| panic!("onnx model {path}: {e}"))
 }
 
+/// ONNX 실행 결과: 검출 [300, 6 + pc] 와 원형 [pc, ph, pw] 를 이어 붙인 버퍼
+#[cfg(feature = "onnx")]
+struct OnnxOut {
+    id: i32,
+    buf: Vec<f32>,
+    det: usize,
+    p: (usize, usize, usize),
+}
+#[cfg(feature = "onnx")]
+type Pools = std::sync::Arc<std::sync::Mutex<(Vec<Vec<f32>>, Vec<Vec<f32>>)>>;
+
+/// PC: 세션을 맡은 실행 스레드 하나에 올리고(NPU 의 비동기 실행과 같은 길) 결과는 올린 순서대로 받는다.
+/// 입력(f32 NCHW)·출력 버퍼는 돌려쓴다
 #[cfg(feature = "onnx")]
 pub struct OnnxSeg {
-    sess: ort::session::Session,
+    tx: Option<std::sync::mpsc::Sender<(i32, Vec<f32>)>>,
+    rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<OnnxOut>>>,
+    /// 입력 f32 버퍼 줄, 출력 버퍼 줄
+    pool: Pools,
+    th: Option<std::thread::JoinHandle<()>>,
+    next: i32,
     scratch: (SegIn, SegRaw),
-    f32: Vec<f32>, // 모델 입력(f32 NCHW /255)
 }
 #[cfg(feature = "onnx")]
 impl OnnxSeg {
     pub fn new(env: &ort::environment::Environment, path: &str) -> OnnxSeg {
         let _ = env;
-        OnnxSeg { sess: session(path), scratch: Default::default(), f32: vec![] }
+        let mut sess = session(path);
+        let (tx, rx_in) = std::sync::mpsc::channel::<(i32, Vec<f32>)>();
+        let (tx_out, rx) = std::sync::mpsc::channel::<OnnxOut>();
+        let pool: Pools = Default::default();
+        let pool_w = pool.clone();
+        let th = std::thread::Builder::new().name("seg-onnx".into()).spawn(move || {
+            crate::out::thread_role(crate::out::Role::Infer);
+            common::prof::track_thread();
+            for (id, f) in rx_in {
+                let t = ort::value::TensorRef::from_array_view(([1usize, 3, SEG_S, SEG_S], &f[..])).unwrap();
+                let out = sess.run(ort::inputs![t]).expect("onnx run");
+                let (_, det) = out[0].try_extract_tensor::<f32>().unwrap();
+                let (ps, proto) = out[1].try_extract_tensor::<f32>().unwrap();
+                let mut buf = pool_w.lock().unwrap().1.pop().unwrap_or_default();
+                buf.clear();
+                buf.extend_from_slice(det);
+                buf.extend_from_slice(proto);
+                common::prof::copy(common::prof::C::SegOnnxOut, (det.len() + proto.len()) * 4);
+                let o = OnnxOut { id, buf, det: det.len(), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize) };
+                drop(out);
+                pool_w.lock().unwrap().0.push(f);
+                if tx_out.send(o).is_err() {
+                    break;
+                }
+            }
+        }).unwrap();
+        OnnxSeg { tx: Some(tx), rx: std::sync::Arc::new(std::sync::Mutex::new(rx)), pool, th: Some(th), next: 0, scratch: Default::default() }
     }
+}
+/// 올린 순서대로 결과 하나를 받아 raw 에(버퍼를 바꿔 끼움: 복사 없음, 옛 버퍼는 줄로)
+#[cfg(feature = "onnx")]
+fn onnx_take(rx: &std::sync::Mutex<std::sync::mpsc::Receiver<OnnxOut>>, pool: &Pools, id: i32, raw: &mut SegRaw) {
+    let o = rx.lock().unwrap().recv().expect("분할 실행 스레드");
+    assert_eq!(o.id, id, "분할 결과 순서");
+    let old = std::mem::replace(&mut raw.buf, o.buf);
+    pool.lock().unwrap().1.push(old);
+    raw.det = (0, o.det);
+    raw.proto = (o.det, raw.buf.len() - o.det);
+    (raw.pc, raw.ph, raw.pw) = o.p;
+    raw.heads = None;
 }
 #[cfg(feature = "onnx")]
 impl Segmenter for OnnxSeg {
@@ -432,17 +494,33 @@ impl Segmenter for OnnxSeg {
         &mut self.scratch
     }
     fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw) {
-        nchw_f32(&inp.u8, SEG_S, &mut self.f32);
-        let t = ort::value::TensorRef::from_array_view(([1usize, 3, SEG_S, SEG_S], &self.f32[..])).unwrap();
-        let out = self.sess.run(ort::inputs![t]).expect("onnx run");
-        let (_, det) = out[0].try_extract_tensor::<f32>().unwrap();
-        let (ps, proto) = out[1].try_extract_tensor::<f32>().unwrap();
-        raw.buf.clear();
-        raw.buf.extend_from_slice(det);
-        raw.buf.extend_from_slice(proto);
-        raw.det = (0, det.len());
-        raw.proto = (det.len(), proto.len());
-        (raw.pc, raw.ph, raw.pw) = (ps[1] as usize, ps[2] as usize, ps[3] as usize);
+        let id = self.submit(inp, raw).unwrap();
+        onnx_take(&self.rx, &self.pool, id, raw);
+    }
+    fn submit(&mut self, inp: &SegIn, _raw: &mut SegRaw) -> Option<i32> {
+        let mut f = self.pool.lock().unwrap().0.pop().unwrap_or_default();
+        nchw_f32(&inp.u8, SEG_S, &mut f);
+        common::prof::copy(common::prof::C::SegNchw, f.len() * 4);
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.tx.as_ref().unwrap().send((id, f)).expect("분할 실행 스레드");
+        Some(id)
+    }
+    fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
+        let (rx, pool) = (self.rx.clone(), self.pool.clone());
+        Some(Box::new(move |id, raw| onnx_take(&rx, &pool, id, raw)))
+    }
+    fn max_jobs(&self) -> usize {
+        1
+    }
+}
+#[cfg(feature = "onnx")]
+impl Drop for OnnxSeg {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(th) = self.th.take() {
+            let _ = th.join();
+        }
     }
 }
 
@@ -499,24 +577,19 @@ impl Segmenter for DxSeg {
     fn scratch(&mut self) -> &mut (SegIn, SegRaw) {
         &mut self.scratch
     }
-    /// 동기 호출. 결과를 raw 버퍼에 바로 받아, 후처리 스레드가 그것을 읽는 동안 다음 장면을 돌린다.
+    /// 동기 호출. 결과를 raw 버퍼에 바로 받는다.
     fn infer(&mut self, inp: &SegIn, raw: &mut SegRaw) {
         self.eng.run_into(&inp.u8, &mut raw.buf);
         self.lay.apply(raw);
     }
-    fn submit(&mut self, inp: &SegIn) -> Option<i32> {
-        Some(self.eng.submit(&inp.u8))
+    /// 올리면서 받을 버퍼(raw.buf)를 함께 넘김: NPU 결과가 거기에 바로 쓰인다(받을 때 DXRT 안 버퍼에서 3.3 MB 를 다시 복사하지 않음)
+    fn submit(&mut self, inp: &SegIn, raw: &mut SegRaw) -> Option<i32> {
+        Some(self.eng.submit(&inp.u8, &mut raw.buf))
     }
     fn collector(&self) -> Option<Box<dyn FnMut(i32, &mut SegRaw) + Send>> {
-        // 모델 안에 CPU 작업(DXRT 가 ONNX Runtime 으로 돌림)이 있는 파일은 한 장씩만: 여러 장을 함께 올리면
-        // 보드가 Illegal instruction 으로 죽거나 멈춘 적이 있다(2026-11-15). NPU 만 도는 머리 출력 모델만 겹쳐 올린다
-        if self.lay.heads.is_none() {
-            common::info!("seg: 모델 안에 CPU 작업이 있어 --npu-jobs 를 1 로 둠");
-            return None;
-        }
         let (w, lay) = (self.eng.waiter(), self.lay);
         Some(Box::new(move |id, raw| {
-            w.wait_into(id, &mut raw.buf);
+            w.wait(id);
             lay.apply(raw);
         }))
     }

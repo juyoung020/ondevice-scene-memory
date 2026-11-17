@@ -99,7 +99,7 @@ DXRT 3.4 C API(`/usr/local/include/dxrt/dxrt_c_api.h`)와 런타임 소스(`~/dx
 | 프로파일러(`--npu-profile`, 항목 `PROFILER` + `PROFILER_SAVE_DATA`) | 작업마다 시간을 재 끝날 때 작업 폴더에 `profiler.json` | 끔 | 끔(잴 때만) |
 | `SHOW_PROFILE` · `SHOW_MODEL_INFO` · `TASK_FLOW` · `SHOW_THROTTLING` · `DEBUG` | 표준 출력에 보이기 | 끔 | 끔 |
 | `SERVICE`(환경 변수 `DXRT_USE_SERVICE`) | `dxrtd` 서비스를 거쳐 여러 프로세스가 NPU 를 나눠 씀 | 빌드값(켬, 보드에 `dxrtd` 가 돎) | 기본 |
-| 비동기 실행 | `dxrt_engine_run_async` · `dxrt_engine_wait`(작업 번호), 콜백 `dxrt_engine_register_callback` | — | 분할 `--npu-jobs` 와 사진 벡터가 올리기 · 받기를 나눠 씀 |
-| 사용자 출력 버퍼 | `run` · `run_async` 의 출력 포인터에 바로 받기 | — | 분할 · 사진 벡터 모두 받을 쪽 버퍼에 바로(`run_into` · `wait_into`) |
+| 비동기 실행 | `dxrt_engine_run_async` · `dxrt_engine_wait`(작업 번호), 콜백 `dxrt_engine_register_callback` | — | 분할(`--npu-jobs`)은 읽기 스레드가 올리고 받기 스레드가 기다림, 사진 벡터는 `--embed-jobs` 장(기본 3)까지 함께 |
+| 사용자 출력 버퍼 | `run` · `run_async` 의 출력 포인터에 바로 받기. `wait` 는 출력 포인터가 있으면 텐서마다 memcpy, NULL 이면 건너뜀(3.4.0 디스어셈블) | — | 올릴 때 받을 버퍼를 넘기고 `wait` 는 NULL(복사 없음) |
 | 클럭 · 전압 · 온도 | `dxrt_device_get_npu_clock` · `_voltage` · `_temperature`(읽기만). 바꾸기는 펌웨어 설정 JSON(`dxrt-cli -C`)뿐 | 1000 MHz · 750 mV | 그대로(보드 온도 기록 `~/temp.log` 의 npu 값) |
 | 시간 재기 | `dxrt_engine_get_npu_inference_time` · `_latency_mean` 등, `dxrt_profiler_get_job_metrics` | — | 쓰지 않음(프로그램이 단계 시간을 따로 남김) |

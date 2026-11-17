@@ -71,7 +71,7 @@ static LATEST: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>
 
 /// 그 물체의 가장 새 사진 벡터(길이 1). 아직 계산 전이면 None
 pub fn get(id: u32) -> Option<Vec<f32>> {
-    LATEST.lock().unwrap().as_ref()?.get(&id).cloned()
+    common::prof::lock(&LATEST, common::prof::W::LockEmbed).as_ref()?.get(&id).cloned()
 }
 
 /// SigLIP2 base patch32-256: 로짓 = SCALE · 코사인 (체크포인트의 logit_scale = e^4.717)
@@ -129,7 +129,7 @@ fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)>
 /// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,
 /// 이름 없는 물체(object)는 몫 NAME_MIN_UNNAMED 이상이면 가장 닮은 이름을 쓴다. `--vocab` 이 없거나 벡터 계산 전이면 None
 pub fn name(id: u32, _sure: bool) -> Option<(String, f32)> {
-    NAMES.lock().unwrap().as_ref()?.get(&id).cloned() // 기준 없이 가장 닮은 이름을 늘 붙임(사용자 결정 26-11-15)
+    common::prof::lock(&NAMES, common::prof::W::LockEmbed).as_ref()?.get(&id).cloned() // 기준 없이 가장 닮은 이름을 늘 붙임(사용자 결정 26-11-15)
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 fn put(id: u32, v: Vec<f32>) {
@@ -145,10 +145,10 @@ fn put(id: u32, v: Vec<f32>) {
     };
     if let Some((names, vecs)) = VOCAB.get() {
         if let Some(n) = look_name(names, vecs, &mean) {
-            NAMES.lock().unwrap().get_or_insert_with(Default::default).insert(id, n);
+            common::prof::lock(&NAMES, common::prof::W::LockEmbed).get_or_insert_with(Default::default).insert(id, n);
         }
     }
-    LATEST.lock().unwrap().get_or_insert_with(Default::default).insert(id, v);
+    common::prof::lock(&LATEST, common::prof::W::LockEmbed).get_or_insert_with(Default::default).insert(id, v);
 }
 
 /// 리셋: 물체 id 가 처음부터 다시 쓰이므로 id 별 이름·벡터 합을 비운다
@@ -180,7 +180,6 @@ pub fn rel_path(id: u32) -> String {
 #[cfg(any(feature = "onnx", feature = "dxrt"))]
 mod worker {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::{mpsc, Mutex};
 
     struct Job {
@@ -190,10 +189,13 @@ mod worker {
         h: u32,
         rgb: std::sync::Arc<Vec<u8>>, // 물체 사진(기억의 사진과 나눠 씀)
     }
-    type Handle = (mpsc::Sender<Job>, std::thread::JoinHandle<()>);
+    type Handle = (mpsc::Sender<Vec<Job>>, std::thread::JoinHandle<()>);
     static W: Mutex<Option<Handle>> = Mutex::new(None);
     /// 맡겼지만 아직 끝나지 않은 사진 수
     static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// NPU 에 함께 올리는 사진 수(`--embed-jobs`, 기본 3 = DX-M1 NPU 코어 수). 밀린 사진을 이만큼 한꺼번에 올려 올린 순서대로 받는다
+    pub static JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3);
 
     /// 인코더 실행기: 입력 NCHW f32(−1..1) 256×256 → 768 차원
     enum Net {
@@ -207,9 +209,12 @@ mod worker {
         fn open(model: &str) -> Net {
             #[cfg(feature = "dxrt")]
             if model.ends_with(".dxnn") {
-                let e = crate::seg::dx::Engine::embed(model);
-                assert_eq!(e.out.len(), DIM * 4, "embed model output");
-                common::info!("embed: NPU 모델 {model}, 출력 {}", e.tensors[0].0);
+                // 함께 올릴 수만큼 DXRT 입출력 버퍼를 잡는다(모자라면 올리기가 DXRT 안에서 기다림)
+                let jobs = JOBS.load(std::sync::atomic::Ordering::Relaxed).max(1) as i32;
+                let e = crate::seg::dx::Engine::try_open(model, crate::seg::dx::EMBED_BOUND.load(std::sync::atomic::Ordering::Relaxed),
+                    crate::seg::dx::BUFFERS.load(std::sync::atomic::Ordering::Relaxed).max(jobs)).unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(e.out_len, DIM * 4, "embed model output");
+                common::info!("embed: NPU 모델 {model}, 출력 {}, 함께 올림 {jobs}", e.tensors[0].0);
                 return Net::Dx(e);
             }
             #[cfg(feature = "onnx")]
@@ -231,46 +236,44 @@ mod worker {
                 _ => false,
             }
         }
-        fn submit(&mut self, buf: &[f32]) -> Ticket {
+        /// 한 장 올리기: NPU 는 결과가 out 에 바로 쓰인다(받을 때 다시 복사하지 않음). CPU(ONNX)는 여기서 계산해 out 에 둠
+        fn submit(&mut self, buf: &[f32], out: &mut Vec<f32>) -> Option<i32> {
             match self {
                 #[cfg(feature = "dxrt")]
                 Net::Dx(e) => {
                     let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
-                    Ticket::Job(e.submit(bytes))
+                    Some(e.submit(bytes, out))
                 }
                 #[allow(unreachable_patterns)]
-                _ => Ticket::Done(self.run(buf)),
+                _ => {
+                    self.run(buf, out);
+                    None
+                }
             }
         }
-        fn wait(&mut self, t: Ticket) -> Vec<f32> {
-            match (self, t) {
+        /// 올린 작업이 끝날 때까지(결과는 이미 out 에)
+        fn wait(&mut self, id: Option<i32>) {
+            match (self, id) {
                 #[cfg(feature = "dxrt")]
-                (Net::Dx(e), Ticket::Job(id)) => {
-                    let mut v = Vec::new();
-                    e.waiter().wait_into(id, &mut v);
-                    v.truncate(DIM);
-                    v
-                }
-                (_, Ticket::Done(v)) => v,
-                #[allow(unreachable_patterns)]
-                _ => unreachable!(),
+                (Net::Dx(e), Some(id)) => e.waiter().wait(id),
+                _ => {}
             }
         }
-        fn run(&mut self, buf: &[f32]) -> Vec<f32> {
+        fn run(&mut self, buf: &[f32], v: &mut Vec<f32>) {
             match self {
                 #[cfg(feature = "onnx")]
                 Net::Onnx(sess) => {
                     let inp = ort::value::TensorRef::from_array_view(([1usize, 3, SIZE, SIZE], buf)).unwrap();
                     let out = sess.run(ort::inputs![inp]).expect("embed run");
-                    let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().unwrap();
-                    assert_eq!(v.len(), DIM, "embed model output");
-                    v.to_vec()
+                    let (_, o) = out["pooler_output"].try_extract_tensor::<f32>().unwrap();
+                    assert_eq!(o.len(), DIM, "embed model output");
+                    v.clear();
+                    v.extend_from_slice(o);
                 }
                 #[cfg(feature = "dxrt")]
                 Net::Dx(e) => {
                     let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
-                    e.run(bytes);
-                    e.f32_at(0).to_vec()
+                    e.run_into(bytes, v);
                 }
             }
         }
@@ -281,68 +284,117 @@ mod worker {
         n: u32,
         pre: f64,
         net: f64,
+        npu_wait: f64,
         write: f64,
+        batches: u32,
+        max_batch: usize,
     }
-    /// 올린 추론 하나: NPU 는 작업 번호, CPU(ONNX)는 이미 끝난 벡터
-    enum Ticket {
-        Done(Vec<f32>),
-        #[cfg(feature = "dxrt")]
-        Job(i32),
+    /// 올린 사진 하나: 일, 작업 번호(NPU), 올린 때, 전처리 시간, 입력 · 출력 버퍼 자리
+    struct Flight {
+        job: Job,
+        id: Option<i32>,
+        t0: std::time::Instant,
+        pre: f64,
+        slot: usize,
     }
-    fn finish_job(net: &mut Net, (j, tk, t0, pre): (Job, Ticket, std::time::Instant, f64), st: &mut Stat) {
-        let mut v = net.wait(tk);
+    fn finish_job(net: &mut Net, f: Flight, outs: &mut [Vec<f32>], st: &mut Stat) {
+        let c = std::time::Instant::now();
+        net.wait(f.id);
+        common::prof::wait(common::prof::W::EmbedNpu, c);
         let t1 = std::time::Instant::now();
+        st.npu_wait += (t1 - c).as_secs_f64() * 1e3;
+        // 벡터는 그 물체의 가장 새 벡터로 남으므로 버퍼째 넘김(다음 올리기에서 새로 잡음)
+        let mut v = std::mem::take(&mut outs[f.slot]);
+        v.truncate(DIM);
         normalize(&mut v);
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-        // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
-        let tmp = j.path.with_extension("bin.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &j.path).is_ok() {
-            crate::out::publish(&j.path, bytes); // --serve: 검색이 파일을 다시 읽지 않게
+        common::prof::copy(common::prof::C::EmbedBytes, bytes.len());
+        if crate::out::memory_only() {
+            crate::out::publish(&f.job.path, bytes); // --serve: 기억 폴더는 메모리에만(끝에 · 저장 버튼으로 디스크에)
+        } else {
+            // 임시 파일에 쓰고 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게
+            let tmp = f.job.path.with_extension("bin.tmp");
+            common::prof::copy(common::prof::C::EmbedDisk, bytes.len());
+            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &f.job.path).is_ok() {
+                crate::out::publish(&f.job.path, bytes);
+            }
         }
-        put(j.id, v);
+        put(f.job.id, v);
         st.n += 1;
-        st.pre += pre;
-        st.net += (t1 - t0).as_secs_f64() * 1e3;
+        st.pre += f.pre;
+        st.net += (t1 - f.t0).as_secs_f64() * 1e3;
         st.write += t1.elapsed().as_secs_f64() * 1e3;
     }
 
     pub fn start(model: &str) {
         let mut net = Net::open(model);
         let patches = net.patches();
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::channel::<Vec<Job>>();
         let th = std::thread::Builder::new().name("embed".into()).spawn(move || {
-            let mut bufs = [Vec::new(), Vec::new()];
+            common::prof::track_thread();
+            let k = JOBS.load(std::sync::atomic::Ordering::Relaxed).max(1);
+            // 입력 · 출력 버퍼 k 벌(올린 사진마다 한 벌, 받으면 그 자리를 다음 사진이 씀)
+            let mut ins: Vec<Vec<f32>> = (0..k).map(|_| Vec::new()).collect();
+            let mut outs: Vec<Vec<f32>> = (0..k).map(|_| Vec::new()).collect();
             let mut st = Stat::default();
-            while let Ok(first) = rx.recv() {
-                // 밀린 일은 물체(파일)마다 가장 새 사진만
-                let mut jobs: HashMap<PathBuf, Job> = HashMap::new();
-                jobs.insert(first.path.clone(), first);
-                let mut taken = 1;
-                while let Ok(j) = rx.try_recv() {
-                    jobs.insert(j.path.clone(), j);
+            loop {
+                let c_idle = std::time::Instant::now();
+                let Ok(first) = rx.recv() else { break };
+                common::prof::wait(common::prof::W::EmbedIdle, c_idle);
+                // 밀린 일은 물체(파일)마다 가장 새 사진만, 맡긴 순서대로
+                let mut jobs: Vec<Job> = Vec::with_capacity(first.len());
+                let mut taken = 0;
+                for j in first.into_iter().chain(rx.try_iter().flatten()) {
                     taken += 1;
-                }
-                // NPU 에 한 장 올려 둔 동안 다음 사진을 전처리(입력 버퍼 둘을 번갈아)
-                let mut prev: Option<(Job, Ticket, std::time::Instant, f64)> = None;
-                for (i, j) in jobs.into_values().enumerate() {
-                    let t = std::time::Instant::now();
-                    preprocess_into(&j.rgb, j.w, j.h, patches, &mut bufs[i % 2]);
-                    let pre = t.elapsed().as_secs_f64() * 1e3;
-                    if let Some(p) = prev.take() {
-                        finish_job(&mut net, p, &mut st);
+                    match jobs.iter_mut().find(|x| x.path == j.path) {
+                        Some(x) => *x = j,
+                        None => jobs.push(j),
                     }
-                    let tk = net.submit(&bufs[i % 2]);
-                    prev = Some((j, tk, std::time::Instant::now(), pre));
                 }
-                if let Some(p) = prev.take() {
-                    finish_job(&mut net, p, &mut st);
+                st.batches += 1;
+                st.max_batch = st.max_batch.max(jobs.len());
+                // NPU 에 k 장까지 함께 올림. 처음 k 장은 전처리(32×32 조각)를 코어 여럿에서 함께 한 뒤 모두 올리고,
+                // 그 뒤로는 가장 먼저 올린 것을 받을 때마다 그 자리에 다음 사진을 전처리해 올린다(남은 장이 NPU 에서 도는 동안)
+                let mut flying: std::collections::VecDeque<Flight> = std::collections::VecDeque::new();
+                let mut jobs = jobs.into_iter();
+                let first: Vec<Job> = jobs.by_ref().take(k).collect();
+                let t = std::time::Instant::now();
+                {
+                    use rayon::prelude::*;
+                    ins[..first.len()].par_iter_mut().zip(&first).for_each(|(b, j)| preprocess_into(&j.rgb, j.w, j.h, patches, b));
+                }
+                let pre = t.elapsed().as_secs_f64() * 1e3 / first.len().max(1) as f64;
+                for (slot, j) in first.into_iter().enumerate() {
+                    common::prof::copy(common::prof::C::EmbedIn, ins[slot].len() * 4);
+                    let id = net.submit(&ins[slot], &mut outs[slot]);
+                    flying.push_back(Flight { job: j, id, t0: t, pre, slot });
+                }
+                for j in jobs {
+                    let f = flying.pop_front().unwrap();
+                    let slot = f.slot;
+                    finish_job(&mut net, f, &mut outs, &mut st);
+                    let t = std::time::Instant::now();
+                    preprocess_into(&j.rgb, j.w, j.h, patches, &mut ins[slot]);
+                    common::prof::copy(common::prof::C::EmbedIn, ins[slot].len() * 4);
+                    let pre = t.elapsed().as_secs_f64() * 1e3;
+                    let id = net.submit(&ins[slot], &mut outs[slot]);
+                    flying.push_back(Flight { job: j, id, t0: t, pre, slot });
+                }
+                while let Some(f) = flying.pop_front() {
+                    finish_job(&mut net, f, &mut outs, &mut st);
                 }
                 PENDING.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
             }
-            let k = st.n.max(1) as f64;
-            common::info!("embed: {} vectors, 전처리 {:.1} ms · 모델(올림 → 받음) {:.1} ms · 쓰기 {:.1} ms 씩", st.n, st.pre / k, st.net / k, st.write / k);
+            let n = st.n.max(1) as f64;
+            common::info!("embed: {} vectors({} 묶음, 가장 큰 묶음 {}), 전처리 {:.1} ms · 모델(올림 → 받음) {:.1} ms(받기 기다림 {:.1}) · 쓰기 {:.1} ms 씩",
+                st.n, st.batches, st.max_batch, st.pre / n, st.net / n, st.npu_wait / n, st.write / n);
         }).unwrap();
         *W.lock().unwrap() = Some((tx, th));
+    }
+
+    /// 함께 올릴 사진 수(`--embed-jobs`, start 전에)
+    pub fn set_jobs(k: usize) {
+        JOBS.store(k.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn on() -> bool {
@@ -361,7 +413,8 @@ mod worker {
             let img = image::open(f).unwrap_or_else(|e| panic!("{}: {e}", f.display())).to_rgb8();
             preprocess_into(img.as_raw(), img.width(), img.height(), net.patches(), &mut buf);
             let t = std::time::Instant::now();
-            let mut v = net.run(&buf);
+            let mut v = Vec::new();
+            net.run(&buf, &mut v);
             if i > 0 {
                 ms += t.elapsed().as_secs_f64() * 1e3; // 첫 장은 모델 올리는 시간이 섞여 뺌
             }
@@ -385,10 +438,14 @@ mod worker {
         }
     }
 
-    pub fn submit(dir: &Path, id: u32, w: u32, h: u32, rgb: std::sync::Arc<Vec<u8>>) {
+    /// 한 기록 회차에 바뀐 물체 사진(번호, 폭, 높이, 화소)을 한 묶음으로: 사진 벡터 스레드를 한 번만 깨우고 묶음째 전처리 · 올림
+    pub fn submit(dir: &Path, items: Vec<(u32, u32, u32, std::sync::Arc<Vec<u8>>)>) {
+        if items.is_empty() {
+            return;
+        }
         if let Some((tx, _)) = &*W.lock().unwrap() {
-            PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = tx.send(Job { id, path: dir.join(rel_path(id)), w, h, rgb });
+            PENDING.fetch_add(items.len(), std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(items.into_iter().map(|(id, w, h, rgb)| Job { id, path: dir.join(rel_path(id)), w, h, rgb }).collect());
         }
     }
 
@@ -409,7 +466,7 @@ mod worker {
 
 /// 인코더를 올리고 계산 스레드를 띄운다(`--embed <vision_model.onnx | .dxnn>`)
 #[cfg(any(feature = "onnx", feature = "dxrt"))]
-pub use worker::{check, drain, finish, on, start, submit};
+pub use worker::{check, drain, finish, on, set_jobs, start, submit};
 
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn start(_model: &str) {
@@ -420,11 +477,13 @@ pub fn check(model: &str, _dir: &str, _vec_file: &str) {
     start(model);
 }
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
+pub fn set_jobs(_k: usize) {}
+#[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn on() -> bool {
     false
 }
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
-pub fn submit(_dir: &Path, _id: u32, _w: u32, _h: u32, _rgb: std::sync::Arc<Vec<u8>>) {}
+pub fn submit(_dir: &Path, _items: Vec<(u32, u32, u32, std::sync::Arc<Vec<u8>>)>) {}
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn finish() {}
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
@@ -490,6 +549,22 @@ mod tests {
         assert!((at(0, 10, 100) - 1.0).abs() < 1e-4 && (at(2, 10, 100) + 1.0).abs() < 1e-4);
         assert!((at(0, 245, 100) + 1.0).abs() < 1e-4 && (at(2, 245, 100) - 1.0).abs() < 1e-4);
         assert!(out.iter().all(|v| (-1.0..=1.0).contains(v)));
+    }
+
+    /// `cargo test -p ondevice --release -- --ignored --nocapture name_time`: 물체 하나 이름 붙이기(실내 낱말 104 개와 견줌) 시간
+    #[test]
+    #[ignore]
+    fn name_time() {
+        let mut s = 3u64;
+        let mut rnd = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((s >> 40) as f32) / (1u64 << 24) as f32 - 0.5 };
+        let names: Vec<String> = (0..104).map(|i| format!("n{i}")).collect();
+        let vecs: Vec<f32> = (0..104 * DIM).map(|_| rnd()).collect();
+        let es: Vec<Vec<f32>> = (0..1000).map(|_| { let mut e: Vec<f32> = (0..DIM).map(|_| rnd()).collect(); normalize(&mut e); e }).collect();
+        let c = std::time::Instant::now();
+        for e in &es {
+            std::hint::black_box(look_name(&names, &vecs, e));
+        }
+        println!("이름 붙이기(낱말 104 개): {:.1} µs/물체", c.elapsed().as_secs_f64() * 1e6 / es.len() as f64);
     }
 
     #[test]

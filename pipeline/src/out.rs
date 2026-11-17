@@ -28,19 +28,20 @@ struct WriteQ {
 
 impl WriteQ {
     fn send(&self, p: std::path::PathBuf, job: Job, wait: bool) {
-        let mut q = self.q.lock().unwrap();
+        let mut q = common::prof::lock(&self.q, common::prof::W::LockWriteQ);
         while wait && q.len() >= WRITE_Q {
             q = self.space.wait(q).unwrap();
         }
         q.push_back((p, job));
         self.item.notify_one();
     }
-    fn recv(&self) -> (std::path::PathBuf, Job) {
-        let mut q = self.q.lock().unwrap();
+    /// 다음 일과, 그 뒤에 줄이 더 남았는지
+    fn recv(&self) -> (std::path::PathBuf, Job, bool) {
+        let mut q = common::prof::lock(&self.q, common::prof::W::LockWriteQ);
         loop {
             if let Some(x) = q.pop_front() {
                 self.space.notify_one();
-                return x;
+                return (x.0, x.1, !q.is_empty());
             }
             q = self.item.wait(q).unwrap();
         }
@@ -56,13 +57,23 @@ pub fn start_writer() {
     if first {
         std::thread::spawn(move || {
             thread_role(Role::Writer);
+            // 줄에 이어 온 파일(물체 사진 3 장 + 점, 점 지도 노드 수십 개)은 걸기만 하고, 줄이 빌 때 뷰어(/stream)를 한 번만 깨움
+            let mut owe = false;
             loop {
-                let (p, job) = w.recv();
+                let (p, job, more) = w.recv();
                 if p.as_os_str().is_empty() {
+                    if std::mem::take(&mut owe) {
+                        sgview::memfs::bump();
+                    }
                     job(); // flush_writer 표시
                     continue;
                 }
-                run_job(&p, job);
+                run_job(&p, job, true);
+                owe = true;
+                if !more {
+                    sgview::memfs::bump();
+                    owe = false;
+                }
             }
         });
     }
@@ -77,18 +88,25 @@ pub fn write_owned(dst: &Path, bytes: Vec<u8>) {
 fn write_lazy(dst: &Path, job: Job) {
     match WRITER.get() {
         Some(w) => w.send(dst.to_path_buf(), job, BG.with(|b| b.get())),
-        None => run_job(dst, job),
+        None => run_job(dst, job, false),
     }
 }
 
-fn run_job(dst: &Path, job: Job) {
+/// quiet: 걸기만 하고 뷰어는 깨우지 않음(기록 스레드가 줄이 빌 때 한 번 깨움)
+fn run_job(dst: &Path, job: Job, quiet: bool) {
     let c0 = std::time::Instant::now();
     let b = job();
     if !memory_only() {
         write_now(dst, &b);
     }
     let n = b.len();
-    publish(dst, b);
+    if quiet {
+        if sgview::memfs::enabled() {
+            sgview::memfs::publish_quiet(dst, Arc::new(b));
+        }
+    } else {
+        publish(dst, b);
+    }
     slow(c0);
     stats::add(stats::kind(dst), n, c0.elapsed().as_nanos() as u64);
 }
@@ -328,6 +346,8 @@ pub fn thread_role(r: Role) {
     cpu::enter(common::threads::tid(), r as usize);
     common::threads::apply(nice, mask);
     common::threads::rt(ROLE_NAMES[r as usize]);
+    common::threads::name_if_unnamed(ROLE_NAMES[r as usize]);
+    common::prof::track_thread();
 }
 
 thread_local! {

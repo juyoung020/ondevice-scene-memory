@@ -240,6 +240,50 @@ pub type Encode<'a> = &'a dyn Fn(&str) -> Option<Arc<Vec<f32>>>;
 /// vocabulary name then every NULLS text: a query reads no vector file and computes no name × picture product
 static TABLE: Mutex<Option<crate::objtable::ObjTable<std::path::PathBuf>>> = Mutex::new(None);
 
+/// `--search-direct <logit_bias>`: search in one step, query vector × the object table (see [`search_direct`])
+static DIRECT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+pub fn set_direct(logit_bias: f32) {
+    let _ = DIRECT.set(logit_bias);
+}
+
+/// One-step search: p = sigmoid(SCALE · cos(query, picture) + logit_bias) for every object of the table (no vocabulary, no NULLS),
+/// an object whose name holds the query letters (or the query holds the name) scores 1. Same reply shape as [`search`]
+/// (`names` empty, `p_name` 1 for a letter match else 0)
+pub fn search_direct(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: usize, min: f32, bias: f32) -> serde_json::Value {
+    let ql = q.trim().to_lowercase();
+    let objs = view["objects"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    let tq = if ql.is_empty() { None } else { enc(&ql) };
+    let mut table = TABLE.lock().unwrap();
+    let table = table.get_or_insert_with(|| crate::objtable::ObjTable::new(DIM, SCALE));
+    let paths: Vec<Option<std::path::PathBuf>> = objs.iter().map(|o| o["emb"].as_str().map(|p| root.join(p))).collect();
+    if tq.is_some() {
+        let items: Vec<(std::path::PathBuf, Arc<Vec<u8>>)> = paths.iter().flatten().filter_map(|p| crate::memfs::read(p).map(|b| (p.clone(), b))).collect();
+        table.sync_bytes(&items);
+    }
+    let cosines = tq.as_ref().map(|t| table.scores(t)).unwrap_or_default();
+    let mut hits: Vec<(f32, serde_json::Value)> = vec![];
+    for (o, p) in objs.iter().zip(&paths) {
+        if ql.is_empty() {
+            break;
+        }
+        let nl = o["name"].as_str().unwrap_or("").to_lowercase();
+        let exact = !nl.is_empty() && (nl.contains(&ql) || ql.contains(nl.as_str()));
+        let p_look = match p.as_ref().and_then(|p| table.row(p)) {
+            Some(r) if !cosines.is_empty() => 1.0 / (1.0 + (-(SCALE * cosines[r] + bias)).exp()),
+            _ => 0.0,
+        };
+        let score = if exact { 1.0 } else { p_look };
+        if score >= min {
+            let r3 = |x: f32| (x as f64 * 1000.0).round() / 1000.0;
+            hits.push((score, serde_json::json!({"id": o["id"], "name": o["name"], "state": o["state"], "pos": o["pos"],
+                "score": r3(score), "by": if exact { "name" } else { "look" }, "p_name": if exact { 1.0 } else { 0.0 }, "p_look": r3(p_look)})));
+        }
+    }
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1["p_look"].as_f64().unwrap_or(0.0).total_cmp(&a.1["p_look"].as_f64().unwrap_or(0.0))));
+    hits.truncate(k);
+    serde_json::json!({"q": q, "names": [], "semantic": tq.is_some(), "results": hits.into_iter().map(|h| h.1).collect::<Vec<_>>()})
+}
+
 /// log(Σ e^x)
 fn lse(xs: impl Iterator<Item = f32>) -> f32 {
     let v: Vec<f32> = xs.collect();
@@ -274,6 +318,9 @@ fn vocabulary(root: &Path, present: &[String]) -> Vec<String> {
 ///           (NAME_GAP_LO above the median name and within e^−1.6 of the closest name) are left out
 ///   score   1 − (1 − p_name)(1 − p_look);  by = "name" or "look", whichever is larger
 pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: usize, min: f32) -> serde_json::Value {
+    if let Some(&bias) = DIRECT.get() {
+        return search_direct(root, view, q, enc, k, min, bias);
+    }
     let ql = q.trim().to_lowercase();
     let objs = view["objects"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     let names: Vec<String> = objs.iter().map(|o| o["name"].as_str().unwrap_or("").to_lowercase()).collect();
@@ -453,6 +500,19 @@ mod tests {
     }
 
     #[test]
+    fn direct_one_step() {
+        let (root, view) = memory("direct");
+        // letters: the chair scores 1 by name
+        let r = search_direct(&root, &view, "chair", &enc, 5, 0.5, -10.0);
+        assert_eq!(ids(&r)[0], (0, "name".to_string()));
+        // a description: the picture closest to the query vector comes first, by look
+        let r = search_direct(&root, &view, "마실 것", &enc, 5, 0.0, -10.0);
+        assert_eq!(ids(&r)[0], (1, "look".to_string()));
+        assert_eq!(r["names"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn missing_vector_file_is_skipped() {
         let (root, view) = memory("missing");
         std::fs::remove_file(root.join("objects/O0_emb.bin")).unwrap();
@@ -613,6 +673,21 @@ mod pre_tests {
             let first = { let c = std::time::Instant::now(); search(&root, &view, "chair-ish", &enc, 20, 0.0); c.elapsed().as_secs_f64() * 1e3 };
             let new = time(&|| search(&root, &view, "something", &enc, 20, 0.0));
             println!("objects {n}: per-query scan {old:.2} ms, memory table {new:.2} ms (first query after all vectors changed {first:.2} ms)");
+            // no vocabulary: query vector × object table → sigmoid(scale · cos + bias) → threshold · top-k
+            let mut t: crate::objtable::ObjTable<u32> = crate::objtable::ObjTable::new(DIM, SCALE);
+            let mut s = 77u64;
+            for id in 0..n as u32 {
+                t.upsert(id, &rnd_unit(&mut s));
+            }
+            let q = rnd_unit(&mut s);
+            let direct = time(&|| {
+                let p: Vec<f32> = t.scores(&q).iter().map(|c| 1.0 / (1.0 + (-(SCALE * c - 16.77)).exp())).collect();
+                let mut o: Vec<usize> = (0..p.len()).filter(|&i| p[i] >= 0.0).collect();
+                o.sort_by(|a, b| p[*b].total_cmp(&p[*a]));
+                o.truncate(20);
+                serde_json::json!(o)
+            });
+            println!("objects {n}: no vocabulary (scores + sigmoid + top-k) {direct:.3} ms");
             let _ = std::fs::remove_dir_all(&root);
         }
     }

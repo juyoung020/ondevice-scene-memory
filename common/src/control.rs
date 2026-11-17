@@ -34,11 +34,32 @@ pub fn take_level() -> bool {
 
 /// 저장: 메모리에 든 기억 폴더를 지금 디스크에 씀
 pub fn request_save() {
+    let _g = SAVE_WAKE.0.lock().unwrap();
     SAVE.store(true, Ordering::Release);
+    SAVE_WAKE.1.notify_all();
 }
 pub fn take_save() -> bool {
     SAVE.swap(false, Ordering::AcqRel)
 }
+/// 저장 요청이 오거나 timeout 이 지날 때까지 잠듦(None = 요청까지). 돌려줌: 요청이 있었는지(받아 감)
+pub fn wait_save(timeout: Option<std::time::Duration>) -> bool {
+    let mut g = SAVE_WAKE.0.lock().unwrap();
+    let end = timeout.map(|t| std::time::Instant::now() + t);
+    while !SAVE.load(Ordering::Acquire) {
+        match end {
+            Some(e) => {
+                let left = e.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                g = SAVE_WAKE.1.wait_timeout(g, left).unwrap().0;
+            }
+            None => g = SAVE_WAKE.1.wait(g).unwrap(),
+        }
+    }
+    take_save()
+}
+static SAVE_WAKE: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
 
 #[cfg(test)]
 mod tests {

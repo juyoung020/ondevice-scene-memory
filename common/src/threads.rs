@@ -222,3 +222,21 @@ mod tests {
         assert!(!rt("nothing"));
     }
 }
+
+/// 이름 없는 스레드에 이름 붙이기(/proc 의 comm, 15 바이트까지): 스레드별 CPU · 깨어남 재기에서 가려 보려고. 리눅스만
+pub fn name_if_unnamed(name: &str) {
+    if std::thread::current().name().is_some() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_setname_np(t: usize, name: *const std::ffi::c_char) -> i32;
+        }
+        let mut b: Vec<u8> = name.bytes().take(15).collect();
+        b.push(0);
+        pthread_setname_np(pthread_self(), b.as_ptr() as *const std::ffi::c_char);
+    }
+    let _ = name;
+}

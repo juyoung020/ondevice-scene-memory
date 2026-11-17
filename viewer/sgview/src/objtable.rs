@@ -52,12 +52,12 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
-/// 여러 줄을 나눠 돌림(rayon 이 있으면 코어 여럿, 없으면 차례대로). 결과 순서는 입력 순서
+/// 여러 줄을 나눠 돌림(rayon 이 있으면 128 줄씩 코어 여럿 — 그보다 적으면 깨우는 비용이 더 커서 한 스레드로, 없으면 차례대로). 결과 순서는 입력 순서
 fn par_map<T: Sync, R: Send>(v: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
     #[cfg(feature = "search")]
     {
         use rayon::prelude::*;
-        v.par_iter().with_min_len(8).map(f).collect()
+        v.par_iter().with_min_len(128).map(f).collect()
     }
     #[cfg(not(feature = "search"))]
     v.iter().map(f).collect()

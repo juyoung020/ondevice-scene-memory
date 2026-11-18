@@ -9,11 +9,13 @@
 |---|---|---|---|
 | 처리 루프(프로그램 이름) | pipeline/src/main.rs `Driver::run` · `LoopIo` | 카메라 짝 맞추기 · 위치 추적(`slam::app::Runner::step`) · 지도 노드 명령, 분할 전처리 · NPU 올리기 · 받기 · 마스크 해독, 수평 · 바닥 · 점유 격자 · 물체 트래커 · 병합 · 기록 회차, 장면 사이 위치(IMU), 뷰어 HTTP · 스트림 | epoll: 카메라 fd · NPU 끝 · 줄 끝 · IMU 표본 · 소켓 · 마감(저장 · 열 보호 · 연결 정리) |
 | `imu`(IMU 모드) | slam/src/imu.rs `spawn_reader` | I2C 200 Hz 읽기 · 거르기 · 링(생산자 하나 · 소비자 = 루프) | 자기 타이머, SCHED_FIFO 50 |
+| `memory` | pipeline/src/main.rs `Driver::run` | 물체 기억 한 장씩(마스크 → 점 · 트래커 · 병합 · 기록 회차): 루프가 다음 장면 위치 추적 · 분할 올리기를 하는 동안. 점 줄(압축 · 점 격자)을 기다리므로 풀 일로 두지 않음(아래 3 절 "기다리는 일") | 루프가 장면을 넘길 때 |
+| `rebuild` | common/src/rt.rs `Lane::thread` | 다시 쌓기 · 이어 넣기(nice 10) | 루프가 일을 넣을 때 |
 | `pool-0` · `pool-1` · `pool-2`(`--pool N`) | common/src/rt.rs | 줄 일 · 펼치기(par_iter) | 루프가 일을 넣을 때 |
 | `npu-wait-seg` · `npu-wait-emb`(`--npu-wake thread`, 기본) | common/src/dxrt.rs `Engine::on_done` | 모델마다 `dxrt_engine_wait` 만, 끝나면 루프를 깨움 | NPU |
 | (PC 만) `seg-onnx` | pipeline/src/seg.rs | ONNX 분할 실행(NPU 자리), 끝나면 루프를 깨움 | 올림 |
 
-없어진 스레드: slam · camera(PrefetchSource) · 지도(MapHost) · klt 기술자 · georeg · imu-pose · reader · seg-done · embed · pts · view · writer · save · rebuild(+ 다시 쌓기 안 scope 1) · sgview(accept) · sgview-stream · sgview-http 8 개 · 장면마다 띄우던 재생 PNG 풀기 scope 1 · 따로 된 rayon 풀 둘(pts 2 · slam 코어 수).
+없어진 스레드: slam · camera(PrefetchSource) · 지도(MapHost) · klt 기술자 · georeg · imu-pose · reader · seg-done · embed · pts · view · writer · save · sgview(accept) · sgview-stream · sgview-http 8 개 · 장면마다 띄우던 재생 PNG 풀기 scope 1 · 따로 된 rayon 풀 둘(pts 2 · slam 코어 수).
 
 ## 2. 처리 루프
 
@@ -105,15 +107,15 @@ D435 ─V4L2 fd─▶ 루프: YUYV → RGB · 회색, 깊이 정렬 → 위치 �
 
 | 항목 | 전 | 후 |
 |---|---|---|
-| 프로세스 스레드(최대, ONNX Runtime 스레드 포함) | 46 – 48 | 11 |
-| 우리 스레드(이름 붙은 것) | 21 종 28 개 | 루프 1 + 풀 3 + seg-onnx 1(PC 만) |
+| 프로세스 스레드(최대, ONNX Runtime 스레드 포함) | 46 – 48 | 11 (멈춤 고친 뒤 12 – 13: memory · rebuild) |
+| 우리 스레드(이름 붙은 것) | 21 종 28 개 | 루프 1 + memory 1 + rebuild 1 + 풀 3 + seg-onnx 1(PC 만) |
 | 장면이 스레드를 건너는 횟수 | 7 | 0 |
 | 장면당 깊이 미터 칸 복사 | 1.17 MB(123 장 144 MB) | 0 |
 | 실행 전체 복사(PC 만의 f32 NCHW · ONNX 출력 포함) | 1,395 – 1,400 MB | 1,269 MB |
 | 깨어남(실행 전체, 대부분 ONNX Runtime 스레드) | 123 k – 124 k | 108 k – 115 k |
 | 뷰어 깨움(`--serve`) | 258 – 476 | 239 – 251 |
 | 실시간 재생(`--rate 1 --every 5`) kf/s · 장면 지연 p50 | 4.8 – 5.5 · 96 – 100 ms | 3.8 – 5.3 · 85 – 108 ms |
-| 최대 속도 재생 kf/s | 9.3 – 10.8 | 4.9 – 6.8 |
+| 최대 속도 재생 kf/s | 9.3 – 10.8 | 4.9 – 6.8 → 물체 기억을 루프와 겹친 뒤 21.8 – 21.9(아래) |
 
 - 최대 속도 재생은 느려졌다: 위치 추적 · 물체 기억이 한 루프에서 차례로 돌고, PC 의 ONNX 분할 · 사진 벡터(CPU)가 같은 코어 8 개를 나눠 쓴다. 보드 실시간은 카메라 속도(30 장/초)가 위이고 루프 예산은 장면당 약 12 ms(설계 2.7 절) — 보드 실측(`scripts/board_all.sh`)으로 확인한다.
 - 사진 벡터를 켠 최대 속도 재생 두 번: 전 판은 view.json · 벡터 파일 2 개가 달랐고, 후는 357 파일 모두 같다.

@@ -331,6 +331,8 @@ struct LaneInner<S> {
     nice: i32,
     busy_ns: AtomicU64,
     jobs: AtomicU64,
+    /// 전용 스레드 줄([`Lane::thread`]): 일꾼을 풀 대신 이 스레드에 깨움
+    kick: std::sync::OnceLock<Sender<()>>,
 }
 // 상태 · 받는 쪽은 pending 규칙으로 한 번에 일꾼 하나만 만진다
 unsafe impl<S: Send> Sync for LaneInner<S> {}
@@ -339,8 +341,12 @@ impl<S: Send + 'static> LaneInner<S> {
     fn push(self: &Arc<Self>, job: Job<S>) {
         let _ = self.tx.send(job); // 넣은 뒤 셈(일꾼이 센 수만큼 꼭 꺼낼 수 있게)
         if self.pending.fetch_add(1, Ordering::AcqRel) == 0 {
-            let me = self.clone();
-            rayon::spawn(move || me.run());
+            if let Some(k) = self.kick.get() {
+                let _ = k.send(());
+            } else {
+                let me = self.clone();
+                rayon::spawn(move || me.run());
+            }
         }
     }
     fn run(&self) {
@@ -397,6 +403,7 @@ fn lane_inner<S>(name: &'static str, s: S, nice: i32, on_idle: Option<Box<dyn Fn
         nice,
         busy_ns: AtomicU64::new(0),
         jobs: AtomicU64::new(0),
+        kick: std::sync::OnceLock::new(),
     })
 }
 
@@ -404,6 +411,29 @@ impl<S: Send + 'static> Lane<S> {
     /// nice: 일꾼이 이 줄을 도는 동안의 nice(긴 일 줄: 다시 쌓기 · 저장 = 10, 그 밖 0)
     pub fn new(name: &'static str, s: S, nice: i32) -> Lane<S> {
         Lane(lane_inner(name, s, nice, None))
+    }
+    /// 전용 스레드 하나에서 도는 줄: 다른 줄을 기다리는 일(다시 쌓기 등)은 이것으로. 풀 일꾼이 펼치기(par_iter) 중에 남의 일을
+    /// 훔쳐 돌 수 있어, 기다리는 일이 풀에 있으면 기다리는 대상 줄의 일꾼 위에 얹혀 서로 기다리며 멈출 수 있다.
+    /// setup 은 스레드 시작 때 한 번(우선순위 · 코어)
+    pub fn thread(name: &'static str, s: S, nice: i32, setup: impl FnOnce() + Send + 'static) -> Lane<S> {
+        let inner = lane_inner(name, s, nice, None);
+        let (ktx, krx) = std::sync::mpsc::channel::<()>();
+        let _ = inner.kick.set(ktx);
+        let weak = Arc::downgrade(&inner);
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                setup();
+                // 줄이 없어지면(넣는 쪽 Sender 가 닫힘) 끝
+                while krx.recv().is_ok() {
+                    match weak.upgrade() {
+                        Some(me) => me.run(),
+                        None => break,
+                    }
+                }
+            })
+            .expect("줄 스레드");
+        Lane(inner)
     }
     /// 일꾼이 밀린 일을 다 돌고 내려놓을 때마다 부를 함수(루프 깨우기 등)
     pub fn with_idle(name: &'static str, s: S, nice: i32, on_idle: impl Fn() + Send + Sync + 'static) -> Lane<S> {

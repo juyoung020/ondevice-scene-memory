@@ -731,28 +731,38 @@ impl Driver {
             self.run_tum(a, seq, body);
             return self.seg;
         }
-        // 물체 기억(마스크 → 점 · 병합 · 지도)은 작업 풀에서 한 장씩 차례로(한 번에 하나): 루프는 그동안 다음 장면 위치 추적 · 분할 올리기를 겹쳐 한다.
-        // 상태는 물체 기억 일이 쥐고(뮤텍스, 한 번에 하나라 다툼 없음) 장면 순서는 그대로 → 결과 같음
+        // 물체 기억(마스크 → 점 · 병합 · 지도)은 물체 기억 스레드 하나에서 한 장씩 차례로: 루프는 그동안 다음 장면 위치 추적 · 분할 올리기를 겹쳐 한다.
+        // 상태는 물체 기억 일이 쥐고(뮤텍스, 한 번에 하나라 다툼 없음) 장면 순서는 그대로 → 결과 같음.
+        // 작업 풀 일로 두면 안 된다: 물체 기억은 점 줄(압축 · 점 격자)을 기다리는데, 점 줄 일꾼이 펼치기(par_iter) 중에 이 일을 훔쳐 돌면
+        // 점 줄이 그 밑에 깔린 채 서로 기다려 멈춘다(fr3 long_office --every 2 에서 475 장째 멈춤, gdb: pts_grid → join → settle → wait_ready)
         let mem = std::sync::Mutex::new(body);
         let busy = std::sync::atomic::AtomicBool::new(false);
         let mem_ns = std::sync::atomic::AtomicU64::new(0);
         let mut mq: std::collections::VecDeque<Frame> = Default::default();
         let wk = io.waker();
-        let seg = rayon::in_place_scope(|sc| {
+        let seg = std::thread::scope(|sc| {
+        let (mtx, mrx) = std::sync::mpsc::channel::<Frame>();
+        {
+            let (mem, busy, wk, mem_ns) = (&mem, &busy, wk.clone(), &mem_ns);
+            std::thread::Builder::new().name("memory".into()).spawn_scoped(sc, move || {
+                let (_, mask) = out::layout(out::Role::Points);
+                common::threads::apply(0, mask);
+                common::prof::track_thread();
+                for f in mrx {
+                    let c = Instant::now();
+                    (mem.lock().unwrap())(Some(f));
+                    mem_ns.fetch_add(c.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    busy.store(false, std::sync::atomic::Ordering::Release);
+                    wk.wake();
+                }
+            }).expect("물체 기억 스레드");
+        }
         loop {
             // 물체 기억 일이 비었으면 다음 장면을 넘김
             if !busy.load(std::sync::atomic::Ordering::Acquire) {
                 if let Some(f) = mq.pop_front() {
                     busy.store(true, std::sync::atomic::Ordering::Release);
-                    let (mem, busy, wk) = (&mem, &busy, wk.clone());
-                    let mem_ns = &mem_ns;
-                    sc.spawn(move |_| {
-                        let c = Instant::now();
-                        (mem.lock().unwrap())(Some(f));
-                        mem_ns.fetch_add(c.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                        busy.store(false, std::sync::atomic::Ordering::Release);
-                        wk.wake();
-                    });
+                    let _ = mtx.send(f);
                 }
             }
             let mut progress = false;
@@ -1217,7 +1227,12 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
     let mut lag_rb = (0u32, 0f32); // 다시 쌓기가 도는 동안 끝낸 장면 수·그중 밀림 최대
     let (mut write_due, mut scene_due) = (false, false); // 미룬 정기 기록·점 지도 쓰기
     let a_rb = std::sync::Arc::new(a.clone());
-    let mut rb_lane = common::rt::Lane::new("rebuild", (), 10); // 다시 쌓기 · 이어 넣기(긴 일: 도는 동안 nice 10)
+    // 다시 쌓기 · 이어 넣기(긴 일: 도는 동안 nice 10). 점 줄을 기다리는 일이라 풀이 아닌 전용 스레드에서(Lane::thread 설명)
+    let mut rb_lane = common::rt::Lane::thread("rebuild", (), 10, || {
+        let (_, mask) = out::layout(out::Role::Points);
+        common::threads::apply(0, mask);
+        common::prof::track_thread();
+    });
     let mut rb_job: Option<Pending<Rebuilt>> = None;
     let mut rb_cache: Option<std::sync::Arc<RbCache>> = None; // 지난 다시 쌓기의 중간 상태
     let mut lat: Vec<[f32; 4]> = vec![]; // 장면 지연(ms): 받음→분할 끝, 분할 끝→본 스레드가 받음, 본 스레드 처리, 받음→본 스레드 끝
@@ -1893,6 +1908,13 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     // 점 지도는 점유 격자·물체와 서로 상관없음: 작업 풀의 다른 일꾼이 같은 장면 순서로 쌓는다(각자 차례대로라 결과 같음, 시간은 둘 중 긴 쪽)
     let mut main_ck: Vec<(usize, Grid, Memory, Vec<(f64, [f64; 3])>, Vec<(f64, V3, M3)>)> = vec![];
     let mut pts_out = None;
+    // 점 격자는 점 줄이 채운다: 풀에 들어가기 전에 이 스레드(다시 쌓기 전용)에서 다 기다린다. 풀 일이 기다리면 점 줄 일꾼이 펼치기 중에
+    // 그 일을 훔쳐 돌아 서로 기다리며 멈출 수 있다(물체 기억 · unpack_all 과 같은 규칙)
+    if !a.chunk_map {
+        for (kf, _, _) in snap.iter().skip(start) {
+            let _ = kf.pts_wait();
+        }
+    }
     rayon::in_place_scope(|sc| {
         let mut scene = scene;
         let pts_slot = &mut pts_out;

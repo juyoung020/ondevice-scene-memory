@@ -224,6 +224,8 @@ mod engine {
         cam: Camera,
         pose: Option<Tf>,
         trusted: bool,
+        /// 다시 잡기 · 잇기용 특징은 방향 BRIEF 로 따로(`--imu-brief dual`)
+        dual: bool,
     }
 
     type KfOut = (Features, Tf, bool, i32);
@@ -241,7 +243,7 @@ mod engine {
                 desc: feats.desc.clone(),
             };
             if let Some(p) = r.pose {
-                kf = Some((feats, p, r.trusted));
+                kf = Some((if r.dual { ext.extract_with(&fr, true) } else { feats }, p, r.trusted));
             }
         }
         slam.forced_hyp = forced;
@@ -381,6 +383,9 @@ mod engine {
         cam: Arc<Mutex<Option<Camera>>>,
         /// 지금 장면 SensorData 의 특징(위치 추적이 data.setFeatures 로 채운 것)
         cur: Features,
+        /// `--imu-brief dual`: 평소 추적 · 루프는 곧은 BRIEF(cur), 놓친 뒤 다시 잡기 · 지도 잇기 후보 찾기만 방향 BRIEF(cur_o, 필요할 때만 뽑음)
+        pub dual: bool,
+        cur_o: Features,
         /// Odometry 의 previous_stamp · framesProcessed 그림자(OdometryInfo::interval 계산용)
         prev_stamp: f64,
         frames: i32,
@@ -439,6 +444,8 @@ mod engine {
                 slam: { let st = snap_of(&slam); MapHost::Inline(Box::new(slam), st) },
                 cam,
                 cur: Features::default(),
+                dual: false,
+                cur_o: Features::default(),
                 prev_stamp: 0.0,
                 frames: 0,
                 loop_unique_ids: unique,
@@ -494,6 +501,7 @@ mod engine {
                 interval: if dt > 0.0 { dt } else { 0.0 },
             };
             self.cur = r.features;
+            self.cur_o = Features::default();
             out
         }
 
@@ -621,7 +629,25 @@ mod engine {
         }
 
         pub fn global_reloc(&mut self, f: &Frame, min_inliers: usize) -> Option<(Tf, i32, [f64; 36])> {
-            self.ensure_cur(f);
+            if !self.dual {
+                return self.global_reloc_in(f, min_inliers);
+            }
+            self.ensure_cur_o(f);
+            std::mem::swap(&mut self.cur, &mut self.cur_o);
+            let r = self.global_reloc_in(f, min_inliers);
+            std::mem::swap(&mut self.cur, &mut self.cur_o);
+            r
+        }
+        /// 방향 BRIEF 특징(dual): 이 장면에서 한 번만 뽑음
+        fn ensure_cur_o(&mut self, f: &Frame) {
+            if self.cur_o.kps.is_empty() {
+                self.cur_o = self.ext.extract_with(f, true);
+            }
+        }
+        fn global_reloc_in(&mut self, f: &Frame, min_inliers: usize) -> Option<(Tf, i32, [f64; 36])> {
+            if !self.dual {
+                self.ensure_cur(f);
+            }
             if self.cur.desc.is_empty() || self.kf_db.is_empty() {
                 return None;
             }
@@ -746,7 +772,7 @@ mod engine {
         pub fn slam_process(&mut self, f: &Frame, node: bool, pose: Option<Tf>, cov: &[f64; 36], velocity: Vec<f32>) {
             // 지도 스레드 + 광류 경로: 노드 특징(GFTT·BRIEF)도 지도 스레드에서 뽑음(회색조 사본·깊이 나눠 듦만 넘김)
             let raw = if node && self.cur.kps.is_empty() && matches!(self.odom, Odom::Klt(_)) && self.slam.is_thread() {
-                Some(Box::new(RawNode { gray: f.gray.clone(), depth: f.depth_mm.clone(), cam: f.cam.clone(), pose, trusted: self.trusted }))
+                Some(Box::new(RawNode { gray: f.gray.clone(), depth: f.depth_mm.clone(), cam: f.cam.clone(), pose, trusted: self.trusted, dual: self.dual }))
             } else {
                 None
             };
@@ -754,7 +780,10 @@ mod engine {
                 self.ensure_cur(f);
                 if let Some(p) = pose {
                     if !self.cur.desc.is_empty() {
-                        self.kf_db.push((self.cur.clone(), p));
+                        if self.dual {
+                            self.ensure_cur_o(f);
+                        }
+                        self.kf_db.push((if self.dual { self.cur_o.clone() } else { self.cur.clone() }, p));
                         self.kf_ids.push((0, self.trusted, 0)); // id 는 process 뒤에 채움
                     }
                 }
@@ -801,7 +830,19 @@ mod engine {
         }
 
         pub fn propose_merge(&mut self, f: &Frame, min_inliers: usize) -> bool {
-            self.ensure_cur(f);
+            if !self.dual {
+                return self.propose_merge_in(f, min_inliers);
+            }
+            self.ensure_cur_o(f);
+            std::mem::swap(&mut self.cur, &mut self.cur_o);
+            let r = self.propose_merge_in(f, min_inliers);
+            std::mem::swap(&mut self.cur, &mut self.cur_o);
+            r
+        }
+        fn propose_merge_in(&mut self, f: &Frame, min_inliers: usize) -> bool {
+            if !self.dual {
+                self.ensure_cur(f);
+            }
             if self.cur.desc.is_empty() {
                 return false;
             }
@@ -942,7 +983,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--geo]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--geo] [--imu-brief oriented|upright|dual]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
     );
 }
 
@@ -972,6 +1013,8 @@ pub struct Args {
     no_boost: bool,
     /// IMU 모드 깊이 서브맵 정합(--geo, 기본 끔: 보드 · 합성 재생 11 번 중 이음 0 번)
     geo: bool,
+    /// IMU 모드 BRIEF: oriented(모두 방향 BRIEF) · upright(모두 곧은 BRIEF) · dual(평소 곧은 BRIEF, 다시 잡기 · 잇기 후보만 방향 BRIEF)
+    imu_brief: String,
     reset_at: i64,
     stride: usize,
     block: i32,
@@ -1047,6 +1090,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         map_inline: false,
         no_boost: false,
         geo: false,
+        imu_brief: "oriented".into(),
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
@@ -1157,6 +1201,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--no-bridge" => a.bridge = false,
             "--no-provisional" => a.provisional = false,
             "--geo" => a.geo = true,
+            "--imu-brief" => a.imu_brief = val()?,
             "--bridge-gap" => a.bridge_gap = num(&val()?)?,
             "--map-inline" => a.map_inline = true,
             "--no-boost" => a.no_boost = true,
@@ -1506,6 +1551,7 @@ impl Runner {
         if let Some(f) = imu_fusion {
             eng.set_imu(f)?;
             eng.merge_top = 5;
+        eng.dual = klt_path && a.imu_brief == "dual";
             eng.near_first = true;
         }
         // 실시간(카메라·찍은 속도 재생)이면 지도 갱신을 따로 도는 스레드로(--map-inline 으로 끔). 최대 속도 재생은 결정적이게 그대로
@@ -1706,7 +1752,7 @@ impl Runner {
             r.feed(ring, fr.t + self.calib.shift + crate::imu::REPLAY_LEAD);
         }
         // IMU 모드: BRIEF 를 점마다 방향으로 돌려 뽑음(ORB 식) → 굴려도 같은 설명자, 다시 잡기 · 지도 잇기 · 루프 검증이 시점 변화에 버팀
-        fr.cam.oriented = self.imu_on && self.klt_path;
+        fr.cam.oriented = self.imu_on && self.klt_path && self.a.imu_brief == "oriented";
         fr.id = self.n + 1;
         // 리셋 요청(뷰어의 Reset 버튼: 한 프로그램이면 common::control 신호, 따로 띄운 뷰어면 --reset-file 파일): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
         // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다

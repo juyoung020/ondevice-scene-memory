@@ -129,8 +129,13 @@ impl Extractor {
 
     /// 특징점 → 설명자(가장자리 점은 빠짐) → 3D 점. RegistrationVis 와 같은 순서
     pub fn extract(&self, f: &Frame) -> Features {
+        self.extract_with(f, f.cam.oriented)
+    }
+
+    /// extract 와 같되 설명자 종류를 직접 고름(oriented = 방향 BRIEF)
+    pub fn extract_with(&self, f: &Frame, oriented: bool) -> Features {
         let mut kps = self.detect(f);
-        let desc = describe_oriented(&f.gray, f.cam.width as usize, f.cam.height as usize, &mut kps, f.cam.oriented);
+        let desc = describe_oriented(&f.gray, f.cam.width as usize, f.cam.height as usize, &mut kps, oriented);
         let pts3d = self.keypoints_3d(f, &kps);
         Features { kps, pts3d, desc }
     }

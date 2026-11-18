@@ -521,7 +521,11 @@ struct LoopIo {
     turn_max: f32,
     turn_sum: f64,
     turn_t0: Option<Instant>,
+    /// 루프 단계별 시간 합(초): 입력 · 위치 추적, 분할 올리기, 분할 받기 · 후처리, 뷰어 · 기타, 물체 기억(풀)
+    stage: [f64; 5],
 }
+
+const STAGE_NAMES: [&str; 5] = ["track", "submit", "post", "misc", "memory_pool"];
 
 const T_IN: u64 = 1;
 const T_NPU: u64 = 2;
@@ -539,7 +543,7 @@ impl LoopIo {
         let wm = w_misc.clone();
         common::control::on_signal(move || wm.wake());
         LoopIo { poll, w_in, w_misc, w_imu, fast_out: None, server: None, thermal: thermal::Thermal::from_args(argv), npu_tx, npu_rx, seg_async: false, toks: vec![], out: a.out.clone(), save_every: if a.serve.is_some() { a.save_every } else { 0.0 },
-                 last_save: Instant::now(), turns: 0, turn_max: 0.0, turn_sum: 0.0, turn_t0: None }
+                 last_save: Instant::now(), turns: 0, turn_max: 0.0, turn_sum: 0.0, turn_t0: None, stage: [0.0; 5] }
     }
     fn waker(&self) -> std::sync::Arc<common::rt::Waker> {
         self.w_misc.clone()
@@ -596,7 +600,8 @@ impl LoopIo {
         }
     }
     fn json(&self) -> serde_json::Value {
-        json!({"turns": self.turns, "turn_ms_mean": self.turn_sum / self.turns.max(1) as f64, "turn_ms_max": self.turn_max, "sleeps": self.poll.sleeps, "thermal": self.thermal.json()})
+        json!({"turns": self.turns, "turn_ms_mean": self.turn_sum / self.turns.max(1) as f64, "turn_ms_max": self.turn_max, "sleeps": self.poll.sleeps, "thermal": self.thermal.json(),
+               "stage_s": STAGE_NAMES.iter().zip(self.stage).map(|(n, v)| (n.to_string(), json!((v * 1e3).round() / 1e3))).collect::<serde_json::Map<_, _>>()})
     }
 }
 
@@ -620,6 +625,10 @@ impl<T: Send + 'static> Pending<T> {
         self.got.is_some()
     }
     fn join(mut self) -> T {
+        if self.got.is_none() && rayon::current_thread_index().is_some() {
+            // 풀 일꾼에서 기다림: 그 일(다시 쌓기)을 이 일꾼이 대신 돌 수도 있게
+            common::rt::wait_until(|| self.is_finished());
+        }
         self.got.take().unwrap_or_else(|| self.rx.recv().expect("줄 일"))
     }
 }
@@ -674,7 +683,10 @@ struct Driver {
 impl Driver {
     #[allow(clippy::too_many_arguments)]
     fn new(a: &Args, seg: Box<dyn seg::Segmenter + Send>, rd: Option<stream::StreamReader>, first: Option<stream::StreamFrame>, pace0: Instant, pace_t0: f64, lag_on: bool, io: &LoopIo) -> Driver {
-        let jobs = if io.seg_async { a.npu_jobs.min(seg.max_jobs()).max(1) } else { 1 };
+        // 함께 올려 둘 수: 실시간은 실행기 상한까지(PC ONNX 1: 더 올리면 장면 지연만 늚). 결과를 늘 같게 하는 재생(--no-drop)은 모든 분할 장면을 어차피
+        // 차례대로 하므로 다음 장면을 미리 올려 둬(상한 2 이상) 앞 장면이 끝나는 즉시 이어 돌게 한다(루프가 위치 추적 중이어도 실행기가 쉬지 않음)
+        let cap = if a.no_drop { seg.max_jobs().max(2) } else { seg.max_jobs() };
+        let jobs = if io.seg_async { a.npu_jobs.min(cap).max(1) } else { 1 };
         Driver {
             seg_async: io.seg_async,
             seg,
@@ -709,12 +721,35 @@ impl Driver {
     }
 
     /// 루프: 입력이 끝나고 분할 길이 빌 때까지. 돌려줌: 분할 실행기(다음 실행 · 리셋이 이어 씀)
-    fn run(mut self, a: &Args, seq: &tum::Tum, io: &mut LoopIo, body: &mut dyn FnMut(Option<Frame>)) -> Box<dyn seg::Segmenter + Send> {
+    fn run(mut self, a: &Args, seq: &tum::Tum, io: &mut LoopIo, body: &mut (dyn FnMut(Option<Frame>) + Send)) -> Box<dyn seg::Segmenter + Send> {
         if self.rd.is_none() {
             self.run_tum(a, seq, body);
             return self.seg;
         }
+        // 물체 기억(마스크 → 점 · 병합 · 지도)은 작업 풀에서 한 장씩 차례로(한 번에 하나): 루프는 그동안 다음 장면 위치 추적 · 분할 올리기를 겹쳐 한다.
+        // 상태는 물체 기억 일이 쥐고(뮤텍스, 한 번에 하나라 다툼 없음) 장면 순서는 그대로 → 결과 같음
+        let mem = std::sync::Mutex::new(body);
+        let busy = std::sync::atomic::AtomicBool::new(false);
+        let mem_ns = std::sync::atomic::AtomicU64::new(0);
+        let mut mq: std::collections::VecDeque<Frame> = Default::default();
+        let wk = io.waker();
+        let seg = rayon::in_place_scope(|sc| {
         loop {
+            // 물체 기억 일이 비었으면 다음 장면을 넘김
+            if !busy.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(f) = mq.pop_front() {
+                    busy.store(true, std::sync::atomic::Ordering::Release);
+                    let (mem, busy, wk) = (&mem, &busy, wk.clone());
+                    let mem_ns = &mem_ns;
+                    sc.spawn(move |_| {
+                        let c = Instant::now();
+                        (mem.lock().unwrap())(Some(f));
+                        mem_ns.fetch_add(c.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        busy.store(false, std::sync::atomic::Ordering::Release);
+                        wk.wake();
+                    });
+                }
+            }
             let mut progress = false;
             // NPU 끝 알림
             for tag in io.npu_rx.try_iter() {
@@ -725,27 +760,42 @@ impl Driver {
                 }
             }
             // 앞 장면부터 차례로 본 처리(물체 기억)
-            while self.q.front().is_some_and(|f| matches!(f.1, FlSt::Ready | FlSt::Done(..))) {
+            let c_st = Instant::now();
+            while mq.len() < 2 && self.q.front().is_some_and(|f| matches!(f.1, FlSt::Ready | FlSt::Done(..))) {
                 let (job, st) = self.q.pop_front().unwrap();
                 let f = self.finish(job, st, a.conf);
-                body(Some(f));
+                mq.push_back(f);
                 progress = true;
             }
+            io.stage[2] += c_st.elapsed().as_secs_f64();
+            if !mq.is_empty() && !busy.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            let c_st = Instant::now();
             self.submit_waiting(a.conf);
+            io.stage[1] += c_st.elapsed().as_secs_f64();
+            let c_st = Instant::now();
             if let Some(rd) = self.rd.as_mut() {
                 rd.service(); // 실시간: 준비된 카메라 장면은 모두 위치 추적에
             }
             if !self.ended {
                 progress |= self.pull(a);
             }
+            io.stage[0] += c_st.elapsed().as_secs_f64();
+            let c_st = Instant::now();
             io.misc();
             if let (Some(pp), Some(rd)) = (io.fast_out.as_ref(), self.rd.as_ref()) {
                 if let Some((t, ts, twc)) = rd.fast_pose() {
                     fast_pose(pp, t, ts, &twc);
                 }
             }
-            body(None);
-            if self.ended && self.q.is_empty() {
+            if !busy.load(std::sync::atomic::Ordering::Acquire) {
+                if let Ok(mut b) = mem.try_lock() {
+                    (b)(None);
+                }
+            }
+            io.stage[3] += c_st.elapsed().as_secs_f64();
+            if self.ended && self.q.is_empty() && mq.is_empty() && !busy.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
             if progress {
@@ -755,6 +805,10 @@ impl Driver {
                 .or_else(|| self.rd.as_ref().and_then(|r| r.due()));
             io.sleep(timeout);
         }
+        });
+        let _ = seg;
+        io.stage[4] += mem_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9;
+        let body = mem.into_inner().unwrap();
         // 마지막 장면 뒤에 온 노드(끝난 뒤 최적화): 위치 없는 장면 하나로 넘김
         if let Some(rd) = self.rd.as_mut() {
             self.graph.append(&mut rd.take_graph());
@@ -956,7 +1010,7 @@ impl Driver {
     }
 
     /// TUM 입력(--tum, 위치 = 정답 · --gt): 영상 · 깊이 읽기와 분할을 루프에서 차례로(--live 면 찍은 속도에 맞춤)
-    fn run_tum(&mut self, a: &Args, seq: &tum::Tum, body: &mut dyn FnMut(Option<Frame>)) {
+    fn run_tum(&mut self, a: &Args, seq: &tum::Tum, body: &mut (dyn FnMut(Option<Frame>) + Send)) {
         let (mut t_start, mut w_start) = (None::<f64>, Instant::now());
         for (fi, (t, rel)) in seq.rgb.iter().enumerate() {
             if fi % a.every != 0 {

@@ -256,8 +256,23 @@ mod worker {
     static LANE: Mutex<Option<common::rt::SharedLane<St>>> = Mutex::new(None);
     /// 맡겼지만 아직 끝나지 않은 사진 수
     static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    /// 결과를 늘 같게(재생): 끝난 벡터를 바로 반영하지 않고 쌓아 두었다가 다음 기록 회차 앞(`sync_round`)에 맡긴 차례대로 반영
-    static STAGED: Mutex<Vec<(u64, u32, PathBuf, Vec<f32>)>> = Mutex::new(Vec::new());
+    /// 결과를 늘 같게(재생): 끝난 벡터를 바로 반영하지 않고 쌓아 두었다가, 맡긴 회차에서 DET_LAG 회차 뒤 기록 회차 앞(`sync_round`)에 맡긴 차례대로 반영.
+    /// 그 사이 회차에 같은 물체의 더 새 사진이 맡겨졌으면 앞 사진은 건너뜀(반영 규칙이 회차 번호로만 정해져 실행마다 같음).
+    /// 루프는 묶음이 DET_LAG 회차 넘게 밀릴 때만 기다린다(사진 벡터 계산이 장면 처리와 겹쳐 돎)
+    #[derive(Default)]
+    struct Det {
+        /// 끝난 벡터: (차례, 물체, 파일, 벡터)
+        staged: Vec<(u64, u32, PathBuf, Vec<f32>)>,
+        /// 맡겼고 아직 반영 · 건너뜀을 정하지 않은 사진: (차례, 회차, 물체)
+        log: Vec<(u64, u64, u32)>,
+        /// 건너뛸 차례(줄이 아직 시작 전이면 계산하지 않음)
+        cancel: std::collections::HashSet<u64>,
+    }
+    static DETS: Mutex<Option<Det>> = Mutex::new(None);
+    static DET_CV: std::sync::Condvar = std::sync::Condvar::new();
+    static ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// 반영을 미루는 회차 수
+    const DET_LAG: u64 = 4;
     static DET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static NEXT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     /// 맡긴 사진이 다 끝났다는 알림(drain 이 잠들어 기다림)
@@ -395,17 +410,35 @@ mod worker {
         /// 열 보호로 늦출 때: 지난 묶음 올린 때, 늦춤을 무시하고 올림(끝 · 회차 맞추기)
         last_pump: std::time::Instant,
         force: bool,
+        /// CPU 실행기(올리면 그 자리에서 계산)
+        cpu: bool,
     }
     impl St {
         /// 빈 자리만큼 밀린 사진을 전처리(여럿이면 풀에서 함께)해 올린다. CPU(ONNX)는 그 자리에서 계산까지 끝냄
         fn pump(&mut self) {
             // 비상 열 보호 2 단: 묶음 사이를 THROTTLE_GAP 넘게 띄움(밀린 사진은 물체마다 가장 새 것만 남아 기다림)
-            if THROTTLE.load(std::sync::atomic::Ordering::Relaxed) && !self.force && self.last_pump.elapsed() < THROTTLE_GAP {
+            let det = DET.load(std::sync::atomic::Ordering::Relaxed);
+            if THROTTLE.load(std::sync::atomic::Ordering::Relaxed) && !det && !self.force && self.last_pump.elapsed() < THROTTLE_GAP {
                 return;
             }
             self.last_pump = std::time::Instant::now();
             loop {
-                let free: Vec<usize> = (0..self.fly.len()).filter(|i| self.fly[*i].is_none()).take(self.queue.len()).collect();
+                if det {
+                    // 건너뛰기로 정해진 사진은 계산하지 않음
+                    let g = DETS.lock().unwrap();
+                    if let Some(d) = g.as_ref() {
+                        self.queue.retain(|j| {
+                            let skip = d.cancel.contains(&j.n);
+                            if skip {
+                                dec_pending();
+                            }
+                            !skip
+                        });
+                    }
+                }
+                // CPU 실행기는 한 장씩(그 사이 건너뛰기 표시를 다시 봄)
+                let cap = if self.cpu { 1 } else { self.queue.len() };
+                let free: Vec<usize> = (0..self.fly.len()).filter(|i| self.fly[*i].is_none()).take(self.queue.len().min(cap)).collect();
                 if free.is_empty() {
                     return;
                 }
@@ -442,7 +475,12 @@ mod worker {
             v.truncate(DIM);
             normalize(&mut v);
             if DET.load(std::sync::atomic::Ordering::Relaxed) {
-                STAGED.lock().unwrap().push((f.job.n, f.job.id, f.job.path, v));
+                let mut g = DETS.lock().unwrap();
+                let d = g.get_or_insert_with(Default::default);
+                if !d.cancel.contains(&f.job.n) {
+                    d.staged.push((f.job.n, f.job.id, f.job.path, v));
+                }
+                DET_CV.notify_all();
             } else {
                 apply(f.job.id, &f.job.path, v);
             }
@@ -477,7 +515,7 @@ mod worker {
         let mut net = Net::open(model);
         let patches = net.patches();
         let k = JOBS.load(std::sync::atomic::Ordering::Relaxed).max(1);
-        let st = St { net: None, patches, ins: vec![Vec::new(); k], outs: vec![Vec::new(); k], fly: (0..k).map(|_| None).collect(), queue: Default::default(), st: Stat::default(), last_pump: std::time::Instant::now(), force: false };
+        let st = St { net: None, patches, ins: vec![Vec::new(); k], outs: vec![Vec::new(); k], fly: (0..k).map(|_| None).collect(), queue: Default::default(), st: Stat::default(), last_pump: std::time::Instant::now(), force: false, cpu: !model.ends_with(".dxnn") };
         let lane = common::rt::SharedLane::new("embed", st, 0, None);
         // NPU 끝 알림(기다림 스레드 또는 DXRT 콜백) → 이 줄에 "자리 slot 끝" 일
         let l2 = lane.clone();
@@ -545,6 +583,20 @@ mod worker {
         let Some(lane) = LANE.lock().unwrap().clone() else { return };
         PENDING.fetch_add(items.len(), std::sync::atomic::Ordering::SeqCst);
         let jobs: Vec<Job> = items.into_iter().map(|(id, w, h, rgb)| Job { id, path: dir.join(rel_path(id)), w, h, rgb, n: NEXT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }).collect();
+        if DET.load(std::sync::atomic::Ordering::Relaxed) {
+            // 같은 물체의 앞 회차 사진(아직 반영 전)은 건너뜀으로 표시하고 이 묶음을 기록
+            let r = ROUND.load(std::sync::atomic::Ordering::Relaxed);
+            let mut g = DETS.lock().unwrap();
+            let d = g.get_or_insert_with(Default::default);
+            for j in &jobs {
+                for e in d.log.iter().filter(|e| e.2 == j.id) {
+                    d.cancel.insert(e.0);
+                }
+                d.log.retain(|e| e.2 != j.id);
+                d.log.push((j.n, r, j.id));
+            }
+            d.staged.retain(|x| !d.cancel.contains(&x.0));
+        }
         lane.push(move |s: &mut St| {
             s.st.batches += 1;
             s.st.max_batch = s.st.max_batch.max(jobs.len());
@@ -577,27 +629,63 @@ mod worker {
                 s.force = false;
             });
         }
-        let mut g = DRAINED.0.lock().unwrap();
-        while PENDING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            g = DRAINED.1.wait(g).unwrap();
+        if rayon::current_thread_index().is_some() {
+            common::rt::wait_until(|| PENDING.load(std::sync::atomic::Ordering::SeqCst) == 0);
+        } else {
+            let mut g = DRAINED.0.lock().unwrap();
+            while PENDING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                g = DRAINED.1.wait(g).unwrap();
+            }
         }
-        drop(g);
-        commit();
+        commit(u64::MAX);
     }
 
-    /// 쌓아 둔 벡터를 맡긴 차례대로 반영
-    fn commit() {
-        let mut v = std::mem::take(&mut *STAGED.lock().unwrap());
+    /// 회차 upto 까지 맡긴 사진의 벡터를 맡긴 차례대로 반영(끝나지 않은 것은 기다림)
+    fn commit(upto: u64) {
+        let mut g = DETS.lock().unwrap();
+        let Some(d) = g.as_mut() else { return };
+        let need: Vec<u64> = d.log.iter().filter(|e| e.1 <= upto).map(|e| e.0).collect();
+        if need.is_empty() {
+            return;
+        }
+        let c = std::time::Instant::now();
+        let ready = |d: &Det| need.iter().all(|n| d.staged.iter().any(|x| x.0 == *n));
+        if rayon::current_thread_index().is_some() {
+            // 풀 일꾼에서 기다림(물체 기억 일): 사진 벡터 줄을 이 일꾼이 대신 돌 수 있게 잠금을 놓고 기다림
+            drop(g);
+            common::rt::wait_until(|| DETS.lock().unwrap().as_ref().is_some_and(&ready));
+            g = DETS.lock().unwrap();
+        } else {
+            while !ready(g.as_ref().unwrap()) {
+                g = DET_CV.wait(g).unwrap();
+            }
+        }
+        common::prof::wait(common::prof::W::EmbedNpu, c);
+        let d = g.as_mut().unwrap();
+        let mut v: Vec<_> = Vec::new();
+        let mut rest = Vec::new();
+        for x in d.staged.drain(..) {
+            if need.contains(&x.0) { v.push(x) } else { rest.push(x) }
+        }
+        d.staged = rest;
+        d.log.retain(|e| !need.contains(&e.0));
+        if d.log.is_empty() {
+            d.cancel.clear();
+        }
+        drop(g);
         v.sort_by_key(|x| x.0);
         for (_, id, path, e) in v {
             apply(id, &path, e);
         }
     }
 
-    /// 기록 회차 앞(결과를 늘 같게 하는 재생): 앞 회차에 맡긴 묶음이 끝나기를 기다려 그 벡터를 반영. 실시간은 아무것도 안 함(끝나는 대로 반영됨)
+    /// 기록 회차 앞(결과를 늘 같게 하는 재생): DET_LAG 회차 앞에 맡긴 묶음을 반영(덜 끝났으면 기다림). 실시간은 아무것도 안 함(끝나는 대로 반영됨)
     pub fn sync_round() {
         if DET.load(std::sync::atomic::Ordering::Relaxed) && on() {
-            drain();
+            let r = ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if r > DET_LAG {
+                commit(r - DET_LAG);
+            }
         }
     }
 

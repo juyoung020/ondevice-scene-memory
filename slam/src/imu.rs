@@ -164,6 +164,13 @@ impl Ring {
         r
     }
 
+    /// 쌓인 표본을 모두 꺼냄(소비자 하나: 녹화 도구 `imu_rec`)
+    pub fn drain(&self, mut f: impl FnMut(&Sample)) {
+        let (h, a, b) = self.view(0);
+        a.iter().chain(b.iter()).for_each(&mut f);
+        self.release(h);
+    }
+
     fn release(&self, upto: u64) {
         let t = self.tail.load(Ordering::Relaxed);
         if upto > t {

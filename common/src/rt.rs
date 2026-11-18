@@ -67,15 +67,17 @@ impl Waker {
         #[cfg(not(target_os = "linux"))]
         self.hub.notify();
     }
-    /// 루프가 깬 뒤 부름: 다음 wake 가 다시 깨우게
+    /// 루프가 깬 뒤 부름: 다음 wake 가 다시 깨우게.
+    /// 차례가 중요하다: eventfd 를 먼저 비우고 그다음 표시를 내린다. 거꾸로(표시 먼저)면 그 사이에 온 wake 가 표시를 올리고 쓴 값을
+    /// 이쪽 read 가 지워, 표시는 올라가 있는데 eventfd 는 빈 채로 남아 이후 wake 가 모두 그냥 돌아간다(루프가 영영 안 깸).
+    /// 이 차례에서는 비우기와 내리기 사이에 온 wake 가 쓰지 않고 돌아가도, 루프가 이미 깨어 있어 이 뒤에 상태를 본다
     pub fn clear(&self) {
-        if self.armed.swap(false, Ordering::AcqRel) {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let mut v = 0u64;
-                sys::read(self.fd, &mut v as *mut u64 as *mut std::ffi::c_void, 8);
-            }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let mut v = 0u64;
+            sys::read(self.fd, &mut v as *mut u64 as *mut std::ffi::c_void, 8);
         }
+        self.armed.store(false, Ordering::Release);
     }
     #[cfg(target_os = "linux")]
     pub fn fd(&self) -> i32 {
@@ -366,6 +368,10 @@ impl<S: Send + 'static> LaneInner<S> {
         self.idle.1.notify_all();
     }
     fn wait_idle(&self) {
+        // 풀 일꾼이 기다리면(물체 기억 일이 점 줄을 기다릴 때) 일꾼을 붙잡지 않고 풀의 다른 일을 대신 돈다: 일꾼이 하나여도 막히지 않음
+        if rayon::current_thread_index().is_some() {
+            return wait_until(|| self.pending.load(Ordering::Acquire) == 0);
+        }
         let mut g = self.idle.0.lock().unwrap();
         while self.pending.load(Ordering::Acquire) > 0 {
             g = self.idle.1.wait(g).unwrap();

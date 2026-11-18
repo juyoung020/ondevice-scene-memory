@@ -3,8 +3,11 @@
 # 녹화 재생 → 실시간 가만히 60 초 → 열 시험 10 분 → 흔들기 60 초(사람) → 요약 → 실시간 시연(뷰어 :8091)을 띄워 둠.
 # 항목 하나가 실패해도 다음으로 넘어가고 요약에 표시한다. 사람이 할 일은 전원 켜기와 흔들기(알림이 뜨면)뿐.
 #
-#   PC 에서: ssh -t kau@192.168.219.101 'bash -lc "cd ~/ondevice-scene-memory && git fetch -q origin opt/integrate && git checkout -q opt/integrate && git reset -q --hard origin/opt/integrate && bash scripts/board_all.sh"'
+#   PC 에서: ssh -t kau@192.168.219.101 'bash -lc "cd ~/ondevice-scene-memory && git fetch -q origin opt/integrate && git show origin/opt/integrate:scripts/board_all.sh > /tmp/board_all_new.sh && bash /tmp/board_all_new.sh"'
+#            끝난 뒤 PC(WSL)에서 녹화 가져오기: bash scripts/board_fetch.sh
 #   보드에서: bash scripts/board_all.sh [브랜치=opt/integrate]
+# 안전망: 새 판을 받기 전에 지금 보드에 있는 실행 파일을 ~/ondevice-prev 로 남긴다. 새 판이 빌드에 실패하거나 실시간 가만히에서 죽거나
+#   kf/s 가 기존 기록(BASE_KFS, 기본 28)보다 10 % 넘게 낮으면 마지막 시연은 기존 판으로 띄우고 요약 첫 줄에 적는다.
 #
 # 환경 변수(기본값)
 #   OUT=~/board_all/<시각>   결과 폴더(요약 summary.md, 단계별 로그 · TSV)
@@ -12,6 +15,8 @@
 #   SHAKE_WAIT=60            흔들기 알림 뒤 기다리는 최대 초(엔터를 누르면 바로 시작)
 #   EMBED_JOBS="3 4 6 8"     사진 벡터 함께 올리기 수 후보
 #   RUNS="~/imucal/run_173135 ~/imucal/run_174258"   녹화 재생(각 폴더에 imu0.csv)
+#   REC=~/board_rec          이번에 남기는 녹화(가만히 · 흔들기, 컬러 + 깊이 + IMU): 다음부터 보드 없이 PC 에서 재생
+#   BASE_KFS=28              기존 판의 실시간 kf/s 기록(안전망 기준)
 #   TUM=~/om/data/tum/rgbd_dataset_freiburg1_desk     사진 벡터 · 물체 병합 재생용 녹화
 #   VIEW=1                   실시간 단계에 화면 뷰어(Chromium 키오스크)도 띄움(보드 화면이 있을 때)
 #   DEMO=1                   끝에 실시간 시연을 띄워 둠
@@ -45,9 +50,19 @@ step() {
   else echo -e "$name\tFAIL($?)\t$((SECONDS - c0)) s" >> "$R"; log "    FAIL"; fi
 }
 BIN=$REPO/target/release/ondevice
+REC=${REC:-$HOME/board_rec}; BASE_KFS=${BASE_KFS:-28}
+STAMP=$(date +%m%d_%H%M)
+
+# 0. 안전망: 지금 잘 돌던 실행 파일을 남김(같은 커밋을 다시 돌리는 것이면 그대로 둠)
+PREV=$HOME/ondevice-prev
+if [ -x "$BIN" ]; then
+  git -C "$REPO" fetch -q origin "$BRANCH" 2>/dev/null
+  old=$(git -C "$REPO" rev-parse HEAD 2>/dev/null); new=$(git -C "$REPO" rev-parse "origin/$BRANCH" 2>/dev/null)
+  if [ "$old" != "$new" ] || [ ! -x "$PREV" ]; then cp -p "$BIN" "$PREV" && echo "$old" > "$PREV.commit" && log "기존 판 보존: $PREV ($(echo "$old" | cut -c1-7))"; fi
+fi
 
 # 1. 동기화 · 빌드(scripts/board_build.sh: 가져오기 → 브랜치 맞춤 → NPU dxrt 빌드)
-build() { bash "$REPO/scripts/board_build.sh" "$BRANCH" "$REPO"; }
+build() { bash "$REPO/scripts/board_build.sh" "$BRANCH" "$REPO" && (cd "$REPO" && cargo build --release -p rsdriver --bin rsd_rec); }
 step "동기화 · 빌드($BRANCH)" build
 cd "$REPO" || exit 1
 git rev-parse --short HEAD > "$OUT/commit.txt" 2>/dev/null
@@ -158,21 +173,56 @@ live() {
 step "실시간 가만히 ${STILL_S} 초" live still "$STILL_S"
 # 8. 열 시험: 실시간 전체 부하(뷰어 포함) 10 분 연속
 step "열 시험 ${THERMAL_S} 초" live thermal "$THERMAL_S"
-# 9. 흔들기: 사람이 필요 — 화면 · 파일 · 터미널로 알리고 기다렸다가 시작
+# 녹화 하나: <이름> <초> — 컬러 · 깊이(rsd_rec)와 IMU(imu_rec)를 함께 $REC/<시각>_<이름> 에(imu0.csv 포함, ondevice slam --rsdrec … --imu-csv … 로 재생)
+record() {
+  local name=$1 secs=$2 d=$REC/${STAMP}_$1
+  mkdir -p "$REC"; rm -rf "$d"
+  [ -e /dev/i2c-1 ] && "$REPO/target/release/imu_rec" /dev/i2c-1 "$d.imu0.csv" $((secs + 4)) & local ip=$!
+  "$REPO/target/release/rsd_rec" "$d" $((secs * 30)); local rc=$?
+  wait $ip 2>/dev/null; [ -f "$d.imu0.csv" ] && mv "$d.imu0.csv" "$d/imu0.csv"
+  du -sh "$d" 2>/dev/null
+  return $rc
+}
+# 녹화를 찍은 속도 그대로 한 프로그램(위치 + 물체 기억)으로 재생: <이름> <녹화 폴더>
+replay_full() {
+  local name=$1 run=$2 d=$OUT/$1; mkdir -p "$d"
+  local imu; imu=$([ -f "$run/imu0.csv" ] && echo "--imu-csv $run/imu0.csv")
+  "$BIN" --slam "--rsdrec $run $imu --rate 1 --config docs/rtabmap_pi.ini --stats $d/stats.csv" --every 1 --live 1 --seg "$SEG" --embed "$EMB" --vocab vocab/indoor.voc       --max-depth 3.5 --out "$d/mem" --rt auto --serve "8091 --bind 0.0.0.0" --serve-exit > "$d/log.txt" 2> "$d/err.txt"; local rc=$?
+  grep '^{"by_name"' "$d/log.txt" | tail -1 > "$d/summary.json"
+  "$REPO/target/release/slam_eval" --stats "$d/stats.csv" --tag "$name" > "$d/eval.json" 2>/dev/null
+  return $rc
+}
+# 8b. 가만히 녹화(사람 필요 없음)
+[ "$STILL_S" -gt 0 ] && step "녹화: 가만히 ${STILL_S} 초" record still "$STILL_S"
+# 9. 흔들기: 사람이 필요 — 화면 · 파일 · 터미널로 알리고 기다렸다가 녹화를 시작, 그 녹화를 찍은 속도로 재생해 잰다(같은 녹화를 PC 에서 다시 쓸 수 있음)
 shake() {
   local msg="지금 장비를 손으로 빠르게 흔들어 주세요(${SHAKE_S} 초). 준비되면 엔터(또는 ${SHAKE_WAIT} 초 뒤 자동 시작)"
   echo "$msg" > "$HOME/board_all_SHAKE_NOW.txt"
   wall "$msg" 2>/dev/null || true
   [ -n "${DISPLAY:-}" ] && command -v zenity > /dev/null && (zenity --info --text "$msg" --timeout "$SHAKE_WAIT" > /dev/null 2>&1 &)
-  printf '\n\n=====================================================\n %s\n=====================================================\n' "$msg" > /dev/tty 2>/dev/null || echo "$msg"
+  printf '
+
+=====================================================
+ %s
+=====================================================
+' "$msg" > /dev/tty 2>/dev/null || echo "$msg"
   read -r -t "$SHAKE_WAIT" < /dev/tty 2>/dev/null || sleep "$SHAKE_WAIT"
   echo "흔들기 시작" > "$HOME/board_all_SHAKE_NOW.txt"
-  live shake "$SHAKE_S"
-  local rc=$?
+  record shake "$SHAKE_S"; local rc=$?
+  echo "흔들기 끝 — 고맙습니다" > /dev/tty 2>/dev/null
   rm -f "$HOME/board_all_SHAKE_NOW.txt"
-  return $rc
+  [ $rc = 0 ] && replay_full shake "$REC/${STAMP}_shake"
 }
-[ "$SHAKE_S" -gt 0 ] && step "흔들기 ${SHAKE_S} 초(사람)" shake
+[ "$SHAKE_S" -gt 0 ] && step "흔들기 ${SHAKE_S} 초(사람): 녹화 → 재생" shake
+
+# 9b. 안전망 판정: 빌드 실패 · 실시간 가만히에서 죽음 · kf/s 가 기존 기록보다 10 % 넘게 낮음 → 시연은 기존 판으로
+NEW_KFS=$(awk -F'	' 'NR>1 && $1 > 10 {s+=$11; n++} END{if(n) printf "%.1f", s/n; else print 0}' "$OUT/still/samples.tsv" 2>/dev/null); NEW_KFS=${NEW_KFS:-0}
+FALLBACK=""
+grep -q "^동기화 · 빌드.*FAIL" "$R" && FALLBACK="빌드 실패"
+[ -z "$FALLBACK" ] && [ "$STILL_S" -gt 0 ] && grep -q "^실시간 가만히.*FAIL" "$R" && FALLBACK="실시간 가만히에서 죽음"
+[ -z "$FALLBACK" ] && [ "$STILL_S" -gt 0 ] && awk "BEGIN{exit !($NEW_KFS < 0.9 * $BASE_KFS)}" && FALLBACK="kf/s $NEW_KFS < 기존 $BASE_KFS 의 90 %"
+DEMO_BIN=$BIN
+if [ -n "$FALLBACK" ] && [ -x "$PREV" ]; then DEMO_BIN=$PREV; log "안전망: $FALLBACK → 시연은 기존 판($PREV)"; fi
 
 # 10. 요약
 {
@@ -182,6 +232,7 @@ shake() {
   peak=$(cat "$OUT"/*/samples.tsv 2>/dev/null | awk -F'\t' 'NR>1 && $2+0 > m {m=$2+0} END{print m+0}')
   echo "# 보드 통합 측정 $(date '+%Y-%m-%d %H:%M') ($(cat "$OUT/commit.txt" 2>/dev/null))"
   echo
+  [ -n "$FALLBACK" ] && { echo "**안전망 발동: $FALLBACK — 시연은 기존 판($(cut -c1-7 "$PREV.commit" 2>/dev/null))으로 띄움. 새 판 실시간 kf/s $NEW_KFS(기존 $BASE_KFS)**"; echo; }
   echo "**스로틀: $([ -z "$thr" ] && echo '한 번도 안 걸림' || echo "걸림($thr)") · 비상 열 보호: ${hits} 번 · 최고 CPU ${peak} °C**"
   echo
   echo "## 단계"
@@ -205,12 +256,15 @@ shake() {
     echo '```'
   done
   echo "열 시험 시간별 표(그래프용): $OUT/thermal/samples.tsv"
+  echo
+  echo "## 남긴 녹화(PC 로 가져오기: PC 에서 bash scripts/board_fetch.sh)"
+  echo '```'; du -sh $RUNS "$REC"/${STAMP}_* 2>/dev/null; echo '```'
 } > "$OUT/summary.md"
 cat "$OUT/summary.md"
 
 # 11. 실시간 시연을 띄워 둠(뷰어 http://<보드>:8091, 보드 화면에도)
 if [ "$DEMO" = 1 ]; then
-  nohup bash scripts/board_run.sh > "$OUT/demo.log" 2>&1 &
+  BIN=$DEMO_BIN nohup bash scripts/board_run.sh > "$OUT/demo.log" 2>&1 &
   [ "$VIEW" = 1 ] && (DISPLAY=${DISPLAY:-:0} nohup bash scripts/board_view.sh 8091 > "$OUT/demo_view.log" 2>&1 &)
   log "실시간 시연을 띄워 둠: http://$(hostname -I | cut -d' ' -f1):8091 (끄기: pkill -x ondevice)"
 fi

@@ -281,7 +281,7 @@ impl KfStore {
             return;
         }
         self.bytes = self.kfs.iter().map(|k| {
-            k.z.wait();
+            k.wait_ready();
             k.bytes().unwrap()
         }).sum(); // 점 격자는 점 작업 스레드가 나중에 채우니 매번 다시 셈
         while self.bytes > self.budget && self.kfs.len() > 2 {

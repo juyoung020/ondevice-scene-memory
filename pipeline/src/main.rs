@@ -11,6 +11,7 @@ mod depth;
 mod embed;
 mod geom;
 mod graph;
+mod chunks;
 mod kfstore;
 mod maps;
 #[cfg(feature = "dxrt")]
@@ -27,7 +28,7 @@ use depth::Depth;
 use geom::*;
 use maps::*;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -60,6 +61,8 @@ struct Args {
     scene_step: usize, // 3D 지도에 쓸 화소 간격
     pts_depth: f64,    // --pts-depth M: 점 지도에 넣을 최대 깊이(멀수록 깊이 잡음이 커 표면이 두꺼워짐)
     pts_obs: u8,       // --pts-obs N: 고운 칸이 점이 되려면 키프레임 N 장 이상에서 보여야(한두 번 맞은 잡음 점을 거름)
+    chunk_map: bool,   // --pts-map chunk|octree: 점 지도를 청크(기준 자세 + i16 점, 루프 클로저는 자세만 고침)로, 또는 옛 옥트리(다시 쌓기)로
+    chunk_keep: usize, // --chunk-keep N: 청크 점 지도에 남길 키프레임 수(0 = 모두)
     stream: Option<String>, // --stream <파일|->: 녹화·파이프로 받는 장면 스트림(위치·컬러·깊이). --slam 이면 "--slam"
     slam: Option<slam::app::Args>, // --slam "<위치 인자>": 같은 프로세스에서 위치 프로그램을 돌림(장면은 메모리 큐로)
     no_level: bool,         // --no-level: 스트림 위치의 z 를 그대로 위로(바닥 합의로 수평을 다시 맞추지 않음)
@@ -113,6 +116,8 @@ fn args(v: &common::cli::Argv) -> Args {
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
         pts_depth: get("--pts-depth").map_or(3.0, |s| s.parse().unwrap()),
         pts_obs: get("--pts-obs").map_or(3, |s| s.parse().unwrap()),
+        chunk_map: get("--pts-map").is_some_and(|s| s == "chunk"),
+        chunk_keep: get("--chunk-keep").map_or(0, |s| s.parse().unwrap()),
         // --slam "<slam_bridge 인자>": 위치 프로그램을 이 프로세스 안에서 돌려 장면을 메모리로 받음(스트림 입력과 같은 경로, 이름만 "--slam")
         stream: get("--stream").or_else(|| get("--slam").map(|_| "--slam".into())),
         slam: v.group("--slam").map(|g| {
@@ -1281,6 +1286,10 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
                 force_rb = false;
                 UPS.lock().unwrap().retain(|s, _| kfs.kfs().iter().any(|k| k.seq == *s));
                 let snap = snapshot(&kfs, &stream_fix, z0.unwrap_or(0.0));
+                // 청크 점 지도는 다시 쌓기를 기다리지 않고 지금 바로 자세만 고침(점유 격자 · 물체만 작업 스레드가 다시 쌓음)
+                if let Some(p) = pw.as_mut().filter(|p| p.chunk) {
+                    p.repose(&snap);
+                }
                 let (ar, k, next, moved) = (a_rb.clone(), seq.k, mem.next + 100_000, kfs.moved); // 물체 id: 쌓는 동안 실시간에서 생긴 id 와 겹치지 않게
                 kfs.clear_dirty();
                 let cache = rb_cache.clone();
@@ -1507,7 +1516,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
                     scene_json = json!({"run": run_id, "voxel": a.scene_vox});
                     if let Some(p) = pw.as_mut() {
                         p.write(PTS_BUDGET);
-                        scene_json["octree"] = p.json();
+                        scene_json[p.key()] = p.json();
                     }
                 }
                 }
@@ -1621,9 +1630,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
     // 점 지도: 남은 노드를 모두 쓰고 점 작업 스레드를 끝냄
     let (n_pts, scene_mb, pts_dropped) = match pw.as_mut() {
         Some(p) => {
-            let (s, j) = p.finish();
-            scene_json["octree"] = j;
-            (s.n_points(), s.bytes() as f64 / 1048576.0, (p.dropped, p.skipped))
+            let (n, mb, j) = p.finish();
+            scene_json[p.key()] = j;
+            (n, mb, (p.dropped, p.skipped))
         }
         None => (0, 0.0, (0, 0)),
     };
@@ -1887,12 +1896,16 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
     rayon::in_place_scope(|sc| {
         let mut scene = scene;
         let pts_slot = &mut pts_out;
+        let chunk = a.chunk_map;
         sc.spawn(move |_| {
             let mut cks: Vec<(usize, SceneMap)> = vec![];
             let mut t = 0.0f64;
             for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
                 if i > start && i % ck_every == 0 {
                     cks.push((i, scene.clone()));
+                }
+                if chunk {
+                    continue; // 청크 점 지도: 점은 다시 쌓지 않고 청크 자세만 고침(PtsWorker::repose)
                 }
                 let cp = Instant::now();
                 // 점 작업 스레드가 보관해 둔 점 격자(온 장면을 풀지 않음)
@@ -1902,7 +1915,7 @@ fn rebuild_maps(a: &Args, k: [f64; 4], snap: &Snap, next_id: u32, moved: (f64, f
                 t += cp.elapsed().as_secs_f64();
             }
             let ce = Instant::now();
-            let pts = Some(export_points(&mut scene)); // 점 지도 옥트리 노드 파일도 작업 스레드에서
+            let pts = (!chunk).then(|| export_points(&mut scene)); // 점 지도 옥트리 노드 파일도 작업 스레드에서
             *pts_slot = Some((scene, cks, t, pts, ce.elapsed().as_secs_f64()));
         });
         for (i, (kf, r, pwc)) in snap.iter().enumerate().skip(start) {
@@ -1958,9 +1971,13 @@ fn install(a: &Args, k: [f64; 4], rb: Rebuilt, kfs: &kfstore::KfStore, fix: &M3,
     let newer = newer_than(kfs, fix, z0, rb.last_seq);
     let n_extra = rb.extra.len();
     if let Some(pw) = pw {
+        if pw.chunk {
+            pw.repose(&snapshot(kfs, fix, z0)); // 청크: 지금 보관 장면 위치로 자세만(다시 쌓기 시작 때 한 번 고쳤고 그 뒤 움직임까지)
+        } else {
         pw.replace(rb.scene, rb.pts.unwrap_or_default());
         for (i, (kf, r, pwc)) in rb.extra.iter().chain(newer.iter()).enumerate() {
             pw.stored((rb.n + i) as u32, *r, *pwc, kf.clone());
+        }
         }
     }
     for ((kf, r, pwc), (d, rgb, dets)) in newer.iter().zip(unpack_all(&newer)) {
@@ -2107,6 +2124,22 @@ fn grid_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, scene: &mut SceneMap,
     }
 }
 
+/// 점 격자 → 청크 점 지도(카메라 좌표 그대로 넘기면 청크가 자기 기준 자세 좌표로 바꿔 담음)
+fn chunk_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, cm: &mut chunks::ChunkMap, kf: u32, seq: Option<u64>) {
+    let [fx, fy, cx, cy] = k;
+    let ax: Vec<f64> = (0..g.gw).map(|gx| ((g.off[0] + gx * g.step) as f64 - cx) / fx).collect();
+    let it = (0..g.gh).flat_map(|gy| {
+        let ay = ((g.off[1] + gy * g.step) as f64 - cy) / fy;
+        let ax = &ax;
+        (0..g.gw).filter_map(move |gx| {
+            let i = gy * g.gw + gx;
+            let z = g.d[i] as f64;
+            (z > 0.0).then(|| ([ax[gx] * z, ay * z, z], [g.rgb[i * 3], g.rgb[i * 3 + 1], g.rgb[i * 3 + 2]], z as f32))
+        })
+    });
+    cm.add(kf, seq, r, pwc, it);
+}
+
 /// 장면 버퍼를 쥔 채 쓰다가 버려질 때 카메라 입력에 돌려줌(Deref 로 안의 값을 그대로 씀)
 struct Recycle<T: Give + Default>(T);
 trait Give {
@@ -2160,6 +2193,7 @@ struct PtsSt {
     a: std::sync::Arc<Args>,
     k: [f64; 4],
     scene: SceneMap,
+    chunks: Option<chunks::ChunkMap>, // --pts-map chunk: 옥트리 대신 이것에 쌓음
     published: std::sync::Arc<std::sync::atomic::AtomicU64>, // view.json 에 실은 판(이 판 폴더는 지우지 않음)
     json_tx: std::sync::mpsc::Sender<serde_json::Value>,
     t_grid: f64,
@@ -2182,6 +2216,7 @@ struct PtsWorker {
     last: Option<(M3, V3)>, // 마지막으로 다 넣은 장면 위치
     skipped: u32, // 점 격자 일부만 넣은 가까운 자리 장면 수
     dropped: u32,
+    chunk: bool, // --pts-map chunk
 }
 
 impl PtsWorker {
@@ -2189,9 +2224,11 @@ impl PtsWorker {
         let published = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(scene.run));
         let (json_tx, json_rx) = std::sync::mpsc::channel();
         let (out, vox) = (a.out.clone(), scene.vox);
-        let st = PtsSt { a, k, scene, published: published.clone(), json_tx, t_grid: 0.0, t_add: 0.0, t_write: 0.0, nf: 0 };
+        let chunk = a.chunk_map;
+        let chunks = chunk.then(|| chunks::ChunkMap::new(a.scene_vox, a.pts_obs, a.chunk_keep));
+        let st = PtsSt { a, k, scene, chunks, published: published.clone(), json_tx, t_grid: 0.0, t_add: 0.0, t_write: 0.0, nf: 0 };
         PtsWorker { lane: common::rt::Lane::new("pts", st, 0), json_rx, json: std::cell::RefCell::new(serde_json::Value::Null), published, wait, out, vox,
-                    dropped: 0, gap: (PTS_GAP_M, PTS_GAP_DEG.to_radians()), last: None, skipped: 0 }
+                    dropped: 0, gap: (PTS_GAP_M, PTS_GAP_DEG.to_radians()), last: None, skipped: 0, chunk }
     }
     /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게.
     /// 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면은 점 격자 일부만(어긋남을 돌려 가며) 넣음: 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
@@ -2223,11 +2260,15 @@ impl PtsWorker {
             }
             let g = pts_grid(&s.a, s.k, &depth, &rgb, w, h, part);
             give_back(rgb, depth);
+            let seq = keep.as_ref().map(|z| z.seq);
             if let Some(z) = keep {
                 let _ = z.pts.set(Some(g.pack()));
             }
             let c1 = Instant::now();
-            grid_points(s.k, &g, &r, &pwc, &mut s.scene, kf);
+            match &mut s.chunks {
+                Some(cm) => chunk_points(s.k, &g, &r, &pwc, cm, kf, seq),
+                None => grid_points(s.k, &g, &r, &pwc, &mut s.scene, kf),
+            }
             (s.t_grid, s.t_add, s.nf) = (s.t_grid + (c1 - c0).as_secs_f64(), s.t_add + c1.elapsed().as_secs_f64(), s.nf + 1);
             out::slow(c0);
         });
@@ -2252,10 +2293,40 @@ impl PtsWorker {
     /// 보관 장면(다시 쌓은 뒤 이어 넣기): 붙여 둔 점 격자로
     fn stored(&mut self, kf: u32, r: M3, pwc: V3, store: std::sync::Arc<kfstore::Kf>) {
         self.lane.push(move |s: &mut PtsSt| {
+            if s.chunks.as_ref().is_some_and(|cm| cm.has(store.seq)) {
+                return;
+            }
             if let Some(g) = store.pts_wait().as_ref().map(PtsGrid::from_z) {
-                grid_points(s.k, &g, &r, &pwc, &mut s.scene, kf);
+                match &mut s.chunks {
+                    Some(cm) => chunk_points(s.k, &g, &r, &pwc, cm, kf, Some(store.seq)),
+                    None => grid_points(s.k, &g, &r, &pwc, &mut s.scene, kf),
+                }
             }
         });
+    }
+    /// 청크 점 지도: 고친 보관 장면 위치로 청크 기준 자세만 고치고, 이제 지도에 들어갈 보관 장면(맡아 둔 것이 이어짐)을 넣는다
+    fn repose(&mut self, snap: &Snap) {
+        let poses: HashMap<u64, (M3, V3)> = snap.iter().map(|(kf, r, p)| (kf.seq, (*r, *p))).collect();
+        let snap: Vec<_> = snap.iter().map(|(kf, r, p)| (kf.clone(), *r, *p)).collect();
+        self.lane.push(move |s: &mut PtsSt| {
+            let Some(cm) = &mut s.chunks else { return };
+            let n = cm.repose(&poses);
+            if std::env::var("MEMMAP_PTS_LOG").is_ok() {
+                common::info!("청크 자세 고침: {n} 개 / 지금까지 {} 개 {:.1} ms", cm.n_repose, cm.t_repose * 1e3);
+            }
+            for (kf, r, p) in &snap {
+                if cm.has(kf.seq) {
+                    continue;
+                }
+                if let Some(g) = kf.pts_wait().as_ref().map(PtsGrid::from_z) {
+                    chunk_points(s.k, &g, r, p, cm, 0x8000_0000 | kf.seq as u32, Some(kf.seq));
+                }
+            }
+        });
+    }
+    /// view.json scene_points 에 실을 이름: 옥트리 "octree", 청크 "submap"
+    fn key(&self) -> &'static str {
+        if self.chunk { "submap" } else { "octree" }
     }
     /// 밀린 장면 없음(실시간 점 노드 쓰기를 장면마다 해도 줄이 늘지 않을 때)
     fn idle(&self) -> bool {
@@ -2265,7 +2336,10 @@ impl PtsWorker {
     fn write(&mut self, budget: usize) {
         self.lane.push(move |s: &mut PtsSt| {
             let c0 = Instant::now();
-            let j = write_points(&s.a.out, &mut s.scene, budget, None, s.published.load(std::sync::atomic::Ordering::Relaxed));
+            let j = match &mut s.chunks {
+                Some(cm) => cm.write(&s.a.out),
+                None => write_points(&s.a.out, &mut s.scene, budget, None, s.published.load(std::sync::atomic::Ordering::Relaxed)),
+            };
             out::slow(c0);
             s.t_write += c0.elapsed().as_secs_f64();
             let _ = s.json_tx.send(j);
@@ -2293,16 +2367,20 @@ impl PtsWorker {
         }
         cur.clone()
     }
-    /// 남은 노드를 모두 쓰고 끝냄: (지도, 노드 목록)
-    fn finish(&mut self) -> (SceneMap, serde_json::Value) {
+    /// 남은 노드를 모두 쓰고 끝냄: (점 수, 지도 MB, 노드 목록)
+    fn finish(&mut self) -> (usize, f64, serde_json::Value) {
         self.write(0);
         let vox = self.vox;
-        let scene = self.lane.with(|s| {
+        let (scene, chunked) = self.lane.with(|s| {
             if std::env::var("MEMMAP_PTS_LOG").is_ok() {
                 let n = s.nf.max(1) as f64;
                 common::info!("점 줄: 장면 {} 개, 점 고르기 {:.1} ms/장 + 지도 넣기 {:.1} ms/장, 노드 쓰기 합 {:.2} 초", s.nf, s.t_grid / n * 1e3, s.t_add / n * 1e3, s.t_write);
             }
-            std::mem::replace(&mut s.scene, SceneMap::new(vox, 0.04))
+            let chunked = s.chunks.as_ref().map(|cm| {
+                common::info!("청크 점 지도: 청크 {} 개 · 점 {} · {:.1} MB, 자세 고침 {} 번 합 {:.1} ms", cm.write_count(), cm.n_points(), cm.bytes() as f64 / 1048576.0, cm.n_repose, cm.t_repose * 1e3);
+                (cm.n_points(), cm.bytes() as f64 / 1048576.0)
+            });
+            (std::mem::replace(&mut s.scene, SceneMap::new(vox, 0.04)), chunked)
         });
         // 지금 판이 아닌 판 폴더(갈아 끼우기 전 판)를 지움
         let a_out = self.out.clone();
@@ -2311,7 +2389,8 @@ impl PtsWorker {
                 out::remove_dir_all(&a_out.join("scene").join(name));
             }
         }
-        (scene, self.json())
+        let (n, mb) = chunked.unwrap_or((scene.n_points(), scene.bytes() as f64 / 1048576.0));
+        (n, mb, self.json())
     }
 }
 
@@ -2359,7 +2438,7 @@ fn fresh_outputs(run_id: &mut u64, vox: f64, pw: Option<&PtsWorker>) -> serde_js
     *run_id += 1;
     let mut sj = json!({"run": *run_id, "voxel": vox});
     if let Some(pw) = pw {
-        sj["octree"] = pw.json();
+        sj[pw.key()] = pw.json();
     }
     sj
 }

@@ -623,6 +623,65 @@ async function loadSceneChunks(sp) {
   sceneChunks.busy = false; pendingLoads--; loadDone();
 }
 
+// ---------------- 3D map point chunks (memmap --pts-map chunk) ----------------
+// Each chunk holds a few nearby keyframes' points in its own reference pose: int16 xyz in mm, RGB (chunks/<run>/c<id>.bin = u32 n, n × 3
+// int16, n × 3 uint8). A loop closure or leveling moves only the chunk poses: the binary stream sends the chunks whose pose or point
+// version changed (section 8) and the page sets that chunk's matrix; the point file is fetched again only when its version grew.
+const gSub = new THREE.Group(); scene.add(gSub);
+const sub = { run:null, map:new Map(), mat:null, dir:null };
+function subMat() {
+  const sp = view && view.scene_points, size = ((sp && sp.voxel) || 0.01) * opt("n_ssize");
+  if (!sub.mat) sub.mat = pointMat({ size, vertexColors:true, square:true, opacity:opt("n_sop") });
+  sub.mat.uniforms.uSize.value = size; sub.mat.uniforms.uOpacity.value = opt("n_sop");
+  return sub.mat;
+}
+function subPose(c, p, o) {   // p: r (row order) then translation; points are mm → scale 0.001
+  const s = 0.001, m = c.mesh.matrix;
+  m.set(p[o] * s, p[o + 1] * s, p[o + 2] * s, p[o + 9], p[o + 3] * s, p[o + 4] * s, p[o + 5] * s, p[o + 10], p[o + 6] * s, p[o + 7] * s, p[o + 8] * s, p[o + 11], 0, 0, 0, 1);
+  c.mesh.matrixWorldNeedsUpdate = true;
+}
+async function subFetch(id, c) {
+  if (c.busy) return;
+  c.busy = true;
+  try {
+    while (c.have !== c.ver) {
+      const want = c.ver, r = await fetch("/file/" + sub.dir + "/c" + id + ".bin?v=" + want, { cache:"no-store" });
+      if (!r.ok) break;
+      const b = await r.arrayBuffer(), n = new DataView(b).getUint32(0, true);
+      if (sub.map.get(id) !== c) return;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(new Int16Array(b, 4, 3 * n), 3));
+      g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(b, 4 + 6 * n, 3 * n), 3, true));
+      g.computeBoundingSphere();
+      const old = c.mesh.geometry; c.mesh.geometry = g; old.dispose();
+      c.have = want; invalidate();
+    }
+  } catch (e) {}
+  c.busy = false;
+}
+// one batch of chunk changes: ids / vers / ns (arrays), poses (12 per chunk), gone ids
+function subApply(run, reset, ids, vers, ns, poses, gone, dir) {
+  if (reset || sub.run !== run) { for (const c of sub.map.values()) { gSub.remove(c.mesh); c.mesh.geometry.dispose(); } sub.map.clear(); sub.run = run; }
+  sub.dir = dir;
+  for (const id of gone || []) { const c = sub.map.get(id); if (c) { gSub.remove(c.mesh); c.mesh.geometry.dispose(); sub.map.delete(id); } }
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    let c = sub.map.get(id);
+    if (!c) { const mesh = new THREE.Points(new THREE.BufferGeometry(), subMat()); mesh.matrixAutoUpdate = false; gSub.add(mesh); c = { mesh, ver:-1, have:-1, busy:false }; sub.map.set(id, c); }
+    subPose(c, poses, 12 * i);
+    c.ver = vers[i];
+    if (c.have !== c.ver && ns[i] > 0) subFetch(id, c);
+  }
+  gSub.visible = opt("c_scene"); invalidate();
+}
+// file mode (no binary stream): the whole list from view.json
+function subFromList(sm) {
+  const L = sm.list || [], ids = [], vers = [], ns = [], poses = new Float32Array(12 * L.length);
+  L.forEach((e, i) => { ids.push(e[0]); vers.push(e[1]); ns.push(e[2]); for (let k = 0; k < 12; k++) poses[12 * i + k] = e[3 + k]; });
+  const keep = new Set(ids), gone = [...sub.map.keys()].filter(id => !keep.has(id));
+  subApply(sm.run, false, ids, vers, ns, poses, gone, sm.dir);
+}
+
 // ---------------- 3D map point octree (Potree-style level of detail) ----------------
 // memmap writes the point map as an octree (scene/<run>/octree.json + one n<L>_<x>_<y>_<z>.bin per node). Level L keeps one point per
 // cell of spacing voxel·2^(depth−L); a node is G such cells wide and its eight children (level L+1) halve both. Each point lives in
@@ -999,10 +1058,14 @@ function octUpdate() {
 function drawObjects() {  invalidate();
   disposeGroup(gObjs);
   gObjs.visible = true;
+  gSub.visible = !!(view && view.scene_points && view.scene_points.submap && opt("c_scene"));
   if (view && view.scene_points && opt("c_scene")) {   // whole-scene 3D map points (walls, desks, floor)
     const sp = view.scene_points, mat = () => pointMat({ size:(sp.voxel || 0.02) * opt("n_ssize"), vertexColors:true, square:true, opacity:opt("n_sop") });
     if (sp.octree) {   // octree map: the level-of-detail pass (octUpdate) picks and fetches nodes every frame (node list: binary stream, else octree.json)
       if (!DELTA) loadOctree(sp.octree);
+    } else if (sp.submap) {   // pose chunks: the list comes in the binary stream (section 8), else whole from view.json
+      if (!DELTA && sp.submap.list) subFromList(sp.submap);
+      subMat(); gSub.visible = true;
     } else if (sp.chunks != null) {   // chunked map: only chunks not yet fetched are downloaded and appended to gScene (not rebuilt here)
       loadSceneChunks(sp);
     } else {
@@ -1596,7 +1659,7 @@ function applyView(v) {
   view = v;
   // with a point map the objects are already in it (shape and colour): their own point clouds only speckle it, so start them off.
   // Clicking an object still highlights its points.
-  if (pointsAuto && view.scene_points && view.scene_points.octree && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
+  if (pointsAuto && view.scene_points && (view.scene_points.octree || view.scene_points.submap) && $("c_points").checked) { pointsAuto = false; $("c_points").checked = false; }
   objs.clear(); for (const o of view.objects) objs.set(o.id, o);
   if (selected != null && !objs.has(selected)) selected = null;
   // geometry-relevant signature only: n_obs / last_seen / score change every keyframe and must not rebuild anything
@@ -1767,6 +1830,14 @@ function frame(u8) {
       for (let i = 0; i < k; i++, p += 21) { list[6 * i] = u8[p]; list[6 * i + 1] = dv.getInt32(p + 1, true); list[6 * i + 2] = dv.getInt32(p + 5, true); list[6 * i + 3] = dv.getInt32(p + 9, true); list[6 * i + 4] = dv.getUint32(p + 13, true); list[6 * i + 5] = dv.getUint32(p + 17, true); }
       out.oct = { run, reset, list, n:k }; tr.push(list.buffer);
     } else if (tag === 7) out.pose = JSON.parse(dec.decode(u8.subarray(a, e)));
+    else if (tag === 8) {
+      const run = dv.getFloat64(a, true), reset = u8[a + 8] === 1, k = dv.getUint32(a + 9, true);
+      const ids = new Uint32Array(k), vers = new Uint32Array(k), ns = new Uint32Array(k), poses = new Float32Array(12 * k); let p = a + 13;
+      for (let i = 0; i < k; i++) { ids[i] = dv.getUint32(p, true); vers[i] = dv.getUint32(p + 4, true); ns[i] = dv.getUint32(p + 8, true); p += 12; for (let j = 0; j < 12; j++, p += 4) poses[12 * i + j] = dv.getFloat32(p, true); }
+      const m = dv.getUint32(p, true), gone = new Uint32Array(m); p += 4;
+      for (let i = 0; i < m; i++, p += 4) gone[i] = dv.getUint32(p, true);
+      out.sub = { run, reset, ids, vers, ns, poses, gone }; tr.push(ids.buffer, vers.buffer, ns.buffer, poses.buffer, gone.buffer);
+    }
   }
   postMessage(out, tr);
 }`;
@@ -1810,7 +1881,7 @@ function applyMapDelta(d) {
 }
 function applyDelta(m) {
   if (m.pose) onFilePose(m.pose);   // the camera first: it does not wait for the view / map work below
-  if (!m.ver && !m.head && !m.objs && !m.traj && !m.map && !m.oct) { invalidate(); return; }
+  if (!m.ver && !m.head && !m.objs && !m.traj && !m.map && !m.oct && !m.sub) { invalidate(); return; }
   const t0 = performance.now();
   met.kb += m.bytes / 1024; met.lastChange = t0;
   if (m.head) { const h = Object.assign({}, dlt.head || {}, m.head); for (const k of m.head.__del || []) delete h[k]; delete h.__del; dlt.head = h; }
@@ -1845,6 +1916,7 @@ function applyDelta(m) {
     updateWalls();
     bootDone("first");
   }
+  if (m.sub) { const sm = view && view.scene_points && view.scene_points.submap, s = m.sub; subApply(s.run, s.reset, s.ids, s.vers, s.ns, s.poses, s.gone, sm ? sm.dir : "chunks/" + s.run); }
   if (m.oct) dlt.octWait.push(m.oct);
   if (dlt.octWait.length) {
     const o = view && view.scene_points && view.scene_points.octree;

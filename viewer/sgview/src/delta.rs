@@ -9,6 +9,8 @@
 //!   5 MAP   u16 n + 판 글자, u32 w, h, u8 full, u32 k + k × (u32 x0, y0, tw, th + tw·th 바이트)(PGM 줄 차례, 바뀐 32 칸 조각만)
 //!   6 OCT   f64 run, u8 reset, u32 n + n × (u8 l, i32 x, y, z, u32 점 수, u32 판)(점이 늘어난 노드만; reset 이면 전부)
 //!   7 POSE  pose.json 바이트
+//!   8 SUB   f64 run, u8 reset, u32 n × (u32 id, u32 점 판, u32 점 수, f32 × 12 자세(r 행 차례 + p)), u32 m × u32 없어진 id
+//!           (청크 점 지도 `--pts-map chunk`: 자세가 바뀌었거나 점이 는 청크만 — 루프 클로저는 자세만 오고 점 파일은 그대로)
 //! 빈 덩어리(길이 0)는 살아 있음 알림.
 use crate::live::View;
 use serde_json::Value;
@@ -25,6 +27,16 @@ pub struct Parts {
     objs: Vec<(u32, u64, Vec<u8>)>,
     wall: f64,
     oct: Option<(u64, String, i64)>, // (run, octree.json 경로, 판)
+    sub: Option<(u64, Vec<SubChunk>)>, // 청크 점 지도(판, 청크 목록): 머리에서는 뺀다
+}
+
+/// 청크 하나: id, 점 판, 점 수, 자세(r 행 차례 9 + p 3)
+#[derive(Clone, PartialEq)]
+pub struct SubChunk {
+    id: u32,
+    ver: u32,
+    n: u32,
+    pose: [f32; 12],
 }
 
 /// 옥트리 노드 목록(octree.json 판마다 한 번 읽음)
@@ -44,6 +56,8 @@ pub struct Client {
     map_v: String,
     oct_run: Option<u64>,
     oct: HashMap<(i64, i64, i64, i64), i64>,
+    sub_run: Option<u64>,
+    sub: HashMap<u32, SubChunk>,
     pose_v: String,
 }
 
@@ -72,6 +86,7 @@ pub fn parts(cache: &Mutex<Option<Arc<Parts>>>, v: &View) -> Option<Arc<Parts>> 
     let mut head = Vec::new();
     let mut order = Vec::new();
     let mut objs = Vec::new();
+    let mut sub = None;
     for (k, x) in m {
         match k.as_str() {
             "objects" => {
@@ -83,6 +98,26 @@ pub fn parts(cache: &Mutex<Option<Arc<Parts>>>, v: &View) -> Option<Arc<Parts>> 
                 }
             }
             "wall" => {}
+            "scene_points" if x["submap"]["list"].is_array() => {
+                // 청크 목록은 칸 8 로 바뀐 것만(자세가 바뀐 청크 · 점이 는 청크), 머리에는 나머지만
+                let s = &x["submap"];
+                let list = s["list"].as_array().unwrap().iter().filter_map(|e| {
+                    let a = e.as_array()?;
+                    let g = |i: usize| a.get(i).and_then(|v| v.as_f64());
+                    let mut pose = [0f32; 12];
+                    for (i, q) in pose.iter_mut().enumerate() {
+                        *q = g(3 + i)? as f32;
+                    }
+                    Some(SubChunk { id: g(0)? as u32, ver: g(1)? as u32, n: g(2)? as u32, pose })
+                }).collect();
+                sub = Some((s["run"].as_u64().unwrap_or(0), list));
+                let mut y = x.clone();
+                if let Some(o) = y["submap"].as_object_mut() {
+                    o.remove("list");
+                }
+                let b = serde_json::to_vec(&y).unwrap_or_default();
+                head.push((k.clone(), fnv(&b), b));
+            }
             _ => {
                 let b = if k == "graph" { serde_json::to_vec(&serde_json::json!({"edges": x["edges"]})) } else { serde_json::to_vec(x) }.unwrap_or_default();
                 head.push((k.clone(), fnv(&b), b));
@@ -92,7 +127,7 @@ pub fn parts(cache: &Mutex<Option<Arc<Parts>>>, v: &View) -> Option<Arc<Parts>> 
     let wall = doc["wall"].as_f64().unwrap_or(0.0);
     let o = &doc["scene_points"]["octree"];
     let oct = o["path"].as_str().map(|p| (o["run"].as_u64().unwrap_or(0), p.to_string(), o["ver"].as_i64().unwrap_or(0)));
-    let p = Arc::new(Parts { ver: v.ver.clone(), head, order, objs, wall, oct });
+    let p = Arc::new(Parts { ver: v.ver.clone(), head, order, objs, wall, oct, sub });
     *cache.lock().unwrap() = Some(p.clone());
     Some(p)
 }
@@ -245,6 +280,38 @@ pub fn frame(c: &mut Client, now: &Now) -> Option<Vec<u8>> {
                 w.close(at);
                 c.traj = (id, n);
             }
+            if let Some((run, list)) = &p.sub {
+                let reset = c.sub_run != Some(*run);
+                if reset {
+                    c.sub.clear();
+                }
+                let ch: Vec<&SubChunk> = list.iter().filter(|s| c.sub.get(&s.id) != Some(s)).collect();
+                let gone: Vec<u32> = c.sub.keys().filter(|id| !list.iter().any(|s| s.id == **id)).copied().collect();
+                if reset || !ch.is_empty() || !gone.is_empty() {
+                    let at = w.open(8);
+                    w.f64(*run as f64);
+                    w.u8(reset as u8);
+                    w.u32(ch.len() as u32);
+                    for s in &ch {
+                        w.u32(s.id);
+                        w.u32(s.ver);
+                        w.u32(s.n);
+                        for q in s.pose {
+                            w.0.extend_from_slice(&q.to_le_bytes());
+                        }
+                    }
+                    w.u32(gone.len() as u32);
+                    for id in &gone {
+                        w.u32(*id);
+                        c.sub.remove(id);
+                    }
+                    w.close(at);
+                    for s in ch {
+                        c.sub.insert(s.id, s.clone());
+                    }
+                    c.sub_run = Some(*run);
+                }
+            }
         }
     }
     if let Some((ver, cur)) = &now.map {
@@ -335,5 +402,36 @@ mod tests {
         let s = String::from_utf8_lossy(&f2);
         assert!(s.contains("\"a\":5") && !s.contains("\"a\":0"));
         assert!(frame(&mut c, &Now { view: Some((v2, p2)), map: None, map_hist: &[], oct: None, pose: None }).is_none());
+    }
+
+    #[test]
+    fn submap_sends_changed_chunks_only() {
+        let e = |id: u32, px: f64| serde_json::json!([id, 1, 10, 1, 0, 0, 0, 1, 0, 0, 0, 1, px, 0, 0]);
+        let mk = |ver: u64, px: f64| {
+            let head = serde_json::json!({"stamp": 1.0, "objects": [], "graph": {"edges": []},
+                "scene_points": {"run": 1, "submap": {"run": 9, "dir": "chunks/9", "list": [e(0, 0.0), e(1, px)]}}});
+            Arc::new(View::live(ver, head, crate::live::TrajLog::new(), 0))
+        };
+        let cache = Mutex::new(None);
+        let mut c = Client::default();
+        let v1 = mk(1, 0.0);
+        let p1 = parts(&cache, &v1).unwrap();
+        frame(&mut c, &Now { view: Some((v1, p1)), map: None, map_hist: &[], oct: None, pose: None }).unwrap();
+        assert_eq!(c.sub.len(), 2);
+        // 청크 1 만 자세가 바뀜: 칸 8 에 하나, 머리(scene_points)는 그대로라 칸 2 없음
+        let v2 = mk(2, 0.5);
+        let p2 = parts(&cache, &v2).unwrap();
+        let f = frame(&mut c, &Now { view: Some((v2, p2)), map: None, map_hist: &[], oct: None, pose: None }).unwrap();
+        let mut o = 4;
+        let mut tags = vec![];
+        while o + 5 <= f.len() {
+            let len = u32::from_le_bytes(f[o + 1..o + 5].try_into().unwrap()) as usize;
+            tags.push(f[o]);
+            if f[o] == 8 {
+                assert_eq!(u32::from_le_bytes(f[o + 14..o + 18].try_into().unwrap()), 1);
+            }
+            o += 5 + len;
+        }
+        assert!(tags.contains(&8) && !tags.contains(&2), "{tags:?}");
     }
 }

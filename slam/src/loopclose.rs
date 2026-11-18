@@ -127,6 +127,9 @@ pub struct NodeInput {
     pub prov_from: i32,
     /// 깊이 점 지도 정합으로 찾은 잇기(IMU 모드): (기존 지도 노드 id, 이 노드 → 그 노드 변환). 시각 루프가 없을 때 이 링크로 최적화
     pub geo_link: Option<(i32, Tf)>,
+    /// 신경망 루프(`--lc net | both`): (질의 노드, 예전 노드, 질의 → 예전 몸체 변환, 이동 · 회전 표준편차 m · rad).
+    /// 이번 단계에 다른 루프 후보가 없을 때 그대로 루프 링크로
+    pub lc_link: Option<(i32, i32, Tf, [f64; 2])>,
 }
 
 /// 한 번의 결과 요약(검증·통계용)
@@ -144,6 +147,8 @@ pub struct StepInfo {
     /// 같은 최적화에서 옮겨진 노드 최대(m, 다른 지도 노드 포함: 새 지도를 옛 지도에 이을 때 옮겨지는 쪽)
     pub max_moved_all: f32,
     pub rejected_by_correction: u32,
+    /// 이번 단계에 들어가 최적화를 통과한 신경망 루프 링크 수(0 · 1)
+    pub lc_links: u32,
 }
 
 /// 설정(우리 ini 와 Parameters.h 기본값)
@@ -246,6 +251,12 @@ impl Slam {
             info: StepInfo::default(),
             connected_graph_calls: 0,
         }
+    }
+
+    /// 낱말(BoW) 루프 후보를 끔(`--lc net`): 사후 확률이 문턱을 넘지 못하게. 근접 루프 · 신경망 루프 · 지도 잇기는 그대로
+    pub fn disable_bow_loops(&mut self) {
+        self.p.loop_thr = f32::INFINITY;
+        self.p.aggressive_loop_thr = f32::INFINITY;
     }
 
     pub fn loop_closure_id(&self) -> i32 {
@@ -423,8 +434,24 @@ impl Slam {
         self.forced_hyp = 0;
         self.info.highest = self.highest;
         let mut added: Vec<(i32, i32)> = Vec::new();
-        // 깊이 정합 잇기: 시각 루프 후보가 없을 때만, 정합이 낸 상대 변환을 그대로 루프 링크로(1 cm · 0.6° 불확실)
         let mut geo = false;
+        // 신경망 루프: 낱말 루프 후보가 없을 때, 검증된 상대 위치를 그대로 루프 링크로
+        if let (0, Some((from, to, t, sd))) = (self.loop_hyp.0, inp.lc_link) {
+            if from != to && self.mem.sig(from).is_some() && self.mem.sig(to).is_some() {
+                let mut inf = [0.0; 36];
+                for i in 0..3 {
+                    inf[i * 7] = 1.0 / (sd[0] * sd[0]);
+                    inf[(i + 3) * 7] = 1.0 / (sd[1] * sd[1]);
+                }
+                if self.mem.add_link(Link::new(from, to, LinkType::GlobalClosure, t, inf)) {
+                    added.push((from, to));
+                    self.loop_hyp = (to, 1.0);
+                    geo = true;
+                    self.info.lc_links += 1;
+                }
+            }
+        }
+        // 깊이 정합 잇기: 시각 루프 후보가 없을 때만, 정합이 낸 상대 변환을 그대로 루프 링크로(1 cm · 0.6° 불확실)
         if let (0, Some((to, t))) = (self.loop_hyp.0, inp.geo_link) {
             if to != sid && self.mem.sig(to).is_some() {
                 let mut inf = [0.0; 36];
@@ -603,6 +630,7 @@ impl Slam {
                 }
             }
             if reject {
+                self.info.lc_links = 0;
                 for (a, b) in &added {
                     self.mem.remove_link(*a, *b);
                 }
@@ -1012,6 +1040,6 @@ mod refdump;
 
 impl Default for NodeInput {
     fn default() -> Self {
-        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0, geo_link: None }
+        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0, geo_link: None, lc_link: None }
     }
 }

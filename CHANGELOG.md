@@ -32,8 +32,10 @@
 - `scripts/board_all.sh`: 보드를 한 번 켜서 동기화 · 빌드 → 모델 확인 → NPU 단독 · 끝 알림 시험 → 사진 벡터 함께 올리기 수 → 녹화 재생 → 실시간 가만히 · 열 시험 10 분 · 흔들기 → 요약 → 시연까지.
 - `ondevice npu-test`: NPU 끝 알림 길(DXRT 콜백 · 기다림 스레드)의 결과 비트 같음 · 지연 · 알림 스레드를 잰다. `--npu-wake callback|thread`(기본 thread).
 - `--pool N`: 작업 풀 일꾼 수(기본 3).
-- 비상 열 보호(`--thermal-cpu 80`, `--thermal-npu`, `--no-thermal`): 문턱을 넘으면 MegaLoc 간격 · 사진 벡터 묶음만 늦추고 분할 · 위치 추적은 그대로 둔다.
+- 비상 열 보호(`--thermal-cpu 80`, `--thermal-npu`, `--no-thermal`): 문턱을 넘으면 신경망 루프(노드 3 개에 하나) · 사진 벡터 묶음만 늦추고 분할 · 위치 추적은 그대로 둔다.
 - `scripts/pc_bytes.sh`: 구조를 바꾼 판이 결과를 바꾸지 않았는지 보는 PC 바이트 비교 세트(카메라 전용 TUM 5 개 · 합성 IMU 재생 · 기억 폴더 333 · 766 파일).
+- 신경망 루프 클로저 `--lc bow|net|both`(기본 both, 모델이 없으면 bow): 지도 노드마다 MegaLoc(DINOv2-B + SALAD, 168×224) 기술자로 20 초보다 오래된 노드 후보 3 개를 찾고, XFeat 짝 + 깊이 + 위쪽 방향 고정 4 자유도 검증(맞은 점 ≥ 20)이 맞으면 그 상대 위치를 루프 링크로 넣는다. 한 스레드("lc")가 노드를 차례로 받고, 최대 속도 재생은 한 노드 늦게 고정해 결정적. 모델 폴더 `--lc-dir`(보드 `.dxnn`, PC 같은 계산의 ONNX). 설계 · 측정은 `docs/loop_closure_npu.md`.
+- MegaLoc · XFeat NPU 모델(`megaloc_168x224.dxnn` 120.5 MB · `xfeat_480x640.dxnn` 1.0 MB, INT8, CPU 작업 없음)과 주성분 1,024 투영(`megaloc_head_pca1024.bin`), 보드 확인 `scripts/board_lc_check.sh`.
 
 ### Changed
 - 다시 쌓기용 장면 보관은 검출 마스크 안 화소의 컬러 · 깊이만 남긴다: 긴 사무실 1,179 → 704 MB. 물체 위치 · 점은 그대로이고, 다시 쌓은 물체 사진은 마스크 밖이 검게 바뀐다.

@@ -144,6 +144,7 @@
 | 특징점 짝 맞추기 코어 나눔 | 5.4 ms | 3.1 ms | 1.7 | PC | – | PL › 보드 화면(HDMI, Chromium)에서 뷰어 끊김 |
 | 깊이 정렬 `fast_align` (librealsense 규칙) | 0.92 ms (rs2::align) | 0.61 ms / 스레드 4 개 0.28 ms | 1.5 / 3.3 | PC MSVC 코어 1, 640×480 | 다른 화소 0 | PL › D455 깊이→컬러 정렬 |
 | 깊이 정렬 C++ → Rust(`tools::fast_align`) | 0.76 ms / 스레드 4 개 0.37 ms (C++ GCC) | 0.46 ms / 0.29 ms | 1.65 / 1.28 | PC WSL 코어 1·4, 640×480 | 비트 동일(실제 D435 깊이 80 장 포함) | PL › 깊이 정렬 Rust 이식 |
+| 신경망 루프 클로저 `--lc both`(MegaLoc 후보 + XFeat 검증, 기본은 bow) | 낱말 루프만 | + 노드당 MegaLoc 80 · XFeat 11 · 검증 0 – 5 ms(PC CPU, 보드는 NPU) | – | PC WSL, TUM 7 녹화 · 흐림 · 합성 IMU | ATE 같은 범위(차 0.2 cm 안), 기본 bow 는 바이트 동일 | PL › 신경망 루프 클로저 MegaLoc + XFeat 앱 연결 |
 
 ### memmap 지도·물체·다시 쌓기
 

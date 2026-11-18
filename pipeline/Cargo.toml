@@ -25,10 +25,10 @@ slam = { path = "../slam", features = ["rsdriver"] }
 
 [features]
 default = ["onnx"]
-onnx = ["dep:ort", "dep:ndarray", "common/onnx", "sgview/search-onnx"]
+onnx = ["dep:ort", "dep:ndarray", "common/onnx", "sgview/search-onnx", "slam/onnx"]
 # 윈도우 PC 그래픽카드(DirectML)로 ONNX 모델 실행
 directml = ["onnx", "ort/directml"]
-dxrt = ["common/dxrt", "sgview/dxrt"]
+dxrt = ["common/dxrt", "sgview/dxrt", "slam/dxrt"]
 mimalloc = ["dep:mimalloc"]
 
 # 한 프로그램: ondevice [run] … = 물체 기억(memmap), ondevice slam … = 위치 프로그램, ondevice view … = 뷰어 서버

@@ -53,7 +53,7 @@ $P patches-calib <물체 사진 폴더> patches_calib.npy 200
 
 ## 루프 · 재위치: megaloc_168x224.dxnn · xfeat_480x640.dxnn
 
-쓰임과 정확도는 [loop_closure_npu.md](loop_closure_npu.md). 내보내기 · 손질 · 보정은 저장소 밖 일회성 파이썬(데스크톱 WSL `/home/rea/port/lc`, `~/sfm` 가상 환경의 torch, CPU 만)이고, 컴파일은 `~/dx241/bin/python`(DX-COM 2.4.1 의 파이썬 API `dx_com.compile`, 보정 자료를 한 장씩 내주는 dataloader, `calibration_method="ema"`, `quant_diagnosis=True`).
+쓰임과 정확도는 [loop_closure_npu.md](loop_closure_npu.md). 내보내기 · 손질 · 보정은 저장소 밖 일회성 파이썬(데스크톱 WSL `/home/rea/port/lc`, `~/sfm` 가상 환경의 torch, CPU 만)이고, 컴파일은 `~/dx241/bin/python`(DX-COM 2.4.1 의 파이썬 API `dx_com.compile`, 보정 자료를 한 장씩 내주는 dataloader, `calibration_method="ema"`; 진단 보고는 `quant_diagnosis=True` 로 따로).
 
 보정 사진 320 장(평가 녹화 fr1 360 · rpy · desk · room 은 뺌): 우리 D435 녹화 walk1 80 · rec 20 · fr3 office(D435) 40 · digiteo2(D435) 30, TUM fr3 long_office 60 · fr1 desk2 50 · fr1 floor 40. 녹화마다 고르게 건너뛰며 고름.
 
@@ -72,7 +72,12 @@ $P patches-calib <물체 사진 폴더> patches_calib.npy 200
    - LayerNorm · GELU 는 `F.layer_norm`(배율 없음) · `F.gelu`(erf)를 opset 13 으로 내보낸 분해형으로 둔다. 손으로 쓴 RMSNorm 꼴은 DX-COM 이 알아보지 못해 블록 전체를 CPU 작업으로 남겼다.
 5. 컴파일: 보정 자료 = 위 320 장의 조각 [320,192,588].
 
-⟨ML_COMPILE⟩
+   - DX-COM 2.4.1 은 `f − ReLU(f − 10)`(자르기)를 Clip 으로 바꾼 뒤 낮추기에서 멈춘다(`UnknownError`, 컴파일 40 % 지점). 같은 값인 `10 − ReLU(10 − f)` 로 쓰면 지나간다(작은 판으로 가른 결과: `min` · `two` · `mm` 꼴도 지나가지만 `min` 은 CPU 작업이 하나 생김).
+   - 컴파일 `cml_fast.py`(EMA, 보정 320 장, `quant_diagnosis=False`, 보정은 GPU `quantization_device="cuda:0"`): 3 분 42 초, 최대 RAM 4.4 GB.
+
+확인: NPU 작업 하나(CPU 작업 없음), 파일 120.5 MB, NPU 메모리 132 MB(무게 116.7 MB + 명령 3.7 MB + 활성값). DX-COM 진단(같은 손질의 앞 판, `quant_diagnosis=True`) 코사인 0.903(QSNR 7.3 dB, 출력 f · s · t 날값). 날값 코사인은 낮지만 집계 뒤 기술자로 찾는 성능은 거의 그대로다(8 비트 흉내 R@1 88.3 %, 실수 89.0 %, [loop_closure_npu.md](loop_closure_npu.md) 5 절). 컴파일러 앞단 검사(무작위 입력)는 코사인 0.81 을 오류로 적지만 컴파일은 끝까지 간다.
+
+PC 판은 같은 손질의 실수 ONNX(`megaloc_168x224.onnx`, 462 MB)이고, 손질 전 원본 계산 ONNX 는 `megaloc_fp32.onnx`(349 MB, 보드 비교 기준만). 마지막 투영은 주성분 1,024 차원을 접은 `megaloc_head_pca1024.bin`(68 MB, 앱 기본, R@1 88.3 %)과 원본 8,448 차원 `megaloc_head.bin`(562 MB).
 
 ### XFeat(verlab/accelerated_features, Apache-2.0): 입력 u8 [1,1,480,640] → feats [1,64,60,80] · kpts [1,65,60,80] · heat [1,1,60,80]
 
@@ -82,7 +87,9 @@ $P patches-calib <물체 사진 폴더> patches_calib.npy 200
 2. 입력: 합성곱이 첫 연산인 입력을 DX-COM 은 u8 로 받는다(컴파일 로그 `NPU input : uint8`, 형식 FORMATTER). 그래서 CPU 가 정규화된 회색 x 를 `q = clamp(round(32·x + 112), 0, 255)` 로 넣고, 모델 첫머리에서 `(q − 112)/32` 로 되돌린다(정규화 범위 −3.5 ~ 4.47, 보정 사진에서 이 밖 화소 0.04 %). `.dxnn` 의 입력 기록은 `UINT8 [1,480,640,1]`, scale 없음.
 3. 컴파일: 보정 자료 = 320 장의 q [320,1,480,640].
 
-확인: DX-COM 진단 코사인 0.9916(QSNR 17.8 dB, 무게만 0.9970 · 활성값만 0.9938). NPU 작업 하나(CPU 작업 없음). 파일 1.0 MB.
+확인: DX-COM 진단 코사인 0.9916(QSNR 17.8 dB, 무게만 0.9970 · 활성값만 0.9938). NPU 작업 하나(CPU 작업 없음). 파일 1.0 MB, NPU 메모리 44.6 MB.
+
+PC 판 `xfeat_480x640.onnx` 는 같은 모델의 입력을 u8 로 받게 앞에 Cast 를 붙인 것(`.dxnn` 과 같은 입력 바이트, 실행기 `nnrun` 이 입력 형식을 모델에서 읽음).
 
 ## 글 인코더(뷰어 검색): Rust
 

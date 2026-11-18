@@ -1,5 +1,5 @@
 //! 비상 열 보호: 몇 초마다(기본 5 초) 온도를 읽어 문턱(CPU 80 °C = 펌웨어 스로틀 직전, NPU 는 `--thermal-npu`)을 넘으면
-//! 선택 일만 줄인다 — 1 단 MegaLoc 간격 늘리기(모듈이 들어오면), 2 단 SigLIP2 사진 벡터 묶음 늦추기. 분할 · 위치 추적은 줄이지 않는다.
+//! 선택 일만 줄인다 — 1 단 신경망 루프(MegaLoc)를 노드 3 개에 하나로(`--lc both|net` 일 때), 2 단 SigLIP2 사진 벡터 묶음 늦추기. 분할 · 위치 추적은 줄이지 않는다.
 //! 문턱보다 5 °C 내려가면 되돌린다. `--no-thermal` 로 끔. 읽기는 루프 마감(타이머)으로만 해 따로 깨우지 않는다.
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ pub struct Thermal {
     npu_file: Option<PathBuf>,
     every: Duration,
     last: Instant,
-    /// 0 = 보통, 1 = MegaLoc 간격 늘림, 2 = + 사진 벡터 늦춤
+    /// 0 = 보통, 1 = 신경망 루프 노드 3 개에 하나, 2 = + 사진 벡터 늦춤
     pub level: u8,
     /// 비상 보호가 걸린 횟수 · 가장 높았던 CPU · NPU 온도
     pub hits: u32,

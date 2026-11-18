@@ -4,8 +4,8 @@
 # 환경 변수
 #   BOARD=kau@192.168.219.101   보드
 #   MODELS=models               PC 의 모델 폴더(아래 파일들, 만드는 법 docs/npu_models.md)
-#       megaloc_168x224.dxnn · megaloc_npu.onnx(그 원본) · megaloc_168x224.onnx(PC 실수) · megaloc_head.bin
-#       xfeat_480x640.dxnn · xfeat_480x640_u8.onnx(그 원본, PC 실수)
+#       megaloc_168x224.dxnn · megaloc_168x224.onnx(그 원본, PC 실수) · megaloc_fp32.onnx(손질 전 원본 계산) · megaloc_head_pca1024.bin
+#       xfeat_480x640.dxnn · xfeat_480x640.onnx(그 원본, u8 입력, PC 실수)
 #       objectsam-416_640.dxnn · siglip2-vision_npu.dxnn(함께 올리기 시험용, 보드 ~/models 에 이미 있으면 그것)
 #   IMG=사진 한 장(640×480 PNG, 기본 TUM fr1_desk 첫 장)   STRESS_S=60(함께 돌리기 초)
 #   CARGO_TARGET_DIR(PC 빌드 폴더, 기본 /home/rea/tgt-lc). 보드용 lc_bench(dxrt)는 PC 에서 교차 빌드(scripts/cross_board.sh 와 같은 설정)
@@ -32,10 +32,10 @@ cargo build --release -p slam --features onnx --example lc_bench 2>&1 | tail -1
 LB=$CARGO_TARGET_DIR/release/examples/lc_bench
 "$LB" prep-in megaloc "$IMG" "$LOCAL/ml_in.bin"
 "$LB" prep-in xfeat8 "$IMG" "$LOCAL/xf_in.bin"
-"$LB" npu-check "$MODELS/megaloc_168x224.onnx" "$LOCAL/ml_in.bin" "$LOCAL/ref_ml" --save > /dev/null
-"$LB" npu-check "$MODELS/megaloc_npu.onnx" "$LOCAL/ml_in.bin" "$LOCAL/ref_ml_npu32" --save > /dev/null
-"$LB" npu-check "$MODELS/xfeat_480x640_u8.onnx" "$LOCAL/xf_in.bin" "$LOCAL/ref_xf" --save > /dev/null
-( cd "$MODELS" && sha256sum megaloc_168x224.dxnn xfeat_480x640.dxnn megaloc_head.bin ) > "$LOCAL/sha256.txt"
+"$LB" npu-check "$MODELS/megaloc_fp32.onnx" "$LOCAL/ml_in.bin" "$LOCAL/ref_ml" --save > /dev/null
+"$LB" npu-check "$MODELS/megaloc_168x224.onnx" "$LOCAL/ml_in.bin" "$LOCAL/ref_ml_npu32" --save > /dev/null
+"$LB" npu-check "$MODELS/xfeat_480x640.onnx" "$LOCAL/xf_in.bin" "$LOCAL/ref_xf" --save > /dev/null
+( cd "$MODELS" && sha256sum megaloc_168x224.dxnn xfeat_480x640.dxnn megaloc_head_pca1024.bin ) > "$LOCAL/sha256.txt"
 log "PC 기준 출력: $LOCAL"
 
 # ---------- 보드용 lc_bench(dxrt, aarch64) 교차 빌드 ----------
@@ -50,7 +50,7 @@ LBA=$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/examples/lc_bench
 # ---------- 보드로 ----------
 R=lccheck/$STAMP
 ssh "$BOARD" "mkdir -p ~/$R ~/models" || { log "보드 연결 실패: $BOARD"; exit 1; }
-scp -q "$MODELS/megaloc_168x224.dxnn" "$MODELS/xfeat_480x640.dxnn" "$MODELS/megaloc_head.bin" "$BOARD:models/"
+scp -q "$MODELS/megaloc_168x224.dxnn" "$MODELS/xfeat_480x640.dxnn" "$MODELS/megaloc_head_pca1024.bin" "$BOARD:models/"
 scp -q -r "$LOCAL/ml_in.bin" "$LOCAL/xf_in.bin" "$LOCAL/ref_ml" "$LOCAL/ref_ml_npu32" "$LOCAL/ref_xf" "$LOCAL/sha256.txt" "$BOARD:$R/"
 scp -q "$LBA" "$BOARD:$R/lc_bench"
 
@@ -64,8 +64,8 @@ for m in megaloc_168x224 xfeat_480x640; do
     echo "== parse_model $m"; parse_model -m ~/models/$m.dxnn 2>&1 | tail -25
     echo "== run_model $m(NPU 계산 · 지연)"; run_model -m ~/models/$m.dxnn -s -v -l 100 2>&1 | tail -12
 done
-echo "== MegaLoc: PC 원본 실수 대비"; $LB npu-check ~/models/megaloc_168x224.dxnn "$R/ml_in.bin" "$R/ref_ml" --head ~/models/megaloc_head.bin --runs 50
-echo "== MegaLoc: PC NPU 원본 ONNX(실수) 대비"; $LB npu-check ~/models/megaloc_168x224.dxnn "$R/ml_in.bin" "$R/ref_ml_npu32" --head ~/models/megaloc_head.bin --runs 1
+echo "== MegaLoc: PC 원본 실수 대비"; $LB npu-check ~/models/megaloc_168x224.dxnn "$R/ml_in.bin" "$R/ref_ml" --head ~/models/megaloc_head_pca1024.bin --runs 50
+echo "== MegaLoc: PC NPU 원본 ONNX(실수) 대비"; $LB npu-check ~/models/megaloc_168x224.dxnn "$R/ml_in.bin" "$R/ref_ml_npu32" --head ~/models/megaloc_head_pca1024.bin --runs 1
 echo "== XFeat: PC 실수(u8 입력 ONNX) 대비"; $LB npu-check ~/models/xfeat_480x640.dxnn "$R/xf_in.bin" "$R/ref_xf" --runs 50
 # 네 모델 동시 적재 + 동시 실행: 입력은 0 으로 채운 바이트(크기만 맞춤)
 head -c $((640*640*3)) /dev/zero > "$R/osam_in.bin"

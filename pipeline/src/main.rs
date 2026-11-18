@@ -584,8 +584,9 @@ impl LoopIo {
         if let Some(sv) = self.server.as_mut() {
             sv.tick(&mut self.poll);
         }
-        // 비상 열 보호: 1 단 = MegaLoc 간격 늘림(모듈이 들어오면), 2 단 = 사진 벡터 묶음 늦춤. 분할 · 위치 추적은 그대로
+        // 비상 열 보호: 1 단 = 신경망 루프(MegaLoc)를 노드 3 개에 하나로, 2 단 = 사진 벡터 묶음 늦춤. 분할 · 위치 추적은 그대로
         if let Some(l) = self.thermal.check() {
+            slam::lcnet::throttle(l >= 1);
             embed::throttle(l >= 2);
             common::info!("열 보호 {l} 단: {}", self.thermal.json());
         }

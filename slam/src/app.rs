@@ -66,7 +66,7 @@ mod engine {
     use crate::params::Params;
     use crate::register::{new_shared_rng, RegistrationVis, SharedRng, Tf};
     use crate::{Camera, Features, Frame};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -204,6 +204,8 @@ mod engine {
         last_id: i32,
         map_corr: Tf,
         jobs: u64,
+        /// 이 단계(지도 스레드면 끝난 단계들)에 들어간 신경망 루프 링크 수
+        lc: u32,
     }
 
     fn snap_of(s: &Slam) -> MapSt {
@@ -214,6 +216,7 @@ mod engine {
             last_id: s.last_location_id(),
             map_corr: s.map_correction(),
             jobs: 0,
+            lc: s.info.lc_links,
         }
     }
 
@@ -315,9 +318,11 @@ mod engine {
                         *st = last.clone();
                         st.loop_id = lp_loop;
                         st.corr = (mc, rej, sts.iter().fold(0f32, |m, x| m.max(x.corr.2)));
+                        st.lc = sts.iter().map(|x| x.lc).sum();
                     } else {
                         st.loop_id = 0;
                         st.corr = ((0.0, 0.0), 0, 0.0);
+                        st.lc = 0;
                     }
                     (ids, kfs)
                 }
@@ -413,6 +418,31 @@ mod engine {
         grr: usize,
         /// 지금 지도가 믿는 지도인지(app 이 slam_process 앞에 알려 줌)
         pub trusted: bool,
+        /// 신경망 루프 스레드(`--lc net | both`)와 노드 id 를 기다리는 노드(일 번호), 다음 단계들에 넘길 루프 링크
+        lc: Option<crate::lcnet::LcWorker>,
+        lc_wait: Vec<(u64, crate::lcnet::LcNode)>,
+        lc_links: VecDeque<(i32, i32, Tf, [f64; 2])>,
+        lc_recv: VecDeque<crate::lcnet::LcOut>,
+        /// 신경망 루프 링크 표준편차(이동 m, 회전 rad). 0 = 맞은 점 수로(0.3 m · 10° / √맞은 점)
+        pub lc_sd: [f64; 2],
+        lc_last: i32,
+        /// 최대 속도 재생: 노드마다 루프 결과를 기다려 결정적으로
+        pub lc_block: bool,
+        /// 통계: 보낸 노드 · 결과 · 맞은 루프 · 지도에 들어간 루프, ms 합(MegaLoc · XFeat · 짝 + 검증), 후보 · 검증 수
+        pub lc_stats: LcStats,
+    }
+
+    #[derive(Default, Clone, Debug)]
+    pub struct LcStats {
+        pub sent: u64,
+        pub done: u64,
+        pub hits: u64,
+        pub accepted: u64,
+        pub ms: [f64; 3],
+        pub ms_max: [f64; 3],
+        pub tried: u64,
+        /// 열 보호로 건너뛴 노드 수를 세는 자리
+        pub skipped: u64,
     }
 
     impl Engine {
@@ -462,6 +492,61 @@ mod engine {
                 rr: 0,
                 grr: 0,
                 trusted: true,
+                lc: None,
+                lc_wait: Vec::new(),
+                lc_links: VecDeque::new(),
+                lc_recv: VecDeque::new(),
+                lc_sd: [0.0, 0.0],
+                lc_last: 0,
+                lc_block: false,
+                lc_stats: LcStats::default(),
+            }
+        }
+
+        /// 신경망 루프 켜기(net = 낱말 루프는 끔)
+        pub fn start_lc(&mut self, cfg: crate::lcnet::LcConfig, net_only: bool) -> Result<(), String> {
+            self.lc = Some(crate::lcnet::LcWorker::start(cfg)?);
+            if net_only {
+                self.slam.inline().disable_bow_loops();
+            }
+            Ok(())
+        }
+
+        /// 끝난 루프 결과를 다음 노드에 넘길 것으로. 최대 속도 재생(lc_block)은 한 노드 늦게 고정: 바로 앞에 보낸 노드 것만 빼고
+        /// 모두 끝날 때까지 기다린다(실행마다 같은 노드에 같은 링크, 신경망은 그 사이 장면들과 겹쳐 돎)
+        fn lc_poll(&mut self) {
+            let Some(lc) = self.lc.as_mut() else { return };
+            while let Some(o) = lc.recv(false) {
+                self.lc_recv.push_back(o);
+            }
+            let n = if self.lc_block {
+                let need = self.lc_stats.sent.saturating_sub(1);
+                while self.lc_stats.done + (self.lc_recv.len() as u64) < need {
+                    match lc.recv(true) {
+                        Some(o) => self.lc_recv.push_back(o),
+                        None => break,
+                    }
+                }
+                need.saturating_sub(self.lc_stats.done) as usize
+            } else {
+                self.lc_recv.len()
+            };
+            for o in self.lc_recv.drain(..n.min(self.lc_recv.len())) {
+                let s = &mut self.lc_stats;
+                s.done += 1;
+                s.tried += o.tried as u64;
+                for i in 0..3 {
+                    s.ms[i] += o.ms[i];
+                    s.ms_max[i] = s.ms_max[i].max(o.ms[i]);
+                }
+                if let Some(h) = o.hit {
+                    s.hits += 1;
+                    common::info!("신경망 루프: 노드 {} → {} (MegaLoc {:.3}, 맞은 점 {}, 이동 {:.2} m)", h.from, h.to, h.score, h.inliers, h.t.norm_sq().sqrt());
+                    // 불확실성: 맞은 점이 많을수록 작게(TUM 긴 사무실 정답 대조: 맞은 점 20 – 50 은 5 – 11 cm, 100 개 넘으면 1 – 3 cm)
+                    let k = 1.0 / (h.inliers.max(1) as f64).sqrt();
+                    let sd = if self.lc_sd[0] > 0.0 { self.lc_sd } else { [(0.3 * k).clamp(0.01, 0.1), (10f64 * k).clamp(0.3, 3.0).to_radians()] };
+                    self.lc_links.push_back((h.from, h.to, h.t, sd));
+                }
             }
         }
 
@@ -798,16 +883,26 @@ mod engine {
             } else {
                 NodeFeatures::default()
             };
-            let inp = NodeInput { features, stamp: f.t, pose: pose.unwrap_or(Tf::NULL), cov: *cov, velocity, image_size: (f.cam.width, f.cam.height), prov_from: self.prov_from, geo_link: self.geo_link.take() };
+            if node {
+                self.lc_poll();
+            }
+            let lc_link = if node { self.lc_links.pop_front() } else { None };
+            let inp = NodeInput { features, stamp: f.t, pose: pose.unwrap_or(Tf::NULL), cov: *cov, velocity, image_size: (f.cam.width, f.cam.height), prov_from: self.prov_from, geo_link: self.geo_link.take(), lc_link };
             let had = node && self.kf_ids.last().map(|x| x.0 == 0).unwrap_or(false);
             let job = self.slam.jobs() + 1;
+            let lc_node = node && self.lc.is_some() && !f.color.is_empty();
+            if let (true, Some(p)) = (lc_node, pose) {
+                let n = crate::lcnet::LcNode { id: 0, stamp: f.t, color: f.color.clone(), bgr: !f.color_is_rgb, depth: f.depth_mm.clone(), pose: p.to_pose(), cam: f.cam.clone() };
+                self.lc_wait.push((job, n));
+            }
             if had {
                 if let Some(l) = self.kf_ids.last_mut() {
                     l.2 = job;
                 }
             }
             let forced = std::mem::take(&mut self.forced_hyp);
-            let (ids, kfs) = self.slam.process(inp, forced, had, job, raw);
+            let (ids, kfs) = self.slam.process(inp, forced, had || lc_node, job, raw);
+            self.lc_stats.accepted += self.slam.st().lc as u64;
             for (feats, p, trusted, id) in kfs {
                 if !feats.desc.is_empty() {
                     self.kf_db.push((feats, p));
@@ -819,7 +914,22 @@ mod engine {
                 if let Some(e) = self.kf_ids.iter_mut().find(|e| e.0 == 0 && e.2 == k) {
                     e.0 = id;
                 }
+                // 신경망 루프: id 가 정해진 노드를 루프 스레드로(새 노드가 안 생겨 id 가 그대로면 넘기지 않음)
+                if let Some(i) = self.lc_wait.iter().position(|e| e.0 == k) {
+                    let (_, mut n) = self.lc_wait.swap_remove(i);
+                    let hot = crate::lcnet::THROTTLE.load(Ordering::Relaxed) && {
+                        self.lc_stats.skipped += 1;
+                        self.lc_stats.skipped % 3 != 0
+                    };
+                    if id > 0 && id != self.lc_last && !hot {
+                        self.lc_last = id;
+                        n.id = id;
+                        self.lc_stats.sent += 1;
+                        self.lc.as_mut().unwrap().send(n);
+                    }
+                }
             }
+            self.lc_wait.retain(|e| e.0 + 8 > job);
         }
 
         /// 이어지지 않은 새 지도에서: 믿는 지도의 노드 가운데 이번 장면과 기술자로 맞는 노드를 찾아(PnP 확인)
@@ -983,7 +1093,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--geo] [--imu-brief oriented|upright|dual]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--geo] [--imu-brief oriented|upright|dual]] [--imu-csv <imu0.csv> (재생)] [--lc bow|net|both [--lc-dir <모델 폴더>]] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
     );
 }
 
@@ -1057,6 +1167,10 @@ pub struct Args {
     /// 흐림 시험: 노출(초) 동안 각속도만큼 번진 영상(각속도는 --stress-gyro 또는 --imu-csv 파일)
     stress_blur: f64,
     stress_gyro: String,
+    /// 루프 클로저: bow(RTAB-Map 낱말, 기본) · net(MegaLoc 후보 + XFeat 검증, 낱말 루프 끔) · both
+    lc: String,
+    /// 신경망 루프 모델 폴더(megaloc_168x224 · megaloc_head_pca1024.bin · xfeat_480x640)
+    lc_dir: String,
 }
 
 /// 명령줄(0 번은 프로그램 이름) → 설정. 도움말·잘못된 인자면 끝 코드
@@ -1119,6 +1233,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         stress_imu_gap: false,
         stress_blur: 0.0,
         stress_gyro: String::new(),
+        lc: "bow".into(),
+        lc_dir: "models".into(),
     };
     let mut i = 1;
     let num = |s: &str| -> Result<f64, i32> {
@@ -1201,6 +1317,8 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--no-bridge" => a.bridge = false,
             "--no-provisional" => a.provisional = false,
             "--geo" => a.geo = true,
+            "--lc" => a.lc = val()?,
+            "--lc-dir" => a.lc_dir = val()?,
             "--imu-brief" => a.imu_brief = val()?,
             "--bridge-gap" => a.bridge_gap = num(&val()?)?,
             "--map-inline" => a.map_inline = true,
@@ -1548,6 +1666,23 @@ impl Runner {
         let reloc_min = params.get("Vis/MinInliers", 20i32).max(25);
         let mut eng = engine::Engine::new(&params, &odom_params, reloc_min);
         let klt_path = params.get("Odom/Strategy", 0i32) == 9;
+        match a.lc.as_str() {
+            "bow" => {}
+            "net" | "both" => {
+                let mut cfg = crate::lcnet::LcConfig::from_dir(&a.lc_dir);
+                let e = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+                if let Some(v) = e("LC_MIN_SCORE") { cfg.min_score = v as f32; }
+                if let Some(v) = e("LC_SKIP_S") { cfg.skip_s = v; }
+                if let Some(v) = e("LC_TOPK") { cfg.topk = v as usize; }
+                if let Some(v) = e("LC_MIN_INLIERS") { cfg.verify.min_inliers = v as usize; }
+                if let Some(v) = e("LC_SD_T") { eng.lc_sd[0] = v; }
+                if let Some(v) = e("LC_SD_R") { eng.lc_sd[1] = v.to_radians(); }
+                common::info!("루프 클로저: {} (MegaLoc {} · XFeat {} · 후보 {} · 내적 ≥ {} · {} 초 안 노드 뺌)", a.lc, cfg.megaloc, cfg.xfeat, cfg.topk, cfg.min_score, cfg.skip_s);
+                eng.start_lc(cfg, a.lc == "net").map_err(|e| format!("--lc {}: {e}", a.lc))?;
+                eng.lc_block = !a.tum.is_empty() && a.rate == 0.0;
+            }
+            o => return Err(format!("--lc {o}: bow · net · both 가운데 하나")),
+        }
         if let Some(f) = imu_fusion {
             eng.set_imu(f)?;
             eng.merge_top = 5;
@@ -2335,6 +2470,14 @@ impl Runner {
         }
         {
             common::info!("루프 클로저 받음 {n_loop} · 보정이 커서 버림 {n_loop_rejected}, 살펴본 보정 최대 {:.2} m · {:.1}°", max_corr.0, max_corr.1.to_degrees());
+            let l = &eng.lc_stats;
+            if l.sent > 0 {
+                let d = l.done.max(1) as f64;
+                common::info!(
+                    "신경망 루프: 노드 {} 개 보냄 · {} 개 끝남, 검증 {} 번, 맞음 {} · 지도에 들어감 {}, ms/노드 MegaLoc {:.1}(최대 {:.1}) · XFeat {:.1}(최대 {:.1}) · 짝 + 검증 {:.1}(최대 {:.1})",
+                    l.sent, l.done, l.tried, l.hits, l.accepted, l.ms[0] / d, l.ms_max[0], l.ms[1] / d, l.ms_max[1], l.ms[2] / d, l.ms_max[2]
+                );
+            }
         }
         common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {n_lost}, 새 지도 {n_newmap}, 루프 클로저 {n_loop}, 지도 보정 바뀜 {n_corr}", n as f64 / wall.max(1e-9));
         common::info!("위치 질: 좋음 {} · 불확실 {} · 놓침 {}", nq[0], nq[1], nq[2]);

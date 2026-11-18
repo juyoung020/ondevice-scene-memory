@@ -4,10 +4,10 @@
 //! 입력: MegaLoc 은 f32 조각(patches), XFeat 은 ONNX 판 f32 정규화 회색 · NPU 판 u8 회색(모델이 u8 을 받는지 [`Net::wants_u8`]).
 //! DXRT 출력 순서는 모델 파일이 정하므로 이름으로 찾는다([`Net::span`]).
 
-/// 올린 추론 하나
+/// 올린 추론 하나(결과는 올릴 때 준 버퍼에 바로 쓰임)
 pub enum Ticket {
-    /// ONNX: 올릴 때 이미 끝나 결과를 들고 있음
-    Done(Vec<f32>),
+    /// ONNX: 올릴 때 이미 끝남
+    Done,
     #[cfg(feature = "dxrt")]
     Job(i32),
 }
@@ -41,7 +41,7 @@ impl Net {
                 let (s, n) = e.f32_span(i);
                 outs.push((e.tensors[i].0.clone(), s, n));
             }
-            let total = e.out.len().div_ceil(4);
+            let total = e.out_len.div_ceil(4);
             return Ok(Net { kind: Kind::Dx(e), outs, total });
         }
         #[cfg(feature = "onnx")]
@@ -103,11 +103,12 @@ impl Net {
         self.total
     }
 
-    /// 입력(바이트: f32 면 f32 의 바이트, u8 이면 그대로) 하나를 올림. DXRT 는 바로 돌아오고 입력 버퍼는 받을 때까지 그대로 둬야 한다
-    pub fn submit(&mut self, input: &[u8]) -> Ticket {
+    /// 입력(바이트: f32 면 f32 의 바이트, u8 이면 그대로) 하나를 올림. 결과는 out(모든 출력 이어 붙임)에 바로 쓰인다.
+    /// DXRT 는 바로 돌아오고, 입력 버퍼와 out 은 [`Net::wait`] 까지 그대로 둔다
+    pub fn submit(&mut self, input: &[u8], out: &mut Vec<f32>) -> Ticket {
         match &mut self.kind {
             #[cfg(feature = "dxrt")]
-            Kind::Dx(e) => Ticket::Job(e.submit(input)),
+            Kind::Dx(e) => Ticket::Job(e.submit(input, out)),
             #[cfg(feature = "onnx")]
             Kind::Onnx { sess, input: name, shape, u8_in } => {
                 let shape: Vec<usize> = shape.iter().map(|&d| d.max(1) as usize).collect();
@@ -120,24 +121,24 @@ impl Net {
                     let v = ort::value::TensorRef::from_array_view((shape, f)).expect("입력");
                     sess.run(ort::inputs![name.as_str() => v]).expect("onnx run")
                 };
-                let mut buf = vec![0f32; self.total];
+                out.resize(self.total, 0.0);
                 for (n, s, len) in &self.outs {
                     let (_, d) = outs[n.as_str()].try_extract_tensor::<f32>().expect("출력");
-                    buf[*s..*s + len].copy_from_slice(&d[..*len]);
+                    out[*s..*s + len].copy_from_slice(&d[..*len]);
                 }
-                Ticket::Done(buf)
+                Ticket::Done
             }
             #[allow(unreachable_patterns)]
             _ => panic!("실행기 없음"),
         }
     }
 
-    /// 결과 받기(받을 버퍼를 미리 넘김: 크기가 맞으면 다시 잡지 않는다)
-    pub fn wait(&mut self, t: Ticket, out: &mut Vec<f32>) {
+    /// 올린 추론이 끝날 때까지 기다림(결과는 submit 에 준 버퍼에 이미 있음)
+    pub fn wait(&mut self, t: Ticket) {
         match (&mut self.kind, t) {
             #[cfg(feature = "dxrt")]
-            (Kind::Dx(e), Ticket::Job(id)) => e.waiter().wait_into(id, out),
-            (_, Ticket::Done(v)) => *out = v,
+            (Kind::Dx(e), Ticket::Job(id)) => e.waiter().wait(id),
+            (_, Ticket::Done) => {}
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
@@ -145,8 +146,8 @@ impl Net {
 
     /// 올리고 바로 받기
     pub fn run(&mut self, input: &[u8], out: &mut Vec<f32>) {
-        let t = self.submit(input);
-        self.wait(t, out);
+        let t = self.submit(input, out);
+        self.wait(t);
     }
 }
 

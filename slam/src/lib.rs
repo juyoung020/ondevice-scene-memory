@@ -17,6 +17,11 @@ pub mod bufpool;
 pub mod simd;
 pub mod imu;
 pub mod georeg;
+// 루프 · 재위치 신경망 경로(MegaLoc 후보 · XFeat 검증 · 중력 고정 검증, 앱 연결 전: docs/loop_closure_npu.md)
+pub mod place;
+pub mod xfeat;
+pub mod lcverify;
+pub mod nnrun;
 
 use nalgebra::{Isometry3, Point3};
 

@@ -2,7 +2,7 @@
 
 보드(Pi 5 + DX-M1, DXRT 3.4)는 파일 형식 6 ~ 8 을 연다. 컴파일러는 **DX-COM 2.4.1**(형식 8)을 쓴다(2.5.0 은 형식 9 라 열리지 않음). 데스크톱 WSL 의 `~/dx241` 가상 환경에 설치되어 있다.
 
-두 모델 모두 NPU 작업 하나로만 돈다(CPU 작업 없음, `parse_model -m <파일>` 로 확인). 모델 안에 CPU 작업이 남으면 DXRT 가 ONNX Runtime 으로 그 부분을 돌리며 CPU 를 쓴다.
+모든 모델이 NPU 작업 하나로만 돈다(CPU 작업 없음, `parse_model -m <파일>` 로 확인). 모델 안에 CPU 작업이 남으면 DXRT 가 ONNX Runtime 으로 그 부분을 돌리며 CPU 를 쓴다.
 
 ONNX 손질은 `tools` 의 `npu_prep`(Rust)으로 한다.
 
@@ -50,6 +50,39 @@ $P patches-calib <물체 사진 폴더> patches_calib.npy 200
 확인: 컴파일러 진단 코사인 0.9907(이전 판 0.973). 보드에서 PC 기준 벡터와 코사인 평균 0.928(사진 40 장, `ondevice --embed-check`). NPU 계산 13.5 ms.
 
 프로그램은 입력 이름이 `patches` 이면 조각 배치로 전처리한다(`embed.rs` `preprocess_into`).
+
+## 루프 · 재위치: megaloc_168x224.dxnn · xfeat_480x640.dxnn
+
+쓰임과 정확도는 [loop_closure_npu.md](loop_closure_npu.md). 내보내기 · 손질 · 보정은 저장소 밖 일회성 파이썬(데스크톱 WSL `/home/rea/port/lc`, `~/sfm` 가상 환경의 torch, CPU 만)이고, 컴파일은 `~/dx241/bin/python`(DX-COM 2.4.1 의 파이썬 API `dx_com.compile`, 보정 자료를 한 장씩 내주는 dataloader, `calibration_method="ema"`, `quant_diagnosis=True`).
+
+보정 사진 320 장(평가 녹화 fr1 360 · rpy · desk · room 은 뺌): 우리 D435 녹화 walk1 80 · rec 20 · fr3 office(D435) 40 · digiteo2(D435) 30, TUM fr3 long_office 60 · fr1 desk2 50 · fr1 floor 40. 녹화마다 고르게 건너뛰며 고름.
+
+### MegaLoc(gmberton/MegaLoc, MIT): 입력 조각 [1,192,588] → f [1,192,256] · s [1,192,64] · t [1,256]
+
+가중치는 `torch.hub.load('gmberton/MegaLoc','get_trained_model')`(Hugging Face `gberton/MegaLoc`, 약 870 MB). 모델을 같은 계산의 손으로 짠 판으로 옮겨(원본과 기술자 코사인 1.000000000, 최대 차 4e-7) 그 판을 내보낸다.
+
+1. 조각 합성곱(14×14, 보폭 14)을 행렬곱으로: 입력 = 224×168 사진의 조각 192 개(조각 안 순서 채널 · 세로 · 가로, 값 /255). ImageNet 평균 · 표준편차는 행렬곱 무게 · 편향에 접는다. 위치 임베딩은 168×224 로 미리 보간(원본 `interpolate_pos_encoding`, 쌍삼차 + 0.1 오프셋)해 상수, CLS 토큰과 더해 앞에 붙인다. LayerScale 은 proj · fc2 무게에 접는다.
+2. SALAD 의 세 MLP(군집 특징 768→512→256, 점수 768→512→64, 토큰 768→512→256)까지 모델 안. Sinkhorn · 군집 가중합 · 정규화 · 마지막 선형(16,640 → 8,448)은 Rust(`place.rs`). 마지막 선형 무게는 `megaloc_head.bin`(MLH1).
+3. 8 비트로 깨지는 까닭: 블록 8 의 MLP 가 토큰 1~2 개(첫 조각 토큰은 늘, 나머지 하나는 사진마다 다른 자리)의 채널 38 · 60 · 293 · 415 에 약 400 을 쓰고 잔차가 끝까지 ±450 범위가 된다(보통 값 ±2). 손질 없이 8 비트 흉내 코사인 −0.02.
+4. 손질(실수 결과는 원본과 코사인 0.998 – 0.9996):
+   - 첫 조각 토큰 고정: 블록 8 주의 뒤로 흐름에서 빼고, 블록 9 – 11 에서 다른 토큰이 보는 K · V 와 끝 값은 보정 자료 평균 상수(SigLIP2 와 같은 방법).
+   - 블록 8 · 11 의 fc1 출력을 10 으로 자름(다른 자리의 큰 값 토큰이 생기지 않게).
+   - 잔차를 평균 0 으로 유지(잔차에 쓰는 층의 출력 채널 평균을 뺌) → LayerNorm 의 배율 · 편향을 다음 선형 층에 접음 → 잔차 채널을 직교 행렬 Q(Q·1 = 1, 무작위 씨앗 0)로 돌림. 평균 0 이라 돌린 뒤에도 LayerNorm(배율 없음)이 그대로 맞는다.
+   - GELU 나누기: `GELU(min(f,2)) · W + ReLU(f−2) · W`.
+   - LayerNorm · GELU 는 `F.layer_norm`(배율 없음) · `F.gelu`(erf)를 opset 13 으로 내보낸 분해형으로 둔다. 손으로 쓴 RMSNorm 꼴은 DX-COM 이 알아보지 못해 블록 전체를 CPU 작업으로 남겼다.
+5. 컴파일: 보정 자료 = 위 320 장의 조각 [320,192,588].
+
+⟨ML_COMPILE⟩
+
+### XFeat(verlab/accelerated_features, Apache-2.0): 입력 u8 [1,1,480,640] → feats [1,64,60,80] · kpts [1,65,60,80] · heat [1,1,60,80]
+
+가중치 `xfeat.pt`(6 MB). 모델 = 원본 `XFeatModel.forward` 의 InstanceNorm 뒤 전부(원본 출력과 최대 차 9e-5).
+
+1. BatchNorm(배율 없음)을 합성곱에 접고, 키포인트 머리의 8×8 펼치기(unfold) + 1×1 합성곱을 8×8 보폭 8 합성곱 하나로 바꾼다. 쌍선형 올리기는 배율 2 · 4 고정 Resize.
+2. 입력: 합성곱이 첫 연산인 입력을 DX-COM 은 u8 로 받는다(컴파일 로그 `NPU input : uint8`, 형식 FORMATTER). 그래서 CPU 가 정규화된 회색 x 를 `q = clamp(round(32·x + 112), 0, 255)` 로 넣고, 모델 첫머리에서 `(q − 112)/32` 로 되돌린다(정규화 범위 −3.5 ~ 4.47, 보정 사진에서 이 밖 화소 0.04 %). `.dxnn` 의 입력 기록은 `UINT8 [1,480,640,1]`, scale 없음.
+3. 컴파일: 보정 자료 = 320 장의 q [320,1,480,640].
+
+확인: DX-COM 진단 코사인 0.9916(QSNR 17.8 dB, 무게만 0.9970 · 활성값만 0.9938). NPU 작업 하나(CPU 작업 없음). 파일 1.0 MB.
 
 ## 글 인코더(뷰어 검색): Rust
 

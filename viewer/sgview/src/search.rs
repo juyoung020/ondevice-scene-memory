@@ -3,7 +3,9 @@
 //! memmap (`--embed`) leaves one SigLIP2 image vector per object (`objects/O<id>_emb.bin`, 768 f32, unit length), kept in memory as one
 //! table ([`crate::objtable`]). A query is turned into a vector by the SigLIP2 text encoder and every object gets
 //! p = sigmoid(SCALE · cos(query, picture) + LOGIT_BIAS), the pair probability the model was trained to give; objects with p ≥ the
-//! threshold come back in cosine order. An object whose stored name holds the query letters (or the query holds the name) scores 1.
+//! threshold come back. The query is also read as class names (query text × name text against the `--vocab` word vectors, made ahead of
+//! time): an object whose stored name the query means ("마우스" → mouse) is a hit even when its picture alone scores low.
+//! score = 1 − (1 − p_name)(1 − p_look). An object whose stored name holds the query letters (or the query holds the name) scores 1.
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +20,31 @@ pub const DIRECT_MIN: f32 = 0.004;
 pub const DIRECT_MIN_KO: f32 = 0.0025;
 /// Token count the text encoder was trained with
 const TOKENS: usize = 64;
+/// Reading the query as a class name (text × text, no picture): constants read off 36 Korean / English queries against the 1,225 names of
+/// vocab/names.voc (docs/performance_log.md). Closest-name cosine minus the median cosine below which the query is no class name, and from which it surely is
+const NAME_GAP_LO: f32 = 0.06;
+const NAME_GAP_HI: f32 = 0.10;
+/// cosine distance from the closest name over which a name's share drops by e
+const NAME_FALLOFF: f32 = 0.035;
+/// A stored name the query was read as with at least this share is a hit ("마우스" → mouse, "티비" → tv · monitor)
+pub const NAME_MIN_P: f32 = 0.2;
+/// Word vectors the query is read against (`--vocab`, made ahead of time): set when the encoder loads
+static READ_VOCAB: std::sync::OnceLock<Vec<(String, Arc<Vec<f32>>)>> = std::sync::OnceLock::new();
+
+/// How strongly the query means each name: conf · e^((cos − best) / NAME_FALLOFF), conf = how far the closest name stands out from the median
+/// name (text vectors of this model all sit close together, so cosines are read relative to each other). Names: `vocab` ∪ `present`
+fn read_names(tq: &[f32], vocab: &[(String, Arc<Vec<f32>>)], present: &[(String, Arc<Vec<f32>>)]) -> HashMap<String, f32> {
+    let mut all: Vec<(&str, f32)> = vocab.iter().chain(present.iter()).map(|(n, v)| (n.as_str(), cos(tq, v))).collect();
+    if all.is_empty() {
+        return HashMap::new();
+    }
+    let mut sorted: Vec<f32> = all.iter().map(|x| x.1).collect();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    let (best, median) = (sorted[0], sorted[sorted.len() / 2]);
+    let conf = ((best - median - NAME_GAP_LO) / (NAME_GAP_HI - NAME_GAP_LO)).clamp(0.0, 1.0);
+    all.dedup_by(|a, b| a.0 == b.0);
+    all.into_iter().map(|(n, c)| (n.to_string(), conf * ((c - best) / NAME_FALLOFF).exp())).collect()
+}
 
 /// a · b (unit vectors → cosine): [`crate::objtable::dot`] (NEON on the board, the plain loop elsewhere)
 pub fn cos(a: &[f32], b: &[f32]) -> f32 {
@@ -250,8 +277,19 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         table.sync_bytes(&items);
     }
     let cosines = tq.as_ref().map(|t| table.scores(t)).unwrap_or_default();
-    // (letter match, cosine, reply row)
-    let mut hits: Vec<(bool, f32, serde_json::Value)> = vec![];
+    // the query read as class names (text × text): "마우스" → mouse even when the picture alone is too weak (Korean queries score low on pictures)
+    let p_names: HashMap<String, f32> = match &tq {
+        Some(t) => {
+            let mut present: Vec<String> = objs.iter().map(|o| o["name"].as_str().unwrap_or("").to_lowercase()).filter(|n| !n.is_empty()).collect();
+            present.sort();
+            present.dedup();
+            let pv: Vec<(String, Arc<Vec<f32>>)> = present.into_iter().filter_map(|n| enc(&n).map(|v| (n, v))).collect();
+            read_names(t, READ_VOCAB.get().map(|v| v.as_slice()).unwrap_or(&[]), &pv)
+        }
+        None => HashMap::new(),
+    };
+    // (letter match, score, cosine, reply row)
+    let mut hits: Vec<(bool, f32, f32, serde_json::Value)> = vec![];
     for (o, p) in objs.iter().zip(&paths) {
         if ql.is_empty() {
             break;
@@ -260,15 +298,22 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         let exact = !nl.is_empty() && (nl.contains(&ql) || ql.contains(nl.as_str()));
         let c = p.as_ref().and_then(|p| table.row(p)).filter(|_| !cosines.is_empty()).map(|r| cosines[r]);
         let pl = c.map_or(0.0, prob);
-        if exact || pl >= min {
+        let pn = if exact { 1.0 } else { p_names.get(&nl).copied().unwrap_or(0.0) };
+        if exact || pn >= NAME_MIN_P || pl >= min {
+            let score = 1.0 - (1.0 - pn) * (1.0 - pl);
             let r4 = |x: f32| (x as f64 * 10000.0).round() / 10000.0;
-            hits.push((exact, c.unwrap_or(-1.0), serde_json::json!({"id": o["id"], "name": o["name"], "state": o["state"], "pos": o["pos"],
-                "score": if exact { 1.0 } else { r4(pl) }, "cos": r4(c.unwrap_or(0.0)), "by": if exact { "name" } else { "look" }})));
+            hits.push((exact, score, c.unwrap_or(-1.0), serde_json::json!({"id": o["id"], "name": o["name"], "state": o["state"], "pos": o["pos"],
+                "score": r4(score), "cos": r4(c.unwrap_or(0.0)), "p_name": r4(pn), "p_look": r4(pl), "by": if pn >= pl { "name" } else { "look" }})));
         }
     }
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)).then(b.2.total_cmp(&a.2)));
     hits.truncate(k);
-    serde_json::json!({"q": q, "semantic": tq.is_some(), "min": min, "results": hits.into_iter().map(|h| h.2).collect::<Vec<_>>()})
+    let mut read: Vec<(&String, &f32)> = p_names.iter().filter(|(_, p)| **p >= NAME_MIN_P).collect();
+    read.sort_by(|a, b| b.1.total_cmp(a.1));
+    read.truncate(3);
+    serde_json::json!({"q": q, "semantic": tq.is_some(), "min": min,
+        "names": read.iter().map(|(n, p)| serde_json::json!({"name": n, "p": (**p as f64 * 100.0).round() / 100.0})).collect::<Vec<_>>(),
+        "results": hits.into_iter().map(|h| h.3).collect::<Vec<_>>()})
 }
 
 #[cfg(test)]
@@ -427,7 +472,10 @@ pub fn load_encoder(dir: &str, vocab: Option<&str>) -> Option<TextEnc> {
     match TextEnc::load(Path::new(dir)) {
         Ok(e) => {
             match vocab.map(|f| read_vocab(Path::new(f))) {
-                Some(Ok(v)) => e.know(v),
+                Some(Ok(v)) => {
+                    let _ = READ_VOCAB.set(v.clone());
+                    e.know(v)
+                }
                 Some(Err(err)) => eprintln!("search: {err}"),
                 None => {}
             }

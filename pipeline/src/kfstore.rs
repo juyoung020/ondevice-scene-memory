@@ -30,9 +30,9 @@ pub struct Kf {
 }
 
 struct KfZ {
-    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 검출 마스크 합집합 화소만, 줄 차례로 이어 한 줄로)
+    rgb_z: Vec<u8>,   // 컬러: 채널별 면 + 왼쪽 화소와의 차 → LZ4(줄인 보관이면 검출 상자 합집합 안 화소만, 줄마다 구간을 이어 한 줄로)
     depth_z: Vec<u8>, // 깊이 mm: 왼쪽 화소와의 차 → 아래·위 바이트 면 → LZ4(줄인 보관이면 4 화소 간격)
-    box_depth_z: Vec<u8>, // 줄인 보관: 검출 마스크 합집합 화소의 깊이 mm(rgb_z 와 같은 화소 차례)
+    box_depth_z: Vec<u8>, // 줄인 보관: 검출 마스크 합집합 화소의 깊이 mm(줄 차례)
 }
 
 impl KfZ {
@@ -41,7 +41,39 @@ impl KfZ {
     }
 }
 
-/// 검출 마스크들의 합집합 화소 번호(줄 차례): 줄인 보관이 컬러 · 깊이를 남기는 화소(물체 점과 그 색). 보관한 검출에서 다시 만들어 따로 저장하지 않는다
+/// 검출 상자들의 합집합을 줄마다 겹치지 않는 구간으로: [(y, x0, x1)](줄 차례, 줄 안 왼쪽부터). 줄인 보관이 컬러를 남기는 곳(다시 쌓은 물체 사진 = 받은 사진).
+/// 겹친 상자의 화소를 한 번만 보관한다
+fn box_spans(dets: &[DetZ], w: usize, h: usize) -> Vec<(usize, usize, usize)> {
+    let boxes: Vec<[usize; 4]> = dets.iter().filter_map(|d| {
+        let [x1, y1, x2, y2] = d.box_.map(|v| v.max(0) as usize);
+        let (x2, y2) = (x2.min(w), y2.min(h));
+        (x2 > x1 && y2 > y1).then_some([x1, y1, x2, y2])
+    }).collect();
+    let mut out = vec![];
+    let mut iv: Vec<(usize, usize)> = vec![];
+    for y in 0..h {
+        iv.clear();
+        iv.extend(boxes.iter().filter(|b| b[1] <= y && y < b[3]).map(|b| (b[0], b[2])));
+        iv.sort_unstable();
+        let mut cur: Option<(usize, usize)> = None;
+        for &(a, b) in &iv {
+            cur = match cur {
+                Some((c0, c1)) if a <= c1 => Some((c0, c1.max(b))),
+                Some((c0, c1)) => {
+                    out.push((y, c0, c1));
+                    Some((a, b))
+                }
+                None => Some((a, b)),
+            };
+        }
+        if let Some((c0, c1)) = cur {
+            out.push((y, c0, c1));
+        }
+    }
+    out
+}
+
+/// 검출 마스크들의 합집합 화소 번호(줄 차례): 줄인 보관이 깊이를 화소마다 남기는 곳(물체 점). 보관한 검출에서 다시 만들어 따로 저장하지 않는다
 fn mask_pixels(dets: &[DetZ], w: usize, h: usize) -> Vec<u32> {
     let mut on = vec![false; w * h];
     for d in dets {
@@ -136,26 +168,33 @@ impl Kf {
         }
         d
     }
-    /// 검출 마스크 합집합 화소(줄인 보관의 화소 차례)
+    /// 검출 마스크 합집합 화소(줄인 보관 깊이의 화소 차례)
     fn mask_px(&self) -> Vec<u32> {
         self.dets.as_deref().map_or_else(Vec::new, |d| mask_pixels(d, self.w, self.h))
+    }
+    /// 검출 상자 합집합 구간(줄인 보관 컬러의 화소 차례)
+    fn spans(&self) -> Vec<(usize, usize, usize)> {
+        self.dets.as_deref().map_or_else(Vec::new, |d| box_spans(d, self.w, self.h))
     }
     /// 보관한 검출(받은 것과 같은 값)
     pub fn dets(&self) -> Option<Vec<Det>> {
         self.dets.as_ref().map(|v| v.iter().map(DetZ::unpack).collect())
     }
-    /// 컬러: 줄인 보관이면 검출 마스크 안 화소만, 그 밖은 0
+    /// 컬러: 줄인 보관이면 검출 상자 안 화소만, 그 밖은 0
     pub fn rgb(&self) -> Vec<u8> {
         if !self.sparse {
             return unpack_rgb(&self.z().rgb_z, self.w, self.h);
         }
         let mut rgb = vec![0u8; self.w * self.h * 3];
-        let px = self.mask_px();
-        if !px.is_empty() {
-            let z = unpack_rgb(&self.z().rgb_z, px.len(), 1);
-            for (k, &i) in px.iter().enumerate() {
-                let o = i as usize * 3;
-                rgb[o..o + 3].copy_from_slice(&z[k * 3..k * 3 + 3]);
+        let spans = self.spans();
+        let n: usize = spans.iter().map(|s| s.2 - s.1).sum();
+        if n > 0 {
+            let z = unpack_rgb(&self.z().rgb_z, n, 1);
+            let mut i = 0;
+            for &(y, x0, x1) in &spans {
+                let o = (y * self.w + x0) * 3;
+                rgb[o..o + (x1 - x0) * 3].copy_from_slice(&z[i * 3..(i + x1 - x0) * 3]);
+                i += x1 - x0;
             }
         }
         rgb
@@ -197,17 +236,18 @@ impl Kf {
         let z = if self.sparse {
             let (qw, qh) = (w.div_ceil(Q), h.div_ceil(Q));
             let q: Vec<u16> = (0..qw * qh).map(|i| depth.mm_round((i / qw) * Q * w + (i % qw) * Q)).collect();
-            // 검출 마스크 합집합 화소만(물체 점과 그 색), 줄 차례로 이어 한 줄로 압축. 마스크 밖 컬러는 버리고 깊이는 4 화소 간격만
-            let px = self.mask_px();
-            let n = px.len();
-            let mut cr = Vec::with_capacity(n * 3);
-            let mut cd = Vec::with_capacity(n);
-            for &i in &px {
-                let i = i as usize;
-                cr.extend_from_slice(&rgb[i * 3..i * 3 + 3]);
-                cd.push(depth.mm_round(i));
+            // 컬러 = 검출 상자 합집합(겹친 상자 화소를 한 번, 줄마다 구간을 이어 한 줄로): 다시 쌓은 물체 사진이 받은 사진과 같아 사진 벡터 · 이름이 그대로.
+            // 깊이 = 검출 마스크 합집합 화소(물체 점) + 그 밖은 4 화소 간격
+            let spans = self.spans();
+            let nc: usize = spans.iter().map(|s| s.2 - s.1).sum();
+            let mut cr = Vec::with_capacity(nc * 3);
+            for &(y, x0, x1) in &spans {
+                cr.extend_from_slice(&rgb[(y * w + x0) * 3..(y * w + x1) * 3]);
             }
-            let (rgb_z, box_depth_z) = if n > 0 { (pack_rgb(&cr, n, 1), pack_depth(&cd, n, 1)) } else { (vec![], vec![]) };
+            let px = self.mask_px();
+            let cd: Vec<u16> = px.iter().map(|&i| depth.mm_round(i as usize)).collect();
+            let rgb_z = if nc > 0 { pack_rgb(&cr, nc, 1) } else { vec![] };
+            let box_depth_z = if !cd.is_empty() { pack_depth(&cd, cd.len(), 1) } else { vec![] };
             KfZ { rgb_z, depth_z: pack_depth(&q, qw, qh), box_depth_z }
         } else {
             KfZ { rgb_z: pack_rgb(rgb, w, h), depth_z: pack_depth_it((0..w * h).map(|i| depth.mm_round(i)), w, h), box_depth_z: vec![] }
@@ -562,7 +602,7 @@ mod tests {
 
     #[test]
     fn sparse_keeps_grid_and_masks() {
-        // 줄인 보관: 점유 격자 화소(8 + 16k)와 검출 마스크 안은 받은 값 그대로, 마스크 밖 컬러는 0 · 깊이는 4 화소 간격 값
+        // 줄인 보관: 점유 격자 화소(8 + 16k)와 검출 마스크 안 깊이는 받은 값 그대로, 상자 안 컬러는 그대로 · 상자 밖은 0, 마스크 밖 깊이는 4 화소 간격 값
         let (w, h) = (64, 48);
         let d: Vec<f32> = (0..w * h).map(|i| 0.5 + (i % 97) as f32 * 0.01).collect();
         let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
@@ -584,12 +624,13 @@ mod tests {
                 assert_eq!(c2[(v * w + u) * 3..(v * w + u) * 3 + 3], rgb[(v * w + u) * 3..(v * w + u) * 3 + 3]);
             }
             for u in 20..30 {
-                assert_eq!(c2[(v * w + u) * 3..(v * w + u) * 3 + 3], [0, 0, 0]);
+                assert_eq!(c2[(v * w + u) * 3..(v * w + u) * 3 + 3], rgb[(v * w + u) * 3..(v * w + u) * 3 + 3]);
                 let q = (v - v % Q) * w + (u - u % Q);
                 assert!((d2[v * w + u] - mm(d[q])).abs() < 1e-6);
             }
         }
         assert!((d2[3 * w + 2] - mm(d[0])).abs() < 1e-6);
+        assert_eq!(c2[(3 * w + 2) * 3..(3 * w + 2) * 3 + 3], [0, 0, 0]);
     }
     #[test]
     fn sparse_fill_matches_per_pixel() {

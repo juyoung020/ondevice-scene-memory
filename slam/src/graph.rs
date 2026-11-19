@@ -1,13 +1,6 @@
-//! 그래프 최적화: RTAB-Map 0.24.2 OptimizerGTSAM::optimize (corelib/src/optimizer/OptimizerGTSAM.cpp) 의 우리 설정 경로.
-//! 설정: Optimizer/Strategy=2(GTSAM), GTSAM/Optimizer=1(가우스-뉴턴), GTSAM/Incremental=false(iSAM2 아님),
-//!       Optimizer/Iterations=20, Optimizer/Epsilon=1e-5, Optimizer/Robust=false, Optimizer/PriorsIgnored=true, Reg/Force3DoF=false.
-//! 경로: 뿌리 노드 사전(prior) 인자 → 링크마다 BetweenFactor<Pose3>(정보 행렬 → 잡음 모델) → 가우스-뉴턴을 RTAB 의 반복 고리로
-//!       (반복마다 오차 감소 < Epsilon 이면 멈춤, 오차 > 1e12 이면 실패) → 결과 Pose3 를 float Transform 으로.
-//! GTSAM 4.2.0(빌드 플래그 POSE3_EXPMAP·ROT3_EXPMAP, 사원수·TBB 없음, Eigen 3.4.0 SSE2) 의 다음을 그대로 옮김:
-//!   Pose3 between·Logmap·Expmap·AdjointMap(geom.rs), noiseModel::Gaussian::Information(대각 판정 → Diagonal/Isotropic/Unit, 아니면 Eigen LLT),
-//!   NoiseModelFactor::linearize(화이트닝)·error(0.5·마할라노비스²), NonlinearFactorGraph::error(인자 순서대로 합), Values::retract.
-//! 선형 풀이(solve.rs)만 원본(COLAMD + 다전선 숄레스키)과 덧셈 순서가 다르다.
-//! 검증: tests::ref_dumps 가 실제 실행(rtab_bridge)에서 남긴 최적화 호출 덤프를 모두 다시 돌려 비트 비교한다.
+//! 자세 그래프 최적화(키프레임 노드 + 연속 간선 + 루프 간선): 뿌리 노드 고정 → 간선마다 between 인자(정보 행렬 → 잡음 모델)
+//! → 가우스-뉴턴(반복마다 오차 감소 < epsilon 이면 멈춤, 오차 > 1e12 이면 실패) → 결과 자세를 float 변환으로.
+//! Pose3 between · Logmap · Expmap · AdjointMap 은 geom.rs, 선형 풀이(최소 차수 순서 + 숄레스키)는 solve.rs.
 mod ccolamd;
 mod exact;
 mod geom;
@@ -17,10 +10,10 @@ pub use geom::Pose3;
 use geom::M6;
 use std::collections::BTreeMap;
 
-/// RTAB-Map Transform 의 값(3×4 행 우선 float: r11 r12 r13 x / r21 .. y / r31 .. z)
+/// 강체 변환 값(3×4 행 우선 float: r11 r12 r13 x / r21 .. y / r31 .. z)
 pub type Tf = [f32; 12];
 
-/// rtabmap::Link::Type
+/// 간선 종류
 pub mod link_type {
     pub const NEIGHBOR: i32 = 0;
     pub const GLOBAL_CLOSURE: i32 = 1;
@@ -34,7 +27,7 @@ pub mod link_type {
     pub const GRAVITY: i32 = 9;
 }
 
-/// rtabmap::Link 중 최적화가 읽는 칸. inf = 정보 행렬 6×6(cv::Mat 행 우선, x y z roll pitch yaw 순)
+/// 간선: from → to 상대 자세(from⁻¹ · to). inf = 정보 행렬 6×6(행 우선, x y z roll pitch yaw 순)
 #[derive(Clone, Debug)]
 pub struct Link {
     pub from: i32,
@@ -44,7 +37,7 @@ pub struct Link {
     pub inf: [f64; 36],
 }
 
-/// 최적화 파라미터(RTAB-Map Parameters.h 의 GTSAM 빌드 기본값)
+/// 최적화 파라미터
 #[derive(Clone, Debug)]
 pub struct OptimizerParams {
     pub iterations: i32,
@@ -77,31 +70,13 @@ impl Default for OptimizerParams {
     }
 }
 
-impl OptimizerParams {
-    pub fn from_params(p: &crate::params::Params) -> OptimizerParams {
-        let d = OptimizerParams::default();
-        OptimizerParams {
-            iterations: p.get("Optimizer/Iterations", d.iterations),
-            epsilon: p.get("Optimizer/Epsilon", d.epsilon),
-            variance_ignored: p.get_bool("Optimizer/VarianceIgnored", d.variance_ignored),
-            priors_ignored: p.get_bool("Optimizer/PriorsIgnored", d.priors_ignored),
-            gravity_sigma: p.get("Optimizer/GravitySigma", d.gravity_sigma),
-            force_3dof: p.get_bool("Reg/Force3DoF", d.force_3dof),
-            gtsam_optimizer: p.get("GTSAM/Optimizer", d.gtsam_optimizer),
-            robust: p.get_bool("Optimizer/Robust", d.robust),
-            incremental: p.get_bool("GTSAM/Incremental", d.incremental),
-            fast_solver: d.fast_solver,
-        }
-    }
-}
-
-/// 최적화 결과. RTAB 이 빈 결과를 내는 경우(링크 없음, 발산, 풀이 실패)는 poses 가 비어 있다
+/// 최적화 결과. 링크 없음 · 발산 · 풀이 실패면 poses 가 비어 있다
 #[derive(Clone, Debug, Default)]
 pub struct Optimized {
     pub poses: BTreeMap<i32, Tf>,
-    /// RTAB finalError(멈춘 반복은 빼고 마지막으로 받아들인 오차)
+    /// 마지막으로 받아들인 오차
     pub final_error: f64,
-    /// RTAB iterationsDone
+    /// 반복 수
     pub iterations: i32,
 }
 
@@ -323,7 +298,7 @@ fn linearize(f: &Factor, x: &[Pose3]) -> exact::LinFactor {
     exact::LinFactor { keys: f.keys[..f.n].to_vec(), a, b }
 }
 
-/// RTAB-Map OptimizerGTSAM::optimize(rootId, poses, edgeConstraints) 의 3D · 배치 · 가우스-뉴턴 경로.
+/// 3D 자세 그래프 가우스-뉴턴(배치).
 /// links 는 std::multimap<int, Link> 의 순회 순서(키 = from, 같은 키는 넣은 순서)로 준다.
 /// 우리 설정 밖(2D, iSAM2, Robust, 사전 사용, 중력 링크, 랜드마크, 다른 GTSAM 최적화기)이면 Err.
 pub fn optimize(root: i32, poses: &BTreeMap<i32, Tf>, links: &[Link], p: &OptimizerParams) -> Result<Optimized, String> {
@@ -350,7 +325,7 @@ pub fn optimize(root: i32, poses: &BTreeMap<i32, Tf>, links: &[Link], p: &Optimi
     let fs = build_factors(root, &index, &x0, links, p)?;
     // GaussNewtonOptimizer 가 만들 때 한 번 정하는 소거 순서(Ordering::Create(COLAMD, graph))
     let ord = if p.fast_solver { None } else { Some(colamd_order(&fs, x0.len())) };
-    // RTAB 반복 고리
+    // 반복 고리
     let mut x = x0;
     let mut last_error = graph_error(&fs, &x);
     let mut it = 0;
@@ -378,7 +353,7 @@ pub fn optimize(root: i32, poses: &BTreeMap<i32, Tf>, links: &[Link], p: &Optimi
     Ok(Optimized { poses: ids.iter().zip(&x).map(|(&id, q)| (id, q.to_tf())).collect(), final_error: last_error, iterations: it })
 }
 
-/// 인자 그래프: 뿌리 사전 먼저, 그다음 링크 순서대로(RTAB 이 graph.add 하는 순서)
+/// 인자 그래프: 뿌리 사전 먼저, 그다음 링크 순서대로
 fn build_factors(root: i32, index: &BTreeMap<i32, usize>, x0: &[Pose3], links: &[Link], p: &OptimizerParams) -> Result<Vec<Factor>, String> {
     let mut fs: Vec<Factor> = Vec::with_capacity(links.len() + 1);
     // 뿌리 사전: 위 축(up = Rᵀz) 둘레 회전은 분산 1e-9, 나머지 회전·위치는 1e-2

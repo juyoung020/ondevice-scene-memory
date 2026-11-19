@@ -268,7 +268,7 @@ impl SlamSide {
     }
 
     /// 가장 새 IMU 표본까지의 장면 사이 위치(카메라 시계 시각, IMU 시각, 카메라 광학 → 지도)
-    pub fn fast_pose(&self) -> Option<(f64, f64, slam::register::Tf)> {
+    pub fn fast_pose(&self) -> Option<(f64, f64, slam::geom::Tf)> {
         self.r.as_ref()?.imu_ring.as_ref()?.fast_next()
     }
 
@@ -352,7 +352,7 @@ impl StreamReader {
     }
 
     /// IMU 모드 장면 사이 위치(같은 프로세스 위치 프로그램)
-    pub fn fast_pose(&self) -> Option<(f64, f64, slam::register::Tf)> {
+    pub fn fast_pose(&self) -> Option<(f64, f64, slam::geom::Tf)> {
         match self.src.as_ref() {
             Some(Src::Slam(s)) => s.fast_pose(),
             _ => None,

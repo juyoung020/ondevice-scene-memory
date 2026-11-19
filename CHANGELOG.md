@@ -36,6 +36,7 @@
 - MegaLoc · XFeat NPU 모델(`megaloc_168x224.dxnn` 120.5 MB · `xfeat_480x640.dxnn` 1.0 MB, INT8, CPU 작업 없음)과 주성분 1,024 투영(`megaloc_head_pca1024.bin`), 보드 확인 `scripts/board_lc_check.sh`.
 
 ### Changed
+- 위치 프로그램을 새 SLAM 으로: 광류 + PnP + IMU 앞단은 놓쳐도 지도 하나(마지막 위치에서 다시 시작, 그 구간은 약한 간선), 지도 노드마다 MegaLoc 후보 · XFeat 검증(루프 스레드) → 자세 그래프 가우스-뉴턴(그래프 스레드), 처리 루프는 기다리지 않음. 되찾기는 BRIEF 상호 최근접 + PnP.
 - 점 지도를 옥트리 대신 청크로 쌓는다: 가까운 키프레임 점을 청크 기준 자세 좌표(i16 mm + u8 색)로 담고, 루프 클로저 · 수평 맞춤은 청크 자세만 고친다(긴 사무실 최대 RSS 2,411 → 1,587 MB, 점 지도 90 → 23 MB). 뷰어는 `/bstream` 칸 8 로 바뀐 청크 자세만 받는다.
 - 모델 폴더 규칙 하나(`$ONDEVICE_MODELS`, 보드 `~/models`, PC `models/` · WSL `/mnt/c/ondevice/models`)로 루프 클로저 모델을 찾는다.
 - 뷰어 청크 점은 `/bstream` 한 연결로(칸 9, 새 청크부터, 덩어리당 256 KB · 밀린 바이트만큼 줄임): 청크마다 파일 요청이 없어 느린 링크(Tailscale 중계)에서도 점이 쌓이고, 루프 보정 · 다시 쌓기는 자세만 바뀌어 받은 점을 그대로 둔다.
@@ -67,6 +68,7 @@
 - IMU 모드 특징 설명자를 점마다 방향으로 돌린 BRIEF(ORB 식)로 뽑고, 다시 잡기 · 지도 잇기는 PnP 후보 5 개까지 맞춰 본다: 흔들어도 새 지도를 덜 열고 빨리 다시 붙는다.
 
 ### Removed
+- RTAB-Map 에서 옮긴 경로 전부: 낱말 루프(사전 · 베이즈 · FLANN) · Memory · 여러 지도(새 지도 · 맡아 두기 · 잇기) · RegistrationVis · 다시 잡기 PnP RANSAC · F2F 위치 추적 · 파라미터(`docs/rtabmap_pi.ini`, `--config`, `--Group/Name`, `--reloc-wait`, `--bridge-gap`, `--imu-hold-*`).
 - 채택한 동작을 끄고 켜던 옵션과 옛 경로: `--lc` · `--lc-dir`(낱말 루프만), `--pts-map` · `--chunk-keep`(옥트리 점 지도), `--geo`(깊이 서브맵 정합), `--imu-brief`(곧은 · 둘 다 BRIEF), `--no-bridge`, `--no-provisional`, `--map-inline`, `--no-boost`, `--seg-skip`, `--no-level`, `--no-rebuild`, `scripts/board_run.sh` 의 `LC=`.
 - `--seg-pipe`, `--seg-min-ms`, `--infer-min-ms`(분할 단계 스레드 · 보드 시간 흉내).
 - `scripts/board_imu_measure.sh`, `scripts/board_merge_check.sh`(`scripts/board_all.sh` 로 합침).

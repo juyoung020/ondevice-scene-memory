@@ -1,22 +1,19 @@
-//! RTAB-Map 0.24.2 에서 우리 설정(docs/rtabmap_pi.ini)이 지나가는 경로를 Rust 로 옮긴 것.
-//! 원본: introlab/rtabmap 0.24.2 (BSD-3-Clause), OpenCV 4.10 (Apache-2.0) 의 해당 함수. 모듈마다 원본 파일·함수를 적는다.
+//! 위치 추적과 지도(SLAM): 장면마다 광류 + IMU 로 위치를 따라가고(klt · imu), 지도 노드마다 MegaLoc 후보 + XFeat 검증으로
+//! 예전 자리를 찾아(lcnet, 따로 도는 스레드) 자세 그래프(graph)를 바로잡는다. 구조는 docs/slam.md.
 //!
-//! 흐름(장면마다): 입력(io) → 특징점(features) → 앞 장면과 짝짓기·PnP(register) → 위치 추적(odom)
-//!                 1 초에 1 번: 지도 노드 추가 · 루프 클로저(loopclose) · 그래프 최적화(graph) → 스트림(stream)
+//! 흐름(장면마다): 입력(io) → 광류 위치 추적 + IMU(klt · imu) → 장면 스트림(stream)
+//!                 1 초에 1 번: 지도 노드(app::Mapper) → 루프 스레드(lcnet) → 자세 그래프 풀이(graph, 따로 도는 스레드)
 pub mod features;
+pub mod geom;
 pub mod graph;
 pub mod io;
-pub mod loopclose;
-pub mod odom;
 pub mod klt;
-pub mod params;
-pub mod register;
 pub mod stream;
 pub mod app;
 pub mod bufpool;
 pub mod simd;
 pub mod imu;
-// 루프 · 재위치 신경망 경로(MegaLoc 후보 · XFeat 검증 · 중력 고정 검증, docs/loop_closure_npu.md), 앱 연결은 lcnet
+// 장소 인식 · 루프 검증 신경망(MegaLoc 후보 · XFeat 검증 · 중력 고정 검증, docs/loop_closure_npu.md), 앱 연결은 lcnet
 pub mod lcnet;
 pub mod place;
 pub mod xfeat;
@@ -25,10 +22,10 @@ pub mod nnrun;
 
 use nalgebra::{Isometry3, Point3};
 
-/// 강체 변환(회전 + 이동, 미터). RTAB-Map Transform 과 같은 뜻: 몸체 축(x 앞, y 왼쪽, z 위)
+/// 강체 변환(회전 + 이동, 미터). 몸체 축(x 앞, y 왼쪽, z 위)
 pub type Pose = Isometry3<f64>;
 
-/// 핀홀 카메라(왜곡 없음). local = 몸체 → 광학 축(RTAB-Map CameraModel::localTransform, 보통 opticalRotation)
+/// 핀홀 카메라(왜곡 없음). local = 몸체 → 광학 축(보통 광학 회전)
 #[derive(Clone, Debug)]
 pub struct Camera {
     pub fx: f64,

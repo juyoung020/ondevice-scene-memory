@@ -39,7 +39,7 @@ if [ "${PGO:-}" != "" ] && [ "${PGO%%:*}" = auto ]; then
   [ -x "$PD" ] || { echo "llvm-profdata 없음: rustup component add llvm-tools"; exit 1; }
   PGO=gen SEND=0 bash "$0" "$BOARD" "$DEST"
   scp -q "${CARGO_TARGET_DIR:-target}/pgo-gen/aarch64-unknown-linux-gnu/$PROFILE/ondevice" "$BOARD:ondevice-pgo-gen"
-  ssh "$BOARD" "rm -rf ~/pgo && mkdir -p ~/pgo && chmod +x ~/ondevice-pgo-gen && cd ~/ondevice-scene-memory &&     ~/ondevice-pgo-gen --slam '--tum $REC --rate 0 --block --config docs/rtabmap_pi.ini --send-every 2' --no-drop --every 1       --seg ~/models/objectsam-416_640.dxnn --embed ~/models/siglip2-vision_npu.dxnn --vocab vocab/indoor.voc --max-depth 3.5 --out /tmp/pgo-out > /dev/null 2>&1;     rm -rf /tmp/pgo-out ~/ondevice-pgo-gen"
+  ssh "$BOARD" "rm -rf ~/pgo && mkdir -p ~/pgo && chmod +x ~/ondevice-pgo-gen && cd ~/ondevice-scene-memory &&     ~/ondevice-pgo-gen --slam '--tum $REC --rate 0 --block --send-every 2' --no-drop --every 1       --seg ~/models/objectsam-416_640.dxnn --embed ~/models/siglip2-vision_npu.dxnn --vocab vocab/indoor.voc --max-depth 3.5 --out /tmp/pgo-out > /dev/null 2>&1;     rm -rf /tmp/pgo-out ~/ondevice-pgo-gen"
   rm -rf /tmp/ondevice-pgo && mkdir -p /tmp/ondevice-pgo && scp -q "$BOARD:pgo/*.profraw" /tmp/ondevice-pgo/
   "$PD" merge -o /tmp/ondevice-pgo/merged.profdata /tmp/ondevice-pgo/*.profraw
   mkdir -p "$(dirname "$PGO_PROFILE")" && cp /tmp/ondevice-pgo/merged.profdata "$PGO_PROFILE"

@@ -6,7 +6,7 @@
 //!   - 자이로 치우침: 시작할 때 가만히 있으면 평균, 그 뒤 광류가 잘 된 장면마다 영상 회전과의 차이로 조금씩 고침
 //! 시각: 장면 시각(rsdriver = 카메라 HW 시계 + 첫 장면에서 고정한 UNIX 시각 오프셋)과 같은 UNIX 시계. t_imu = t_cam + timeshift_cam_imu(Kalibr).
 //! 셈(사전적분 · 회전 보정 · 좌표 변환 · 레지스터 변환)은 simd.rs 의 NEON 판(보드)과 스칼라 판(PC)이 비트까지 같다.
-use crate::register::rtf::Tf;
+use crate::geom::rtf::Tf;
 use crate::simd::{gyro_step, m34_mul, m34_t, m34_vec, so3_exp, M34, M34_I};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -855,9 +855,9 @@ mod tests {
         let wb = [0.0, 0.0, 0.52, 0.0];
         feed(&ring, 0.0, 400, wb);
         // 광학 → 몸체(OPTICAL)의 역을 R_ci 로 두면 IMU 축 = 몸체 축
-        let l = m34_of_tf(&crate::register::rtf::OPTICAL);
+        let l = m34_of_tf(&crate::geom::rtf::OPTICAL);
         let mut f = Fusion::new(ring.clone(), Calib { r_ci: m34_t(&l), shift: 0.0 }, 1.0);
-        f.poll(&crate::register::rtf::OPTICAL, 1.0, 0.0);
+        f.poll(&crate::geom::rtf::OPTICAL, 1.0, 0.0);
         let up = f.up_body().unwrap();
         assert!((up[2] - 1.0).abs() < 1e-5);
         // 움직이는 중이 아니라 가만히(흔들림 0)라 처음 평균 = 0.52 가 치우침이 됨 → 0 으로 되돌리고 영상으로 고치기

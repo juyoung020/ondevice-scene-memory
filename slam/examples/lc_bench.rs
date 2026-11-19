@@ -149,7 +149,7 @@ fn judge(p: &Pair, kq: &[[f32; 2]], kd: &[[f32; 2]], dq: &[u16], dd: &[u16]) -> 
     }
     let mut ok6 = false;
     if op.len() >= 6
-        && let Some((tf, inl)) = slam::register::pnp_ransac_k(&op, &ip, &[K.fx, K.fy, K.cx, K.cy], 100, 2.0)
+        && let Some((tf, inl)) = slam::geom::pnp_ransac_k(&op, &ip, &[K.fx, K.fy, K.cx, K.cy], 100, 2.0)
         && inl.len() >= 20
     {
         let m = tf.0;
@@ -331,10 +331,7 @@ fn brief_frame(path: &str, depth: &str, oriented: bool) -> slam::Frame {
 
 fn verify(vb: &str, onnx: Option<&str>) {
     let ps = pairs(vb);
-    let mut params = slam::params::Params::read_ini("docs/rtabmap_pi.ini").unwrap_or_else(|_| slam::params::Params::default());
-    params.set("Vis/MinInliers", "20");
-    let ext = slam::features::Extractor::new(&params);
-    let reg = slam::register::RegistrationVis::new(&params);
+    let ext = slam::features::Extractor::new();
     let local = slam::io::optical_rotation();
     #[cfg(feature = "onnx")]
     let mut net = onnx.map(|o| slam::nnrun::Net::open(o, 8, 0).unwrap());
@@ -387,7 +384,7 @@ fn verify(vb: &str, onnx: Option<&str>) {
                     }
                 }
             }
-            // 지금 BRIEF · 방향 BRIEF: 이식된 RTAB-Map 경로(GFTT + BRIEF → 짝 → PnP) 그대로(LC_DUMPS_ONLY=1 이면 건너뜀)
+            // BRIEF · 방향 BRIEF: GFTT + BRIEF → 상호 최근접 짝 → PnP(klt::brief_pnp, 위치 추적 되찾기와 같은 것)(LC_DUMPS_ONLY=1 이면 건너뜀)
             let dumps_only = std::env::var("LC_DUMPS_ONLY").is_ok();
             for (name, ori) in [("brief", false), ("brief_ori", true)] {
                 if dumps_only {
@@ -398,7 +395,7 @@ fn verify(vb: &str, onnx: Option<&str>) {
                 let fd = brief_frame(&p.d_rgb, &p.d_depth, ori);
                 let (a, b) = (ext.extract(&fd), ext.extract(&fq));
                 let t1 = Instant::now();
-                let info = reg.compute_tf(&a, &b, &fq.cam, slam::register::Tf::NULL);
+                let info = slam::klt::brief_pnp(&a, &b, &fq.cam, 20, 100, 2.0);
                 let t2 = Instant::now();
                 let e = times.entry(if ori { "brief_ori 특징(두 장)" } else { "brief 특징(두 장)" }).or_default();
                 e.0 += (t1 - t0).as_secs_f64();
@@ -406,10 +403,8 @@ fn verify(vb: &str, onnx: Option<&str>) {
                 let e = times.entry("brief 짝+PnP").or_default();
                 e.0 += (t2 - t1).as_secs_f64();
                 e.1 += 1;
-                let ok = info.transform.is_some_and(|tr| {
-                    if info.inliers < 20 {
-                        return false;
-                    }
+                let ok = info.is_some_and(|(tf, _)| {
+                    let tr = tf.to_pose();
                     // 몸체 축 (질의의 대상 기준 위치) → 광학 축 db → 질의 변환
                     let tdq = local.inverse() * tr * local;
                     let tqd = tdq.inverse();

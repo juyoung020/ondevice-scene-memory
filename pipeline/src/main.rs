@@ -1797,7 +1797,7 @@ fn early_pose(pp: &Path, sf: &stream::StreamFrame) {
 }
 
 /// 장면 사이 위치(IMU 회전, 200 Hz)를 pose.json 으로: early_pose 와 같은 좌표 바꾸기. 같은 프로세스 뷰어가 메모리에서 읽으므로 디스크에는 쓰지 않음
-fn fast_pose(pp: &Path, t: f64, ts: f64, twc: &slam::register::Tf) {
+fn fast_pose(pp: &Path, t: f64, ts: f64, twc: &slam::geom::Tf) {
     let Some((fix, z0v)) = *POSE_FIX.lock().unwrap() else { return };
     if !sgview::memfs::enabled() {
         return;

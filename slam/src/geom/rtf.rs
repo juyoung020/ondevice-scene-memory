@@ -1,7 +1,4 @@
-//! RTAB-Map Transform(3x4 float) 를 비트 단위로 같게 옮긴 것.
-//! 원본: corelib/src/Transform.cpp. 곱·역행렬은 Eigen 3.4(SSE) 의 Matrix4f 연산, 회전 정규화는 Quaternionf,
-//! 오일러 각은 pcl::getTransformation / getTranslationAndEulerAngles(float) 를 같은 연산 순서로 따라 한다.
-//! 위치 추적의 모든 위치 계산(추측 움직임, 키프레임 기준 움직임, 누적 위치)이 이 float 연산을 거친다.
+//! 강체 변환(3×4 float, 행 우선): 곱 · 역행렬 · 사원수 · 오일러 각. 위치 추적의 모든 위치 계산이 이 float 연산을 거친다.
 use crate::Pose;
 use nalgebra::{Matrix3, Rotation3, Translation3, UnitQuaternion};
 
@@ -113,6 +110,23 @@ impl Tf {
 
     /// util3d::transformPoint(cv::Point3f, Transform)
     #[inline]
+    /// 이동 크기의 제곱
+    pub fn norm_sq(&self) -> f32 {
+        self.x() * self.x() + self.y() * self.y() + self.z() * self.z()
+    }
+    /// 두 회전 사이 각(라디안, 사원수 각 거리)
+    pub fn angle_to(&self, o: &Tf) -> f32 {
+        let q = |t: &Tf| quat_normalized_f(quat_from_mat3f(&[t.0[0], t.0[1], t.0[2], t.0[4], t.0[5], t.0[6], t.0[8], t.0[9], t.0[10]]));
+        let a = q(self);
+        let b = q(o);
+        let (x1, y1, z1, w1) = (-a[0], -a[1], -a[2], a[3]);
+        let (x2, y2, z2, w2) = (b[0], b[1], b[2], b[3]);
+        let w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2;
+        let x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2;
+        let y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2;
+        let z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2;
+        2.0 * (x * x + y * y + z * z).sqrt().atan2(w.abs())
+    }
     pub fn transform_point(&self, p: [f32; 3]) -> [f32; 3] {
         let t = &self.0;
         [

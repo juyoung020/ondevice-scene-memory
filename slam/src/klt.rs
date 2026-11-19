@@ -6,14 +6,26 @@
 //!   5) 예측으로 실패하면 '움직임 없음' 시작점으로 한 번 더. 그래도 실패면 놓침(마지막 성공 장면·점을 그대로 둬 다음 장면이 거기서 다시 시도)
 //! 지도 점은 한 번 만든 뒤 바꾸지 않는다(세계 좌표, 몸체 축). 루프 클로저·지도용 특징(BRIEF)은 지도 노드 장면에서만 따로 뽑는다(app::Engine).
 use crate::features::{keypoints_3d, Extractor};
-use crate::register::RegistrationVis;
-use crate::odom::OdomResult;
-use crate::params::Params;
-use crate::register::rtf::Tf;
-use crate::register::pnp_ransac_k;
-use crate::{Features, Frame, KeyPoint};
+use crate::geom::rtf::Tf;
+use crate::geom::{cam_local, pnp_ransac_k};
+use crate::{Features, Frame, KeyPoint, Pose};
 use nalgebra::{Matrix6, Rotation3, Vector3, Vector6};
 use rayon::prelude::*;
+
+/// 위치 추적 한 장의 결과
+pub struct OdomResult {
+    /// 누적 위치(위치 추적 좌표, 몸체 축). 놓쳤으면 None
+    pub pose: Option<Pose>,
+    pub tf: Tf,
+    pub lost: bool,
+    /// 공분산. 처음 장면 · 다시 시작한 첫 장면은 대각 9999 = "새로 시작"
+    pub covariance: [[f64; 6]; 6],
+    pub inliers: usize,
+    pub matches: usize,
+    pub keyframe_updated: bool,
+    /// 직전 위치 기준 이번 장면 움직임
+    pub transform: Tf,
+}
 
 const LEVELS: usize = 4;
 const HW: i32 = 5; // 창 반쪽(11×11)
@@ -420,7 +432,6 @@ pub struct OdometryKlt {
     desc_every_kf: u32,
     kf_count: u32,
     ext: Extractor,
-    reg: RegistrationVis,
     /// 다음 장면 피라미드에 다시 쓸 버퍼
     spare: Option<Pyr>,
     prev_t: f64,
@@ -480,7 +491,7 @@ pub struct OdometryKlt {
 }
 
 impl OdometryKlt {
-    pub fn new(p: &Params) -> OdometryKlt {
+    pub fn new() -> OdometryKlt {
         OdometryKlt {
             pose: Tf::IDENTITY,
             prev: None,
@@ -488,32 +499,31 @@ impl OdometryKlt {
             kf_t: 0.0,
             desc_tx: None,
             desc_rx: None,
-            desc_every: p.get("OdomKlt/DescEvery", 0.0f64),
-            desc_every_kf: p.get("OdomKlt/DescEveryKf", 1u32),
+            desc_every: 0.0,
+            desc_every_kf: 1,
             kf_count: 0,
-            ext: Extractor::new(p),
-            reg: RegistrationVis::new(p),
+            ext: Extractor::new(),
             spare: None,
             prev_t: 0.0,
             tracks: Vec::new(),
             velocity: Tf::NULL,
-            max_features: p.get("Vis/MaxFeatures", 400i32),
-            min_distance: p.get("GFTT/MinDistance", 7.0),
-            min_depth: p.get("Vis/MinDepth", 0.0f32),
-            max_depth: p.get("Vis/MaxDepth", 0.0f32),
-            min_inliers: p.get("Vis/MinInliers", 20i32).max(6) as usize,
-            reproj: p.get("Vis/PnPReprojError", 2.0f32),
-            iterations: p.get("OdomKlt/Iterations", 100i32),
-            redetect: p.get("OdomKlt/RedetectRatio", 0.6f32),
-            keep_err: p.get("OdomKlt/KeepError", 3.0f32),
+            max_features: 400,
+            min_distance: 7.0,
+            min_depth: 0.0,
+            max_depth: 0.0,
+            min_inliers: 20,
+            reproj: 2.0,
+            iterations: 100,
+            redetect: 0.6,
+            keep_err: 3.0,
             recovered: 0,
             diag: Diag::default(),
-            strict: p.get_bool("OdomKlt/Strict", true),
-            min_good: p.get("OdomKlt/MinGood", 30usize),
+            strict: true,
+            min_good: 30,
             by_icp: 0,
             bridge_verified: false,
             bridges_verified: 0,
-            depth_only: p.get_bool("OdomKlt/DepthOnly", false),
+            depth_only: false,
             prev_sub: Vec::new(),
             cur_sub: Vec::new(),
             imu: None,
@@ -527,7 +537,7 @@ impl OdometryKlt {
             imu_streak: 0,
             restart_t: 0.0,
             imu_restarts: 0,
-            par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
+            par: false, // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
 
@@ -645,20 +655,14 @@ impl OdometryKlt {
         self.desc_rx = Some(rrx);
     }
 
-    /// 광류가 모두 실패했을 때: 마지막 키프레임 특징과 이번 장면 특징을 기술자로 맞춤(RTAB-Map 맞추기 그대로). 성공하면 점을 이 장면에서 새로
-    fn recover(&mut self, f: &Frame, pred: Option<Tf>) -> Option<(Tf, [[f64; 6]; 6], usize)> {
+    /// 광류가 모두 실패했을 때: 마지막 키프레임 특징과 이번 장면 특징을 BRIEF 로 맞추고(상호 최근접 + 2 등 비율) PnP RANSAC.
+    /// 성공하면 점을 이 장면에서 새로
+    fn recover(&mut self, f: &Frame, _pred: Option<Tf>) -> Option<(Tf, [[f64; 6]; 6], usize)> {
         let (kff, kfp) = self.kf.as_ref()?;
         let kfp = *kfp;
         let cf = self.ext.extract(f);
-        let g = pred.map(|p| kfp.inverse().mul(&p)).unwrap_or(Tf::NULL);
-        let mut info = self.reg.compute_tf(kff, &cf, &f.cam, g);
-        if info.tf.is_null() && !g.is_null() {
-            info = self.reg.compute_tf(kff, &cf, &f.cam, Tf::NULL);
-        }
-        if info.tf.is_null() {
-            return None;
-        }
-        let pose = kfp.mul(&info.tf);
+        let (rel, inl) = brief_pnp(kff, &cf, &f.cam, self.min_inliers, self.iterations, self.reproj)?;
+        let pose = kfp.mul(&rel);
         self.tracks.clear();
         for (k, p) in cf.kps.iter().zip(cf.pts3d.iter()) {
             if p.x.is_finite() {
@@ -666,7 +670,7 @@ impl OdometryKlt {
             }
         }
         self.kf = Some((cf, pose));
-        Some((pose, info.covariance, info.inliers))
+        Some((pose, Self::eye(1e-3), inl))
     }
 
     fn eye(v: f64) -> [[f64; 6]; 6] {
@@ -688,8 +692,6 @@ impl OdometryKlt {
             matches,
             keyframe_updated: kf,
             transform,
-            features: Features::default(),
-            reg: None,
         }
     }
 
@@ -1005,8 +1007,6 @@ impl OdometryKlt {
                     matches: n_tracks,
                     keyframe_updated: false,
                     transform: self.pose.inverse().mul(&pose_b),
-                    features: Features::default(),
-                    reg: None,
                 };
             }
             // 놓침: 마지막 성공 장면 그대로 둠(다음 장면이 거기서 다시)
@@ -1109,4 +1109,53 @@ mod tests {
         let r = track_one(&a, &c, [120.0, 100.0], [163.0, 121.0]).unwrap();
         assert!((r[0] - 165.0).abs() < 0.3 && (r[1] - 120.0).abs() < 0.3, "{r:?}");
     }
+}
+
+/// BRIEF 해밍 상호 최근접(2 등 비율 0.8, 거리 ≤ 80) → 기준 장면 3D 점(몸체 축) · 이번 장면 화소로 PnP RANSAC.
+/// 결과 = 기준 몸체에서 본 이번 몸체 자세, 안쪽 점 수
+pub fn brief_pnp(a: &Features, b: &Features, cam: &crate::Camera, min_inliers: usize, iterations: i32, reproj: f32) -> Option<(Tf, usize)> {
+    let words = |d: &[[u8; 32]]| -> Vec<[u64; 4]> { d.iter().map(|x| std::array::from_fn(|i| u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap()))).collect() };
+    let (wa, wb) = (words(&a.desc), words(&b.desc));
+    let ok_a: Vec<bool> = a.pts3d.iter().map(|p| p.x.is_finite() && p.z.is_finite()).collect();
+    if wa.len() < min_inliers || wb.len() < min_inliers {
+        return None;
+    }
+    // b 의 점마다 a 에서 1 · 2 등, a 의 점마다 b 에서 1 등
+    let mut best_ab = vec![(u32::MAX, u32::MAX, usize::MAX); wb.len()];
+    let mut best_ba = vec![(u32::MAX, usize::MAX); wa.len()];
+    for (j, qb) in wb.iter().enumerate() {
+        for (i, qa) in wa.iter().enumerate() {
+            if !ok_a[i] {
+                continue;
+            }
+            let d = crate::simd::hamming256(qa, qb);
+            let e = &mut best_ab[j];
+            if d < e.0 {
+                *e = (d, e.0, i);
+            } else if d < e.1 {
+                e.1 = d;
+            }
+            if d < best_ba[i].0 {
+                best_ba[i] = (d, j);
+            }
+        }
+    }
+    let (mut op, mut ip) = (Vec::new(), Vec::new());
+    for (j, &(d1, d2, i)) in best_ab.iter().enumerate() {
+        if i == usize::MAX || d1 > 80 || (d1 as f32) > 0.8 * d2 as f32 || best_ba[i].1 != j {
+            continue;
+        }
+        let p = a.pts3d[i];
+        op.push([p.x, p.y, p.z]);
+        ip.push([b.kps[j].x, b.kps[j].y]);
+    }
+    if op.len() < min_inliers {
+        return None;
+    }
+    let k4 = [cam.fx, cam.fy, cam.cx, cam.cy];
+    let (tcw, inl) = pnp_ransac_k(&op, &ip, &k4, iterations, reproj)?;
+    if inl.len() < min_inliers {
+        return None;
+    }
+    Some((cam_local(cam).mul(&tcw).inverse(), inl.len()))
 }

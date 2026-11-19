@@ -1,13 +1,13 @@
-//! 신경망 루프 클로저(낱말 루프와 함께 늘 켬): 지도 노드마다 MegaLoc 기술자로 예전 노드 후보를 찾고, XFeat 짝 + 깊이 +
+//! 장소 인식 · 루프 클로저: 지도 노드마다 MegaLoc 기술자로 예전 노드 후보를 찾고, XFeat 짝 + 깊이 +
 //! 중력 고정 4 자유도 검증(lcverify)으로 맞으면 그 상대 위치를 루프 링크로 지도에 넘긴다.
 //!
 //! 한 스레드("lc")가 노드를 차례로 받는다: 신경망 둘(보드 NPU `.dxnn`, PC ONNX) → 후보 상위 k → 검증 → 결과 줄.
 //! 노드마다 남기는 것: MegaLoc 기술자(주성분 1,024 차원 f32) · XFeat 점 · 기술자(i8) · 점의 3D(카메라 좌표) · 위쪽 방향.
-//! 링크 변환 = 질의 노드 → 후보 노드(몸체 좌표, RTAB-Map 링크와 같은 from⁻¹·to). 최적화 · 보정 크기 검사는 지도 쪽이 원래 루프처럼 한다.
+//! 링크 변환 = 질의 노드 → 후보 노드(몸체 좌표, from⁻¹·to). 최적화 · 모순 검사는 지도 쪽(app::Mapper)이 한다.
 use crate::lcverify::{self, Intr, Params as VParams, V3};
 use crate::nnrun::{self, Net};
 use crate::place::{self, Head, PlaceDb};
-use crate::register::Tf;
+use crate::geom::Tf;
 use crate::xfeat::{self, XFeatures};
 use crate::{Camera, DepthBuf, Pose};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -69,6 +69,8 @@ pub struct LcNode {
     /// 위치 추적 자세(몸체, 위치 추적 좌표). 위쪽 = 이 좌표의 z
     pub pose: Pose,
     pub cam: Camera,
+    /// 0 이 아니면 이 id 앞 노드는 시간 제한(skip_s) 없이 후보로: 위치 추적이 다시 시작한 직후 빈틈 앞 지도에서 제자리 찾기
+    pub reloc_before: i32,
 }
 
 /// 맞은 루프: from(질의) → to(예전 노드) 몸체 변환
@@ -318,7 +320,7 @@ impl State {
         let cands = if o.gap {
             vec![]
         } else {
-            self.db.topk(&self.desc, self.cfg.topk, |id| !recent.contains(&id) && stamps.get(&id).is_some_and(|&t| (me - t).abs() > skip))
+            self.db.topk(&self.desc, self.cfg.topk, |id| !recent.contains(&id) && (id < n.reloc_before as i64 || stamps.get(&id).is_some_and(|&t| (me - t).abs() > skip)))
         };
         o.cands = cands.iter().filter(|c| c.1 >= self.cfg.min_score).count();
         let mut b = XFeatures::default();

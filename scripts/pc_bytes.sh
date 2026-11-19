@@ -18,7 +18,6 @@ LONG=${LONG:-/mnt/c/ondevice/data/tum/rgbd_dataset_freiburg3_long_office_househo
 SYN=${SYN:-$HOME/imub}
 MODELS=${MODELS:-/mnt/c/ondevice/models}
 SEGC=${SEGC:-/dev/shm/int_segcache}
-INI=$ROOT/docs/rtabmap_pi.ini
 
 seq_dir() { if [ "$1" = desk ]; then echo "$DESK"; else echo "$SHAKE/rgbd_dataset_freiburg1_$1"; fi; }
 
@@ -26,7 +25,7 @@ seq_dir() { if [ "$1" = desk ]; then echo "$DESK"; else echo "$SHAKE/rgbd_datase
 mem_run() {
   local B=$1 O=$2 D=$3; shift 3
   rm -rf "$O"; mkdir -p "$O"
-  ( cd "$ROOT" && timeout ${TMO:-900} "$B" --slam "--tum $D --rate 0 --block --config $INI" --no-drop --surface --max-depth 3.5 \
+  ( cd "$ROOT" && timeout ${TMO:-900} "$B" --slam "--tum $D --rate 0 --block" --no-drop --surface --max-depth 3.5 \
       --seg "$MODELS/ObjectSAM-416_640.onnx" --seg-cache "$SEGC" --embed off --out "$O/mem" ${POOL:+--pool $POOL} "$@" > "$O/log.txt" 2> "$O/err.txt" )
   echo "$(basename "$O"): exit $? files $(find "$O/mem" -type f | wc -l)"
 }
@@ -45,12 +44,12 @@ run_all() {
   mkdir -p "$R" "$SEGC"
   for s in desk room 360 rpy floor; do
     local O=$R/cam_$s; mkdir -p "$O"
-    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --config "$INI" --rate 0 --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
+    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --rate 0 --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
     echo "cam_$s: exit $?"; sha256sum < "$O/stream.bin" > "$O/stream.sha"; rm -f "$O/stream.bin"
   done
   for s in desk room floor; do
     local O=$R/imu_$s; mkdir -p "$O"
-    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --config "$INI" --rate 0 --imu-csv "$SYN/syn_$s.csv" --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
+    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --rate 0 --imu-csv "$SYN/syn_$s.csv" --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
     echo "imu_$s: exit $?"; sha256sum < "$O/stream.bin" > "$O/stream.sha"; rm -f "$O/stream.bin"
   done
   mem_all "$B" "$R"

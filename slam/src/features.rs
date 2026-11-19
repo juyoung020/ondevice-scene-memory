@@ -1,6 +1,4 @@
-//! 한 장면 → 특징(특징점 · 몸체 축 3D 점 · BRIEF 32 바이트). F2F 위치 추적이 쓰는 RegistrationVis 경로 그대로.
-//! 원본(RTAB-Map 0.24.2): RegistrationVis.cpp computeTransformationImpl(깊이를 가리개로 generateKeypoints → generateDescriptors → generateKeypoints3D),
-//!   Features2d.cpp Feature2D::generateKeypoints · GFTT · GFTT_BRIEF, util3d_features.cpp generateKeypoints3DDepth, util2d.cpp getDepth, util3d.cpp projectDepthTo3D.
+//! 한 장면 → 특징(특징점 · 몸체 축 3D 점 · BRIEF 32 바이트): 깊이를 가리개로 GFTT → BRIEF → 깊이로 3D 점.
 //! 원본(OpenCV 4.10): featureselect.cpp goodFeaturesToTrack, corner.cpp cornerMinEigenVal(Sobel · boxFilter · calcMinEigenVal),
 //!   filter.simd.hpp RowVec_8u32f · SymmColumnSmallVec_32f, box_filter.simd.hpp RowSum · ColumnSum, contrib xfeatures2d brief.cpp · generated_32.i.
 //!
@@ -9,7 +7,6 @@
 //! - 3×3 상자 합: 가로 합·세로 누적 합 모두 f64, 세로는 맨 위 줄부터 "더하고 빼는" 누적이라 줄마다 나눠 돌리면 비트가 달라진다
 //!   → 여러 코어는 세로 띠(열 묶음)로 나눈다.
 //! - 최소 고유값: x86 은 AVX(곱·덧셈 따로), aarch64 는 NEON v_muladd(fma). 대상 구조에 맞춰 고른다.
-use crate::params::Params;
 use crate::{Features, Frame, KeyPoint};
 use nalgebra::Point3;
 use rayon::prelude::*;
@@ -84,50 +81,34 @@ const BRIEF32: [[i8; 4]; 256] = [
     [-9, 6, -12, -7], [-1, -2, -7, 2], [9, 9, 7, 15], [6, 2, -6, 6],
 ];
 
-/// 특징 추출기: 위치 추적(RegistrationVis)이 Vis/* 로 만든 GFTT/BRIEF
+/// 특징 추출기: GFTT 특징점 + BRIEF 32 바이트 + 깊이로 3D 점(키프레임 · 되찾기)
 #[derive(Clone, Debug)]
 pub struct Extractor {
-    /// Vis/MaxFeatures(→ Kp/MaxFeatures, GFTT maxCorners). 0 = 제한 없음
+    /// GFTT 최대 점 수. 0 = 제한 없음
     pub max_features: i32,
     pub quality_level: f64,
     pub min_distance: f64,
-    /// Vis/MinDepth · Vis/MaxDepth(미터, 0 = 제한 없음)
+    /// 3D 점으로 쓰는 깊이 범위(미터, 0 = 제한 없음)
     pub min_depth: f32,
     pub max_depth: f32,
-    /// Vis/DepthAsMask: 깊이가 있는 화소에서만 특징점을 찾음
+    /// 깊이가 있는 화소에서만 특징점을 찾음
     pub depth_as_mask: bool,
-    /// 상자 합을 f32 로(원본은 f64). 약 25 % 빠르지만 response 아래 자리가 달라져 점 순서가 바뀜. 기본 끔, 설정 이름 Slam/FeatureBoxF32
+    /// 상자 합을 f32 로(기본 f64). 약 25 % 빠르지만 response 아래 자리가 달라져 점 순서가 바뀜
     pub box_f32: bool,
 }
 
+impl Default for Extractor {
+    fn default() -> Self {
+        Extractor::new()
+    }
+}
+
 impl Extractor {
-    /// 기본값은 RTAB-Map 0.24.2 Parameters.h. RegistrationVis 가 Vis/* 를 Kp/* 로 옮겨 Feature2D 를 만든다(RegistrationVis.cpp 157-171, 306-349)
-    pub fn new(p: &Params) -> Self {
-        let need = |ok: bool, what: &str| {
-            assert!(ok, "features: 옮기지 않은 설정 {what} (GFTT/BRIEF·격자 1×1·ROI 없음·부화소 끔만 지원)");
-        };
-        need(p.get("Vis/FeatureType", 6) == 6, "Vis/FeatureType");
-        need(p.get("BRIEF/Bytes", 32) == 32, "BRIEF/Bytes");
-        need(p.get("GFTT/BlockSize", 3) == 3, "GFTT/BlockSize");
-        need(!p.get_bool("GFTT/UseHarrisDetector", false), "GFTT/UseHarrisDetector");
-        need(p.get("Vis/GridRows", 1) == 1 && p.get("Vis/GridCols", 1) == 1, "Vis/GridRows·GridCols");
-        need(p.get("Vis/SubPixIterations", 0) == 0, "Vis/SubPixIterations");
-        need(!p.get_bool("Vis/SSC", false), "Vis/SSC");
-        need(p.get("Vis/DepthMaskFloorThr", 0.0f32) == 0.0, "Vis/DepthMaskFloorThr");
-        let roi = p.0.get("Vis/RoiRatios").map(|s| s.as_str()).unwrap_or("0.0 0.0 0.0 0.0");
-        need(roi.split_whitespace().all(|v| v.parse::<f32>().map(|x| x == 0.0).unwrap_or(false)), "Vis/RoiRatios");
-        Extractor {
-            max_features: p.get("Vis/MaxFeatures", 1000),
-            quality_level: p.get("GFTT/QualityLevel", 0.001),
-            min_distance: p.get("GFTT/MinDistance", 7.0),
-            min_depth: p.get("Vis/MinDepth", 0.0),
-            max_depth: p.get("Vis/MaxDepth", 0.0),
-            depth_as_mask: p.get_bool("Vis/DepthAsMask", true),
-            box_f32: p.get_bool("Slam/FeatureBoxF32", false),
-        }
+    pub fn new() -> Self {
+        Extractor { max_features: 400, quality_level: 0.001, min_distance: 7.0, min_depth: 0.0, max_depth: 0.0, depth_as_mask: true, box_f32: false }
     }
 
-    /// 특징점 → 설명자(가장자리 점은 빠짐) → 3D 점. RegistrationVis 와 같은 순서
+    /// 특징점 → 설명자(가장자리 점은 빠짐) → 3D 점
     pub fn extract(&self, f: &Frame) -> Features {
         self.extract_with(f, f.cam.oriented)
     }
@@ -952,7 +933,7 @@ mod tests {
             }
         }
         let f = frame(g, vec![1000; w * h], w as u32, h as u32);
-        let ex = Extractor::new(&Params::default());
+        let ex = Extractor::new();
         let out = ex.extract(&f);
         assert!(out.kps.len() >= 4, "{}", out.kps.len());
         for (cx, cy) in [(100.0, 80.0), (219.0, 80.0), (100.0, 159.0), (219.0, 159.0)] {

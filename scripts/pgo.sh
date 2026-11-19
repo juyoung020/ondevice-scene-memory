@@ -14,8 +14,7 @@ PROFDATA=$(find "$SYSROOT" -name llvm-profdata -type f | head -1)
 rm -rf "$PROF"; mkdir -p "$PROF"
 cd "$ROOT"
 RUSTFLAGS="-C target-cpu=native -C profile-generate=$PROF" cargo build --release $FEAT --target-dir target/pgo-gen
-INI=${INI:-$ROOT/docs/rtabmap_pi.ini}
-./target/pgo-gen/release/ondevice --slam "--tum $REC --rate 0 --block --config $INI" --no-drop --out "$PROF/out" "$@" > /dev/null
+./target/pgo-gen/release/ondevice --slam "--tum $REC --rate 0 --block" --no-drop --out "$PROF/out" "$@" > /dev/null
 "$PROFDATA" merge -o "$PROF/merged.profdata" "$PROF"/*.profraw
 RUSTFLAGS="-C target-cpu=native -C profile-use=$PROF/merged.profdata -C llvm-args=-pgo-warn-missing-function" cargo build --release $FEAT
 echo "PGO 빌드: $ROOT/target/release/ondevice (프로필 $PROF/merged.profdata)"

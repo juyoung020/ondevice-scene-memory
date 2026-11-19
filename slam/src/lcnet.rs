@@ -68,6 +68,8 @@ pub struct LcNode {
     pub depth: DepthBuf,
     /// 위치 추적 자세(몸체, 위치 추적 좌표). 위쪽 = 이 좌표의 z
     pub pose: Pose,
+    /// 넣을 때의 지도 자세(몸체): 근처 노드 후보를 찾는 데
+    pub map_pose: Pose,
     pub cam: Camera,
     /// 0 이 아니면 이 id 앞 노드는 시간 제한(skip_s) 없이 후보로: 위치 추적이 다시 시작한 직후 빈틈 앞 지도에서 제자리 찾기
     pub reloc_before: i32,
@@ -81,6 +83,8 @@ pub struct LcHit {
     pub t: Tf,
     pub score: f32,
     pub inliers: usize,
+    /// MegaLoc 이 아니라 지도에서 가까운 노드로 찾은 루프
+    pub near: bool,
 }
 
 /// 노드 하나 처리 결과(맞은 루프가 없어도 옴: 최대 속도 재생은 이걸 기다려 결정적으로)
@@ -103,6 +107,7 @@ struct Stored {
     stamp: f64,
     /// 위치 추적 자세(몸체): 맞은 루프가 위치 추적과 이미 같은 말을 하는지(보탤 것 없음) 보는 데
     pose: Pose,
+    map_pose: Pose,
     up: V3,
     kps: Vec<[f32; 2]>,
     desc: Vec<i8>,
@@ -218,6 +223,11 @@ const SAME_DEG: f32 = 2.0;
 const MIN_GAP_S: f64 = 2.0;
 /// 이 시간(초) 안에 이미 루프로 이은 예전 노드는 다시 잇지 않음
 const SAME_TO_S: f64 = 30.0;
+/// 근처 노드 후보(MegaLoc 과 별개, 지역 루프): 지도 자세로 이 거리 · 시선 각 안이고 이 시간 넘게 지난 노드에서 가까운 순으로 몇 개
+const NEAR_M: f64 = 1.0;
+const NEAR_DEG: f64 = 45.0;
+const NEAR_MIN_S: f64 = 10.0;
+const NEAR_K: usize = 2;
 
 impl State {
     fn open(cfg: &LcConfig) -> Result<State, String> {
@@ -323,11 +333,26 @@ impl State {
             self.db.topk(&self.desc, self.cfg.topk, |id| !recent.contains(&id) && (id < n.reloc_before as i64 || stamps.get(&id).is_some_and(|&t| (me - t).abs() > skip)))
         };
         o.cands = cands.iter().filter(|c| c.1 >= self.cfg.min_score).count();
+        // 시도할 후보: MegaLoc(점수 순) 다음 지도에서 가까운 예전 노드(시선이 비슷한 것)
+        let mut tries: Vec<(i64, f32, bool)> = cands.iter().filter(|c| c.1 >= self.cfg.min_score).map(|&(id, sc)| (id, sc, false)).collect();
+        if !o.gap {
+            let fwd = |p: &Pose| p.rotation * nalgebra::Vector3::x();
+            let (qp, qf) = (n.map_pose.translation.vector, fwd(&n.map_pose));
+            let mut near: Vec<(f64, i64)> = self
+                .nodes
+                .iter()
+                .filter(|s| me - s.stamp > NEAR_MIN_S && !recent.contains(&(s.id as i64)) && !tries.iter().any(|t| t.0 == s.id as i64))
+                .filter_map(|s| {
+                    let d = (s.map_pose.translation.vector - qp).norm();
+                    let a = fwd(&s.map_pose).angle(&qf).to_degrees();
+                    (d < NEAR_M && a < NEAR_DEG).then_some((d + a / 90.0, s.id as i64))
+                })
+                .collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0));
+            tries.extend(near.into_iter().take(NEAR_K).map(|(_, id)| (id, 0.0, true)));
+        }
         let mut b = XFeatures::default();
-        for &(cid, score) in &cands {
-            if score < self.cfg.min_score {
-                break;
-            }
+        for &(cid, score, is_near) in &tries {
             let Some(c) = self.nodes.iter().find(|s| s.id as i64 == cid) else { continue };
             o.tried += 1;
             b.kps.clone_from(&c.kps);
@@ -363,7 +388,7 @@ impl State {
                 }
                 self.last_hit = me;
                 self.recent_to.push_back((me, c.id));
-                o.hit = Some(LcHit { from: n.id, to: c.id, t, score, inliers: v.inliers });
+                o.hit = Some(LcHit { from: n.id, to: c.id, t, score, inliers: v.inliers, near: is_near });
                 break;
             }
         }
@@ -371,7 +396,7 @@ impl State {
         // 표에 넣기
         self.db.add(n.id as i64, &self.desc);
         let desc: Vec<i8> = q.desc.iter().map(|&v| (v * Q8).round().clamp(-127.0, 127.0) as i8).collect();
-        self.nodes.push(Stored { id: n.id, stamp: n.stamp, pose: n.pose, up, kps: q.kps, desc, x3 });
+        self.nodes.push(Stored { id: n.id, stamp: n.stamp, pose: n.pose, map_pose: n.map_pose, up, kps: q.kps, desc, x3 });
         o
     }
 }

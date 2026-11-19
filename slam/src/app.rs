@@ -21,18 +21,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
-/// 지도 노드 간격(초)
+/// 지도 노드: 이 시간(초)마다, 또는 NODE_MIN_S 가 지났고 앞 노드에서 NODE_MOVE_M · NODE_TURN_DEG 넘게 움직였으면
 const NODE_EVERY_S: f64 = 1.0;
+const NODE_MIN_S: f64 = 0.3;
+const NODE_MOVE_M: f32 = 0.25;
+const NODE_TURN_DEG: f32 = 15.0;
 /// IMU: 이어 붙인 장면 · 영상이 IMU 와 어긋난 장면 뒤 이만큼 장면까지는 위치만(지도에 안 쌓음)
 const IMU_SETTLE: u32 = 5;
-/// 연속 간선 표준편차(미터 · 라디안): 보통 · 위치 추적이 다시 시작한 구간(IMU 로 이어 감)
-const SD_ODOM: [f64; 2] = [0.01, 0.005];
+/// 연속 간선 표준편차: 움직임에 비례(TUM 정답 대조 1 초 상대 오차: 이동의 7 – 16 %, 회전의 8 – 9 %, fr1 은 3 – 5 cm · 2 – 3°).
+/// 고정 1 cm · 0.3° 는 실제보다 3 – 10 배 자신해 맞는 루프도 그래프와 "모순"으로 버려졌다
+const SD_ODOM_M: [f64; 2] = [0.01, 0.08];
+const SD_ODOM_RAD: [f64; 2] = [0.005, 0.08];
+/// 위치 추적이 다시 시작한 구간(IMU 로 이어 감)
 const SD_GAP: [f64; 2] = [0.5, 0.1];
 /// 다시 시작한 뒤 이 시간(초) 안의 노드는 빈틈 앞 노드를 시간 제한 없이 후보로(제자리 찾기)
 const RELOC_WINDOW_S: f64 = 15.0;
-/// 최적화 뒤 루프 간선이 이만큼 넘게 어긋나면(다른 간선들과 모순) 그 루프를 버림
-const LOOP_RESID_M: f32 = 0.3;
-const LOOP_RESID_DEG: f32 = 10.0;
+/// 루프 받기 전 확인: 지금 지도가 말하는 상대 자세와 루프의 차가 두 노드 사이 연속 간선 불확실성의 이 배수 + 여유를 넘으면 버림
+const GATE_SIGMA: f64 = 3.0;
+const GATE_M: f64 = 0.05;
+const GATE_RAD: f64 = 0.035;
+/// 그래프 풀이: 루프 간선을 Cauchy 가중(바꿀 수 있는 제약과 같은 몫)으로 다시 풀고, 가중이 이보다 작아진 루프는 버림
+const ROBUST_C2: f64 = 9.0;
+const ROBUST_DROP_W: f64 = 0.1;
+const ROBUST_ITERS: usize = 4;
 
 /// 위치를 TUM 한 줄로: 시각 x y z qx qy qz qw
 fn write_tum(o: &mut impl std::io::Write, t: f64, m: &Tf) {
@@ -92,6 +103,8 @@ struct Node {
     odom: Tf,
     /// 지도 자세(최적화 뒤, 몸체)
     opt: Tf,
+    /// 앞 노드에서 이 노드까지 연속 간선의 분산(이동 m², 회전 rad²)
+    var: [f64; 2],
 }
 
 /// 최적화 스레드에 넘기는 일
@@ -110,12 +123,21 @@ struct OptDone {
     ms: f64,
 }
 
-/// 루프 간선이 최적화 결과와 얼마나 어긋나는지(이동 m, 회전 °)
-fn resid(l: &Link, p: &BTreeMap<i32, [f32; 12]>) -> (f32, f32) {
+/// 간선이 최적화 결과와 어긋난 정도를 그 간선의 표준편차로 나눈 제곱 합(이동 + 회전)
+fn resid_chi(l: &Link, p: &BTreeMap<i32, [f32; 12]>) -> f64 {
     match (p.get(&l.from), p.get(&l.to)) {
-        (Some(a), Some(b)) => tf_diff(&Tf(*a).inverse().mul(&Tf(*b)), &Tf(l.transform)),
-        _ => (0.0, 0.0),
+        (Some(a), Some(b)) => {
+            let (m, d) = tf_diff(&Tf(*a).inverse().mul(&Tf(*b)), &Tf(l.transform));
+            let r = (d as f64).to_radians();
+            (m as f64).powi(2) * l.inf[0] + r * r * l.inf[21]
+        }
+        _ => 0.0,
     }
+}
+
+/// 움직임(이동 m, 회전 rad)에 비례한 연속 간선 표준편차
+fn sd_odom(m: f32, rad: f32) -> [f64; 2] {
+    [SD_ODOM_M[0] + SD_ODOM_M[1] * m as f64, SD_ODOM_RAD[0] + SD_ODOM_RAD[1] * rad as f64]
 }
 
 /// 자세 그래프 풀이 스레드: 일이 쌓이면 가장 새 것만. 모순되는 루프는 빼고 한 번 더
@@ -131,24 +153,47 @@ fn spawn_optimizer() -> (Sender<OptJob>, Receiver<OptDone>) {
                     job = j;
                 }
                 let c = Instant::now();
-                let mut dropped = vec![];
-                let mut out = graph::optimize(job.root, &job.poses, &job.links, &p).map(|o| o.poses).unwrap_or_default();
-                if !out.is_empty() {
-                    let bad: Vec<(i32, i32)> = job
-                        .links
+                // 루프 간선은 Cauchy 가중으로 몇 번 다시 풀어(IRLS) 다른 간선과 모순되는 루프의 힘을 빼고, 가중이 작아진 루프는 버림
+                let base: Vec<Link> = job.links.clone();
+                let mut w: Vec<f64> = vec![1.0; base.len()];
+                let mut out = BTreeMap::new();
+                for _ in 0..ROBUST_ITERS {
+                    let links: Vec<Link> = base
                         .iter()
-                        .filter(|l| l.kind == link_type::GLOBAL_CLOSURE)
-                        .filter(|l| {
-                            let (m, d) = resid(l, &out);
-                            m > LOOP_RESID_M || d > LOOP_RESID_DEG
+                        .zip(&w)
+                        .map(|(l, &wi)| {
+                            let mut l = l.clone();
+                            if wi < 1.0 {
+                                for v in l.inf.iter_mut() {
+                                    *v *= wi;
+                                }
+                            }
+                            l
                         })
-                        .map(|l| (l.from, l.to))
                         .collect();
-                    if !bad.is_empty() {
-                        job.links.retain(|l| !bad.contains(&(l.from, l.to)));
-                        out = graph::optimize(job.root, &job.poses, &job.links, &p).map(|o| o.poses).unwrap_or_default();
-                        dropped = bad;
+                    out = graph::optimize(job.root, &job.poses, &links, &p).map(|o| o.poses).unwrap_or_default();
+                    if out.is_empty() {
+                        break;
                     }
+                    let mut changed = false;
+                    for (i, l) in base.iter().enumerate() {
+                        if l.kind != link_type::GLOBAL_CLOSURE {
+                            continue;
+                        }
+                        let nw = 1.0 / (1.0 + resid_chi(l, &out) / ROBUST_C2);
+                        if (nw - w[i]).abs() > 0.05 {
+                            changed = true;
+                        }
+                        w[i] = nw;
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+                let dropped: Vec<(i32, i32)> = base.iter().zip(&w).filter(|(l, wi)| l.kind == link_type::GLOBAL_CLOSURE && **wi < ROBUST_DROP_W).map(|(l, _)| (l.from, l.to)).collect();
+                if !dropped.is_empty() {
+                    let links: Vec<Link> = base.iter().filter(|l| !dropped.contains(&(l.from, l.to))).cloned().collect();
+                    out = graph::optimize(job.root, &job.poses, &links, &p).map(|o| o.poses).unwrap_or_default();
                 }
                 let poses = out.into_iter().map(|(k, v)| (k, Tf(v))).collect();
                 if dtx.send(OptDone { era: job.era, poses, dropped, ms: ms_since(c) }).is_err() {
@@ -171,6 +216,7 @@ struct LcStats {
     gap: u64,
     accepted: u64,
     dropped: u64,
+    gated: u64,
     ms: [f64; 3],
     ms_max: [f64; 3],
 }
@@ -247,23 +293,46 @@ impl Mapper {
     fn add_node(&mut self, fr: &Frame, odom: Tf) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
+        let mut var = [0.0; 2];
         if let Some((&pid, prev)) = self.nodes.iter().next_back() {
-            let sd = if self.weak_next { SD_GAP } else { SD_ODOM };
-            if self.weak_next {
+            let rel = prev.odom.inverse().mul(&odom);
+            let sd = if self.weak_next {
                 self.n_gap_edges += 1;
                 self.gap = Some((id, fr.t));
-            }
-            self.links.push(Link { from: pid, to: id, kind: link_type::NEIGHBOR, transform: prev.odom.inverse().mul(&odom).0, inf: info_of(sd) });
+                SD_GAP
+            } else {
+                sd_odom(rel.norm_sq().sqrt(), rel.angle_to(&Tf::IDENTITY))
+            };
+            var = [sd[0] * sd[0], sd[1] * sd[1]];
+            self.links.push(Link { from: pid, to: id, kind: link_type::NEIGHBOR, transform: rel.0, inf: info_of(sd) });
         }
         self.weak_next = false;
-        self.nodes.insert(id, Node { t: fr.t, odom, opt: self.corr.mul(&odom) });
+        let opt = self.corr.mul(&odom);
+        self.nodes.insert(id, Node { t: fr.t, odom, opt, var });
         let reloc_before = match self.gap {
             Some((g, t0)) if fr.t - t0 < RELOC_WINDOW_S => g,
             _ => 0,
         };
-        self.lc.send(LcNode { id, stamp: fr.t, color: fr.color.clone(), bgr: !fr.color_is_rgb, depth: fr.depth_mm.clone(), pose: odom.to_pose(), cam: fr.cam.clone(), reloc_before });
+        self.lc.send(LcNode { id, stamp: fr.t, color: fr.color.clone(), bgr: !fr.color_is_rgb, depth: fr.depth_mm.clone(), pose: odom.to_pose(), map_pose: opt.to_pose(), cam: fr.cam.clone(), reloc_before });
         self.stats.sent += 1;
         id
+    }
+
+    /// 루프 받기 전 확인: 지금 지도의 상대 자세와 루프의 차가 두 노드 사이 연속 간선 불확실성(분산 합) 안인지
+    fn gate(&self, from: i32, to: i32, t: &Tf) -> bool {
+        let (Some(a), Some(b)) = (self.nodes.get(&from), self.nodes.get(&to)) else { return false };
+        let (lo, hi) = if to < from { (to, from) } else { (from, to) };
+        let mut var = [0.0f64; 2];
+        for (_, n) in self.nodes.range(lo + 1..=hi) {
+            var[0] += n.var[0];
+            var[1] += n.var[1];
+        }
+        let (m, d) = tf_diff(&a.opt.inverse().mul(&b.opt), t);
+        let ok = (m as f64) <= GATE_SIGMA * var[0].sqrt() + GATE_M && (d as f64).to_radians() <= GATE_SIGMA * var[1].sqrt() + GATE_RAD;
+        if !ok {
+            common::info!("루프 {from} → {to} 버림: 지도와 {m:.2} m · {d:.1}° 차(허용 {:.2} m · {:.1}°)", GATE_SIGMA * var[0].sqrt() + GATE_M, (GATE_SIGMA * var[1].sqrt() + GATE_RAD).to_degrees());
+        }
+        ok
     }
 
     /// 끝난 루프 결과를 간선으로. 최대 속도 재생(lc_block)은 한 노드 늦게 고정: 바로 앞에 보낸 노드 것만 빼고 모두 기다림
@@ -299,7 +368,11 @@ impl Mapper {
             if h.to < self.first_id || h.from < self.first_id || !self.nodes.contains_key(&h.from) || !self.nodes.contains_key(&h.to) {
                 continue;
             }
-            common::info!("루프: 노드 {} → {} (MegaLoc {:.3}, 맞은 점 {}, 이동 {:.2} m)", h.from, h.to, h.score, h.inliers, h.t.norm_sq().sqrt());
+            if !self.gate(h.from, h.to, &h.t) {
+                self.stats.gated += 1;
+                continue;
+            }
+            common::info!("루프: 노드 {} → {} ({}, 점수 {:.3}, 맞은 점 {}, 이동 {:.2} m)", h.from, h.to, if h.near { "근처" } else { "MegaLoc" }, h.score, h.inliers, h.t.norm_sq().sqrt());
             // 불확실성: 맞은 점이 많을수록 작게(긴 사무실 정답 대조: 맞은 점 20 – 50 은 5 – 11 cm, 100 개 넘으면 1 – 3 cm)
             let k = 1.0 / (h.inliers.max(1) as f64).sqrt();
             let sd = [(0.3 * k).clamp(0.01, 0.1), (10f64 * k).clamp(0.3, 3.0).to_radians()];
@@ -813,7 +886,7 @@ impl Runner {
                 return Err(format!("장소 인식 모델이 없음: {f} (모델 폴더 = $ONDEVICE_MODELS · 보드 ~/models · PC models/)"));
             }
         }
-        common::info!("slam: 광류 + PnP{} → 지도 노드 {NODE_EVERY_S} 초마다 → MegaLoc {} · XFeat {}(후보 {} · 내적 ≥ {} · {} 초 안 노드 뺌) → 자세 그래프", if imu_on { " + IMU" } else { "" }, cfg.megaloc, cfg.xfeat, cfg.topk, cfg.min_score, cfg.skip_s);
+        common::info!("slam: 광류 + PnP{} → 지도 노드 {NODE_EVERY_S} 초마다(또는 {NODE_MIN_S} 초 뒤 {NODE_MOVE_M} m · {NODE_TURN_DEG}° 움직이면) → 근처 · MegaLoc {} · XFeat {}(후보 {} · 내적 ≥ {} · {} 초 안 노드 뺌) → 자세 그래프", if imu_on { " + IMU" } else { "" }, cfg.megaloc, cfg.xfeat, cfg.topk, cfg.min_score, cfg.skip_s);
         let map = Mapper::new(cfg, replay_max).map_err(|e| format!("장소 인식 신경망: {e}"))?;
 
         let writer = if local { Sink::Local(LocalQ { q: VecDeque::new(), cap: a.queue.max(1), block, written: 0, dropped: 0 }) } else { Sink::Pipe(Writer::new(&a.out, stream_fd, a.queue, block)?) };
@@ -959,9 +1032,18 @@ impl Runner {
         // 뒷단: 노드 넣기 · 끝난 루프 · 그래프 결과 거두기(기다리지 않음. 최대 속도 재생만 결정적이게 기다림)
         let c2 = Instant::now();
         let mut new_node = None;
+        let node_due = |p: &Tf, m: &Mapper, node_t: f64| {
+            let dt = fr.t - node_t;
+            dt >= NODE_EVERY_S
+                || (dt >= NODE_MIN_S
+                    && m.nodes.values().next_back().is_some_and(|n| {
+                        let (dm, dd) = tf_diff(&n.odom, p);
+                        dm > NODE_MOVE_M || dd > NODE_TURN_DEG
+                    }))
+        };
         if let Some(p) = pose
             && !imu_hold
-            && fr.t - self.node_t >= NODE_EVERY_S
+            && node_due(&p, &self.map, self.node_t)
         {
             self.node_t = fr.t;
             new_node = Some(self.map.add_node(&fr, p));
@@ -1107,8 +1189,8 @@ impl Runner {
         let l = &self.map.stats;
         let d = l.done.max(1) as f64;
         common::info!(
-            "루프: 노드 {} 개 보냄 · {} 개 끝남, 검증 {} 번, 맞음 {} · 위치 추적과 같아 버림 {} · 간격 안이라 건너뜀 {} · 간선 {} · 그래프와 맞지 않아 버림 {}, ms/노드 MegaLoc {:.1}(최대 {:.1}) · XFeat {:.1}(최대 {:.1}) · 짝 + 검증 {:.1}(최대 {:.1})",
-            l.sent, l.done, l.tried, l.hits, l.redundant, l.gap, l.accepted, l.dropped, l.ms[0] / d, l.ms_max[0], l.ms[1] / d, l.ms_max[1], l.ms[2] / d, l.ms_max[2]
+            "루프: 노드 {} 개 보냄 · {} 개 끝남, 검증 {} 번, 맞음 {} · 위치 추적과 같아 버림 {} · 간격 안이라 건너뜀 {} · 지도와 너무 달라 버림 {} · 간선 {} · 그래프와 맞지 않아 버림 {}, ms/노드 MegaLoc {:.1}(최대 {:.1}) · XFeat {:.1}(최대 {:.1}) · 짝 + 검증 {:.1}(최대 {:.1})",
+            l.sent, l.done, l.tried, l.hits, l.redundant, l.gap, l.gated, l.accepted, l.dropped, l.ms[0] / d, l.ms_max[0], l.ms[1] / d, l.ms_max[1], l.ms[2] / d, l.ms_max[2]
         );
         common::info!("자세 그래프: 노드 {} · 간선 {}(다시 시작 구간 약한 간선 {}), 풀이 ms {}", self.map.nodes.len(), self.map.links.len(), self.map.n_gap_edges, self.map.s_opt.str());
         common::info!("장면 {n} 개, {wall:.1} 초({:.1} 장/초), 놓침 {}, 위치 추적 다시 시작 {}, 지도 보정 바뀜 {}", n as f64 / wall.max(1e-9), self.n_lost, self.n_restart, self.n_corr);

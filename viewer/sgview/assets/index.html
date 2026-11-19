@@ -1522,12 +1522,13 @@ function flyTo(o) {   // keep the compass direction, look down from at least 40�
   const target = new THREE.Vector3(...o.pos);
   autoFit = false; camGoal = { pos:target.clone().addScaledVector(dir, d), target }; invalidate();
 }
-function findShow(r) {   // r.results: letter matches first (score 1, by "name"), then pictures by cosine (score = p = sigmoid(111.83·cos − 16.77), by "look")
+function findShow(r, partial) {   // r.results: letter matches first (score 1, by "name"), then pictures by cosine (score = p = sigmoid(111.83·cos − 16.77), by "look")
   find.hits = r.results.filter(h => objs.has(h.id)); find.ids = new Set(find.hits.map(h => h.id));
   find.key = find.hits.map(h => h.id + ":" + h.score).join(",");
   const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
   const top = Math.max(1e-6, ...find.hits.map(h => h.score)), pct = p => (p * 100).toFixed(p < 0.1 ? 1 : 0) + "%";
-  $("f_note").innerHTML = !r.semantic ? "No text model loaded: matching the letters of the stored names only."
+  $("f_note").innerHTML = partial ? (find.hits.length ? `${find.hits.length} by name · reading the words…` : "reading the words…")
+    : !r.semantic ? "No text model loaded: matching the letters of the stored names only."
     : find.hits.length ? `${find.hits.length} match${find.hits.length > 1 ? "es" : ""}` : "Nothing in the memory matches.";
   $("f_list").innerHTML = find.hits.map(h => { const o = objs.get(h.id), img = o.rgbd && o.rgbd.rgb ? `<img src="/file/${o.rgbd.rgb}?v=${o.rgbd.v ?? o.last_seen}" alt="">` : "<img alt=''>";
     return `<div class="hit${h.id === selected ? " on" : ""}" data-id="${h.id}">${img}<div class="nm"><b>${esc(o.name)}</b> <span>#${h.id} · ${esc(o.state)}</span><div class="bar"><i style="width:${Math.round(h.score / top * 100)}%"></i></div></div>` +
@@ -1541,17 +1542,28 @@ function findClear(keepText) {
   $("f_out").style.display = "none"; $("f_x").style.display = $("f_q").value ? "block" : "none";
   drawHighlight(); invalidate();
 }
+// As it is typed: 150 ms after the last key (not while a Hangul syllable is being composed) the page asks fast=1 first — letters, known
+// words and queries encoded before, answered at once — and shows it; when the server says "pending" it asks again for the full answer
+// (the query through the text encoder). A newer key aborts both requests (the server drops a search whose page went away).
 async function findRun() {
   const q = $("f_q").value.trim(); $("f_x").style.display = $("f_q").value ? "block" : "none";
+  if (find.ctl) find.ctl.abort();
   if (!q) { findClear(true); return null; }
-  const seq = ++find.seq; find.q = q; find.last = performance.now();
+  const seq = ++find.seq, ctl = new AbortController(); find.ctl = ctl; find.q = q; find.last = performance.now();
+  const ask = async fast => (await fetch("/api/search?q=" + encodeURIComponent(q) + (fast ? "&fast=1" : ""), { signal:ctl.signal })).json();
   try {
-    const r = await (await fetch("/api/search?q=" + encodeURIComponent(q))).json();
+    let r = await ask(true);
     if (seq !== find.seq) return null;   // a newer query is on its way
+    if (r.pending) { findShow(r, true); r = await ask(false); if (seq !== find.seq) return null; }
     findShow(r); return r;
-  } catch (e) { if (seq === find.seq) { $("f_note").textContent = "search failed: " + e.message; $("f_list").innerHTML = ""; $("f_out").style.display = "block"; } return null; }
+  } catch (e) { if (seq === find.seq && e.name !== "AbortError") { $("f_note").textContent = "search failed: " + e.message; $("f_list").innerHTML = ""; $("f_out").style.display = "block"; } return null; }
 }
-$("f_q").addEventListener("input", () => { clearTimeout(find.timer); find.timer = setTimeout(findRun, 180); });
+let findComposing = false;
+$("f_q").addEventListener("compositionstart", () => { findComposing = true; });
+$("f_q").addEventListener("compositionend", () => { findComposing = false; clearTimeout(find.timer); find.timer = setTimeout(findRun, 150); });
+// a Hangul syllable still being composed ("의ㅈ") is not sent at every jamo; the last syllable stays "composing" until the next key, so after
+// 350 ms with no key the box is asked as it stands (typing 의자 and stopping still searches 의자)
+$("f_q").addEventListener("input", e => { clearTimeout(find.timer); find.timer = setTimeout(findRun, findComposing || e.isComposing ? 350 : 150); });
 $("f_q").addEventListener("keydown", async e => {
   if (e.key === "Escape") { findClear(); $("f_q").blur(); }
   if (e.key === "Enter") { clearTimeout(find.timer); await findRun(); const h = find.hits[0]; if (h) { select(h.id); flyTo(objs.get(h.id)); } }   // Enter: go to the best match

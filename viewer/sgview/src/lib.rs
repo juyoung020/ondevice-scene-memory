@@ -148,6 +148,8 @@ struct State {
     streams: Mutex<Vec<StreamClient>>,    // open /stream pages (one thread pushes to all of them)
     parts: Mutex<Option<Arc<delta::Parts>>>, // the current view split into objects + head (once per version, shared by every /bstream page)
     octidx: Mutex<Option<Arc<delta::OctIdx>>>, // octree node list of the current view (read once per version)
+    /// 검색을 기다리다 닫힌 연결(페이지가 다음 글자로 앞 요청을 취소): 검색 스레드가 건너뜀
+    gone: Mutex<std::collections::HashSet<u64>>,
     // --search-model (dir, --vocab): the encoder and tokenizer are loaded on the first search, so a viewer nobody searches holds neither
     #[cfg(feature = "search")]
     text_src: Option<(String, Option<String>)>,
@@ -443,6 +445,40 @@ fn content_type(p: &str) -> &'static str {
     }
 }
 
+/// /api/search reply. fast: no encoder run (and no model load) — the query's vector only if known or encoded before
+fn search_reply(s: &mut Vec<u8>, st: &Arc<State>, q: &HashMap<String, String>, fast: bool) {
+    let Some(v) = load_view(st) else { return respond(s, 200, "application/json", "", b"{\"waiting\":true}") };
+    let Some(view) = v.doc() else { return respond(s, 500, "text/plain", "", b"view.json") };
+    let text = q.get("q").map_or("", |v| v.as_str());
+    let missed = std::cell::Cell::new(false);
+    #[cfg(feature = "search")]
+    let te = if fast { st.text_enc.get().and_then(|e| e.as_ref()) } else { st.text_enc.get_or_init(|| st.text_src.as_ref().and_then(|(m, vocab)| search::load_encoder(m, vocab.as_deref()))).as_ref() };
+    #[cfg(feature = "search")]
+    let enc = |t: &str| {
+        let e = te?;
+        if fast {
+            let v = e.lookup(t);
+            missed.set(missed.get() || v.is_none());
+            v
+        } else {
+            e.encode(t).map_err(|e| eprintln!("search: {e}")).ok()
+        }
+    };
+    #[cfg(feature = "search")]
+    if fast && te.is_none() && st.text_src.is_some() {
+        missed.set(true); // encoder still loading
+    }
+    #[cfg(not(feature = "search"))]
+    let enc = |_: &str| None;
+    let k = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(20);
+    let min = q.get("min").and_then(|v| v.parse().ok()); // 없으면 질의 글자로 정한 문턱(search::default_min)
+    let mut body = search::search(&st.dir, view, text, &enc, k, min);
+    if fast {
+        body["pending"] = serde_json::Value::Bool(missed.get() && !text.trim().is_empty());
+    }
+    respond(s, 200, "application/json", "", body.to_string().as_bytes())
+}
+
 /// What the current request on this connection asked for (one connection = one thread, so a thread-local is per request).
 #[derive(Default, Clone)]
 struct ReqCtx {
@@ -635,21 +671,11 @@ fn handle_one(s: &mut Vec<u8>, st: &Arc<State>, line: &str) {
                 respond(&mut s, 200, "application/json", "", b"{\"ok\":false,\"why\":\"the folder is on disk already\"}")
             }
         }
+        // fast=1: answered here at once with what needs no encoder run (letters, known words, queries encoded before) — "pending" says the
+        // full answer (the query encoded, search thread) is worth asking for; the page shows this one while it types
+        "/api/search" if q.get("fast").is_some_and(|v| v == "1") => search_reply(&mut s, &st, &q, true),
         "/api/search" => REQ.with(|r| r.borrow_mut().search = Some(q)),
-        "/api/search-now" => {
-            let Some(v) = load_view(&st) else { return respond(&mut s, 200, "application/json", "", b"{\"waiting\":true}") };
-            let Some(view) = v.doc() else { return respond(&mut s, 500, "text/plain", "", b"view.json") };
-            #[cfg(feature = "search")]
-            let te = st.text_enc.get_or_init(|| st.text_src.as_ref().and_then(|(m, vocab)| search::load_encoder(m, vocab.as_deref())));
-            #[cfg(feature = "search")]
-            let enc = |t: &str| te.as_ref().and_then(|e| e.encode(t).map_err(|e| eprintln!("search: {e}")).ok());
-            #[cfg(not(feature = "search"))]
-            let enc = |_: &str| None;
-            let k = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(20);
-            let min = q.get("min").and_then(|v| v.parse().ok()); // 없으면 질의 글자로 정한 문턱(search::default_min)
-            let body = search::search(&st.dir, view, q.get("q").map_or("", |v| v.as_str()), &enc, k, min).to_string();
-            respond(&mut s, 200, "application/json", "", body.as_bytes())
-        }
+        "/api/search-now" => search_reply(&mut s, &st, &q, false),
         // ?metrics=1 page: frames drawn and pose → screen latency every 2 s, logged here (measuring on the board screen)
         "/api/metric" => {
             let g = |k: &str| q.get(k).map_or("-", |v| v.as_str());
@@ -874,29 +900,56 @@ struct SearchJob {
     q: HashMap<String, String>,
 }
 
-/// 검색 전용 스레드: 글 인코더(rayon)는 이 스레드가 가진 작은 풀(2 일꾼)에서만 돌고, 검색은 한 번에 하나씩.
+/// 검색 전용 스레드: 글 인코더(rayon)는 이 스레드가 가진 작은 풀(4 일꾼)에서만 돌고, 검색은 한 번에 하나씩.
+/// 쌓인 요청은 한꺼번에 꺼내 닫힌 연결(취소된 앞 글자)은 버리고, 같은 질의는 한 번만 계산해 모두에 답한다(치는 동안 줄이 늘지 않게).
 /// 전역 풀(위치 추적 · 물체 기억 · 다시 쌓기)과 나누지 않아 그쪽 긴 일에 막히지 않고, 그쪽도 검색에 막히지 않는다.
 /// 시작할 때 인코더를 미리 올려 첫 검색이 모델 읽기를 기다리지 않게 한다
 fn search_thread(st: Arc<State>, out: std::sync::mpsc::Sender<(u64, Vec<u8>)>, w: Arc<common::rt::Waker>) -> std::sync::mpsc::Sender<SearchJob> {
     let (tx, rx) = std::sync::mpsc::channel::<SearchJob>();
     let _ = std::thread::Builder::new().name("search".into()).spawn(move || {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).thread_name(|i| format!("search-{i}")).build().expect("search pool");
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).thread_name(|i| format!("search-{i}")).build().expect("search pool");
         #[cfg(feature = "search")]
         pool.install(|| {
             if let Some(e) = st.text_enc.get_or_init(|| st.text_src.as_ref().and_then(|(m, vocab)| search::load_encoder(m, vocab.as_deref()))) {
                 let _ = e.encode("warm up");
             }
         });
-        while let Ok(j) = rx.recv() {
-            let out_b = pool.install(|| {
-                REQ.with(|r| *r.borrow_mut() = ReqCtx { gzip: j.ctx.gzip, keep: j.ctx.keep, ..Default::default() });
-                let mut out = Vec::new();
-                let line = format!("GET /api/search-now?{} HTTP/1.1", j.q.iter().map(|(k, v)| format!("{k}={}", enc_uri(v))).collect::<Vec<_>>().join("&"));
-                handle_one(&mut out, &st, &line);
-                out
-            });
-            let _ = out.send((j.id, out_b));
-            w.wake();
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            batch.extend(rx.try_iter());
+            {
+                let mut gone = st.gone.lock().unwrap();
+                batch.retain(|j| !gone.remove(&j.id));
+                if gone.len() > 4096 {
+                    gone.clear();
+                }
+            }
+            // 같은 질의(그리고 같은 gzip · keep)끼리 한 번: 줄 글자 순서는 열쇠 순서로 맞춤
+            let key = |j: &SearchJob| {
+                let mut kv: Vec<_> = j.q.iter().collect();
+                kv.sort();
+                (format!("{kv:?}"), j.ctx.gzip, j.ctx.keep)
+            };
+            let mut done: Vec<((String, bool, bool), Vec<u8>)> = vec![];
+            for j in batch {
+                let kk = key(&j);
+                let body = match done.iter().find(|(k, _)| *k == kk) {
+                    Some((_, b)) => b.clone(),
+                    None => {
+                        let b = pool.install(|| {
+                            REQ.with(|r| *r.borrow_mut() = ReqCtx { gzip: j.ctx.gzip, keep: j.ctx.keep, ..Default::default() });
+                            let mut out = Vec::new();
+                            let line = format!("GET /api/search-now?{} HTTP/1.1", j.q.iter().map(|(k, v)| format!("{k}={}", enc_uri(v))).collect::<Vec<_>>().join("&"));
+                            handle_one(&mut out, &st, &line);
+                            out
+                        });
+                        done.push((kk, b.clone()));
+                        b
+                    }
+                };
+                let _ = out.send((j.id, body));
+                w.wake();
+            }
         }
     });
     tx
@@ -934,7 +987,7 @@ impl Server {
                 std::process::exit(2);
             }
         };
-        let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()),
+        let st = Arc::new(State { dir, walls: Mutex::new(None), view: Mutex::new(None), maps: Mutex::new(MapHist { vers: Vec::new() }), streams: Mutex::new(Vec::new()), gone: Mutex::new(Default::default()),
             parts: Mutex::new(None), octidx: Mutex::new(None),
             #[cfg(feature = "search")]
             text_src: search_model.clone().map(|m| (m, vocab.clone())),
@@ -1012,6 +1065,9 @@ impl Server {
 
     fn close(&mut self, id: u64, poll: &mut common::rt::Poll) {
         if let Some(c) = self.conns.remove(&id) {
+            if c.busy {
+                self.st.gone.lock().unwrap().insert(id);
+            }
             #[cfg(target_os = "linux")]
             {
                 use std::os::fd::AsRawFd;
@@ -1101,6 +1157,11 @@ impl Server {
                 break;
             }
             c.out.extend_from_slice(&out);
+        }
+        if eof && c.busy {
+            // 검색을 기다리던 페이지가 끊음(다음 글자로 앞 요청 취소): 검색 스레드가 건너뛰게 표시하고 닫음
+            self.close(id, poll);
+            return;
         }
         if eof && !c.busy {
             c.keep = false;

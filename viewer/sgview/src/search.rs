@@ -114,6 +114,15 @@ impl TextEnc {
         let _ = self.known.set(vocab.into_iter().map(|(n, v)| (n.trim().to_lowercase(), v)).collect());
     }
 
+    /// The vector of a text only when it needs no encoder run (a known word or one encoded before)
+    pub fn lookup(&self, text: &str) -> Option<Arc<Vec<f32>>> {
+        let key = text.trim().to_lowercase();
+        if let Some(v) = self.known.get().and_then(|k| k.get(&key)) {
+            return Some(v.clone());
+        }
+        self.cache.lock().unwrap().get(&key).cloned()
+    }
+
     /// Text → unit vector. SigLIP2 was trained on lower-cased text; results are kept (class names repeat on every query).
     pub fn encode(&self, text: &str) -> Result<Arc<Vec<f32>>, String> {
         let key = text.trim().to_lowercase();
@@ -477,13 +486,23 @@ mod tests {
 pub fn load_encoder(dir: &str, vocab: Option<&str>) -> Option<TextEnc> {
     match TextEnc::load(Path::new(dir)) {
         Ok(e) => {
-            match vocab.map(|f| read_vocab(Path::new(f))) {
-                Some(Ok(v)) => {
-                    let _ = READ_VOCAB.set(v.clone());
-                    e.know(v)
+            // `--vocab a.voc,b.voc`: every list's words skip the encoder (the memory's own name list too, so a stored name never costs an encode)
+            let mut all: Vec<(String, Arc<Vec<f32>>)> = vec![];
+            for f in vocab.into_iter().flat_map(|v| v.split(',')).map(str::trim).filter(|f| !f.is_empty()) {
+                match read_vocab(Path::new(f)) {
+                    Ok(v) => {
+                        for (n, x) in v {
+                            if !all.iter().any(|(m, _)| m.eq_ignore_ascii_case(&n)) {
+                                all.push((n, x));
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("search: {err}"),
                 }
-                Some(Err(err)) => eprintln!("search: {err}"),
-                None => {}
+            }
+            if !all.is_empty() {
+                let _ = READ_VOCAB.set(all.clone());
+                e.know(all)
             }
             eprintln!("search: text encoder ready ({dir})");
             Some(e)

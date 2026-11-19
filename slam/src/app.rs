@@ -1106,7 +1106,7 @@ pub struct Args {
     /// IMU 모드: 광류 맞은 점이 이보다 적거나 맞은 비율이 이보다 낮은 장면은 위치만
     imu_min_inliers: f64,
     imu_min_ratio: f64,
-    /// IMU 모드: 이어지지 않은 새 지도를 맡겨 두고 기다리는 최대 시간(초). 지나면 새 지도를 받아들여 바로 쌓음
+    /// IMU 모드: 이어지지 않은 새 지도를 맡겨 두고 기다리는 최대 시간(초, 기본 끝없음 = 이어질 때까지). 지나면 새 지도를 받아들여 바로 쌓음
     imu_hold_wait: f64,
     /// IMU 모드: 앞의 믿는 지도 노드가 이보다 적으면(시작 직후) 기다리지 않고 바로 새 지도로
     imu_hold_min_nodes: f64,
@@ -1171,7 +1171,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         imu_exposure: 0.03,
         imu_min_inliers: 60.0,
         imu_min_ratio: 0.6,
-        imu_hold_wait: 2.0,
+        imu_hold_wait: f64::INFINITY, // 이어지지 않은 새 지도를 임시 위치로 쌓으면 끝내 안 이어질 때 같은 책상 · 물체가 어긋난 자리에 한 번 더 남는다
         imu_hold_min_nodes: 30.0,
         imu_csv: String::new(),
         stress_gap: (0.0, 0.0),
@@ -1492,19 +1492,27 @@ impl Runner {
             None
         } else {
             let ring = crate::imu::Ring::new();
-            match &imu_replay {
+            let ok = match &imu_replay {
                 Some(r) => {
                     r.count_into(&ring);
                     let (t0, t1) = r.span();
                     common::info!("IMU 재생: {} 표본 {} 개({t0:.3} – {t1:.3})", a.imu_csv, r.len());
+                    true
                 }
-                None => {
-                    crate::imu::spawn_reader(&a.imu, ring.clone())?;
-                }
-            }
+                // 실시간 IMU 가 응답하지 않으면(배선 빠짐 등) 실행을 멈추지 않고 카메라 전용으로
+                None => match crate::imu::spawn_reader(&a.imu, ring.clone()) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        common::info!("IMU 없음: {e} → 카메라 전용으로 계속(IMU 배선 · I2C 를 확인)");
+                        false
+                    }
+                },
+            };
+            ok.then(|| {
                 imu_ring = Some(ring.clone());
-            common::info!("모드: IMU 융합(시각 보정 {:+.4} 초, 이어 붙이기 최대 {} 초)", calib.shift, a.imu_bridge);
-            Some(crate::imu::Fusion::new(ring, calib.clone(), a.imu_bridge))
+                common::info!("모드: IMU 융합(시각 보정 {:+.4} 초, 이어 붙이기 최대 {} 초)", calib.shift, a.imu_bridge);
+                crate::imu::Fusion::new(ring, calib.clone(), a.imu_bridge)
+            })
         };
         let imu_on = imu_fusion.is_some();
         // 스트림이 표준출력이면 그 파일 기술자를 따로 떼어 두고 표준출력은 표준오류로 돌린다
@@ -2077,7 +2085,7 @@ impl Runner {
         }
         // IMU 모드: 이어지지 않은 새 지도는 위치는 임시 위치로 바로 보내되 지도 · 물체에는 맡겨 두기만(이어지면 다시 쌓기가 고친 위치로 넣음).
         // 놓친 사이 움직임을 모르는 임시 위치로 바로 쌓으면 같은 표면이 어긋난 채 두 겹으로 남는다
-        // 맡겨 두기는 짧게: --imu-hold-wait 초 안에 안 이어지면(또는 앞 지도가 작으면) 새 지도를 받아들여 바로 쌓는다(맡겼던 장면도 그 지도 위치로).
+        // 맡겨 두기: 기본은 이어질 때까지(--imu-hold-wait 초를 주면 그만큼 기다린 뒤, 앞 지도가 작으면 바로) 새 지도를 받아들여 쌓는다(맡겼던 장면도 그 지도 위치로).
         // 나중에 이어지면 노드가 움직여 다시 쌓기가 고친 위치로 옮긴다
         if self.anchored || new_map {
             self.accepted = false;

@@ -2143,22 +2143,19 @@ impl PtsWorker {
         PtsWorker { lane: common::rt::Lane::new("pts", st, 0), json_rx, json: std::cell::RefCell::new(serde_json::Value::Null), wait,
                     dropped: 0, gap: (PTS_GAP_M, PTS_GAP_DEG.to_radians()), last: None, skipped: 0 }
     }
-    /// 실시간 장면 넘기기: 밀렸으면(스트림) 건너뜀 — 보관 장면이면 빈 점 격자로 표시해 다시 쌓기가 기다리지 않게.
-    /// 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면은 점 격자 일부만(어긋남을 돌려 가며) 넣음: 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
+    /// 실시간 장면 넘기기: 지도에 넣는 장면은 버리지 않는다(물체가 들어간 장면이면 점도 들어가게). 줄이 밀리면(스트림) 점 격자 일부만 넣고,
+    /// 많이 밀리면 줄이 줄 때까지 기다린다. 직전에 다 넣은 장면과 거의 같은 자리에서 본 장면도 점 격자 일부만(어긋남을 돌려 가며):
+    /// 칸마다 본 횟수는 쌓이고 넣기는 1/PTS_SUB²
     #[allow(clippy::too_many_arguments)]
     fn frame(&mut self, kf: u32, r: M3, pwc: V3, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: Option<std::sync::Arc<kfstore::Kf>>, thin: bool) {
-        if !self.wait && self.lane.pending() as usize >= PTS_QUEUE {
-            self.dropped += 1;
-            if let Some(s) = &keep {
-                s.fill(&rgb, &depth); // 밀려 건너뛰어도 보관 장면은 압축(드묾)
+        let late = !self.wait && self.lane.pending() as usize >= PTS_QUEUE;
+        if late {
+            self.dropped += 1; // 밀려 일부만 넣은 장면 수
+            if self.lane.pending() as usize >= PTS_QUEUE * 3 {
+                common::rt::wait_until(|| (self.lane.pending() as usize) < PTS_QUEUE * 2);
             }
-            give_back(rgb, depth);
-            if let Some(s) = keep {
-                let _ = s.pts.set(None);
-            }
-            return;
         }
-        let near = thin || self.last.as_ref().is_some_and(|(lr, lp)| norm(&sub(&pwc, lp)) < self.gap.0 && rot_angle(&r, lr) < self.gap.1);
+        let near = thin || late || self.last.as_ref().is_some_and(|(lr, lp)| norm(&sub(&pwc, lp)) < self.gap.0 && rot_angle(&r, lr) < self.gap.1);
         let part = if near {
             self.skipped += 1;
             Some(self.skipped as usize % (PTS_SUB * PTS_SUB))
@@ -2183,14 +2180,11 @@ impl PtsWorker {
             out::slow(c0);
         });
     }
-    /// 맡아 둘 장면: 점 격자만 만들어 붙이게 넘김(밀렸으면 빈 점 격자로 표시)
+    /// 맡아 둘 장면: 점 격자만 만들어 붙이게 넘김
     fn hold(&mut self, depth: Depth, rgb: Vec<u8>, w: usize, h: usize, keep: std::sync::Arc<kfstore::Kf>) {
-        if !self.wait && self.lane.pending() as usize >= PTS_QUEUE {
-            self.dropped += 1;
-            keep.fill(&rgb, &depth);
-            give_back(rgb, depth);
-            let _ = keep.pts.set(None);
-            return;
+        // 맡아 둔 장면도 이어지면 점이 들어가야 하니 버리지 않음(많이 밀렸으면 줄이 줄 때까지 기다림)
+        if !self.wait && self.lane.pending() as usize >= PTS_QUEUE * 3 {
+            common::rt::wait_until(|| (self.lane.pending() as usize) < PTS_QUEUE * 2);
         }
         self.lane.push(move |s: &mut PtsSt| {
             let c0 = Instant::now();
@@ -2254,7 +2248,7 @@ impl PtsWorker {
                 common::info!("점 줄: 장면 {} 개, 점 고르기 {:.1} ms/장 + 지도 넣기 {:.1} ms/장, 청크 쓰기 합 {:.2} 초", s.nf, s.t_grid / n * 1e3, s.t_add / n * 1e3, s.t_write);
             }
             let cm = &s.chunks;
-            common::info!("점 지도: 청크 {} 개 · 점 {} · {:.1} MB, 자세 고침 {} 번 합 {:.1} ms", cm.write_count(), cm.n_points(), cm.bytes() as f64 / 1048576.0, cm.n_repose, cm.t_repose * 1e3);
+            common::info!("점 지도: 청크 {} 개 · 점 {} · {:.1} MB, 이미 점이 있어 건너뛴 새 점 {} · 자세 고친 뒤 겹쳐 뺀 점 {}, 자세 고침 {} 번 합 {:.1} ms", cm.write_count(), cm.n_points(), cm.bytes() as f64 / 1048576.0, cm.n_dup, cm.n_dedup, cm.n_repose, cm.t_repose * 1e3);
             (cm.n_points(), cm.bytes() as f64 / 1048576.0)
         });
         (n, mb, self.json())

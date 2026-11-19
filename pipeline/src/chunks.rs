@@ -1,6 +1,8 @@
 //! 점 지도(청크): 가까운 키프레임 몇 장의 점을 한 청크에 그 청크 기준 자세에서 본 좌표로 담는다.
 //! 점 = i16 × 3(기준 자세 좌표, mm) + 색 u8 × 3, 청크 안에서만 칸(--scene-vox)으로 겹침을 거른다(본 키프레임 수 ≥ --pts-obs 인 칸만 점).
-//! 루프 클로저 · 수평 맞춤은 점을 다시 쌓지 않고 청크 기준 자세만 고친다(기준 키프레임의 고친 위치) → 뷰어는 바뀐 자세만 받는다.
+//! 루프 클로저 · 수평 맞춤은 점을 다시 쌓지 않고 청크 기준 자세만 고친다(청크에 든 첫 보관 장면의 고친 위치 × 그 장면에서 본 청크 자세) → 뷰어는 바뀐 자세만 받는다.
+//! 누적: 점은 버리지 않고(새 지도 · 다시 이어짐 · 다시 쌓기 모두), 새 장면 점은 이미 점이 있는 칸(세계 좌표 --scene-vox 칸, 다른 청크 포함, 고친 자세 기준)이면 건너뛰어
+//! 빈 곳만 채운다(같은 곳을 다시 돌아도 점이 늘지 않음). 이미 있는지는 DUP_CELL 칸에 점이 DUP_MIN 개 넘게 있는지로 본다.
 //! 파일: chunks/<판>/c<id>.bin = u32 n + n × i16 xyz(mm, little-endian) + n × u8 rgb. 목록은 view.json scene_points.submap
 use crate::geom::*;
 use std::collections::{HashMap, HashSet};
@@ -10,6 +12,10 @@ use std::path::Path;
 pub const CHUNK_M: f64 = 0.6;
 pub const CHUNK_DEG: f64 = 25.0;
 pub const CHUNK_KF: u32 = 30;
+/// 이미 점이 있는지 보는 세계 칸(m)과 그 칸이 찼다고 볼 점 수: 같은 곳을 다시 볼 때 위치가 1 – 2 cm 어긋나도 새 점으로 세지 않게
+/// 점 칸(--scene-vox, 1 cm)보다 굵게. 3 cm 칸에 표면 점은 보통 9 개 안팎이라 3 개부터 참
+pub const DUP_CELL: f64 = 0.03;
+pub const DUP_MIN: u16 = 3;
 /// i16 mm 로 담을 수 있는 거리(기준 자세에서)
 const LIM_MM: f64 = 32000.0;
 
@@ -26,8 +32,9 @@ struct Acc {
 
 struct Chunk {
     id: u32,
-    /// 기준 키프레임(보관 장면 순번): 고친 위치가 오면 이 청크 자세가 됨. None = 보관 안 된 장면(자세 고정)
+    /// 닻 키프레임(청크에 처음 든 보관 장면 순번)과 그 장면 자세에서 본 청크 자세: 고친 위치가 오면 청크 자세 = 고친 위치 × rel. None = 아직 보관 장면 없음(자세 고정)
     seq: Option<u64>,
+    rel: (M3, V3),
     r: M3,
     p: V3,
     nkf: u32,
@@ -75,6 +82,11 @@ pub struct ChunkMap {
     next_id: u32,
     /// 넣은 보관 장면(다시 넣지 않게)
     added: HashSet<u64>,
+    /// 닫은 청크 점이 든 세계 DUP_CELL 칸(키 → 점 수): 찬 칸의 새 점은 건너뜀. 청크 자세가 바뀌면 그 청크 몫을 옮김
+    occ: HashMap<u64, u16>,
+    /// 이미 점이 있어 건너뛴 새 점 수 · 자세를 고친 뒤 겹쳐 뺀 점 수
+    pub n_dup: u64,
+    pub n_dedup: u64,
     /// 지금까지 자세를 고친 청크 수 · 걸린 시간(초)
     pub n_repose: usize,
     pub t_repose: f64,
@@ -82,7 +94,7 @@ pub struct ChunkMap {
 
 impl ChunkMap {
     pub fn new(vox: f64, min_obs: u8) -> ChunkMap {
-        ChunkMap { vox, min_obs, run: new_run(), chunks: vec![], next_id: 0, added: HashSet::new(), n_repose: 0, t_repose: 0.0 }
+        ChunkMap { vox, min_obs, run: new_run(), chunks: vec![], next_id: 0, added: HashSet::new(), occ: HashMap::new(), n_dup: 0, n_dedup: 0, n_repose: 0, t_repose: 0.0 }
     }
 
     pub fn has(&self, seq: u64) -> bool {
@@ -100,23 +112,32 @@ impl ChunkMap {
             c.acc.is_some() && c.nkf < CHUNK_KF && norm(&sub(pwc, &c.p)) < CHUNK_M && rot_angle(r, &c.r) < CHUNK_DEG.to_radians()
         });
         if !open {
-            let min_obs = self.min_obs;
-            if let Some(c) = self.chunks.last_mut() {
-                c.close(min_obs);
-            }
-            self.chunks.push(Chunk { id: self.next_id, seq, r: *r, p: *pwc, nkf: 0, acc: Some(HashMap::new()), pts: vec![], col: vec![], ver: 0, written: 0, pose_ver: 0 });
+            self.close_last();
+            self.chunks.push(Chunk { id: self.next_id, seq, rel: (I3, [0.0; 3]), r: *r, p: *pwc, nkf: 0, acc: Some(HashMap::new()), pts: vec![], col: vec![], ver: 0, written: 0, pose_ver: 0 });
             self.next_id += 1;
         }
         let vox_mm = self.vox * 1000.0;
         let c = self.chunks.last_mut().unwrap();
+        // 닻이 없던 청크에 처음 보관 장면이 들면 그 장면에 묶음(그 장면 자세에서 본 청크 자세)
+        if let (None, Some(s)) = (c.seq, seq) {
+            c.seq = Some(s);
+            c.rel = inv_mul(&(*r, *pwc), &(c.r, c.p));
+        }
         // 카메라 → 청크 기준: q = Rcᵀ (R pc + p − pc0) = (Rcᵀ R) pc + Rcᵀ (p − pc0), mm 로
         let rt = transpose(&c.r);
         let rr = mm(&rt, r);
         let tt = mv(&rt, &sub(pwc, &c.p));
         let acc = c.acc.as_mut().unwrap();
+        let occ = &self.occ;
+        let mut dup = 0u64;
         for (pc, col, d) in pts {
             let q = add(&mv(&rr, &pc), &tt).map(|x| x * 1000.0);
             if q.iter().any(|x| x.abs() > LIM_MM) {
+                continue;
+            }
+            // 이미 다른 청크 점이 있는 세계 칸은 건너뜀(빈 곳만 채움)
+            if !occ.is_empty() && occ.get(&crate::maps::key(&add(&mv(r, &pc), pwc), DUP_CELL)).is_some_and(|&n| n >= DUP_MIN) {
+                dup += 1;
                 continue;
             }
             let k = crate::maps::key(&q, vox_mm);
@@ -136,28 +157,70 @@ impl ChunkMap {
         }
         c.nkf += 1;
         c.ver += 1;
+        self.n_dup += dup;
+    }
+
+    /// 쌓던 마지막 청크를 닫고 그 점을 세계 칸에 올림
+    fn close_last(&mut self) {
+        let min_obs = self.min_obs;
+        if let Some(c) = self.chunks.last_mut()
+            && c.acc.is_some()
+        {
+            c.close(min_obs);
+            occ_add(&mut self.occ, c, 1);
+        }
     }
 
     /// 고친 키프레임 위치(순번 → 자세)로 청크 기준 자세를 고침: 바뀐 청크 수. 쌓던 청크는 닫는다(그 안 장면끼리 위치가 바뀌었을 수 있음)
     pub fn repose(&mut self, poses: &HashMap<u64, (M3, V3)>) -> usize {
         let c0 = std::time::Instant::now();
-        let min_obs = self.min_obs;
-        if let Some(c) = self.chunks.last_mut() {
-            c.close(min_obs);
-        }
-        let mut n = 0;
+        self.close_last();
+        let mut moved = HashSet::new();
         for c in &mut self.chunks {
-            if let Some((r, p)) = c.seq.and_then(|s| poses.get(&s)) {
-                if *r != c.r || *p != c.p {
-                    (c.r, c.p) = (*r, *p);
+            if let Some(kp) = c.seq.and_then(|s| poses.get(&s)) {
+                let (r, p) = mul(kp, &c.rel);
+                // 닻 자세 × rel 의 반올림 차는 움직임으로 보지 않음(0.1 mm · 약 0.0006°)
+                if norm(&sub(&p, &c.p)) > 1e-4 || rot_angle(&r, &c.r) > 1e-5 {
+                    (c.r, c.p) = (r, p);
                     c.pose_ver += 1;
-                    n += 1;
+                    moved.insert(c.id);
                 }
             }
+        }
+        let n = moved.len();
+        if n > 0 {
+            self.dedupe(&moved);
         }
         self.n_repose += n;
         self.t_repose += c0.elapsed().as_secs_f64();
         n
+    }
+
+    /// 자세를 고친 뒤 세계 칸을 처음부터 다시 셈(청크 id 차례): 옮겨진 청크의 점 가운데 앞 청크들로 이미 찬 칸에 든 점은 뺀다.
+    /// 이어지기 전 새 지도(임시 위치)로 넣은 점이 이어진 뒤 옛 점과 겹치면 여기서 한 벌만 남음(덮인 곳은 그대로, 겹친 점만 빠짐)
+    fn dedupe(&mut self, moved: &HashSet<u32>) {
+        let mut occ: HashMap<u64, u16> = HashMap::with_capacity(self.occ.len());
+        let mut dropped = 0u64;
+        for c in &mut self.chunks {
+            if c.acc.is_some() {
+                continue;
+            }
+            if moved.contains(&c.id) && !occ.is_empty() {
+                let keep: Vec<bool> = c.pts.iter().map(|q| occ.get(&world_key(c, q)).is_none_or(|&k| k < DUP_MIN)).collect();
+                let before = c.pts.len();
+                let mut it = keep.iter();
+                c.pts.retain(|_| *it.next().unwrap());
+                let mut it = keep.iter();
+                c.col.retain(|_| *it.next().unwrap());
+                if c.pts.len() != before {
+                    dropped += (before - c.pts.len()) as u64;
+                    c.ver += 1;
+                }
+            }
+            occ_add(&mut occ, c, 1);
+        }
+        self.occ = occ;
+        self.n_dedup += dropped;
     }
 
     pub fn write_count(&self) -> usize {
@@ -167,7 +230,7 @@ impl ChunkMap {
         self.chunks.iter().map(|c| c.n_points(self.min_obs)).sum()
     }
     pub fn bytes(&self) -> usize {
-        self.chunks.iter().map(|c| c.bytes()).sum::<usize>() + self.added.capacity() * 9
+        self.chunks.iter().map(|c| c.bytes()).sum::<usize>() + self.added.capacity() * 9 + self.occ.capacity() * 11
     }
 
     /// 바뀐 청크 파일을 쓰고 목록 JSON 을 돌려줌(list: [id, 판, 점 수, r00..r22, px, py, pz])
@@ -222,6 +285,41 @@ pub fn new_run() -> u64 {
     t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16
 }
 
+const I3: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// 닫은 청크 점을 지금 자세로 세계 DUP_CELL 칸에 올림(d = 1) · 내림(d = −1)
+fn occ_add(occ: &mut HashMap<u64, u16>, c: &Chunk, d: i32) {
+    for q in &c.pts {
+        let k = world_key(c, q);
+        if d > 0 {
+            let e = occ.entry(k).or_insert(0);
+            *e = e.saturating_add(1);
+        } else if let Some(e) = occ.get_mut(&k) {
+            *e -= 1;
+            if *e == 0 {
+                occ.remove(&k);
+            }
+        }
+    }
+}
+
+/// 청크 점의 세계 DUP_CELL 칸
+fn world_key(c: &Chunk, q: &[i16; 3]) -> u64 {
+    let w = add(&mv(&c.r, &[q[0] as f64 * 1e-3, q[1] as f64 * 1e-3, q[2] as f64 * 1e-3]), &c.p);
+    crate::maps::key(&w, DUP_CELL)
+}
+
+/// a⁻¹ · b
+fn inv_mul(a: &(M3, V3), b: &(M3, V3)) -> (M3, V3) {
+    let rt = transpose(&a.0);
+    (mm(&rt, &b.0), mv(&rt, &sub(&b.1, &a.1)))
+}
+
+/// a · b
+fn mul(a: &(M3, V3), b: &(M3, V3)) -> (M3, V3) {
+    (mm(&a.0, &b.0), add(&mv(&a.0, &b.1), &a.1))
+}
+
 fn transpose(m: &M3) -> M3 {
     [[m[0][0], m[1][0], m[2][0]], [m[0][1], m[1][1], m[2][1]], [m[0][2], m[1][2], m[2][2]]]
 }
@@ -254,5 +352,29 @@ mod tests {
         // 같은 보관 장면은 다시 넣지 않음
         m.add(1, Some(7), &I, &[3.0, 0.0, 0.0], pts());
         assert_eq!(m.chunks.len(), 1);
+    }
+
+    #[test]
+    fn fills_only_empty_cells_and_anchor_follows_later_kf() {
+        let mut m = ChunkMap::new(0.01, 1);
+        // 3 cm 칸 하나(x 0.09 – 0.12 · y 0 – 0.03 · z 0.99 – 1.02)에 서로 다른 1 cm 점 3 개 = 찬 칸
+        let pts = || vec![([0.1, 0.0, 1.0], [10, 20, 30], 1.0f32), ([0.1, 0.012, 1.0], [1, 2, 3], 1.0), ([0.1, 0.0, 1.012], [1, 2, 3], 1.0)].into_iter();
+        // 보관 안 된 장면으로 청크 시작, 같은 청크의 다음 장면이 보관 장면(순번 5) → 닻
+        m.add(0, None, &I, &[0.0, 0.0, 0.0], pts());
+        m.add(1, Some(5), &I, &[0.1, 0.0, 0.0], std::iter::empty());
+        assert_eq!(m.chunks[0].seq, Some(5));
+        // 멀리 가서 새 청크(앞 청크 닫힘) → 같은 세계 점을 다시 보면 건너뜀
+        m.add(2, None, &I, &[5.0, 0.0, 0.0], std::iter::empty());
+        assert_eq!(m.chunks.len(), 2);
+        m.add(3, None, &I, &[5.0, 0.0, 0.0], vec![([-4.895, 0.0, 1.0], [0, 0, 0], 1.0f32), ([-4.0, 0.0, 1.0], [0, 0, 0], 1.0)].into_iter());
+        assert_eq!(m.n_dup, 1);
+        // 닻 장면이 1 m 옮겨지면 청크도 같은 몫(rel)만큼: 기준 (0,0,0) 이 닻 (0.1,0,0) 에서 −0.1 → 새 닻 (1.1,0,0) 이면 (1.0,0,0)
+        let mut poses = HashMap::new();
+        poses.insert(5u64, (I, [1.1, 0.0, 0.0]));
+        assert_eq!(m.repose(&poses), 1);
+        assert!((m.chunks[0].p[0] - 1.0).abs() < 1e-9);
+        // 옮긴 뒤 세계 칸도 옮겨짐: 옛 자리(0.1, 0, 1)는 비고 새 자리(1.1, 0, 1)가 참
+        let vk = |x: f64, z: f64| crate::maps::key(&[x, 0.0, z], DUP_CELL);
+        assert!(!m.occ.contains_key(&vk(0.1, 1.0)) && m.occ.contains_key(&vk(1.1, 1.0)));
     }
 }

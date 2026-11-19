@@ -69,6 +69,12 @@ mod engine {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// 기한이 지났는가
+    fn past(d: Instant) -> bool {
+        Instant::now() >= d
+    }
 
     /// 위치 추적 한 장의 결과(OdometryInfo 에서 쓰는 칸)
     #[derive(Clone)]
@@ -701,7 +707,8 @@ mod engine {
             v.into_iter().take(n).map(|x| x.1).collect()
         }
 
-        pub fn global_reloc(&mut self, f: &Frame, min_inliers: usize) -> Option<(Tf, i32, [f64; 36])> {
+        /// deadline: 이 시각을 넘으면 남은 후보(PnP RANSAC 한 번에 보드 수 ms – 수십 ms)는 다음 장면으로 미룸(첫 후보는 늘 맞춰 봄)
+        pub fn global_reloc(&mut self, f: &Frame, min_inliers: usize, deadline: Instant) -> Option<(Tf, i32, [f64; 36])> {
             self.ensure_cur(f);
             if self.cur.desc.is_empty() || self.kf_db.is_empty() {
                 return None;
@@ -743,8 +750,8 @@ mod engine {
                 eprintln!("global db {} q {} top {:?}", self.kf_db.len(), q.len(), &scores[..scores.len().min(3)]);
             }
             let cam = f.cam.clone();
-            for &(hits, i) in scores.iter().take(self.merge_top.max(2)) {
-                if hits < 10 {
+            for (k, &(hits, i)) in scores.iter().take(self.merge_top.max(2)).enumerate() {
+                if hits < 10 || (k > 0 && past(deadline)) {
                     break;
                 }
                 let (kf, kp) = &self.kf_db[i];
@@ -906,7 +913,8 @@ mod engine {
             self.slam.st().last_id
         }
 
-        pub fn propose_merge(&mut self, f: &Frame, min_inliers: usize) -> bool {
+        /// deadline: global_reloc 와 같음
+        pub fn propose_merge(&mut self, f: &Frame, min_inliers: usize, deadline: Instant) -> bool {
             self.ensure_cur(f);
             if self.cur.desc.is_empty() {
                 return false;
@@ -956,8 +964,8 @@ mod engine {
             }
             best.sort_by(|a, b| b.cmp(a));
             let cam = f.cam.clone();
-            for &(hits, i) in best.iter().take(self.merge_top) {
-                if hits < 8 {
+            for (k, &(hits, i)) in best.iter().take(self.merge_top).enumerate() {
+                if hits < 8 || (k > 0 && past(deadline)) {
                     break;
                 }
                 let info = self.reloc.compute_tf(&self.kf_db[i].0, &self.cur, &cam, Tf::NULL);
@@ -1843,7 +1851,7 @@ impl Runner {
             // 빈틈 바로 뒤 첫 장면은 예산과 상관없이 한 번 꼭 해 봄(이어 붙이기 전에 제자리 찾기)
             if !relocalized && self.klt_path && (budget_ok(c1, 20.0) || !self.global_tried) && !blurred {
                 self.global_tried = true;
-                if let Some((p, inl, cov)) = self.eng.global_reloc(&fr, self.reloc_min as usize).filter(|r| {
+                if let Some((p, inl, cov)) = self.eng.global_reloc(&fr, self.reloc_min as usize, deadline(c1, 20.0)).filter(|r| {
                     let ok = self.eng.imu_pose_plausible(&r.0);
                     self.n_reloc_tilt += !ok as i64;
                     ok
@@ -1878,7 +1886,7 @@ impl Runner {
             // IMU 로 이어 붙이는 동안(영상이 다 실패, 위치 = 마지막 성공 × 자이로 회전 · 이동 0)도 지도 전체에서 다시 잡아 본다:
             // 잡히면 이어 붙인 자세 대신 영상 위치로(이어 붙이기가 1 초 한도를 다 쓰고 새 지도를 여는 일을 줄임)
             let cr = Instant::now();
-            if let Some((p, inl, cov)) = self.eng.global_reloc(&fr, self.reloc_min as usize).filter(|r| self.eng.imu_pose_plausible(&r.0)) {
+            if let Some((p, inl, cov)) = self.eng.global_reloc(&fr, self.reloc_min as usize, deadline(c1, 20.0)).filter(|r| self.eng.imu_pose_plausible(&r.0)) {
                 self.eng.odom_reset(p);
                 let info2 = self.eng.odom_process(&fr, None);
                 if info2.pose.is_some() {
@@ -1982,7 +1990,7 @@ impl Runner {
         // 이어지지 않은 새 지도 · 이어 붙인 구간: 장면마다(0.2 초 간격, 장면 예산 안) 앞 지도들의 노드에서 이을 후보를 찾고, 찾으면 이 장면을 바로 노드로
         if (fixing || !self.anchored) && !imu_hold && self.klt_path && pose.is_some() && fr.t - self.last_merge_try >= if self.imu_on || fr.t - self.newmap_t < MERGE_FAST { 0.0 } else { 0.2 } && budget_ok(c1, 25.0) {
             self.last_merge_try = fr.t;
-            if self.eng.propose_merge(&fr, self.reloc_min as usize) {
+            if self.eng.propose_merge(&fr, self.reloc_min as usize, deadline(c1, 25.0)) {
                 self.n_merge_try += 1;
                 force_node = true;
             }
@@ -2356,6 +2364,16 @@ fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
 
 /// 장면당 시간 예산(다시 잡기 20 ms · 잇기 25 ms, 벽시계) 안인가. 시험용 ONDEVICE_NO_BUDGET=1 이면 늘 참:
 /// 최대 속도 재생의 결과가 PC 부하와 상관없이 같게(바이트 비교)
+/// 장면 시작 c 에서 ms 뒤 시각(시험용 ONDEVICE_NO_BUDGET=1 이면 끝없음)
+fn deadline(c: Instant, ms: f64) -> Instant {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("ONDEVICE_NO_BUDGET").is_some()) {
+        c + std::time::Duration::from_secs(3600)
+    } else {
+        c + std::time::Duration::from_secs_f64(ms * 1e-3)
+    }
+}
+
 fn budget_ok(c: Instant, ms: f64) -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("ONDEVICE_NO_BUDGET").is_some()) || ms_since(c) < ms

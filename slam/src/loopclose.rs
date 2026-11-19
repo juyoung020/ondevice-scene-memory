@@ -125,9 +125,7 @@ pub struct NodeInput {
     pub image_size: (u32, u32),
     /// 이 id 부터의 노드는 이어 붙인(임시) 구간: 루프 보정 크기 검사에서 빼서 루프가 그 구간을 제자리로 옮길 수 있게(0 = 없음)
     pub prov_from: i32,
-    /// 깊이 점 지도 정합으로 찾은 잇기(IMU 모드): (기존 지도 노드 id, 이 노드 → 그 노드 변환). 시각 루프가 없을 때 이 링크로 최적화
-    pub geo_link: Option<(i32, Tf)>,
-    /// 신경망 루프(`--lc net | both`): (질의 노드, 예전 노드, 질의 → 예전 몸체 변환, 이동 · 회전 표준편차 m · rad).
+    /// 신경망 루프: (질의 노드, 예전 노드, 질의 → 예전 몸체 변환, 이동 · 회전 표준편차 m · rad).
     /// 이번 단계에 다른 루프 후보가 없을 때 그대로 루프 링크로
     pub lc_link: Option<(i32, i32, Tf, [f64; 2])>,
 }
@@ -251,12 +249,6 @@ impl Slam {
             info: StepInfo::default(),
             connected_graph_calls: 0,
         }
-    }
-
-    /// 낱말(BoW) 루프 후보를 끔(`--lc net`): 사후 확률이 문턱을 넘지 못하게. 근접 루프 · 신경망 루프 · 지도 잇기는 그대로
-    pub fn disable_bow_loops(&mut self) {
-        self.p.loop_thr = f32::INFINITY;
-        self.p.aggressive_loop_thr = f32::INFINITY;
     }
 
     pub fn loop_closure_id(&self) -> i32 {
@@ -448,20 +440,6 @@ impl Slam {
                     self.loop_hyp = (to, 1.0);
                     geo = true;
                     self.info.lc_links += 1;
-                }
-            }
-        }
-        // 깊이 정합 잇기: 시각 루프 후보가 없을 때만, 정합이 낸 상대 변환을 그대로 루프 링크로(1 cm · 0.6° 불확실)
-        if let (0, Some((to, t))) = (self.loop_hyp.0, inp.geo_link) {
-            if to != sid && self.mem.sig(to).is_some() {
-                let mut inf = [0.0; 36];
-                for i in 0..6 {
-                    inf[i * 7] = 1e4;
-                }
-                if self.mem.add_link(Link::new(sid, to, LinkType::GlobalClosure, t, inf)) {
-                    added.push((sid, to));
-                    self.loop_hyp = (to, 1.0);
-                    geo = true;
                 }
             }
         }
@@ -1040,6 +1018,6 @@ mod refdump;
 
 impl Default for NodeInput {
     fn default() -> Self {
-        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0, geo_link: None, lc_link: None }
+        NodeInput { features: NodeFeatures::default(), stamp: 0.0, pose: Tf::NULL, cov: [0.0; 36], velocity: Vec::new(), image_size: (0, 0), prov_from: 0, lc_link: None }
     }
 }

@@ -1,4 +1,4 @@
-//! 신경망 루프 클로저(`--lc net | both`): 지도 노드마다 MegaLoc 기술자로 예전 노드 후보를 찾고, XFeat 짝 + 깊이 +
+//! 신경망 루프 클로저(낱말 루프와 함께 늘 켬): 지도 노드마다 MegaLoc 기술자로 예전 노드 후보를 찾고, XFeat 짝 + 깊이 +
 //! 중력 고정 4 자유도 검증(lcverify)으로 맞으면 그 상대 위치를 루프 링크로 지도에 넘긴다.
 //!
 //! 한 스레드("lc")가 노드를 차례로 받는다: 신경망 둘(보드 NPU `.dxnn`, PC ONNX) → 후보 상위 k → 검증 → 결과 줄.
@@ -89,6 +89,9 @@ pub struct LcOut {
     /// 후보 수 · 검증해 본 수
     pub cands: usize,
     pub tried: usize,
+    /// 검증은 맞았지만 위치 추적과 같은 말이라(보정 없음) 버린 수 · 받아들이는 간격 안이라 건너뛴 노드인지
+    pub redundant: usize,
+    pub gap: bool,
     /// ms: MegaLoc(전처리 + 신경망 + 집계) · XFeat(전처리 + 신경망 + 점) · 짝 + 검증
     pub ms: [f64; 3],
 }
@@ -96,6 +99,8 @@ pub struct LcOut {
 struct Stored {
     id: i32,
     stamp: f64,
+    /// 위치 추적 자세(몸체): 맞은 루프가 위치 추적과 이미 같은 말을 하는지(보탤 것 없음) 보는 데
+    pose: Pose,
     up: V3,
     kps: Vec<[f32; 2]>,
     desc: Vec<i8>,
@@ -195,11 +200,22 @@ struct State {
     xsc: xfeat::Scratch,
     sim: Vec<f32>,
     pairs: Vec<(u32, u32)>,
+    /// 마지막으로 받아들인 루프의 노드 시각 · 최근에 이은 예전 노드(노드 시각, id)
+    last_hit: f64,
+    recent_to: std::collections::VecDeque<(f64, i32)>,
     /// 시험용 기록(환경 변수 LC_LOG = 파일): 맞은 루프마다 시각 · id · 점수 · 맞은 점 · 광학 좌표 r · t
     log: Option<std::fs::File>,
 }
 
 const Q8: f32 = 127.0;
+/// 맞은 루프가 위치 추적 상대 자세와 이만큼 안으로 같으면 보탤 보정이 없어 버림(가만히 있거나 표류 없이 같은 자리를 다시 볼 때):
+/// 낱말 루프가 움직임이 작은 노드에서 루프를 찾지 않는 것과 같은 몫. 받아들이면 그때마다 지도 최적화 · 다시 쌓기가 돈다
+const SAME_M: f32 = 0.05;
+const SAME_DEG: f32 = 2.0;
+/// 받아들인 루프 사이 최소 간격(초, 노드 시각): 같은 자리를 연달아 볼 때 노드마다 최적화하지 않게
+const MIN_GAP_S: f64 = 2.0;
+/// 이 시간(초) 안에 이미 루프로 이은 예전 노드는 다시 잇지 않음
+const SAME_TO_S: f64 = 30.0;
 
 impl State {
     fn open(cfg: &LcConfig) -> Result<State, String> {
@@ -234,6 +250,8 @@ impl State {
             xsc: xfeat::Scratch::default(),
             sim: Vec::new(),
             pairs: Vec::new(),
+            last_hit: f64::NEG_INFINITY,
+            recent_to: Default::default(),
             log: std::env::var("LC_LOG").ok().and_then(|p| std::fs::File::create(p).ok()),
         })
     }
@@ -291,7 +309,17 @@ impl State {
         let me = n.stamp;
         let skip = self.cfg.skip_s;
         let stamps: std::collections::HashMap<i64, f64> = self.nodes.iter().map(|s| (s.id as i64, s.stamp)).collect();
-        let cands = self.db.topk(&self.desc, self.cfg.topk, |id| stamps.get(&id).is_some_and(|&t| (me - t).abs() > skip));
+        while self.recent_to.front().is_some_and(|r| me - r.0 > SAME_TO_S) {
+            self.recent_to.pop_front();
+        }
+        let recent: std::collections::HashSet<i64> = self.recent_to.iter().map(|r| r.1 as i64).collect();
+        // 받아들인 루프 바로 뒤(MIN_GAP_S 안)는 후보를 찾지 않음
+        o.gap = (me - self.last_hit).abs() < MIN_GAP_S;
+        let cands = if o.gap {
+            vec![]
+        } else {
+            self.db.topk(&self.desc, self.cfg.topk, |id| !recent.contains(&id) && stamps.get(&id).is_some_and(|&t| (me - t).abs() > skip))
+        };
         o.cands = cands.iter().filter(|c| c.1 >= self.cfg.min_score).count();
         let mut b = XFeatures::default();
         for &(cid, score) in &cands {
@@ -324,6 +352,15 @@ impl State {
                 }
                 let l = Tf::from_pose(&n.cam.local);
                 let t = l.mul(&Tf(a)).mul(&l.inverse());
+                // 위치 추적의 상대 자세(from⁻¹ · to)와 같은 말이면 지도에 보탤 보정이 없음 → 버리고 이 노드는 끝
+                let odo = Tf::from_pose(&(n.pose.inverse() * c.pose));
+                let err = odo.inverse().mul(&t);
+                if err.norm_sq().sqrt() < SAME_M && err.angle_to(&Tf::IDENTITY).to_degrees() < SAME_DEG {
+                    o.redundant += 1;
+                    break;
+                }
+                self.last_hit = me;
+                self.recent_to.push_back((me, c.id));
                 o.hit = Some(LcHit { from: n.id, to: c.id, t, score, inliers: v.inliers });
                 break;
             }
@@ -332,7 +369,7 @@ impl State {
         // 표에 넣기
         self.db.add(n.id as i64, &self.desc);
         let desc: Vec<i8> = q.desc.iter().map(|&v| (v * Q8).round().clamp(-127.0, 127.0) as i8).collect();
-        self.nodes.push(Stored { id: n.id, stamp: n.stamp, up, kps: q.kps, desc, x3 });
+        self.nodes.push(Stored { id: n.id, stamp: n.stamp, pose: n.pose, up, kps: q.kps, desc, x3 });
         o
     }
 }

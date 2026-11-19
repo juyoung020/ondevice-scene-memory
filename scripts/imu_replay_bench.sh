@@ -24,7 +24,7 @@ for kv in $SEQS; do
   O=$OUT/$s; mkdir -p "$O"
   ST=/dev/shm/imub/$T.$M.$s.bin
   if [ "$M" = imu ]; then MODE="--imu-csv $I"; else MODE="--stress-gyro $I"; fi
-  "$SLAM" slam --tum "$D" --config "$REPO/docs/rtabmap_pi.ini" --rate 0 --map-inline --out "$ST" \
+  "$SLAM" slam --tum "$D" --config "$REPO/docs/rtabmap_pi.ini" --rate 0 --out "$ST" \
     --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" $MODE "$@" > "$O/log.txt" 2>&1
   GT=$D/groundtruth.txt
   "$B/slam_eval" --gt "$GT" --poses "$O/poses.txt" --final "$O/final.txt" --stats "$O/stats.csv" --imu "$I" --calib "$CAL" --stream "$ST" --tag "$T/$M/$s" > "$O/eval.json"

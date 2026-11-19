@@ -108,7 +108,7 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 | `--slam "<위치 인자>"` | 위치 프로그램을 같은 프로세스에서 돌려 장면을 메모리로 받음(인자는 `ondevice slam` 과 같음) |
 | `--stream -\|<파일>` | 녹화한 장면 스트림 입력(`ondevice slam` 이 쓴 파일, 표준입력) |
 | `--serve "<포트> [뷰어 인자]"` · `--serve-exit` | 뷰어 서버를 같은 프로세스에서 띄움(기억 폴더에 쓴 파일은 메모리에서 보냄) / 입력이 끝나면 함께 끝냄 |
-| `--rebuild-every S` / `--no-rebuild` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5) / 끄기 |
+| `--rebuild-every S` | 루프 클로저 뒤 다시 쌓기 간격(초, 기본 5, 0 = 끝에만) |
 | `--no-drop` | 밀려도 장면을 버리지 않음(재생 결과를 늘 같게) |
 | `--threads auto\|none\|…` | 스레드 우선순위·코어 배치(기본 auto; 역할 main · reader · pts · rebuild · writer · infer · slam, 예 `slam=0:2-3` 은 위치 프로그램 풀을 코어 2·3 에) |
 | `--npu-jobs K` | 스트림 분할 장면을 NPU 에 K 장까지 함께 올림(NPU 코어 여럿이 나눠 돎, 기본 4, `1` 은 한 장씩) |

@@ -1,7 +1,6 @@
-//! 청크 점 지도(`--pts-map chunk`): 가까운 키프레임 몇 장의 점을 한 청크에 그 청크 기준 자세에서 본 좌표로 담는다.
+//! 점 지도(청크): 가까운 키프레임 몇 장의 점을 한 청크에 그 청크 기준 자세에서 본 좌표로 담는다.
 //! 점 = i16 × 3(기준 자세 좌표, mm) + 색 u8 × 3, 청크 안에서만 칸(--scene-vox)으로 겹침을 거른다(본 키프레임 수 ≥ --pts-obs 인 칸만 점).
 //! 루프 클로저 · 수평 맞춤은 점을 다시 쌓지 않고 청크 기준 자세만 고친다(기준 키프레임의 고친 위치) → 뷰어는 바뀐 자세만 받는다.
-//! 메모리 상한: 마지막 `--chunk-keep` 키프레임이 든 청크만 남긴다(오래된 청크부터 버림).
 //! 파일: chunks/<판>/c<id>.bin = u32 n + n × i16 xyz(mm, little-endian) + n × u8 rgb. 목록은 view.json scene_points.submap
 use crate::geom::*;
 use std::collections::{HashMap, HashSet};
@@ -71,23 +70,19 @@ impl Chunk {
 pub struct ChunkMap {
     pub vox: f64,
     pub min_obs: u8,
-    /// 남길 키프레임 수(0 = 모두)
-    pub keep: usize,
     pub run: u64,
     chunks: Vec<Chunk>,
     next_id: u32,
     /// 넣은 보관 장면(다시 넣지 않게)
     added: HashSet<u64>,
-    /// 버린 청크 id(파일 지움 · 뷰어에서 지움)
-    gone: Vec<u32>,
     /// 지금까지 자세를 고친 청크 수 · 걸린 시간(초)
     pub n_repose: usize,
     pub t_repose: f64,
 }
 
 impl ChunkMap {
-    pub fn new(vox: f64, min_obs: u8, keep: usize) -> ChunkMap {
-        ChunkMap { vox, min_obs, keep, run: crate::maps::SceneMap::new_run(), chunks: vec![], next_id: 0, added: HashSet::new(), gone: vec![], n_repose: 0, t_repose: 0.0 }
+    pub fn new(vox: f64, min_obs: u8) -> ChunkMap {
+        ChunkMap { vox, min_obs, run: new_run(), chunks: vec![], next_id: 0, added: HashSet::new(), n_repose: 0, t_repose: 0.0 }
     }
 
     pub fn has(&self, seq: u64) -> bool {
@@ -141,20 +136,6 @@ impl ChunkMap {
         }
         c.nkf += 1;
         c.ver += 1;
-        self.cap();
-    }
-
-    /// 마지막 keep 키프레임만: 오래된 청크부터 버림
-    fn cap(&mut self) {
-        if self.keep == 0 {
-            return;
-        }
-        let mut total: usize = self.chunks.iter().map(|c| c.nkf as usize).sum();
-        while total > self.keep && self.chunks.len() > 1 {
-            let c = self.chunks.remove(0);
-            total -= c.nkf as usize;
-            self.gone.push(c.id);
-        }
     }
 
     /// 고친 키프레임 위치(순번 → 자세)로 청크 기준 자세를 고침: 바뀐 청크 수. 쌓던 청크는 닫는다(그 안 장면끼리 위치가 바뀌었을 수 있음)
@@ -193,9 +174,6 @@ impl ChunkMap {
     pub fn write(&mut self, dir: &Path) -> serde_json::Value {
         let sub_dir = format!("chunks/{}", self.run);
         std::fs::create_dir_all(dir.join(&sub_dir)).unwrap();
-        for id in self.gone.drain(..) {
-            crate::out::remove_file(&dir.join(format!("{sub_dir}/c{id}.bin")));
-        }
         let min_obs = self.min_obs;
         let mut list = Vec::with_capacity(self.chunks.len());
         let mut total = 0usize;
@@ -236,6 +214,14 @@ impl ChunkMap {
     }
 }
 
+static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 새 지도 번호(뷰어가 받은 청크를 비우게): 시각(ms) × 16 + 프로세스 안 순번
+pub fn new_run() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    t * 16 + RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16
+}
+
 fn transpose(m: &M3) -> M3 {
     [[m[0][0], m[1][0], m[2][0]], [m[0][1], m[1][1], m[2][1]], [m[0][2], m[1][2], m[2][2]]]
 }
@@ -252,7 +238,7 @@ mod tests {
 
     #[test]
     fn chunk_points_follow_pose() {
-        let mut m = ChunkMap::new(0.01, 1, 0);
+        let mut m = ChunkMap::new(0.01, 1);
         let pts = || vec![([0.1, 0.0, 1.0], [10, 20, 30], 1.0f32), ([0.0, 0.2, 2.0], [1, 2, 3], 2.0)].into_iter();
         m.add(0, Some(7), &I, &[1.0, 0.0, 0.0], pts());
         let c = &m.chunks[0];
@@ -268,15 +254,5 @@ mod tests {
         // 같은 보관 장면은 다시 넣지 않음
         m.add(1, Some(7), &I, &[3.0, 0.0, 0.0], pts());
         assert_eq!(m.chunks.len(), 1);
-    }
-
-    #[test]
-    fn keep_caps_keyframes() {
-        let mut m = ChunkMap::new(0.01, 1, 40);
-        for i in 0..100u32 {
-            m.add(i, Some(i as u64), &I, &[i as f64, 0.0, 0.0], std::iter::once(([0.0, 0.0, 1.0], [0, 0, 0], 1.0f32)));
-        }
-        let total: u32 = m.chunks.iter().map(|c| c.nkf).sum();
-        assert!(total <= 40 && m.chunks.last().unwrap().id == 99);
     }
 }

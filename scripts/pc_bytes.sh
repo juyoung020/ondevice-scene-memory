@@ -45,23 +45,23 @@ run_all() {
   mkdir -p "$R" "$SEGC"
   for s in desk room 360 rpy floor; do
     local O=$R/cam_$s; mkdir -p "$O"
-    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --config "$INI" --rate 0 --map-inline --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
+    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --config "$INI" --rate 0 --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
     echo "cam_$s: exit $?"; sha256sum < "$O/stream.bin" > "$O/stream.sha"; rm -f "$O/stream.bin"
   done
   for s in desk room floor; do
     local O=$R/imu_$s; mkdir -p "$O"
-    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --config "$INI" --rate 0 --map-inline --imu-csv "$SYN/syn_$s.csv" --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
+    timeout ${TMO:-900} "$B" slam --tum "$(seq_dir $s)" --config "$INI" --rate 0 --imu-csv "$SYN/syn_$s.csv" --out "$O/stream.bin" --poses "$O/poses.txt" --final-poses "$O/final.txt" --stats "$O/stats.csv" > "$O/log.txt" 2>&1
     echo "imu_$s: exit $?"; sha256sum < "$O/stream.bin" > "$O/stream.sha"; rm -f "$O/stream.bin"
   done
   mem_all "$B" "$R"
 }
 
-# 기억 폴더를 견줄 꼴로: 실행 번호 폴더(scene/<번호>) 이름과 view.json · octree.json 의 run 값만 RUN 으로
+# 기억 폴더를 견줄 꼴로: 실행 번호 폴더(chunks/<번호>) 이름과 view.json 의 run 값만 RUN 으로
 norm_mem() {
   local d=$1 o=$2
   rm -rf "$o"; cp -r "$d" "$o"
-  local r; r=$(ls "$o/scene" 2>/dev/null | head -1)
-  if [ -n "$r" ]; then mv "$o/scene/$r" "$o/scene/RUN"; sed -i -E "s/$r/RUN/g; s/\"run\":[0-9]+/\"run\":RUN/g" "$o/view.json" "$o/scene/RUN/octree.json" 2>/dev/null; fi
+  local r; r=$(ls "$o/chunks" 2>/dev/null | head -1)
+  if [ -n "$r" ]; then mv "$o/chunks/$r" "$o/chunks/RUN"; sed -i -E "s/$r/RUN/g" "$o/view.json" 2>/dev/null; fi
   sed -i -E 's/"run":[0-9]+/"run":RUN/g' "$o/view.json" 2>/dev/null
 }
 

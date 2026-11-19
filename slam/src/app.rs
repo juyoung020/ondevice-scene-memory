@@ -227,8 +227,6 @@ mod engine {
         cam: Camera,
         pose: Option<Tf>,
         trusted: bool,
-        /// 다시 잡기 · 잇기용 특징은 방향 BRIEF 로 따로(`--imu-brief dual`)
-        dual: bool,
     }
 
     type KfOut = (Features, Tf, bool, i32);
@@ -246,7 +244,7 @@ mod engine {
                 desc: feats.desc.clone(),
             };
             if let Some(p) = r.pose {
-                kf = Some((if r.dual { ext.extract_with(&fr, true) } else { feats }, p, r.trusted));
+                kf = Some((feats, p, r.trusted));
             }
         }
         slam.forced_hyp = forced;
@@ -388,9 +386,6 @@ mod engine {
         cam: Arc<Mutex<Option<Camera>>>,
         /// 지금 장면 SensorData 의 특징(위치 추적이 data.setFeatures 로 채운 것)
         cur: Features,
-        /// `--imu-brief dual`: 평소 추적 · 루프는 곧은 BRIEF(cur), 놓친 뒤 다시 잡기 · 지도 잇기 후보 찾기만 방향 BRIEF(cur_o, 필요할 때만 뽑음)
-        pub dual: bool,
-        cur_o: Features,
         /// Odometry 의 previous_stamp · framesProcessed 그림자(OdometryInfo::interval 계산용)
         prev_stamp: f64,
         frames: i32,
@@ -403,8 +398,6 @@ mod engine {
         kf_ids: Vec<(i32, bool, u64)>,
         /// 다음 지도 단계에 넘길 루프 후보
         forced_hyp: i32,
-        /// 다음 지도 단계에 넘길 깊이 정합 잇기(기존 노드 id, 이 노드 → 그 노드)
-        pub geo_link: Option<(i32, Tf)>,
         /// 이어 붙인 구간 시작 노드 id(0 = 없음): 이 앞 노드들에서만 제자리 후보를 찾고, 루프가 이 구간을 옮기는 것은 허용
         pub prov_from: i32,
         /// 지도 잇기 후보 가운데 PnP 로 맞춰 볼 수(IMU 모드 5, 그 밖 1). 지도 전체 다시 잡기는 이것과 2 중 큰 수
@@ -418,13 +411,11 @@ mod engine {
         grr: usize,
         /// 지금 지도가 믿는 지도인지(app 이 slam_process 앞에 알려 줌)
         pub trusted: bool,
-        /// 신경망 루프 스레드(`--lc net | both`)와 노드 id 를 기다리는 노드(일 번호), 다음 단계들에 넘길 루프 링크
+        /// 신경망 루프 스레드와 노드 id 를 기다리는 노드(일 번호), 다음 단계들에 넘길 루프 링크
         lc: Option<crate::lcnet::LcWorker>,
         lc_wait: Vec<(u64, crate::lcnet::LcNode)>,
         lc_links: VecDeque<(i32, i32, Tf, [f64; 2])>,
         lc_recv: VecDeque<crate::lcnet::LcOut>,
-        /// 신경망 루프 링크 표준편차(이동 m, 회전 rad). 0 = 맞은 점 수로(0.3 m · 10° / √맞은 점)
-        pub lc_sd: [f64; 2],
         lc_last: i32,
         /// 최대 속도 재생: 노드마다 루프 결과를 기다려 결정적으로
         pub lc_block: bool,
@@ -443,6 +434,9 @@ mod engine {
         pub tried: u64,
         /// 열 보호로 건너뛴 노드 수를 세는 자리
         pub skipped: u64,
+        /// 위치 추적과 같은 말이라 버린 수 · 받아들인 루프 바로 뒤라 찾지 않은 노드 수
+        pub redundant: u64,
+        pub gap: u64,
     }
 
     impl Engine {
@@ -474,8 +468,6 @@ mod engine {
                 slam: { let st = snap_of(&slam); MapHost::Inline(Box::new(slam), st) },
                 cam,
                 cur: Features::default(),
-                dual: false,
-                cur_o: Features::default(),
                 prev_stamp: 0.0,
                 frames: 0,
                 loop_unique_ids: unique,
@@ -484,7 +476,6 @@ mod engine {
                 kf_db: Vec::new(),
                 kf_ids: Vec::new(),
                 forced_hyp: 0,
-                geo_link: None,
                 prov_from: 0,
                 merge_top: 1,
                 near_first: false,
@@ -496,19 +487,15 @@ mod engine {
                 lc_wait: Vec::new(),
                 lc_links: VecDeque::new(),
                 lc_recv: VecDeque::new(),
-                lc_sd: [0.0, 0.0],
                 lc_last: 0,
                 lc_block: false,
                 lc_stats: LcStats::default(),
             }
         }
 
-        /// 신경망 루프 켜기(net = 낱말 루프는 끔)
-        pub fn start_lc(&mut self, cfg: crate::lcnet::LcConfig, net_only: bool) -> Result<(), String> {
+        /// 신경망 루프 켜기(낱말 루프와 함께)
+        pub fn start_lc(&mut self, cfg: crate::lcnet::LcConfig) -> Result<(), String> {
             self.lc = Some(crate::lcnet::LcWorker::start(cfg)?);
-            if net_only {
-                self.slam.inline().disable_bow_loops();
-            }
             Ok(())
         }
 
@@ -535,6 +522,8 @@ mod engine {
                 let s = &mut self.lc_stats;
                 s.done += 1;
                 s.tried += o.tried as u64;
+                s.redundant += o.redundant as u64;
+                s.gap += o.gap as u64;
                 for i in 0..3 {
                     s.ms[i] += o.ms[i];
                     s.ms_max[i] = s.ms_max[i].max(o.ms[i]);
@@ -544,7 +533,7 @@ mod engine {
                     common::info!("신경망 루프: 노드 {} → {} (MegaLoc {:.3}, 맞은 점 {}, 이동 {:.2} m)", h.from, h.to, h.score, h.inliers, h.t.norm_sq().sqrt());
                     // 불확실성: 맞은 점이 많을수록 작게(TUM 긴 사무실 정답 대조: 맞은 점 20 – 50 은 5 – 11 cm, 100 개 넘으면 1 – 3 cm)
                     let k = 1.0 / (h.inliers.max(1) as f64).sqrt();
-                    let sd = if self.lc_sd[0] > 0.0 { self.lc_sd } else { [(0.3 * k).clamp(0.01, 0.1), (10f64 * k).clamp(0.3, 3.0).to_radians()] };
+                    let sd = [(0.3 * k).clamp(0.01, 0.1), (10f64 * k).clamp(0.3, 3.0).to_radians()];
                     self.lc_links.push_back((h.from, h.to, h.t, sd));
                 }
             }
@@ -586,7 +575,6 @@ mod engine {
                 interval: if dt > 0.0 { dt } else { 0.0 },
             };
             self.cur = r.features;
-            self.cur_o = Features::default();
             out
         }
 
@@ -714,25 +702,7 @@ mod engine {
         }
 
         pub fn global_reloc(&mut self, f: &Frame, min_inliers: usize) -> Option<(Tf, i32, [f64; 36])> {
-            if !self.dual {
-                return self.global_reloc_in(f, min_inliers);
-            }
-            self.ensure_cur_o(f);
-            std::mem::swap(&mut self.cur, &mut self.cur_o);
-            let r = self.global_reloc_in(f, min_inliers);
-            std::mem::swap(&mut self.cur, &mut self.cur_o);
-            r
-        }
-        /// 방향 BRIEF 특징(dual): 이 장면에서 한 번만 뽑음
-        fn ensure_cur_o(&mut self, f: &Frame) {
-            if self.cur_o.kps.is_empty() {
-                self.cur_o = self.ext.extract_with(f, true);
-            }
-        }
-        fn global_reloc_in(&mut self, f: &Frame, min_inliers: usize) -> Option<(Tf, i32, [f64; 36])> {
-            if !self.dual {
-                self.ensure_cur(f);
-            }
+            self.ensure_cur(f);
             if self.cur.desc.is_empty() || self.kf_db.is_empty() {
                 return None;
             }
@@ -857,7 +827,7 @@ mod engine {
         pub fn slam_process(&mut self, f: &Frame, node: bool, pose: Option<Tf>, cov: &[f64; 36], velocity: Vec<f32>) {
             // 지도 스레드 + 광류 경로: 노드 특징(GFTT·BRIEF)도 지도 스레드에서 뽑음(회색조 사본·깊이 나눠 듦만 넘김)
             let raw = if node && self.cur.kps.is_empty() && matches!(self.odom, Odom::Klt(_)) && self.slam.is_thread() {
-                Some(Box::new(RawNode { gray: f.gray.clone(), depth: f.depth_mm.clone(), cam: f.cam.clone(), pose, trusted: self.trusted, dual: self.dual }))
+                Some(Box::new(RawNode { gray: f.gray.clone(), depth: f.depth_mm.clone(), cam: f.cam.clone(), pose, trusted: self.trusted }))
             } else {
                 None
             };
@@ -865,10 +835,7 @@ mod engine {
                 self.ensure_cur(f);
                 if let Some(p) = pose {
                     if !self.cur.desc.is_empty() {
-                        if self.dual {
-                            self.ensure_cur_o(f);
-                        }
-                        self.kf_db.push((if self.dual { self.cur_o.clone() } else { self.cur.clone() }, p));
+                        self.kf_db.push((self.cur.clone(), p));
                         self.kf_ids.push((0, self.trusted, 0)); // id 는 process 뒤에 채움
                     }
                 }
@@ -887,7 +854,7 @@ mod engine {
                 self.lc_poll();
             }
             let lc_link = if node { self.lc_links.pop_front() } else { None };
-            let inp = NodeInput { features, stamp: f.t, pose: pose.unwrap_or(Tf::NULL), cov: *cov, velocity, image_size: (f.cam.width, f.cam.height), prov_from: self.prov_from, geo_link: self.geo_link.take(), lc_link };
+            let inp = NodeInput { features, stamp: f.t, pose: pose.unwrap_or(Tf::NULL), cov: *cov, velocity, image_size: (f.cam.width, f.cam.height), prov_from: self.prov_from, lc_link };
             let had = node && self.kf_ids.last().map(|x| x.0 == 0).unwrap_or(false);
             let job = self.slam.jobs() + 1;
             let lc_node = node && self.lc.is_some() && !f.color.is_empty();
@@ -940,19 +907,7 @@ mod engine {
         }
 
         pub fn propose_merge(&mut self, f: &Frame, min_inliers: usize) -> bool {
-            if !self.dual {
-                return self.propose_merge_in(f, min_inliers);
-            }
-            self.ensure_cur_o(f);
-            std::mem::swap(&mut self.cur, &mut self.cur_o);
-            let r = self.propose_merge_in(f, min_inliers);
-            std::mem::swap(&mut self.cur, &mut self.cur_o);
-            r
-        }
-        fn propose_merge_in(&mut self, f: &Frame, min_inliers: usize) -> bool {
-            if !self.dual {
-                self.ensure_cur(f);
-            }
+            self.ensure_cur(f);
             if self.cur.desc.is_empty() {
                 return false;
             }
@@ -979,7 +934,6 @@ mod engine {
             };
             for &i in &cand {
                 let kf = &self.kf_db[i].0;
-                let id = self.kf_ids[i].0;
                 // 짝 = 가장 가까운 것이 두 번째보다 충분히 가까움(비율 0.8) 이고 거리 < 50
                 let kw: Vec<[u64; 4]> = kf.desc.iter().map(words).collect();
                 let hits = q
@@ -1093,7 +1047,7 @@ mod sys {
 
 fn usage() {
     common::info!(
-        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--no-bridge] [--no-provisional] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N] [--geo] [--imu-brief oriented|upright|dual]] [--imu-csv <imu0.csv> (재생)] [--lc bow|net|both [--lc-dir <모델 폴더>]] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
+        "ondevice slam (--tum|--rsdrec <폴더> [--rate R] [--stride N] | --realsense [--serial S] [--size 640x480] [--color-size 1280x720] [--fps 30] [--camera-profile librealsense|tracking] [--exposure ms | --ae-cap ms] [--gain 0..128])\n            [--config <ini>] [--out -|<파일>] [--send-every N] [--queue N] [--block|--drop]\n            [--poses <파일>] [--final-poses <파일>] [--stats <파일>] [--max-frames N] [--reset-file <파일>] [--reloc-wait 초] [--reset-at N] [--imu /dev/i2c-1 [--imu-calib <yaml>] [--imu-bridge 초] [--imu-max-blur 화소] [--imu-exposure 초] [--imu-min-inliers N] [--imu-min-ratio R] [--imu-hold-wait 초] [--imu-hold-min-nodes N]] [--imu-csv <imu0.csv> (재생)] [--stress-gap 주기:길이 [--stress-imu-gap]] [--stress-blur 노출초 [--stress-gyro <imu0.csv>]] [--Group/Name 값 ...]"
     );
 }
 
@@ -1112,19 +1066,8 @@ pub struct Args {
     realsense: bool,
     driver: String,
     reloc_wait: f64,
-    /// 놓친 뒤 다시 시작할 때 새 지도를 열지 않고 마지막 위치에서 같은 지도로 이어 붙임(광류 경로, --no-bridge 로 끔)
-    bridge: bool,
-    /// 이어지지 않은 새 지도의 장면을 맡아 두지 않고 임시 위치로 바로 보냄(--no-provisional 로 끔)
-    provisional: bool,
     /// 이 시간(초) 이하의 빈틈만 그 자리에서 이어 붙임(그보다 길면 새 지도, 깊이 ICP 로 확인되면 예외)
     bridge_gap: f64,
-    /// 지도 갱신을 위치 추적 스레드에서 바로(시험·비교용)
-    map_inline: bool,
-    no_boost: bool,
-    /// IMU 모드 깊이 서브맵 정합(--geo, 기본 끔: 보드 · 합성 재생 11 번 중 이음 0 번)
-    geo: bool,
-    /// IMU 모드 BRIEF: oriented(모두 방향 BRIEF) · upright(모두 곧은 BRIEF) · dual(평소 곧은 BRIEF, 다시 잡기 · 잇기 후보만 방향 BRIEF)
-    imu_brief: String,
     reset_at: i64,
     stride: usize,
     block: i32,
@@ -1167,14 +1110,14 @@ pub struct Args {
     /// 흐림 시험: 노출(초) 동안 각속도만큼 번진 영상(각속도는 --stress-gyro 또는 --imu-csv 파일)
     stress_blur: f64,
     stress_gyro: String,
-    /// 루프 클로저: bow(RTAB-Map 낱말, 기본) · net(MegaLoc 후보 + XFeat 검증, 낱말 루프 끔) · both
-    lc: String,
-    /// 신경망 루프 모델 폴더(megaloc_168x224 · megaloc_head_pca1024.bin · xfeat_480x640)
-    lc_dir: String,
 }
 
 /// 명령줄(0 번은 프로그램 이름) → 설정. 도움말·잘못된 인자면 끝 코드
 impl Args {
+    /// 우리 깊이 카메라 녹화(rsd_rec · rsdrec 폴더, calib.json 있음) 재생인지: 손에 든 카메라를 똑바로 세우고 시작한 것이라 실시간과 같게 다룬다
+    pub fn is_own_recording(&self) -> bool {
+        !self.tum.is_empty() && std::path::Path::new(&self.tum).join("calib.json").exists()
+    }
     /// 받는 쪽을 기다리는지(--block | --drop, 기본: 최대 속도 재생이면 기다림)
     pub fn block_mode(&self) -> bool {
         let replay_max = !self.tum.is_empty() && self.rate == 0.0;
@@ -1198,13 +1141,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         reset_at: -1,
         stride: 1,
         reloc_wait: -1.0, // 놓친 뒤 이 시간(초) 동안은 같은 지도에서 다시 잡기만 시도. 음수 = 광류 경로 RELOC_WAIT_KLT, F2F 1 초
-        bridge: true,
-        provisional: true,
         bridge_gap: 0.0, // 이어 붙이기는 깊이 ICP 로 자리가 확인될 때만(확인 안 된 이어 붙이기는 어긋난 위치를 감춤). 못 찾으면 새 지도(임시 위치, 불확실 표시) → 루프로 합침
-        map_inline: false,
-        no_boost: false,
-        geo: false,
-        imu_brief: "oriented".into(),
         block: -1,       // -1: 입력에 따라(재생 = 기다림, 카메라 = 버림)
         rate: 0.0,
         exposure_ms: 0.0,
@@ -1233,8 +1170,6 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
         stress_imu_gap: false,
         stress_blur: 0.0,
         stress_gyro: String::new(),
-        lc: "bow".into(),
-        lc_dir: "models".into(),
     };
     let mut i = 1;
     let num = |s: &str| -> Result<f64, i32> {
@@ -1314,15 +1249,7 @@ pub fn parse(argv: &[String]) -> Result<Args, i32> {
             "--imu-hold-min-nodes" => a.imu_hold_min_nodes = num(&val()?)?,
             "--reset-file" => a.reset_file = val()?,
             "--reloc-wait" => a.reloc_wait = num(&val()?)?,
-            "--no-bridge" => a.bridge = false,
-            "--no-provisional" => a.provisional = false,
-            "--geo" => a.geo = true,
-            "--lc" => a.lc = val()?,
-            "--lc-dir" => a.lc_dir = val()?,
-            "--imu-brief" => a.imu_brief = val()?,
             "--bridge-gap" => a.bridge_gap = num(&val()?)?,
-            "--map-inline" => a.map_inline = true,
-            "--no-boost" => a.no_boost = true,
             "--reset-at" => a.reset_at = num(&val()?)? as i64, // 시험용: 이 장면 번호에서 리셋 파일이 생긴 것처럼
             // 프로세스 설정(ondevice 가 처음에 읽음): 실시간 배치·메모리 묶기·조용히
             "--rt" => {
@@ -1369,9 +1296,6 @@ pub fn run(argv: &[String]) -> Result<i32, String> {
 
 /// IMU: 이어 붙인 장면 · 영상이 IMU 와 어긋난 장면 뒤 이만큼 장면까지는 위치만(지도에 안 쌓음)
 const IMU_SETTLE: u32 = 5;
-/// 깊이 서브맵 정합(--geo): 놓치기 직전 이 초 기존 지도 점과 새 지도 첫 GEO_NEW_S 초 점
-const GEO_OLD_S: f64 = 3.0;
-const GEO_NEW_S: f64 = 1.0;
 /// 광류 경로: 놓친 뒤 새 지도를 열기 전에 기존 지도(최근 · 전체 노드)에 다시 잡아 보는 시간(초)
 const RELOC_WAIT_KLT: f64 = 0.0;
 /// 새 지도를 연 뒤 이 시간(초) 동안은 앞 지도 노드에 잇기를 장면마다(그 뒤는 0.2 초 간격)
@@ -1420,18 +1344,6 @@ pub struct Runner {
     n_fast_rot: i64,
     n_weak: i64,
     n_map_held: i64,
-    geo_on: bool,
-    geo_old: VecDeque<(f64, Vec<crate::georeg::P3>)>,
-    geo_new: Vec<crate::georeg::P3>,
-    geo_t0: f64,
-    geo_prov: Tf,
-    geo_tried: bool,
-    geo_job: Option<std::sync::mpsc::Receiver<(Result<crate::georeg::GeoResult, String>, f64)>>,
-    geo_t: Option<Tf>,
-    n_geo_try: i64,
-    n_geo_ok: i64,
-    n_geo_link: i64,
-    s_geo: Summary,
     refs: VecDeque<Ref>,
     ref_next: usize,
     lost_since: f64,
@@ -1467,7 +1379,6 @@ pub struct Runner {
     good_id: i32,
     prev_stamp: f64,
     prev_corr: Tf,
-    provisional: bool,
     prov: Tf,
     prov_nodes: std::collections::BTreeSet<i32>,
     last_sent_world: Option<Tf>,
@@ -1557,8 +1468,8 @@ impl Runner {
     /// local: 장면 스트림을 같은 프로세스 처리 루프의 줄로(아니면 파일 · 표준출력 쓰기 스레드)
     pub fn new(a: Args, local: bool, pool: Option<std::sync::Arc<rayon::ThreadPool>>) -> Result<(Runner, Box<dyn FrameSource>, Option<crate::io::Prep>), String> {
         let in_proc = local;
-        // 실시간이면 위치 추적 스레드를 분할·memmap·뷰어보다 먼저(--no-boost 로 끔)
-        if (a.realsense || a.rate > 0.0) && !a.no_boost {
+        // 실시간이면 위치 추적 스레드를 분할·memmap·뷰어보다 먼저
+        if a.realsense || a.rate > 0.0 {
             common::info!("위치 추적 스레드 우선: {}", common::threads::boost_tracking());
         }
         // IMU 융합 모드: 읽기 스레드를 카메라보다 먼저 띄워 첫 장면 전에 중력·치우침을 잡는다
@@ -1666,35 +1577,29 @@ impl Runner {
         let reloc_min = params.get("Vis/MinInliers", 20i32).max(25);
         let mut eng = engine::Engine::new(&params, &odom_params, reloc_min);
         let klt_path = params.get("Odom/Strategy", 0i32) == 9;
-        match a.lc.as_str() {
-            "bow" => {}
-            "net" | "both" => {
-                let mut cfg = crate::lcnet::LcConfig::from_dir(&a.lc_dir);
-                let e = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
-                if let Some(v) = e("LC_MIN_SCORE") { cfg.min_score = v as f32; }
-                if let Some(v) = e("LC_SKIP_S") { cfg.skip_s = v; }
-                if let Some(v) = e("LC_TOPK") { cfg.topk = v as usize; }
-                if let Some(v) = e("LC_MIN_INLIERS") { cfg.verify.min_inliers = v as usize; }
-                if let Some(v) = e("LC_SD_T") { eng.lc_sd[0] = v; }
-                if let Some(v) = e("LC_SD_R") { eng.lc_sd[1] = v.to_radians(); }
-                common::info!("루프 클로저: {} (MegaLoc {} · XFeat {} · 후보 {} · 내적 ≥ {} · {} 초 안 노드 뺌)", a.lc, cfg.megaloc, cfg.xfeat, cfg.topk, cfg.min_score, cfg.skip_s);
-                eng.start_lc(cfg, a.lc == "net").map_err(|e| format!("--lc {}: {e}", a.lc))?;
-                eng.lc_block = !a.tum.is_empty() && a.rate == 0.0;
+        // 루프 클로저: RTAB-Map 낱말 루프 + MegaLoc 후보 · XFeat 검증(모델 폴더 common::models::dir(), 없으면 시작하지 않음)
+        {
+            let cfg = crate::lcnet::LcConfig::from_dir(&common::models::dir().to_string_lossy());
+            for f in [&cfg.megaloc, &cfg.head, &cfg.xfeat] {
+                if !std::path::Path::new(f).exists() {
+                    return Err(format!("루프 클로저 모델이 없음: {f} (모델 폴더 = $ONDEVICE_MODELS · 보드 ~/models · PC models/)"));
+                }
             }
-            o => return Err(format!("--lc {o}: bow · net · both 가운데 하나")),
+            common::info!("루프 클로저: 낱말 + 신경망(MegaLoc {} · XFeat {} · 후보 {} · 내적 ≥ {} · {} 초 안 노드 뺌)", cfg.megaloc, cfg.xfeat, cfg.topk, cfg.min_score, cfg.skip_s);
+            eng.start_lc(cfg).map_err(|e| format!("루프 클로저 신경망: {e}"))?;
+            eng.lc_block = !a.tum.is_empty() && a.rate == 0.0;
         }
         if let Some(f) = imu_fusion {
             eng.set_imu(f)?;
             eng.merge_top = 5;
-        eng.dual = klt_path && a.imu_brief == "dual";
             eng.near_first = true;
         }
-        // 실시간(카메라·찍은 속도 재생)이면 지도 갱신을 따로 도는 스레드로(--map-inline 으로 끔). 최대 속도 재생은 결정적이게 그대로
-        if (a.realsense || a.rate > 0.0) && !a.map_inline {
+        // 실시간(카메라·찍은 속도 재생)이면 지도 갱신을 따로 도는 스레드로. 최대 속도 재생은 결정적이게 그대로
+        if a.realsense || a.rate > 0.0 {
             eng.start_map_thread();
         }
         let reloc_wait = if a.reloc_wait >= 0.0 { a.reloc_wait } else if klt_path { RELOC_WAIT_KLT } else { 1.0 };
-        let bridge = a.bridge && klt_path;
+        let bridge = klt_path;
         let n_bridge = 0i64;
         let n_global = 0i64;
         let n_reloc_bridge = 0i64; // IMU 로 이어 붙이던 중 지도 전체에서 다시 잡은 수
@@ -1714,16 +1619,6 @@ impl Runner {
         // IMU: 이어 붙인 장면 · 영상이 IMU 와 어긋난 장면 뒤 IMU_SETTLE 장까지는 위치만(지도에 안 쌓음)
         let (since_imu, n_imu_hold, n_imu_reject) = (u32::MAX, 0i64, 0i64);
         let (n_fast_rot, n_weak, n_map_held) = (0i64, 0i64, 0i64);
-        // 깊이 서브맵 정합(IMU 모드, 시각 재위치가 못 이을 때 보조): 놓치기 직전 GEO_OLD_S 초 기존 지도 점과 새 지도 첫 GEO_NEW_S 초 점을
-        // 놓칠 때마다 한 번, 따로 도는 스레드에서 맞춘다(최대 속도 재생은 다음 장면에서 기다려 결정적)
-        let geo_on = imu_on && klt_path && a.geo;
-        let geo_old: VecDeque<(f64, Vec<crate::georeg::P3>)> = VecDeque::new();
-        let geo_new: Vec<crate::georeg::P3> = Vec::new();
-        let (geo_t0, geo_prov, geo_tried) = (f64::MIN, Tf::IDENTITY, false);
-        let geo_job: Option<std::sync::mpsc::Receiver<(Result<crate::georeg::GeoResult, String>, f64)>> = None;
-        let geo_t: Option<Tf> = None;
-        let (n_geo_try, n_geo_ok, n_geo_link) = (0i64, 0i64, 0i64);
-        let s_geo = Summary::default();
 
         let refs: VecDeque<Ref> = VecDeque::new();
         let ref_next = 0usize;
@@ -1763,10 +1658,9 @@ impl Runner {
         let good_id = -1i32;
         let prev_stamp = 0.0f64;
         let prev_corr = Tf::IDENTITY;
-        // 임시 위치(--no-provisional 로 끔): 이어지지 않은 새 지도의 장면·노드를 맡아 두지 않고, 마지막으로 보낸 위치에서 이어 붙인
+        // 임시 위치: 이어지지 않은 새 지도의 장면·노드를 맡아 두지 않고, 마지막으로 보낸 위치에서 이어 붙인
         // 표시 변환(prov)으로 바로 보낸다(화면이 멈추지 않음). slam 그래프에는 아무 제약도 넣지 않는다(표시 전용).
         // 루프 클로저로 이어지면 노드가 참 위치로 다시 가고(움직임 → memmap 다시 쌓기) 그 장면들도 고친 위치로 다시 놓인다.
-        let provisional = a.provisional;
         let prov = Tf::IDENTITY;
         let prov_nodes: std::collections::BTreeSet<i32> = Default::default();
         let last_sent_world: Option<Tf> = None; // 마지막으로 보낸 장면의 몸체 위치(표시 좌표)
@@ -1817,18 +1711,6 @@ impl Runner {
             n_fast_rot,
             n_weak,
             n_map_held,
-            geo_on,
-            geo_old,
-            geo_new,
-            geo_t0,
-            geo_prov,
-            geo_tried,
-            geo_job,
-            geo_t,
-            n_geo_try,
-            n_geo_ok,
-            n_geo_link,
-            s_geo,
             refs,
             ref_next,
             lost_since,
@@ -1864,7 +1746,6 @@ impl Runner {
             good_id,
             prev_stamp,
             prev_corr,
-            provisional,
             prov,
             prov_nodes,
             last_sent_world,
@@ -1887,7 +1768,7 @@ impl Runner {
             r.feed(ring, fr.t + self.calib.shift + crate::imu::REPLAY_LEAD);
         }
         // IMU 모드: BRIEF 를 점마다 방향으로 돌려 뽑음(ORB 식) → 굴려도 같은 설명자, 다시 잡기 · 지도 잇기 · 루프 검증이 시점 변화에 버팀
-        fr.cam.oriented = self.imu_on && self.klt_path && self.a.imu_brief == "oriented";
+        fr.cam.oriented = self.imu_on && self.klt_path;
         fr.id = self.n + 1;
         // 리셋 요청(뷰어의 Reset 버튼: 한 프로그램이면 common::control 신호, 따로 띄운 뷰어면 --reset-file 파일): 위치 추적과 지도를 비우고 받는 쪽에 리셋 블록을 보낸다
         // 지도가 아직 작을 때(3 초 몫 미만) 놓쳐 다시 못 잡은 경우에도 같은 식으로 처음부터 다시 한다
@@ -1902,10 +1783,6 @@ impl Runner {
             self.good_t1 = -1.0;
             self.eng.odom_reset(Tf::IDENTITY);
             self.eng.reset();
-            self.geo_old.clear();
-            self.geo_new.clear();
-            self.geo_tried = false;
-            self.geo_t = None;
             self.sent_nodes.clear();
             self.held_nodes.clear();
             self.held_last = -1;
@@ -2110,30 +1987,6 @@ impl Runner {
                 force_node = true;
             }
         }
-        // 깊이 정합 결과: 맞았고 아직 이어지지 않았으면 이번 장면을 노드로 넣으며 기존 지도 마지막 믿는 노드와 잇는다
-        if let Some((r, ms)) = self.geo_job.as_ref().and_then(|h| if self.replay_max { h.recv().ok() } else { h.try_recv().ok() }) {
-            self.geo_job = None;
-            self.s_geo.add(ms);
-            match r {
-                Ok(g) => {
-                    self.n_geo_ok += 1;
-                    common::info!("장면 {n}: 깊이 정합 맞음(겹침 {:.2} · 맞음 {:.2} · RMSE {:.1} mm · 면 퍼짐 {:.2}, 옮김 {:.2} m · {:.1}°, {ms:.0} ms)", g.overlap, g.fitness, g.rmse * 1e3, g.spread, g.moved.0, g.moved.1);
-                    self.geo_t = Some(g.t.mul(&self.geo_prov));
-                }
-                Err(e) => common::info!("장면 {n}: 깊이 정합 버림({e}, {ms:.0} ms)"),
-            }
-        }
-        if self.anchored {
-            self.geo_t = None;
-        } else if let (Some(t), Some(p), false) = (self.geo_t, pose.as_ref(), imu_hold || force_node) {
-            if let Some(old) = self.sent_nodes.get(&self.good_id) {
-                let body_new = self.eng.map_correction().unwrap_or(Tf::IDENTITY).mul(p);
-                self.eng.geo_link = Some((self.good_id, t.mul(&body_new).inverse().mul(old)));
-                force_node = true;
-                self.geo_t = None;
-                self.n_geo_link += 1;
-            }
-        }
         let det_rate = if self.anchored || self.klt_path { self.detection_rate } else { self.detection_rate.max(4.0) }; // 이어지기를 기다리는 동안은 더 자주 찾아봄
         if !force_node && det_rate > 0.0 && self.prev_stamp > 0.0 && fr.t > self.prev_stamp && fr.t - self.prev_stamp < 1.0 / det_rate as f64 {
             process = false;
@@ -2214,9 +2067,6 @@ impl Runner {
                 self.n_corr += 1;
             }
         }
-        // 놓친 장면: 위치를 못 구함. 다시 시작한 새 지도의 장면도 믿던 지도와 이어지기 전에는 놓침으로 표시
-        // 맡아 둠: 이어지지 않은 새 지도(임시 위치를 쓰면 맡아 두지 않음)
-        let hold = !self.anchored && !self.provisional;
         // IMU 모드: 이어지지 않은 새 지도는 위치는 임시 위치로 바로 보내되 지도 · 물체에는 맡겨 두기만(이어지면 다시 쌓기가 고친 위치로 넣음).
         // 놓친 사이 움직임을 모르는 임시 위치로 바로 쌓으면 같은 표면이 어긋난 채 두 겹으로 남는다
         // 맡겨 두기는 짧게: --imu-hold-wait 초 안에 안 이어지면(또는 앞 지도가 작으면) 새 지도를 받아들여 바로 쌓는다(맡겼던 장면도 그 지도 위치로).
@@ -2225,14 +2075,14 @@ impl Runner {
             self.accepted = false;
         }
         let accept = self.prev_map_small || fr.t - self.newmap_t > self.a.imu_hold_wait;
-        if self.imu_on && !self.anchored && self.provisional && accept && !self.accepted {
+        if self.imu_on && !self.anchored && accept && !self.accepted {
             self.accepted = true;
             self.n_accept += 1;
             common::info!("장면 {n}: 이어지지 않은 새 지도를 받아들임({:.1} 초 기다림) → 바로 쌓기", fr.t - self.newmap_t);
         }
-        let map_hold = self.imu_on && !self.anchored && self.provisional && !self.accepted;
-        let hold_g = hold || map_hold;
-        if !self.anchored && self.provisional && new_map {
+        let map_hold = self.imu_on && !self.anchored && !self.accepted;
+        let hold_g = map_hold;
+        if !self.anchored && new_map {
             // 새 지도 첫 장면 = 마지막으로 보낸 위치(그사이 움직임 모름): 표시 변환을 그에 맞춤
             if let (Some(w), Some(p)) = (self.last_sent_world, pose.as_ref()) {
                 self.prov = w.mul(&corr.unwrap_or(Tf::IDENTITY).mul(p).inverse());
@@ -2241,7 +2091,7 @@ impl Runner {
         if self.anchored {
             self.prov = Tf::IDENTITY;
         }
-        let lost = pose.is_none() || info.lost || (new_map && !self.provisional) || hold;
+        let lost = pose.is_none() || info.lost;
         self.n_lost += lost as i64;
 
         // 그래프 블록: 지도 갱신 뒤 새로 생기거나 움직인(행렬 원소 1e-3 넘게) 노드를 이 장면보다 먼저 보낸다
@@ -2261,7 +2111,7 @@ impl Runner {
                 if !self.anchored && sent.is_some() && !was_held && !self.prov_nodes.contains(&id) {
                     continue; // 믿는 노드는 이어지지 않은 지도의 값으로 덮지 않음
                 }
-                if !self.anchored && self.provisional {
+                if !self.anchored {
                     self.prov_nodes.insert(id);
                 } else if self.anchored {
                     self.prov_nodes.remove(&id);
@@ -2333,45 +2183,6 @@ impl Runner {
             }
             let twc = body.mul(&self.optical);
             of.pose = twc.0.map(|v| v as f64);
-            if self.geo_on && pose.is_some() {
-                let k = [fr.cam.fx, fr.cam.fy, fr.cam.cx, fr.cam.cy];
-                let (w, h) = (fr.cam.width as usize, fr.cam.height as usize);
-                if self.anchored && !lost && !imu_hold && self.n % 4 == 0 {
-                    let mut v = Vec::new();
-                    crate::georeg::backproject(&fr.depth_mm, w, h, k, &twc, 16, &mut v);
-                    self.geo_old.push_back((fr.t, v));
-                    while self.geo_old.front().is_some_and(|x| fr.t - x.0 > GEO_OLD_S) {
-                        self.geo_old.pop_front();
-                    }
-                } else if !self.anchored && !self.geo_tried {
-                    // 새 지도 점은 표시 좌표(마지막으로 보낸 위치에 맞춘 임시 위치)로: 정합 초기값 = 그대로
-                    if self.geo_new.is_empty() {
-                        self.geo_t0 = fr.t;
-                        self.geo_prov = self.prov;
-                    }
-                    if self.n % 2 == 0 {
-                        crate::georeg::backproject(&fr.depth_mm, w, h, k, &twc, 16, &mut self.geo_new);
-                    }
-                    if fr.t - self.geo_t0 >= GEO_NEW_S && self.geo_job.is_none() {
-                        self.geo_tried = true;
-                        self.n_geo_try += 1;
-                        let old: Vec<crate::georeg::P3> = self.geo_old.iter().flat_map(|x| x.1.iter().copied()).collect();
-                        let src = std::mem::take(&mut self.geo_new);
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        rayon::spawn(move || {
-                            let c = Instant::now();
-                            let tg = crate::georeg::Target::build(&old, 0.04);
-                            let s = crate::georeg::voxel(&src, 0.05);
-                            let _ = tx.send((crate::georeg::register(&tg, &s, &Tf::IDENTITY, &Default::default()), ms_since(c)));
-                        });
-                        self.geo_job = Some(rx);
-                    }
-                }
-            }
-            if self.anchored {
-                self.geo_new.clear();
-                self.geo_tried = false;
-            }
             if !lost {
                 // 위치 파일엔 믿는 위치만(임시 위치는 화면·지도용)
                 if let (Some(f), true) = (self.poses_f.as_mut(), self.anchored) {
@@ -2438,9 +2249,9 @@ impl Runner {
 
     /// 끝: 출력 닫기 · 끝 그래프 · 요약 줄. src_dropped: 입력에서 밀려 버린 장면 수
     pub fn finish(self, src_dropped: usize) -> Result<i32, String> {
-        let Runner { t_run, in_proc, calib, imu_replay, imu_ring, imu_on, skipped, stress_counts, replay_max, intermediate, detection_rate, reloc_min, mut eng, klt_path, reloc_wait, bridge, n_bridge, n_global, n_reloc_bridge, global_tried, n_reloc_tilt, n_loop_rejected, n_merge_try, nq, bridge_t, n_bridge_fix, last_merge_try, newmap_t, prev_map_small, accepted, n_accept, max_corr, last_good_t, n_bridge_ok, since_imu, n_imu_hold, n_imu_reject, n_fast_rot, n_weak, n_map_held, geo_on, geo_old, geo_new, geo_t0, geo_prov, geo_tried, geo_job, geo_t, n_geo_try, n_geo_ok, n_geo_link, s_geo, refs, ref_next, lost_since, good_t0, good_t1, restart, n_reloc, s_reloc, mut writer, poses_f, stats_f, optical, s_read, s_odom, s_slam, s_send, s_total, n, n_lost, n_newmap, n_loop, n_corr, n_graph, n_graph_nodes, sent_nodes, held_nodes, held_last, n_held, n_joined, map_id, fresh, anchored, good_id, prev_stamp, prev_corr, provisional, prov, prov_nodes, last_sent_world, fast_prev, fast_vel, tilt_map, tilt_map_max, n_prov, a } = self;
+        let Runner { t_run, in_proc, calib, imu_replay, imu_ring, imu_on, skipped, stress_counts, replay_max, intermediate, detection_rate, reloc_min, mut eng, klt_path, reloc_wait, bridge, n_bridge, n_global, n_reloc_bridge, global_tried, n_reloc_tilt, n_loop_rejected, n_merge_try, nq, bridge_t, n_bridge_fix, last_merge_try, newmap_t, prev_map_small, accepted, n_accept, max_corr, last_good_t, n_bridge_ok, since_imu, n_imu_hold, n_imu_reject, n_fast_rot, n_weak, n_map_held, refs, ref_next, lost_since, good_t0, good_t1, restart, n_reloc, s_reloc, mut writer, poses_f, stats_f, optical, s_read, s_odom, s_slam, s_send, s_total, n, n_lost, n_newmap, n_loop, n_corr, n_graph, n_graph_nodes, sent_nodes, held_nodes, held_last, n_held, n_joined, map_id, fresh, anchored, good_id, prev_stamp, prev_corr, prov, prov_nodes, last_sent_world, fast_prev, fast_vel, tilt_map, tilt_map_max, n_prov, a } = self;
         let _ = (&in_proc, &calib, &imu_replay, &imu_on, &replay_max, &intermediate, &detection_rate, &reloc_min, &klt_path, &reloc_wait, &n_bridge, &global_tried, &bridge_t,
-                 &last_merge_try, &newmap_t, &prev_map_small, &accepted, &last_good_t, &since_imu, &geo_old, &geo_new, &geo_t0, &geo_prov, &geo_tried, &geo_job, &geo_t,
+                 &last_merge_try, &newmap_t, &prev_map_small, &accepted, &last_good_t, &since_imu,
                  &refs, &ref_next, &lost_since, &good_t0, &good_t1, &restart, &sent_nodes, &held_nodes, &held_last, &map_id, &fresh, &anchored, &good_id, &prev_stamp, &prev_corr,
                  &prov, &prov_nodes, &last_sent_world, &fast_prev, &fast_vel, &a);
         let wall = t_run.elapsed().as_secs_f64();
@@ -2474,8 +2285,8 @@ impl Runner {
             if l.sent > 0 {
                 let d = l.done.max(1) as f64;
                 common::info!(
-                    "신경망 루프: 노드 {} 개 보냄 · {} 개 끝남, 검증 {} 번, 맞음 {} · 지도에 들어감 {}, ms/노드 MegaLoc {:.1}(최대 {:.1}) · XFeat {:.1}(최대 {:.1}) · 짝 + 검증 {:.1}(최대 {:.1})",
-                    l.sent, l.done, l.tried, l.hits, l.accepted, l.ms[0] / d, l.ms_max[0], l.ms[1] / d, l.ms_max[1], l.ms[2] / d, l.ms_max[2]
+                    "신경망 루프: 노드 {} 개 보냄 · {} 개 끝남, 검증 {} 번, 맞음 {} · 위치 추적과 같아 버림 {} · 간격 안이라 건너뜀 {} · 지도에 들어감 {}, ms/노드 MegaLoc {:.1}(최대 {:.1}) · XFeat {:.1}(최대 {:.1}) · 짝 + 검증 {:.1}(최대 {:.1})",
+                    l.sent, l.done, l.tried, l.hits, l.redundant, l.gap, l.accepted, l.ms[0] / d, l.ms_max[0], l.ms[1] / d, l.ms_max[1], l.ms[2] / d, l.ms_max[2]
                 );
             }
         }
@@ -2489,10 +2300,7 @@ impl Runner {
                 common::info!("IMU: 가만히 있을 때 기울기를 중력 쪽으로 고친 장면 {ng}(합 {gd:.1}°), 중력과 어긋나 버린 다시 잡기 {n_reloc_tilt}");
             }
         }
-        if geo_on {
-            common::info!("깊이 서브맵 정합: 시도 {n_geo_try}, 맞음 {n_geo_ok}, 잇기로 넘김 {n_geo_link}, ms/회 {}", s_geo.str());
-        }
-        if provisional {
+        {
             common::info!("이어지지 않은 새 지도에서 임시 위치로 바로 보낸 장면 {n_prov}, 지도 전체에서 찾은 잇기 후보 {n_merge_try} 번");
         }
         common::info!("놓침 가운데 새 지도에서 맡긴 장면 {n_held}(보낸 것 가운데 나중에 이어져 지도에 들어간 장면 {n_joined})");

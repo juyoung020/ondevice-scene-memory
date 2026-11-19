@@ -7,9 +7,9 @@ use crate::seg::Det;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// 노드가 이만큼 넘게 움직이면 다시 쌓을 거리(m)·각도(°)
+/// 노드가 마지막으로 쌓은 위치에서 이만큼 넘게 움직이면 다시 쌓을 거리(m)·각도(°). 그 아래 보정은 모아 두었다가 넘을 때 한 번에
 pub const MOVE_T: f64 = 0.02;
-pub const MOVE_R: f64 = 1.0;
+pub const MOVE_R: f64 = 2.0;
 
 pub struct Kf {
     pub seq: u64, // 보관한 순서(다시 쌓는 동안 들어온 장면을 가려냄)
@@ -218,6 +218,8 @@ impl Kf {
 
 pub struct KfStore {
     nodes: HashMap<u32, (M3, V3)>,
+    /// 마지막으로 쌓을 때(다시 쌓기 시작 · 처음 받음)의 노드 위치: 움직임은 여기서 잼(작은 보정이 쌓여도 놓치지 않게)
+    built: HashMap<u32, (M3, V3)>,
     held: HashSet<u32>, // 믿는 지도와 아직 안 이어진 노드
     kfs: Vec<Arc<Kf>>,
     budget: usize,
@@ -260,7 +262,7 @@ pub fn angle(a: &M3, b: &M3) -> f64 {
 
 impl KfStore {
     pub fn new(budget_mb: usize) -> KfStore {
-        KfStore { nodes: HashMap::new(), held: HashSet::new(), kfs: vec![], budget: budget_mb << 20, bytes: 0, stride: 1, count: 0, dirty: false, moved: (0.0, 0.0) }
+        KfStore { nodes: HashMap::new(), built: HashMap::new(), held: HashSet::new(), kfs: vec![], budget: budget_mb << 20, bytes: 0, stride: 1, count: 0, dirty: false, moved: (0.0, 0.0) }
     }
 
     pub fn len(&self) -> usize {
@@ -312,7 +314,8 @@ impl KfStore {
                 continue;
             }
             if let Some(old) = old {
-                let (dt, dr) = (norm(&sub(p, &old.1)), angle(r, &old.0));
+                let b = *self.built.entry(*id).or_insert(old);
+                let (dt, dr) = (norm(&sub(p, &b.1)), angle(r, &b.0));
                 if dt > MOVE_T || dr > MOVE_R {
                     self.dirty |= !self.kfs.is_empty();
                     self.moved = (self.moved.0.max(dt), self.moved.1.max(dr));
@@ -392,6 +395,7 @@ impl KfStore {
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
         self.moved = (0.0, 0.0);
+        self.built.clone_from(&self.nodes);
     }
 }
 

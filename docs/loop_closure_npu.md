@@ -19,7 +19,7 @@
 - 모델 둘 다 CPU 작업 없이 NPU 하나로 컴파일된다. MegaLoc 은 손질(큰 값 토큰 고정 · 자르기 · 회전 · GELU 나누기)과 DX-COM 2.4.1 의 자르기 꼴 우회(`10 − ReLU(10 − f)`)가 있어야 컴파일된다.
 - Rust 앞뒤는 원본과 같다: 전처리 바이트 동일, 기술자 코사인 ≥ 0.9999998, Recall 같음. XFeat 후처리는 점 99.996 % 같은 자리, 검증 기하는 파이썬과 비트 동일.
 - 8 비트로 찾는 성능은 거의 그대로(흉내 R@1 88.3 % ↔ 실수 89.0 %), 검증은 흐림 0 – 15 에서 XFeat 4 자유도(Rust 판)가 지금 BRIEF PnP 보다 성공률이 23 – 32 점 높다.
-- 앱에 이어 TUM 7 녹화 · 흐림 · 합성 IMU 로 재 보니 ATE 는 낱말 루프와 같은 범위(차 0.2 cm 안)이고 지도에 들어가는 신경망 루프는 녹화마다 0 – 2 개다. 그래서 기본은 bow 로 두고 `--lc both` 로 켠다. 보드(NPU 시간 · 실제 녹화 ds_1118)에서 다시 잰다(9 절).
+- 앱에 이어 TUM 7 녹화 · 흐림 · 합성 IMU 로 재 보니 ATE 는 낱말 루프와 같은 범위(차 0.2 cm 안)이고 지도에 들어가는 신경망 루프는 녹화마다 0 – 2 개다. 신경망 루프는 낱말 루프와 함께 늘 켜 둔다(옵션 없음, 모델이 없으면 시작하지 않음). 보드(NPU 시간 · 실제 녹화 ds_1118)에서 다시 잰다(9 절).
 
 ## 3. 만든 것
 
@@ -78,7 +78,7 @@ Recall 세트: TUM fr1 360 · rpy · desk · room 1,146 장 가운데 질의 471
 
 ## 7. 앱 연결과 재생 결과
 
-`ondevice slam … --lc bow|net|both --lc-dir <모델 폴더>`(물체 기억 한 프로세스면 `--slam "… --lc both --lc-dir …"`). bow = RTAB-Map 낱말 루프만(기본, 통합 전 판 80949fd 와 `scripts/pc_bytes.sh` 세트 11 개 바이트 같음), net = 낱말 루프 후보를 끄고 신경망 루프만, both = 둘 다.
+`ondevice slam` 은 RTAB-Map 낱말 루프와 신경망 루프를 함께 돌린다. 모델은 모델 폴더(`$ONDEVICE_MODELS`, 보드 `~/models`, PC `models/` · WSL `/mnt/c/ondevice/models`)의 `megaloc_168x224` · `megaloc_head_pca1024.bin` · `xfeat_480x640`(보드 `.dxnn`, PC `.onnx`)이고, 하나라도 없으면 시작하지 않는다. 아래 표의 bow · net 열은 연결할 때 비교한 기록(되돌릴 판: 태그 `lc-option`)이다.
 
 흐름(`slam/src/lcnet.rs`, `app.rs` 의 `Engine::slam_process` · `lc_poll`, `loopclose.rs` 의 `NodeInput::lc_link`):
 1. 지도 노드를 넘길 때 그 장면의 컬러 · 깊이(나눠 듦) · 위치 추적 자세 · 카메라를 일 번호로 맡겨 두고, 지도가 노드 id 를 정하면 루프 스레드("lc")로 보낸다.
@@ -89,7 +89,7 @@ Recall 세트: TUM fr1 360 · rpy · desk · room 1,146 장 가운데 질의 471
 
 최대 속도 재생(`--tum … --rate 0`)은 결과를 한 노드 늦게 고정한다: 노드 단계마다 바로 앞에 보낸 노드 것만 빼고 모두 끝날 때까지 기다려 실행마다 같은 노드에 같은 링크가 들어간다(fr3 긴 사무실 · fr1 room 합성 IMU 두 번 실행 poses · final · stats 같음). 실시간은 끝난 결과를 바로 넘긴다.
 
-재생 결과(PC, 위치 프로그램 단독 최대 속도, `--map-inline`, `slam_eval`). ATE cm = 실시간 위치 / 끝 그래프, 괄호는 지도에 들어간 신경망 루프 수.
+재생 결과(PC, 위치 프로그램 단독 최대 속도, `slam_eval`). ATE cm = 실시간 위치 / 끝 그래프, 괄호는 지도에 들어간 신경망 루프 수.
 
 | 녹화 | bow | both |
 |---|---|---|
@@ -105,7 +105,7 @@ Recall 세트: TUM fr1 360 · rpy · desk · room 1,146 장 가운데 질의 471
 
 - 맞은 점 문턱: 20 이면 긴 사무실 4.25 / 2.88(5 개)로 좋아지지만 room 흐림에서 30 · 55 cm 틀린 루프(맞은 점 20 · 25)가 들어가 끝 그래프 13.31 → 19.97 이 된다. 긴 사무실 정답 대조로 맞은 점 100 개 넘는 루프는 1 – 3 cm · 0.2 – 0.9°, 20 – 50 개는 5 – 11 cm. 그래서 40.
 - net(낱말 루프 끔, 맞은 점 20)은 긴 사무실 5.36 / 3.49, room 28.87 / 11.99, 나머지 같음.
-- 물체 기억 한 프로세스(fr1_desk, `--slam "… --lc both"`)도 같은 길로 돈다(신경망 루프 노드 20 개, 기억 폴더 333 파일).
+- 물체 기억 한 프로세스(fr1_desk, `--slam "…"`)도 같은 길로 돈다(신경망 루프 노드 20 개, 기억 폴더 333 파일).
 
 ## 8. 실행 빈도와 NPU 부하
 
@@ -124,8 +124,8 @@ PC 최대 RSS 47 → 903 MB(MegaLoc 실수 ONNX 462 MB 를 ONNX Runtime 이 들�
 ## 9. 보드에서 할 일
 
 1. `bash scripts/board_lc_check.sh`(PC WSL 에서): 모델 · 교차 빌드한 `lc_bench`(dxrt) 올리기 → sha256 → `parse_model` · `run_model` 단독 시간 → 같은 입력의 NPU 출력 · 기술자를 PC 실수와 코사인 비교 → ObjectSAM · SigLIP2 · MegaLoc · XFeat 동시 적재 + 60 초 동시 실행(앞뒤 `dxrt-cli -s` · 온도 · dmesg).
-2. 앱: `LC=both bash scripts/board_run.sh --rec ~/rec/ds_1118_121652`(녹화 + imu0.csv) 와 `LC=bow` 를 같은 녹화로 번갈아: 로그 끝 `신경망 루프:` 줄(노드 · 검증 · 맞음 · 지도에 들어감 · ms/노드), kf/s · 지연 · 온도.
-3. 실시간 D435: `LC=both bash scripts/board_run.sh` 로 같은 방을 한 바퀴 돌아 처음 자리로.
+2. 앱: `bash scripts/board_run.sh --rec ~/rec/ds_1118_121652`(녹화 + imu0.csv): 로그 끝 `신경망 루프:` 줄(노드 · 검증 · 맞음 · 지도에 들어감 · ms/노드), kf/s · 지연 · 온도.
+3. 실시간 D435: `bash scripts/board_run.sh` 로 같은 방을 한 바퀴 돌아 처음 자리로.
 
 ## 10. 한계
 

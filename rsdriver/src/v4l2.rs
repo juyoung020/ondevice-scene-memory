@@ -13,6 +13,8 @@ pub const fn fourcc(s: &[u8; 4]) -> u32 {
 }
 pub const FMT_Z16: u32 = fourcc(b"Z16 ");
 pub const FMT_YUYV: u32 = fourcc(b"YUYV");
+/// 적외선 좌우 묶음: 화소마다 2 바이트(낮은 바이트 = 왼쪽, 높은 바이트 = 오른쪽), 깊이와 같은 노출 · 정렬된(rectified) 영상
+pub const FMT_Y8I: u32 = fourcc(b"Y8I ");
 pub const FMT_META_UVC: u32 = fourcc(b"UVCH");
 
 // 제어 번호

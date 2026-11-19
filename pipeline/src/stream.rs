@@ -7,6 +7,8 @@ use slam::stream::OutFrame;
 
 /// 읽기 버퍼: 머리·그래프 블록용. 사진은 이보다 커서 버퍼를 거치지 않고 받을 자리에 바로 읽힌다
 const READ_BUF: usize = 1 << 16;
+/// 실시간 위치 추적이 한 번에 처리 루프를 쥐는 최대 시간(카메라 한 장 간격, 30 fps)
+const SERVICE_BUDGET: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// 그래프 노드: (지도 노드 id, 자세, 위치, 맡아 둠) — OpenCV 카메라 → 세계, 장면 위치와 같은 좌표.
 /// 맡아 둠 = 믿는 지도와 아직 안 이어진 새 지도의 노드(이어지면 같은 id 가 맡아 둠 없이 다시 온다)
@@ -78,10 +80,10 @@ enum Src {
 /// 미리 푼 재생 장면: (장면, 읽기 ms, 미리 뽑은 특징)
 type Ahead = Result<Option<(slam::Frame, f64, Option<slam::Features>)>, String>;
 
-/// 같은 프로세스 위치 프로그램(`--slam`): 스레드 없이 처리 루프가 장면마다 위치 추적을 부른다.
+/// 같은 프로세스 위치 프로그램(`--slam`): 스레드 없이 처리 루프가 장면마다 위치 추적을 부른다(백엔드는 `slam::backend`).
 /// 카메라는 장치 fd 가 루프 epoll 에 걸려 장면이 오면 루프가 깨고, 녹화 재생은 다음 장면 PNG 를 작업 풀이 한 장 앞서 푼다
 pub struct SlamSide {
-    r: Option<slam::app::Runner>,
+    r: Option<Box<dyn slam::backend::SlamBackend>>,
     camera: Option<(Box<dyn slam::io::FrameSource>, Option<slam::io::Prep>)>,
     /// 재생 풀기 줄(입력 · 미리 할 일을 쥠)과 결과 줄
     replay: Option<(common::rt::SharedLane<(Box<dyn slam::io::FrameSource>, Option<slam::io::Prep>)>, std::sync::mpsc::Receiver<Ahead>)>,
@@ -105,7 +107,7 @@ impl SlamSide {
     /// 위치 프로그램 준비(설정 · IMU · 입력 열기). waker: 재생 장면을 다 풀면 루프를 깨움
     pub fn new(a: slam::app::Args, waker: std::sync::Arc<common::rt::Waker>) -> Result<SlamSide, String> {
         let (block, max_frames) = (a.block_mode(), a.max_frames);
-        let (r, mut src, prep) = slam::app::Runner::new(a, true, None)?;
+        let (r, mut src, prep) = slam::backend::open(a)?;
         let pace = src.caller_paces();
         let (camera, replay, tx) = if src.fds().is_empty() {
             let (tx, rx) = std::sync::mpsc::channel::<Ahead>();
@@ -160,7 +162,7 @@ impl SlamSide {
             return false;
         }
         let r = self.r.as_mut().unwrap();
-        if self.max_frames >= 0 && r.n >= self.max_frames {
+        if self.max_frames >= 0 && r.frames() >= self.max_frames {
             self.end();
             return false;
         }
@@ -229,13 +231,12 @@ impl SlamSide {
     /// 입력 끝: 위치 프로그램 끝 요약(끝 그래프 · 통계)
     fn end(&mut self) {
         self.ended = true;
-        if let Some(r) = self.r.take() {
+        if let Some(mut r) = self.r.take() {
             // 끝 요약 전에 줄에 남은 장면을 꺼낼 수 있게 옮겨 둠
-            let mut r = r;
-            if let Some(l) = r.writer.local() {
-                self.rest.append(&mut l.q);
+            while let Some(f) = r.pop() {
+                self.rest.push_back(f);
             }
-            if let Err(e) = r.finish(0) {
+            if let Err(e) = r.finish() {
                 common::info!("slam 끝: {e}");
             }
         }
@@ -247,7 +248,7 @@ impl SlamSide {
             if let Some(f) = self.rest.pop_front() {
                 return Ok(Some(f));
             }
-            if let Some(f) = self.r.as_mut().and_then(|r| r.writer.local()).and_then(|l| l.q.pop_front()) {
+            if let Some(f) = self.r.as_mut().and_then(|r| r.pop()) {
                 return Ok(Some(f));
             }
             if self.ended {
@@ -261,7 +262,7 @@ impl SlamSide {
 
     /// IMU 모드 장면 사이 위치: 표본이 오면 깨울 손잡이를 단다(뷰어가 있을 때만)
     pub fn set_imu_waker(&self, w: std::sync::Arc<common::rt::Waker>) -> bool {
-        match self.r.as_ref().and_then(|r| r.imu_ring.as_ref()) {
+        match self.r.as_ref().and_then(|r| r.imu_ring()) {
             Some(ring) => ring.waker.set(w).is_ok(),
             None => false,
         }
@@ -269,13 +270,16 @@ impl SlamSide {
 
     /// 가장 새 IMU 표본까지의 장면 사이 위치(카메라 시계 시각, IMU 시각, 카메라 광학 → 지도)
     pub fn fast_pose(&self) -> Option<(f64, f64, slam::register::Tf)> {
-        self.r.as_ref()?.imu_ring.as_ref()?.fast_next()
+        self.r.as_ref()?.imu_ring()?.fast_next()
     }
 
-    /// 실시간(카메라): 준비된 장면을 모두 위치 추적에(받는 쪽이 바빠도 위치는 장면마다, 줄이 차면 오래된 장면부터 버림)
+    /// 실시간(카메라): 준비된 장면을 모두 위치 추적에(받는 쪽이 바빠도 위치는 장면마다, 줄이 차면 오래된 장면부터 버림).
+    /// 위치 추적이 카메라보다 느려지면(부하 · 열 보호) 장면이 늘 준비돼 있으므로, SERVICE_BUDGET 이 지나면 처리 루프로 돌려준다
+    /// (돌려주지 않으면 루프가 물체 기억에 장면을 넘기지도, 뷰어 요청을 받지도 못한다)
     pub fn service(&mut self) {
         if !self.block {
-            while self.advance(false) {}
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < SERVICE_BUDGET && self.advance(false) {}
         }
     }
 }

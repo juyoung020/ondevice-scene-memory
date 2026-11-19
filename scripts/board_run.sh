@@ -40,5 +40,5 @@ NPU_JOBS=${NPU_JOBS:-1}
 rm -rf "$OUT"; mkdir -p "$OUT"
 exec "${BIN:-target/release/ondevice}" --slam "$SRC" \
     --every 1 --live 1 --seg "$SEG" --embed "$EMB" --vocab "$VOCAB" \
-    --max-depth 3.5 --out "$OUT" --rt "$RT" --mlock --seg-npu "$SEG_NPU" --embed-npu "$EMB_NPU" --npu-jobs "$NPU_JOBS" \
+    --out "$OUT" --rt "$RT" --mlock --seg-npu "$SEG_NPU" --embed-npu "$EMB_NPU" --npu-jobs "$NPU_JOBS" \
     --serve "${PORT:-8091} --bind 0.0.0.0 --search-model $M/siglip2 --vocab vocab/names.voc,$VOCAB" "$@"

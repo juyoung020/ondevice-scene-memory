@@ -13,6 +13,7 @@ pub mod params;
 pub mod register;
 pub mod stream;
 pub mod app;
+pub mod backend;
 pub mod bufpool;
 pub mod simd;
 pub mod imu;

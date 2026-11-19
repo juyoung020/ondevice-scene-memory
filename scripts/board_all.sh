@@ -187,7 +187,7 @@ record() {
 replay_full() {
   local name=$1 run=$2 d=$OUT/$1; mkdir -p "$d"
   local imu; imu=$([ -f "$run/imu0.csv" ] && echo "--imu-csv $run/imu0.csv")
-  "$BIN" --slam "--rsdrec $run $imu --rate 1 --config docs/rtabmap_pi.ini --stats $d/stats.csv" --every 1 --live 1 --seg "$SEG" --embed "$EMB" --vocab vocab/indoor.voc       --max-depth 3.5 --out "$d/mem" --rt auto --serve "8091 --bind 0.0.0.0" --serve-exit > "$d/log.txt" 2> "$d/err.txt"; local rc=$?
+  "$BIN" --slam "--rsdrec $run $imu --rate 1 --config docs/rtabmap_pi.ini --stats $d/stats.csv" --every 1 --live 1 --seg "$SEG" --embed "$EMB" --vocab vocab/indoor.voc       --out "$d/mem" --rt auto --serve "8091 --bind 0.0.0.0" --serve-exit > "$d/log.txt" 2> "$d/err.txt"; local rc=$?
   grep '^{"by_name"' "$d/log.txt" | tail -1 > "$d/summary.json"
   "$REPO/target/release/slam_eval" --stats "$d/stats.csv" --tag "$name" > "$d/eval.json" 2>/dev/null
   return $rc

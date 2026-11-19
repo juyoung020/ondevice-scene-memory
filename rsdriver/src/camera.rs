@@ -30,6 +30,9 @@ pub struct Found {
     pub speed: String,
     pub depth: String,
     pub depth_meta: Option<String>,
+    /// 적외선 좌우(Y8I): 깊이와 같은 인터페이스의 두 번째 영상 노드
+    pub ir: String,
+    pub ir_meta: Option<String>,
     pub color: String,
     pub color_meta: Option<String>,
 }
@@ -38,7 +41,8 @@ fn rd(p: &Path) -> String {
     fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_default()
 }
 
-/// /sys/class/video4linux/video* 를 USB 장치별로 묶어 D435(8086:0b07)를 찾음. 인터페이스 0 = 깊이, 3 = 컬러, 같은 인터페이스의 META 노드 = 메타데이터
+/// /sys/class/video4linux/video* 를 USB 장치별로 묶어 D435(8086:0b07)를 찾음. 인터페이스 0 = 깊이(첫 영상 노드) · 적외선 좌우(두 번째), 3 = 컬러,
+/// 같은 인터페이스의 META 노드 = 메타데이터(영상 노드와 같은 차례)
 pub fn discover() -> Vec<Found> {
     let mut out: Vec<Found> = Vec::new();
     let Ok(rdir) = fs::read_dir("/sys/class/video4linux") else { return out };
@@ -69,7 +73,9 @@ pub fn discover() -> Vec<Found> {
         let metac = caps & v4l2::CAP_META_CAPTURE != 0;
         match (ifnum, video, metac) {
             (0, true, _) if f.depth.is_empty() => f.depth = dev,
+            (0, true, _) if f.ir.is_empty() => f.ir = dev,
             (0, _, true) if f.depth_meta.is_none() => f.depth_meta = Some(dev),
+            (0, _, true) if f.ir_meta.is_none() => f.ir_meta = Some(dev),
             (3, true, _) if f.color.is_empty() => f.color = dev,
             (3, _, true) if f.color_meta.is_none() => f.color_meta = Some(dev),
             _ => {}
@@ -163,6 +169,8 @@ pub struct Config {
     /// 컬러 제어 묶음(아래 [`Profile`])
     pub profile: Profile,
     pub emitter: bool,
+    /// true 면 적외선 좌우(Y8I, 깊이 크기)도 받아 깊이와 같은 노출끼리 묶음(스테레오 위치 추적용)
+    pub ir: bool,
     /// 처음 버리는 묶음 수
     pub warmup: u32,
     /// 정렬 스레드 수(fast_align)
@@ -179,7 +187,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { width: 640, height: 480, color_width: 0, color_height: 0, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, profile: Profile::Librealsense, emitter: true, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
+        Config { width: 640, height: 480, color_width: 0, color_height: 0, fps: 30, serial: String::new(), exposure_ms: 0.0, gain: -1, ae_cap_ms: 0.0, profile: Profile::Librealsense, emitter: true, ir: false, warmup: 30, align_threads: 1, yuy2: Yuy2Rule::NATIVE }
     }
 }
 
@@ -215,6 +223,9 @@ pub struct Output {
     /// true 면 회색조(OpenCV BGR2GRAY 식)도 YUYV→RGB 와 같은 훑기에서 채움(w*h)
     pub want_gray: bool,
     pub gray: Vec<u8>,
+    /// 적외선 왼쪽 · 오른쪽(깊이 크기, 회색 8 비트, Config::ir 일 때만)
+    pub ir_left: Vec<u8>,
+    pub ir_right: Vec<u8>,
 }
 
 struct Side {
@@ -303,6 +314,7 @@ pub struct Camera {
     ctl: Node,
     color: Side,
     depth: Side,
+    ir: Option<Side>,
     aligner: DepthAligner,
     t_offset_ms: Option<f64>,
     ae: Option<SoftAe>,
@@ -421,8 +433,16 @@ impl Camera {
         let cnode = Node::open(&found.color).map_err(|e| format!("{}: {e}", found.color))?;
         let mut depth = Side::new(dnode, found.depth_meta.clone(), w, h, v4l2::FMT_Z16, cfg.fps)?;
         let mut color = Side::new(cnode, found.color_meta.clone(), cw, ch, v4l2::FMT_YUYV, cfg.fps)?;
+        let mut ir = match cfg.ir {
+            true if found.ir.is_empty() => return Err("적외선 노드(깊이 인터페이스의 두 번째 영상 노드)를 찾지 못함".into()),
+            true => Some(Side::new(Node::open(&found.ir).map_err(|e| format!("{}: {e}", found.ir))?, found.ir_meta.clone(), w, h, v4l2::FMT_Y8I, cfg.fps)?),
+            false => None,
+        };
         depth.start()?;
         color.start()?;
+        if let Some(s) = &mut ir {
+            s.start()?;
+        }
         // 제어: 컬러 PU 는 컬러 노드, 이미터는 깊이 XU
         let cc = &color.s.node;
         // 1) librealsense 와 같은 상태: 수동 노출에서만 쓰이는 감도·노출 기본값을 먼저, 그다음 나머지 기본값(자동 노출 켬)
@@ -458,7 +478,7 @@ impl Camera {
         let _ = ctl.xu(DEPTH_XU_UNIT, XU_EMITTER_ENABLED, v4l2::UVC_SET_CUR, &mut em);
         let opt = Options { threads: cfg.align_threads.max(1), ..Default::default() };
         let aligner = DepthAligner::new(&calib.depth, &calib.color, &calib.depth_to_color, calib.depth_scale, &opt)?;
-        let mut cam = Camera { found, raw, calib, cfg, ctl, color, depth, aligner, t_offset_ms: None, ae };
+        let mut cam = Camera { found, raw, calib, cfg, ctl, color, depth, ir, aligner, t_offset_ms: None, ae };
         let mut scratch = Output::default();
         for _ in 0..cam.cfg.warmup {
             cam.next_into(&mut scratch)?;
@@ -479,16 +499,20 @@ impl Camera {
         &self.color.s.node
     }
 
-    /// 장치 파일 기술자(컬러 · 깊이 · 메타데이터): 처리 루프의 epoll 에 걸어 장면이 오면 깸
+    /// 장치 파일 기술자(컬러 · 깊이 · 적외선 · 메타데이터): 처리 루프의 epoll 에 걸어 장면이 오면 깸
     pub fn fds(&self) -> Vec<i32> {
         let mut v = vec![self.color.s.node.fd, self.depth.s.node.fd];
-        for m in [&self.color.md, &self.depth.md].into_iter().flatten() {
+        if let Some(s) = &self.ir {
+            v.push(s.s.node.fd);
+        }
+        for m in [self.color.md.as_ref(), self.depth.md.as_ref(), self.ir.as_ref().and_then(|s| s.md.as_ref())].into_iter().flatten() {
             v.push(m.node.fd);
         }
         v
     }
 
-    /// 시각이 맞는 컬러 · 깊이 한 쌍을 쥐었는가(기다리지 않음: 안 된 쪽은 다음 장치 알림에서). 엇갈린 장면은 여기서 버림
+    /// 시각이 맞는 컬러 · 깊이(· 적외선) 한 묶음을 쥐었는가(기다리지 않음: 안 된 쪽은 다음 장치 알림에서). 엇갈린 장면은 여기서 버림.
+    /// 적외선은 깊이와 같은 노출이라 깊이 시각에 맞춘다(더 이른 쪽을 버림)
     fn pair_ready(&mut self) -> Result<bool, String> {
         let fps = self.cfg.fps as f64;
         loop {
@@ -498,7 +522,22 @@ impl Camera {
                 return Ok(false);
             }
             match sync::decide(self.color.hw_ms, self.depth.hw_ms, fps) {
-                Decision::DropColor => self.color.release()?,
+                Decision::DropColor => {
+                    self.color.release()?;
+                    continue;
+                }
+                Decision::DropDepth => {
+                    self.depth.release()?;
+                    continue;
+                }
+                Decision::Pair => {}
+            }
+            let Some(ir) = &mut self.ir else { return Ok(true) };
+            if !ir.take()? {
+                return Ok(false);
+            }
+            match sync::decide(ir.hw_ms, self.depth.hw_ms, fps) {
+                Decision::DropColor => ir.release()?,
                 Decision::DropDepth => self.depth.release()?,
                 Decision::Pair => return Ok(true),
             }
@@ -539,10 +578,27 @@ impl Camera {
         {
             let cdata = self.color.s.data(&cb);
             let ddata = self.depth.s.data(&db);
-            if cdata.len() < self.color.stride * (h - 1) + w * 2 || ddata.len() < self.depth.stride * (dh - 1) + dw * 2 {
+            let ir_short = self.ir.as_ref().is_some_and(|s| s.s.data(&s.held.unwrap()).len() < s.stride * (dh - 1) + dw * 2);
+            if cdata.len() < self.color.stride * (h - 1) + w * 2 || ddata.len() < self.depth.stride * (dh - 1) + dw * 2 || ir_short {
                 self.color.release()?;
                 self.depth.release()?;
+                if let Some(s) = &mut self.ir {
+                    s.release()?;
+                }
                 return self.next_into(out);
+            }
+            if let Some(s) = &self.ir {
+                // Y8I: 화소마다 [왼쪽, 오른쪽]
+                let idata = s.s.data(&s.held.unwrap());
+                fit(&mut out.ir_left, dw * dh);
+                fit(&mut out.ir_right, dw * dh);
+                for r in 0..dh {
+                    let row = &idata[r * s.stride..r * s.stride + dw * 2];
+                    for (x, p) in row.chunks_exact(2).enumerate() {
+                        out.ir_left[r * dw + x] = p[0];
+                        out.ir_right[r * dw + x] = p[1];
+                    }
+                }
             }
             // 화소를 모두 덮어쓰므로 길이만 맞춤(새로 잡을 때는 0 페이지 할당: 따로 0 을 쓰지 않음)
             fit(&mut out.rgb, w * h * 3);
@@ -592,6 +648,9 @@ impl Camera {
         };
         self.color.release()?;
         self.depth.release()?;
+        if let Some(s) = &mut self.ir {
+            s.release()?;
+        }
         let off = *self.t_offset_ms.get_or_insert_with(|| sys_ms() - info.color_hw_ms);
         Ok(FrameInfo { t_ms: info.color_hw_ms + off, ..info })
     }

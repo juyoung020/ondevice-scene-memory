@@ -106,8 +106,8 @@ fn args(v: &common::cli::Argv) -> Args {
         scene_vox: get("--scene-vox").map_or(0.01, |s| s.parse().unwrap()),
         max_depth: get("--max-depth").map_or(4.0, |s| s.parse().unwrap()),
         scene_step: get("--scene-step").map_or(2, |s| s.parse().unwrap()),
-        pts_depth: get("--pts-depth").map_or(3.0, |s| s.parse().unwrap()),
-        pts_obs: get("--pts-obs").map_or(3, |s| s.parse().unwrap()),
+        pts_depth: get("--pts-depth").map_or(4.0, |s| s.parse().unwrap()),
+        pts_obs: get("--pts-obs").map_or(1, |s| s.parse().unwrap()),
         // --slam "<slam_bridge 인자>": 위치 프로그램을 이 프로세스 안에서 돌려 장면을 메모리로 받음(스트림 입력과 같은 경로, 이름만 "--slam")
         stream: get("--stream").or_else(|| get("--slam").map(|_| "--slam".into())),
         slam: v.group("--slam").map(|g| {
@@ -557,6 +557,16 @@ impl LoopIo {
         self.toks = toks;
         self.turn_t0 = Some(Instant::now());
     }
+    /// 잠들지 않는 바퀴(받은 장면이 있어 바로 다음 바퀴로)에서도 뷰어 연결 · 요청은 받는다: 기다리지 않고 한 번 봄
+    fn serve_now(&mut self) {
+        let Some(sv) = self.server.as_mut() else { return };
+        let mut toks = std::mem::take(&mut self.toks);
+        self.poll.wait(&mut toks, Some(std::time::Duration::ZERO));
+        for &k in &toks {
+            sv.event(k, &mut self.poll);
+        }
+        self.toks = toks;
+    }
     /// 뷰어 저장 버튼 · --save-every: 메모리 기억 폴더를 디스크에(기록 줄에서, 루프는 기다리지 않음)
     fn misc(&mut self) {
         if let Some(sv) = self.server.as_mut() {
@@ -793,6 +803,7 @@ impl Driver {
                 break;
             }
             if progress {
+                io.serve_now();
                 continue;
             }
             let timeout = self.held.as_ref().map(|sf| std::time::Duration::from_secs_f64(((sf.t - self.pace_t0) / self.rate - self.pace0.elapsed().as_secs_f64()).max(0.0)))

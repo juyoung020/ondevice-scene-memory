@@ -293,6 +293,11 @@ pub fn write_png_rgb(path: &str, rgb: &[u8], w: i32, h: i32) -> bool {
     save_png(path, common::img::png_rgb(w as u32, h as u32, rgb))
 }
 
+/// 회색 8 비트 PNG
+pub fn write_png_gray(path: &str, g: &[u8], w: i32, h: i32) -> bool {
+    save_png(path, common::img::png_gray(w as u32, h as u32, g))
+}
+
 /// PNG 를 16 비트 회색으로 읽음(다른 형식이면 회색 16 비트로 바꿈)
 pub fn read_png16(path: &str) -> Option<(Vec<u16>, i32, i32)> {
     let bytes = std::fs::read(path).ok()?;

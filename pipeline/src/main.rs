@@ -1413,7 +1413,9 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
                 est_traj.push((t, p, r));
                 // 바닥으로 기울기 고침: 세 장마다 바닥 면 법선을 재 고침 회전을 반씩 다가가게(잡음은 누름), 자세에 곱함
                 r = mm(&tilt_c, &r);
-                if nkf % 3 == 0 && !no_map {
+                // IMU 로 중력에 맞춘 지도(GRAVITY)는 위치 쪽이 중력을 지키므로 바닥으로 고치지 않음: 비스듬한 면을 바닥으로 잡으면 고칠수록 더 숙여져
+                // 가만히 있어도 지도가 계단처럼 기울며 겹겹이 쌓였다(위치 쪽 지도 기울기 0.0° 인데 받은 쪽 −30°)
+                if !gravity && nkf % 3 == 0 && !no_map {
                     if let Some(n) = up_normal(&depth, w, h, seq.k, &r, true) {
                         let n = { let l = norm(&n).max(1e-9); n.map(|x| x / l) };
                         if n[2] > 25f64.to_radians().cos() {

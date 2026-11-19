@@ -863,7 +863,43 @@ pub struct Server {
     last_other: u64,
     quiet: Instant,
     search: (std::sync::mpsc::Sender<(u64, Vec<u8>)>, std::sync::mpsc::Receiver<(u64, Vec<u8>)>),
-    waker: Arc<common::rt::Waker>,
+    /// 검색 요청 → 검색 전용 스레드
+    jobs: std::sync::mpsc::Sender<SearchJob>,
+}
+
+/// 검색 하나: 연결, 요청 문맥(gzip · keep), 질의
+struct SearchJob {
+    id: u64,
+    ctx: ReqCtx,
+    q: HashMap<String, String>,
+}
+
+/// 검색 전용 스레드: 글 인코더(rayon)는 이 스레드가 가진 작은 풀(2 일꾼)에서만 돌고, 검색은 한 번에 하나씩.
+/// 전역 풀(위치 추적 · 물체 기억 · 다시 쌓기)과 나누지 않아 그쪽 긴 일에 막히지 않고, 그쪽도 검색에 막히지 않는다.
+/// 시작할 때 인코더를 미리 올려 첫 검색이 모델 읽기를 기다리지 않게 한다
+fn search_thread(st: Arc<State>, out: std::sync::mpsc::Sender<(u64, Vec<u8>)>, w: Arc<common::rt::Waker>) -> std::sync::mpsc::Sender<SearchJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<SearchJob>();
+    let _ = std::thread::Builder::new().name("search".into()).spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).thread_name(|i| format!("search-{i}")).build().expect("search pool");
+        #[cfg(feature = "search")]
+        pool.install(|| {
+            if let Some(e) = st.text_enc.get_or_init(|| st.text_src.as_ref().and_then(|(m, vocab)| search::load_encoder(m, vocab.as_deref()))) {
+                let _ = e.encode("warm up");
+            }
+        });
+        while let Ok(j) = rx.recv() {
+            let out_b = pool.install(|| {
+                REQ.with(|r| *r.borrow_mut() = ReqCtx { gzip: j.ctx.gzip, keep: j.ctx.keep, ..Default::default() });
+                let mut out = Vec::new();
+                let line = format!("GET /api/search-now?{} HTTP/1.1", j.q.iter().map(|(k, v)| format!("{k}={}", enc_uri(v))).collect::<Vec<_>>().join("&"));
+                handle_one(&mut out, &st, &line);
+                out
+            });
+            let _ = out.send((j.id, out_b));
+            w.wake();
+        }
+    });
+    tx
 }
 
 impl Server {
@@ -916,7 +952,9 @@ impl Server {
         eprintln!("sgview: http://localhost:{}  (memory dir {})", port, st.dir.display());
         let w2 = waker.clone();
         memfs::on_change(move || w2.wake());
-        Some(Server { st, l, conns: HashMap::new(), next: 0, seen: u64::MAX, last_other: u64::MAX, quiet: Instant::now(), search: std::sync::mpsc::channel(), waker })
+        let search: (std::sync::mpsc::Sender<(u64, Vec<u8>)>, std::sync::mpsc::Receiver<(u64, Vec<u8>)>) = std::sync::mpsc::channel();
+        let jobs = search_thread(st.clone(), search.0.clone(), waker);
+        Some(Server { st, l, conns: HashMap::new(), next: 0, seen: u64::MAX, last_other: u64::MAX, quiet: Instant::now(), search, jobs })
     }
 
     /// 듣는 소켓을 루프 epoll 에 건다
@@ -1057,17 +1095,9 @@ impl Server {
                 break;
             }
             if let Some(q) = ctx.search {
-                // 글 인코더(보드 약 75 ms)는 작업 풀에서: 끝나면 답을 걸고 루프를 깨움
+                // 글 인코더(보드 약 75 ms)는 검색 전용 스레드에서(search_thread): 끝나면 답을 걸고 루프를 깨움
                 c.busy = true;
-                let (st, tx, w) = (self.st.clone(), self.search.0.clone(), self.waker.clone());
-                rayon::spawn(move || {
-                    REQ.with(|r| *r.borrow_mut() = ReqCtx { gzip: ctx.gzip, keep: ctx.keep, ..Default::default() });
-                    let mut out = Vec::new();
-                    let line = format!("GET /api/search-now?{} HTTP/1.1", q.iter().map(|(k, v)| format!("{k}={}", enc_uri(v))).collect::<Vec<_>>().join("&"));
-                    handle_one(&mut out, &st, &line);
-                    let _ = tx.send((id, out));
-                    w.wake();
-                });
+                let _ = self.jobs.send(SearchJob { id, ctx: ReqCtx { gzip: ctx.gzip, keep: ctx.keep, ..Default::default() }, q });
                 break;
             }
             c.out.extend_from_slice(&out);
@@ -1133,7 +1163,7 @@ impl Server {
         let folder = !memfs::enabled(); // 따로 띄운 뷰어: 폴더를 볼 때마다
         if now != self.seen || keepalive || folder {
             self.seen = now;
-            self.push_streams(keepalive);
+            self.push_streams(keepalive, false);
         }
         let idle: Vec<u64> = self.conns.iter().filter(|(_, c)| !c.stream && !c.busy && c.last.elapsed() > Duration::from_secs(5)).map(|(k, _)| *k).collect();
         for id in idle {
@@ -1148,16 +1178,29 @@ impl Server {
         for id in ids {
             self.flush(id, poll);
         }
+        // 청크 점이 남은 페이지: 보낼 바이트가 반 넘게 빠졌으면 다음 몫을 짬(지도가 그대로여도)
+        let more = self.st.streams.lock().unwrap().iter().any(|s| {
+            s.bin.as_ref().is_some_and(|b| b.pts_pending) && self.conns.get(&s.id).is_some_and(|c| c.out.len() - c.off < delta::PTS_BUDGET / 2)
+        });
+        if more {
+            self.push_streams(false, true);
+            let ids: Vec<u64> = self.conns.iter().filter(|(_, c)| c.out.len() > c.off).map(|(k, _)| *k).collect();
+            for id in ids {
+                self.flush(id, poll);
+            }
+        }
     }
 
     /// 열린 스트림 페이지마다 새 것만: pose.json 만 바뀌었으면 위치만, 아니면 view 판 · 지도 · 점 목록까지
-    fn push_streams(&mut self, keepalive: bool) {
+    fn push_streams(&mut self, keepalive: bool, more_pts: bool) {
         let st = self.st.clone();
         let pp = st.dir.join("pose.json");
         let mut cl = st.streams.lock().unwrap();
         if cl.is_empty() {
             return;
         }
+        // 페이지마다 아직 못 보낸 바이트: 청크 점은 그만큼 줄여 담음(느린 링크에서 쌓이지 않게)
+        let backlog: HashMap<u64, usize> = self.conns.iter().map(|(k, c)| (*k, c.out.len() - c.off)).collect();
         let conns = &mut self.conns;
         let mut send = |id: u64, b: &[u8]| {
             if let Some(c) = conns.get_mut(&id) {
@@ -1166,7 +1209,7 @@ impl Server {
         };
         // pose.json 만 바뀜(장면 사이 위치 200 Hz): 위치만 보내고 view · 지도 · 점 목록은 보지 않음
         let oth = memfs::other();
-        if memfs::enabled() && oth == self.last_other && !keepalive {
+        if memfs::enabled() && oth == self.last_other && !keepalive && !more_pts {
             if let Some((v, b)) = memfs::get(&pp) {
                 let b = b.trim_ascii();
                 if b.starts_with(b"{") && b.ends_with(b"}") {
@@ -1222,7 +1265,8 @@ impl Server {
         for c in cl.iter_mut() {
             if let Some(b) = c.bin.as_mut() {
                 let (view, map, oct, pose) = now.as_ref().unwrap();
-                let n = delta::Now { view: view.clone(), map: map.clone(), map_hist: &hist, oct: oct.clone(), pose: pose.clone() };
+                let budget = delta::PTS_BUDGET.saturating_sub(backlog.get(&c.id).copied().unwrap_or(0));
+                let n = delta::Now { view: view.clone(), map: map.clone(), map_hist: &hist, oct: oct.clone(), pose: pose.clone(), root: &st.dir, pts_budget: budget };
                 if let Some(f) = delta::frame(b, &n).or_else(|| keepalive.then(|| vec![0u8; 4])) {
                     any = true;
                     send(c.id, &f);

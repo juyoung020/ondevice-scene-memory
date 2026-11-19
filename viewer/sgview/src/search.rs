@@ -268,15 +268,9 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
     let ql = q.trim().to_lowercase();
     let min = min.unwrap_or_else(|| default_min(&ql));
     let objs = view["objects"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    // text encodings first, with no lock held: the encoder runs rayon, and a lock held across it let a pool worker that stole another
+    // search block on that same lock (all three workers deadlocked on the board, 26-11-19)
     let tq = if ql.is_empty() { None } else { enc(&ql) };
-    let mut table = TABLE.lock().unwrap();
-    let table = table.get_or_insert_with(|| crate::objtable::ObjTable::new(DIM));
-    let paths: Vec<Option<std::path::PathBuf>> = objs.iter().map(|o| o["emb"].as_str().map(|p| root.join(p))).collect();
-    if tq.is_some() {
-        let items: Vec<(std::path::PathBuf, Arc<Vec<u8>>)> = paths.iter().flatten().filter_map(|p| crate::memfs::read(p).map(|b| (p.clone(), b))).collect();
-        table.sync_bytes(&items);
-    }
-    let cosines = tq.as_ref().map(|t| table.scores(t)).unwrap_or_default();
     // the query read as class names (text × text): "마우스" → mouse even when the picture alone is too weak (Korean queries score low on pictures)
     let p_names: HashMap<String, f32> = match &tq {
         Some(t) => {
@@ -288,15 +282,27 @@ pub fn search(root: &Path, view: &serde_json::Value, q: &str, enc: Encode, k: us
         }
         None => HashMap::new(),
     };
+    let paths: Vec<Option<std::path::PathBuf>> = objs.iter().map(|o| o["emb"].as_str().map(|p| root.join(p))).collect();
+    // picture cosine per object: the table lock covers only the sync and one dot product per object (no rayon under the lock)
+    let cos_of: Vec<Option<f32>> = match &tq {
+        Some(t) => {
+            let items: Vec<(std::path::PathBuf, Arc<Vec<u8>>)> = paths.iter().flatten().filter_map(|p| crate::memfs::read(p).map(|b| (p.clone(), b))).collect();
+            let mut table = TABLE.lock().unwrap();
+            let table = table.get_or_insert_with(|| crate::objtable::ObjTable::new(DIM));
+            table.sync_bytes(&items);
+            paths.iter().map(|p| p.as_ref().and_then(|p| table.row(p)).map(|r| crate::objtable::dot(t, table.vector(r)))).collect()
+        }
+        None => vec![None; paths.len()],
+    };
     // (letter match, score, cosine, reply row)
     let mut hits: Vec<(bool, f32, f32, serde_json::Value)> = vec![];
-    for (o, p) in objs.iter().zip(&paths) {
+    for (o, c) in objs.iter().zip(&cos_of) {
         if ql.is_empty() {
             break;
         }
         let nl = o["name"].as_str().unwrap_or("").to_lowercase();
         let exact = !nl.is_empty() && (nl.contains(&ql) || ql.contains(nl.as_str()));
-        let c = p.as_ref().and_then(|p| table.row(p)).filter(|_| !cosines.is_empty()).map(|r| cosines[r]);
+        let c = *c;
         let pl = c.map_or(0.0, prob);
         let pn = if exact { 1.0 } else { p_names.get(&nl).copied().unwrap_or(0.0) };
         if exact || pn >= NAME_MIN_P || pl >= min {

@@ -10,7 +10,10 @@
 //!   6 OCT   f64 run, u8 reset, u32 n + n × (u8 l, i32 x, y, z, u32 점 수, u32 판)(점이 늘어난 노드만; reset 이면 전부)
 //!   7 POSE  pose.json 바이트
 //!   8 SUB   f64 run, u8 reset, u32 n × (u32 id, u32 점 판, u32 점 수, f32 × 12 자세(r 행 차례 + p)), u32 m × u32 없어진 id
-//!           (청크 점 지도 `--pts-map chunk`: 자세가 바뀌었거나 점이 는 청크만 — 루프 클로저는 자세만 오고 점 파일은 그대로)
+//!           (청크 점 지도: 자세가 바뀌었거나 점이 는 청크만 — 루프 클로저는 자세만 오고 점은 그대로)
+//!   9 PTS   u32 k × (u32 id, u32 점 판, u32 길이 + 청크 점 파일 바이트(u32 n + n × i16 xyz + n × u8 rgb)): 칸 8 로 알린 청크 중
+//!           이 페이지가 아직 그 판의 점을 못 받은 것, 새 청크부터. 한 덩어리에 PTS_BUDGET 바이트까지, 페이지 쪽 보낼 바이트가 쌓여 있으면
+//!           줄여서(느린 링크에서 밀린 바이트가 끝없이 늘지 않게) — 남은 것은 다음 덩어리로. 점은 페이지마다 파일 요청 없이 이 연결로만 간다
 //! 빈 덩어리(길이 0)는 살아 있음 알림.
 use crate::live::View;
 use serde_json::Value;
@@ -27,7 +30,7 @@ pub struct Parts {
     objs: Vec<(u32, u64, Vec<u8>)>,
     wall: f64,
     oct: Option<(u64, String, i64)>, // (run, octree.json 경로, 판)
-    sub: Option<(u64, Vec<SubChunk>)>, // 청크 점 지도(판, 청크 목록): 머리에서는 뺀다
+    sub: Option<(u64, String, Vec<SubChunk>)>, // 청크 점 지도(판, 점 파일 폴더, 청크 목록): 머리에서는 뺀다
 }
 
 /// 청크 하나: id, 점 판, 점 수, 자세(r 행 차례 9 + p 3)
@@ -58,8 +61,15 @@ pub struct Client {
     oct: HashMap<(i64, i64, i64, i64), i64>,
     sub_run: Option<u64>,
     sub: HashMap<u32, SubChunk>,
+    /// 청크마다 보낸 점 판
+    sub_pts: HashMap<u32, u32>,
+    /// 아직 못 보낸 청크 점이 있음(보낼 바이트가 줄면 다시 짬)
+    pub pts_pending: bool,
     pose_v: String,
 }
+
+/// 한 덩어리에 담는 청크 점 바이트 상한(Tailscale 중계 약 1 MB/s 에서 0.25 초 몫)
+pub const PTS_BUDGET: usize = 256 << 10;
 
 fn fnv(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -110,7 +120,7 @@ pub fn parts(cache: &Mutex<Option<Arc<Parts>>>, v: &View) -> Option<Arc<Parts>> 
                     }
                     Some(SubChunk { id: g(0)? as u32, ver: g(1)? as u32, n: g(2)? as u32, pose })
                 }).collect();
-                sub = Some((s["run"].as_u64().unwrap_or(0), list));
+                sub = Some((s["run"].as_u64().unwrap_or(0), s["dir"].as_str().unwrap_or("").to_string(), list));
                 let mut y = x.clone();
                 if let Some(o) = y["submap"].as_object_mut() {
                     o.remove("list");
@@ -193,6 +203,10 @@ pub struct Now<'a> {
     pub map_hist: &'a [(String, Arc<crate::Pgm>)],
     pub oct: Option<Arc<OctIdx>>,
     pub pose: Option<(String, Arc<Vec<u8>>)>,
+    /// 기억 폴더(청크 점 파일을 읽을 곳)
+    pub root: &'a std::path::Path,
+    /// 이번 덩어리에 담을 청크 점 바이트(0 = 담지 않음)
+    pub pts_budget: usize,
 }
 
 /// 위치만 담은 덩어리(바뀌었을 때): 판 · 지도 · 노드를 짜기 전에 먼저 보낸다(무거운 판이 위치를 늦추지 않게)
@@ -280,10 +294,11 @@ pub fn frame(c: &mut Client, now: &Now) -> Option<Vec<u8>> {
                 w.close(at);
                 c.traj = (id, n);
             }
-            if let Some((run, list)) = &p.sub {
+            if let Some((run, _, list)) = &p.sub {
                 let reset = c.sub_run != Some(*run);
                 if reset {
                     c.sub.clear();
+                    c.sub_pts.clear();
                 }
                 let ch: Vec<&SubChunk> = list.iter().filter(|s| c.sub.get(&s.id) != Some(s)).collect();
                 let gone: Vec<u32> = c.sub.keys().filter(|id| !list.iter().any(|s| s.id == **id)).copied().collect();
@@ -304,6 +319,7 @@ pub fn frame(c: &mut Client, now: &Now) -> Option<Vec<u8>> {
                     for id in &gone {
                         w.u32(*id);
                         c.sub.remove(id);
+                        c.sub_pts.remove(id);
                     }
                     w.close(at);
                     for s in ch {
@@ -364,6 +380,46 @@ pub fn frame(c: &mut Client, now: &Now) -> Option<Vec<u8>> {
             c.oct_run = Some(o.run);
         }
     }
+    // 청크 점: 이 페이지가 아는(칸 8) 청크 중 그 판의 점을 아직 못 받은 것, 새 청크(큰 id)부터 예산까지
+    c.pts_pending = false;
+    if let Some((_, p)) = &now.view {
+        if let Some((_, dir, list)) = &p.sub {
+            let mut want: Vec<&SubChunk> = list.iter().filter(|s| s.n > 0 && c.sub.contains_key(&s.id) && c.sub_pts.get(&s.id) != Some(&s.ver)).collect();
+            want.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+            if !want.is_empty() {
+                let mut sent = 0usize;
+                let mut at = None;
+                let mut k = 0u32;
+                for s in want {
+                    if sent >= now.pts_budget {
+                        c.pts_pending = true;
+                        break;
+                    }
+                    let Some(b) = crate::read_file(&now.root.join(dir).join(format!("c{}.bin", s.id))) else { continue };
+                    let n = b.get(..4).map_or(0, |h| u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as usize);
+                    if b.len() != 4 + 9 * n {
+                        continue; // 쓰는 중(다음 판에서)
+                    }
+                    if at.is_none() {
+                        let a = w.open(9);
+                        w.u32(0);
+                        at = Some(a);
+                    }
+                    w.u32(s.id);
+                    w.u32(s.ver);
+                    w.u32(b.len() as u32);
+                    w.0.extend_from_slice(&b);
+                    c.sub_pts.insert(s.id, s.ver);
+                    sent += b.len();
+                    k += 1;
+                }
+                if let Some(a) = at {
+                    w.0[a..a + 4].copy_from_slice(&k.to_le_bytes());
+                    w.close(a);
+                }
+            }
+        }
+    }
     if let Some((v, b)) = &now.pose {
         if *v != c.pose_v {
             let at = w.open(7);
@@ -393,15 +449,15 @@ mod tests {
         let mut c = Client::default();
         let v1 = mk(1, 0);
         let p1 = parts(&cache, &v1).unwrap();
-        let f1 = frame(&mut c, &Now { view: Some((v1.clone(), p1)), map: None, map_hist: &[], oct: None, pose: None }).unwrap();
+        let f1 = frame(&mut c, &Now { view: Some((v1.clone(), p1)), map: None, map_hist: &[], oct: None, pose: None, root: std::path::Path::new("."), pts_budget: 0 }).unwrap();
         let v2 = mk(2, 5);
         let p2 = parts(&cache, &v2).unwrap();
-        let f2 = frame(&mut c, &Now { view: Some((v2.clone(), p2.clone())), map: None, map_hist: &[], oct: None, pose: None }).unwrap();
+        let f2 = frame(&mut c, &Now { view: Some((v2.clone(), p2.clone())), map: None, map_hist: &[], oct: None, pose: None, root: std::path::Path::new("."), pts_budget: 0 }).unwrap();
         assert!(f2.len() < f1.len());
         // 물체 칸: 바뀐 것 하나만
         let s = String::from_utf8_lossy(&f2);
         assert!(s.contains("\"a\":5") && !s.contains("\"a\":0"));
-        assert!(frame(&mut c, &Now { view: Some((v2, p2)), map: None, map_hist: &[], oct: None, pose: None }).is_none());
+        assert!(frame(&mut c, &Now { view: Some((v2, p2)), map: None, map_hist: &[], oct: None, pose: None, root: std::path::Path::new("."), pts_budget: 0 }).is_none());
     }
 
     #[test]
@@ -416,12 +472,12 @@ mod tests {
         let mut c = Client::default();
         let v1 = mk(1, 0.0);
         let p1 = parts(&cache, &v1).unwrap();
-        frame(&mut c, &Now { view: Some((v1, p1)), map: None, map_hist: &[], oct: None, pose: None }).unwrap();
+        frame(&mut c, &Now { view: Some((v1, p1)), map: None, map_hist: &[], oct: None, pose: None, root: std::path::Path::new("."), pts_budget: 0 }).unwrap();
         assert_eq!(c.sub.len(), 2);
         // 청크 1 만 자세가 바뀜: 칸 8 에 하나, 머리(scene_points)는 그대로라 칸 2 없음
         let v2 = mk(2, 0.5);
         let p2 = parts(&cache, &v2).unwrap();
-        let f = frame(&mut c, &Now { view: Some((v2, p2)), map: None, map_hist: &[], oct: None, pose: None }).unwrap();
+        let f = frame(&mut c, &Now { view: Some((v2, p2)), map: None, map_hist: &[], oct: None, pose: None, root: std::path::Path::new("."), pts_budget: 0 }).unwrap();
         let mut o = 4;
         let mut tags = vec![];
         while o + 5 <= f.len() {

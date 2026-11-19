@@ -56,14 +56,15 @@ fn main() {
     }
     let c = &cam.calib;
     let cj = format!(
-        "{{\n  \"driver\": \"rsdriver\",\n  \"serial\": {},\n  \"firmware\": {},\n  \"depth_intrinsics\": {},\n  \"color_intrinsics\": {},\n  \"depth_to_color\": {},\n  \"depth_unit_m\": {},\n  \"depth_png_per_m\": {}\n}}\n",
+        "{{\n  \"driver\": \"rsdriver\",\n  \"serial\": {},\n  \"firmware\": {},\n  \"depth_intrinsics\": {},\n  \"color_intrinsics\": {},\n  \"depth_to_color\": {},\n  \"depth_unit_m\": {},\n  \"depth_png_per_m\": {},\n  \"stereo_baseline_m\": {}\n}}\n",
         jstr(&c.gvd.serial),
         jstr(&c.gvd.firmware),
         intrin_json(&c.depth, "Brown Conrady"),
         intrin_json(&c.color, "Inverse Brown Conrady"),
         extrin_json(&c.depth_to_color),
         jnum(c.depth_scale as f64),
-        jnum(cam.depth_per_m() as f64)
+        jnum(cam.depth_per_m() as f64),
+        jnum(c.baseline_m as f64)
     );
     let _ = std::fs::write(join(&out, "calib.json"), cj);
     let mk = |p: &str| std::fs::File::create(join(&out, p)).unwrap();

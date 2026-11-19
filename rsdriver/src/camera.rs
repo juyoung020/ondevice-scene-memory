@@ -137,6 +137,8 @@ pub struct Calib {
     pub depth_to_color: Extrinsics,
     /// 깊이 단위(m)
     pub depth_scale: f32,
+    /// 적외선 좌우 기준선(m). 적외선 왼쪽 = 깊이 좌표계, 내부값 = depth
+    pub baseline_m: f32,
 }
 
 pub fn parse_calib(raw: &RawCalib, dw: u32, dh: u32, cw: u32, ch: u32) -> Result<Calib, String> {
@@ -147,6 +149,7 @@ pub fn parse_calib(raw: &RawCalib, dw: u32, dh: u32, cw: u32, ch: u32) -> Result
         color: calib::color_intrinsics(&raw.rgb, cw, ch)?,
         depth_to_color: calib::depth_to_color(&raw.rgb)?,
         depth_scale,
+        baseline_m: calib::stereo_baseline_m(&raw.coeff)?,
     })
 }
 

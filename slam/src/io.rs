@@ -1,10 +1,7 @@
-//! 장면 입력: TUM 폴더 재생, RealSense D435(`rsdriver` 기능), 읽기 스레드(PrefetchSource).
-//! 원본: RTAB-Map 연결 프로그램의 frame_source · tum_source · prefetch_source · realsense_source · depth_align(C++).
-//! 회색조·깊이 mm 바꾸기는 OpenCV 4.10 cvtColor(COLOR_BGR2GRAY) · Mat::convertTo 와 비트까지 같게 한다.
-use crate::{Camera, Features, Frame, Pose};
-use nalgebra::{Matrix3, Rotation3, Translation3, UnitQuaternion};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+//! 장면 입력: 녹화 재생(TUM 꼴 폴더, rsd_rec 녹화), RealSense D435(`rsdriver` 기능).
+//! 깊이 mm 바꾸기는 OpenCV 4.10 Mat::convertTo 와 비트까지 같게 한다.
+use crate::{Camera, Frame, Ir, StereoCalib};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "rsdriver")]
@@ -31,22 +28,10 @@ pub trait FrameSource: Send {
     fn caller_paces(&mut self) -> Option<(f64, Arc<std::sync::OnceLock<(f64, Instant)>>)> {
         None
     }
-}
-
-/// 카메라 광학 축(x 오른쪽, y 아래, z 앞) → 몸체 축(x 앞, y 왼쪽, z 위). RTAB-Map CameraModel::opticalRotation
-pub fn optical_rotation() -> Pose {
-    let m = Matrix3::new(0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0);
-    Pose::from_parts(Translation3::identity(), UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(m)))
-}
-
-/// BGR(또는 RGB) → 회색조. OpenCV cvtColor COLOR_BGR2GRAY 의 8 비트 고정소수점 계산 그대로:
-/// (B·3735 + G·19235 + R·9798 + 2^14) >> 15 (4.10 의 cvtColor 가 쓰는 15 비트 계수)
-pub fn to_gray(color: &[u8], is_rgb: bool) -> Vec<u8> {
-    let (cb, cr) = if is_rgb { (2, 0) } else { (0, 2) };
-    color
-        .chunks_exact(3)
-        .map(|p| ((p[cb] as u32 * 3735 + p[1] as u32 * 19235 + p[cr] as u32 * 9798 + (1 << 14)) >> 15) as u8)
-        .collect()
+    /// 적외선 좌우 보정값(장면에 적외선이 실려 올 때)
+    fn stereo(&self) -> Option<StereoCalib> {
+        None
+    }
 }
 
 /// 깊이 단위가 mm(1000/m)라 원본 값이 곧 mm 인가
@@ -64,7 +49,7 @@ pub fn split_depth(raw: Vec<u16>, depth_per_m: f32) -> (crate::DepthBuf, crate::
     }
 }
 
-/// 깊이 값 → mm(u16). 원본 bridge main.cpp: 1000/m 이 아니면 Mat 를 (값/m ÷ 1000) 으로 나눔.
+/// 깊이 값 → mm(u16). 1000/m 이 아니면 (값/m ÷ 1000) 으로 나눔.
 /// OpenCV convertTo(16U→16U, 배율) 는 float 로 값×배율을 구해 짝수 쪽 반올림 후 0..65535 로 자름
 pub fn depth_to_mm(raw: &[u16], depth_per_m: f32) -> Vec<u16> {
     if is_mm(depth_per_m) {
@@ -85,14 +70,43 @@ fn read_list(path: &str) -> Result<Vec<(f64, String)>, String> {
     common::tum::read_list(path).map_err(|_| format!("읽을 수 없음: {path}"))
 }
 
-/// TUM RGB-D 폴더 재생(rgb.txt · depth.txt, 깊이 5000/m): 카메라 없이 시험할 때
+/// calib.json 의 "key": 다음 숫자(from 바이트 뒤 첫 번째)
+fn json_num(j: &str, key: &str, from: usize) -> Option<f64> {
+    let i = j[from..].find(&format!("\"{key}\":"))? + from + key.len() + 3;
+    j[i..].trim_start().split(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace()).next()?.parse().ok()
+}
+
+/// calib.json 의 "key": [ ... ] 숫자 배열
+fn json_arr(j: &str, key: &str) -> Option<Vec<f64>> {
+    let i = j.find(&format!("\"{key}\":"))?;
+    let a = j[i..].find('[')? + i + 1;
+    let b = j[a..].find(']')? + a;
+    j[a..b].split(',').map(|x| x.trim().parse().ok()).collect()
+}
+
+/// rsd_rec 녹화의 적외선 보정값(calib.json: depth_intrinsics · depth_to_color · stereo_baseline_m)
+fn stereo_from_json(j: &str) -> Option<StereoCalib> {
+    let d0 = j.find("\"depth_intrinsics\"")?;
+    let k = [json_num(j, "fx", d0)?, json_num(j, "fy", d0)?, json_num(j, "ppx", d0)?, json_num(j, "ppy", d0)?];
+    let (w, h) = (json_num(j, "width", d0)? as u32, json_num(j, "height", d0)? as u32);
+    let r = json_arr(j, "rotation_col_major").filter(|v| v.len() == 9)?;
+    let t = json_arr(j, "translation_m").filter(|v| v.len() == 3)?;
+    // 열 우선 → 3×4 행 우선
+    let color_from_ir = [r[0], r[3], r[6], t[0], r[1], r[4], r[7], t[1], r[2], r[5], r[8], t[2]];
+    Some(StereoCalib { k, w, h, baseline: json_num(j, "stereo_baseline_m", 0)?, color_from_ir })
+}
+
+/// 녹화 폴더 재생(rgb.txt · depth.txt, 깊이 TUM 5000/m · rsd_rec 1000/m).
+/// rsd_rec --ir 녹화(ir_times.txt + mav0/cam0 · cam1)면 장면마다 가장 가까운 시각의 적외선 좌우도 싣는다
 pub struct TumSource {
     dir: String,
     rate: f64,
     rgb: Vec<(f64, String)>,
     depth: Vec<(f64, String)>,
+    /// 적외선 시각(ns 글자, 초)
+    ir: Vec<(String, f64)>,
+    stereo: Option<StereoCalib>,
     i: usize,
-    skipped: Arc<AtomicUsize>,
     k: [f64; 4],
     /// 깊이 PNG 값/m: TUM 5000, rsd_rec 녹화(calib.json 의 depth_png_per_m) 1000
     depth_per_m: f32,
@@ -102,61 +116,18 @@ pub struct TumSource {
     clock: Arc<std::sync::OnceLock<(f64, Instant)>>,
     /// 찍은 속도 재생을 부르는 쪽이 맞춤(밀린 장면 버리기만 여기서, 잠들지 않음)
     no_sleep: bool,
+    /// 밀려 건너뛴 장면 수
+    pub skipped: usize,
     id: i64,
-    /// 끊김 시험: 이 구간(장면 시각)의 장면은 내지 않음
-    pub drop: Vec<(f64, f64)>,
-    pub n_drop: Arc<AtomicUsize>,
-    /// 흐림 시험: 노출(초) 동안 각속도만큼 번진 영상(각속도 = 장면 시각 → 카메라 광학 축 rad/s)
-    pub blur: Option<(f64, Box<dyn Fn(f64) -> Option<[f32; 4]> + Send>)>,
-    pub n_blur: Arc<AtomicUsize>,
-}
-
-/// 흐림 시험: 화면 중심 점이 노출 동안 움직이는 선(각속도 ω(광학 축) × 초점 거리 × 노출) 위 화소를 고르게 평균(RGB)
-pub fn motion_blur(rgb: &[u8], w: usize, h: usize, fx: f64, fy: f64, w_cam: [f32; 4], exp: f64) -> Option<Vec<u8>> {
-    // 광학 축 회전: y 축 회전 → 화면 가로, x 축 회전 → 세로
-    let (vx, vy) = (-(w_cam[1] as f64) * fx * exp, (w_cam[0] as f64) * fy * exp);
-    let len = (vx * vx + vy * vy).sqrt();
-    if len < 1.0 {
-        return None;
-    }
-    let n = len.ceil() as usize + 1;
-    let taps: Vec<(isize, isize)> = (0..n).map(|k| {
-        let s = k as f64 / (n - 1) as f64 - 0.5;
-        ((s * vx).round() as isize, (s * vy).round() as isize)
-    }).collect();
-    let mut out = vec![0u8; rgb.len()];
-    let (wi, hi) = (w as isize, h as isize);
-    out.chunks_exact_mut(w * 3).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let mut acc = [0u32; 3];
-            for &(dx, dy) in &taps {
-                let xx = (x as isize + dx).clamp(0, wi - 1) as usize;
-                let yy = (y as isize + dy).clamp(0, hi - 1) as usize;
-                let p = &rgb[(yy * w + xx) * 3..];
-                acc[0] += p[0] as u32;
-                acc[1] += p[1] as u32;
-                acc[2] += p[2] as u32;
-            }
-            for c in 0..3 {
-                row[x * 3 + c] = ((acc[c] + n as u32 / 2) / n as u32) as u8;
-            }
-        }
-    });
-    Some(out)
 }
 
 impl TumSource {
     /// rate: 0 = 최대 속도(모든 장면), 1 = 찍은 시각 간격대로(밀리면 건너뜀), 2 = 두 배 빠르게 ...
     pub fn new(dir: &str, rate: f64) -> Result<TumSource, String> {
-        TumSource::with_stride(dir, rate, 1)
-    }
-    /// stride N: N 장에 한 장만(빠른 움직임 흉내: 2 = 2 배 빠르게 움직인 것과 같은 장면 간 움직임)
-    pub fn with_stride(dir: &str, rate: f64, stride: usize) -> Result<TumSource, String> {
-        let st = stride.max(1);
-        let rgb: Vec<_> = read_list(&format!("{dir}/rgb.txt"))?.into_iter().step_by(st).collect();
+        let rgb = read_list(&format!("{dir}/rgb.txt"))?;
         let depth = read_list(&format!("{dir}/depth.txt"))?;
         if rgb.is_empty() || depth.is_empty() {
-            return Err(format!("빈 TUM 폴더: {dir}"));
+            return Err(format!("빈 녹화 폴더: {dir}"));
         }
         // 시퀀스별 보정값(TUM 문서): 폴더 이름으로 고름(물체 기억의 TUM 입력과 같은 표)
         let mut k = common::tum::camera_k(dir);
@@ -167,38 +138,34 @@ impl TumSource {
                 k.copy_from_slice(&c);
             }
         }
-        // rsd_rec 녹화 폴더: calib.json 의 컬러 보정·깊이 배율
+        // rsd_rec 녹화 폴더: calib.json 의 컬러 보정 · 깊이 배율 · 적외선 보정
         let mut depth_per_m = 5000.0f32;
+        let mut stereo = None;
         if let Ok(j) = std::fs::read_to_string(format!("{dir}/calib.json")) {
-            let num = |key: &str, from: usize| -> Option<f64> {
-                let i = j[from..].find(&format!("\"{key}\":"))? + from + key.len() + 3;
-                j[i..].trim_start().split(|c: char| c == ',' || c == '}' || c.is_whitespace()).next()?.parse().ok()
-            };
-            if let Some(v) = num("depth_png_per_m", 0) {
+            if let Some(v) = json_num(&j, "depth_png_per_m", 0) {
                 depth_per_m = v as f32;
             }
             if let Some(c0) = j.find("\"color_intrinsics\"") {
-                if let (Some(fx), Some(fy), Some(cx), Some(cy)) = (num("fx", c0), num("fy", c0), num("ppx", c0), num("ppy", c0)) {
+                if let (Some(fx), Some(fy), Some(cx), Some(cy)) = (json_num(&j, "fx", c0), json_num(&j, "fy", c0), json_num(&j, "ppx", c0), json_num(&j, "ppy", c0)) {
                     k = [fx, fy, cx, cy];
                 }
             }
+            stereo = stereo_from_json(&j);
         }
-        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, i: 0, skipped: Arc::new(AtomicUsize::new(0)), k, depth_per_m, read_ms: 0.0, start: None, clock: Default::default(), no_sleep: false, id: 0, drop: Vec::new(), n_drop: Default::default(), blur: None, n_blur: Default::default() })
+        let ir: Vec<(String, f64)> = std::fs::read_to_string(format!("{dir}/ir_times.txt"))
+            .map(|s| s.lines().filter_map(|l| l.trim().parse::<i64>().ok().map(|ns| (l.trim().to_string(), ns as f64 * 1e-9))).collect())
+            .unwrap_or_default();
+        if !ir.is_empty() && stereo.is_none() {
+            return Err(format!("{dir}: 적외선 녹화인데 calib.json 에 적외선 보정값(depth_intrinsics · depth_to_color · stereo_baseline_m)이 없음"));
+        }
+        Ok(TumSource { dir: dir.to_string(), rate, rgb, depth, stereo: if ir.is_empty() { None } else { stereo }, ir, i: 0, k, depth_per_m, read_ms: 0.0, start: None, clock: Default::default(), no_sleep: false, skipped: 0, id: 0 })
     }
     /// 재생 시계(첫 장면을 낼 때 정해짐)
     pub fn clock(&self) -> Arc<std::sync::OnceLock<(f64, Instant)>> {
         self.clock.clone()
     }
-    /// 첫 장면 시각
-    pub fn t_first(&self) -> f64 {
-        self.rgb[0].0
-    }
     pub fn len(&self) -> usize {
         self.rgb.len()
-    }
-    /// 재생에서 밀려 건너뛴 장면 수(읽기 스레드로 옮긴 뒤에도 읽을 수 있게 나눠 가짐)
-    pub fn skipped_counter(&self) -> Arc<AtomicUsize> {
-        self.skipped.clone()
     }
 
     /// 시각 t 에 가장 가까운 깊이(memmap tum.rs kinect_depth 와 같은 짝)
@@ -212,6 +179,23 @@ impl TumSource {
         }
         j
     }
+
+    /// 시각 t 의 적외선 좌우(20 ms 안에 없으면 None)
+    fn ir_at(&self, t: f64) -> Result<Option<Ir>, String> {
+        let s = &self.ir;
+        if s.is_empty() {
+            return Ok(None);
+        }
+        let j = s.partition_point(|x| x.1 < t);
+        let j = [j.wrapping_sub(1), j].into_iter().filter(|&i| i < s.len()).min_by(|&a, &b| (s[a].1 - t).abs().total_cmp(&(s[b].1 - t).abs())).unwrap();
+        if (s[j].1 - t).abs() > 0.02 {
+            return Ok(None);
+        }
+        let (l, r) = (format!("{}/mav0/cam0/data/{}.png", self.dir, s[j].0), format!("{}/mav0/cam1/data/{}.png", self.dir, s[j].0));
+        let (li, ri) = rayon::join(|| read_png(&l), || read_png(&r));
+        let (li, ri) = (li?.into_luma8(), ri?.into_luma8());
+        Ok(Some(Ir { w: li.width(), h: li.height(), left: li.into_raw(), right: ri.into_raw(), t: s[j].1 }))
+    }
 }
 
 impl FrameSource for TumSource {
@@ -223,19 +207,18 @@ impl FrameSource for TumSource {
     }
     fn describe(&self) -> String {
         let r = if self.rate > 0.0 { format!("{:.6}배", self.rate) } else { "최대".into() };
-        format!("TUM {} ({} 장, 속도 {r})", self.dir, self.rgb.len())
+        format!("녹화 {} ({} 장, 속도 {r}{})", self.dir, self.rgb.len(), if self.ir.is_empty() { "" } else { ", 적외선 좌우" })
     }
     fn last_read_ms(&self) -> f64 {
         self.read_ms
+    }
+    fn stereo(&self) -> Option<StereoCalib> {
+        self.stereo.clone()
     }
     fn next(&mut self) -> Result<Option<Frame>, String> {
         while self.i < self.rgb.len() {
             let (t, rel) = self.rgb[self.i].clone();
             self.i += 1;
-            if self.drop.iter().any(|&(a, b)| t >= a && t < b) {
-                self.n_drop.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             if self.rate > 0.0 {
                 match self.start {
                     None => {
@@ -246,7 +229,7 @@ impl FrameSource for TumSource {
                         let ahead = (t - t0) / self.rate - w0.elapsed().as_secs_f64();
                         if ahead < -0.1 {
                             // 처리가 밀렸으면 카메라처럼 지난 장면은 버림
-                            self.skipped.fetch_add(1, Ordering::Relaxed);
+                            self.skipped += 1;
                             continue;
                         }
                         if ahead > 0.0 && !self.no_sleep {
@@ -262,36 +245,28 @@ impl FrameSource for TumSource {
             let (ci, di) = rayon::join(|| read_png(&cp), || read_png(&dp));
             let (ci, di) = (ci?, di?);
             let (w, h) = (ci.width(), ci.height());
-            // 푼 RGB 그대로 둔다(스트림·memmap 이 RGB 를 씀). 회색조는 채널 차례만 맞춰 imread(BGR) + cvtColor 와 같은 값
-            let mut color = match ci {
+            let color = match ci {
                 image::DynamicImage::ImageRgb8(b) => b.into_raw(),
                 o => o.to_rgb8().into_raw(),
             };
-            if let Some((exp, gyro)) = &self.blur {
-                if let Some(b) = gyro(t).and_then(|wc| motion_blur(&color, w as usize, h as usize, self.k[0], self.k[1], wc, *exp)) {
-                    color = b;
-                    self.n_blur.fetch_add(1, Ordering::Relaxed);
-                }
-            }
             let depth_raw = match di {
                 image::DynamicImage::ImageLuma16(b) if b.width() == w && b.height() == h => b.into_raw(),
                 _ => return Err(format!("장면 읽기 실패: {rel}")),
             };
-            let gray = to_gray(&color, true);
+            let ir = self.ir_at(t)?;
             let depth_mm = depth_to_mm(&depth_raw, self.depth_per_m).into();
-            let depth_raw = depth_raw.into();
             self.id += 1;
             let k = self.k;
             let f = Frame {
                 id: self.id,
                 t,
-                gray,
                 color,
                 color_is_rgb: true,
                 depth_mm,
-                depth_raw,
+                depth_raw: depth_raw.into(),
                 depth_per_m: self.depth_per_m,
-                cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h, local: optical_rotation(), oriented: false },
+                cam: Camera { fx: k[0], fy: k[1], cx: k[2], cy: k[3], width: w, height: h },
+                ir,
             };
             self.read_ms = c0.elapsed().as_secs_f64() * 1e3;
             return Ok(Some(f));
@@ -300,153 +275,31 @@ impl FrameSource for TumSource {
     }
 }
 
-/// 읽기 스레드가 장면마다 미리 해 둘 일(특징 추출 등). 결과는 장면과 함께 넘겨짐
-pub type Prep = Box<dyn FnMut(&Frame) -> Features + Send>;
-
-struct Slot {
-    frame: Option<(Frame, f64, Option<Features>)>,
-    done: bool,
-    stop: bool,
-    err: Option<String>,
-}
-
-/// 장면 읽기(카메라 대기·깊이 정렬·PNG 풀기)를 따로 도는 스레드에 맡긴다: 위치 추적이 읽기를 기다리지 않게.
-/// drop = true(카메라·찍은 속도 재생): 위치 추적이 밀리면 아직 안 가져간 장면을 새 장면으로 바꿈
-/// drop = false(최대 속도 재생): 한 장 앞서 읽고 가져갈 때까지 기다림(장면을 하나도 버리지 않음)
-pub struct PrefetchSource {
-    sh: Arc<(Mutex<Slot>, Condvar)>,
-    th: Option<std::thread::JoinHandle<()>>,
-    desc: String,
-    read_ms: f64,
-    dropped: Arc<AtomicUsize>,
-    prepped: Option<Features>,
-}
-
-impl PrefetchSource {
-    pub fn new(inner: Box<dyn FrameSource>, drop: bool) -> PrefetchSource {
-        Self::with_prep(inner, drop, None)
-    }
-
-    /// prep 이 있으면 읽기 스레드가 장면마다 그것을 돌려 결과를 장면과 함께 넘긴다(take_prepped 로 꺼냄).
-    /// 읽기 시간(last_read_ms)에는 prep 시간이 들어가지 않는다
-    pub fn with_prep(mut inner: Box<dyn FrameSource>, drop: bool, mut prep: Option<Prep>) -> PrefetchSource {
-        let desc = inner.describe() + if drop { ", 읽기 스레드(밀리면 지난 장면 버림)" } else { ", 읽기 스레드" };
-        let sh = Arc::new((Mutex::new(Slot { frame: None, done: false, stop: false, err: None }), Condvar::new()));
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let (sh2, dr2) = (sh.clone(), dropped.clone());
-        let th = std::thread::spawn(move || {
-            common::threads::rt("camera"); // --rt camera=우선순위[@코어]: 장면 받는 스레드
-            let (m, cv) = &*sh2;
-            loop {
-                match inner.next() {
-                    Ok(Some(f)) => {
-                        let ms = inner.last_read_ms();
-                        let pf = prep.as_mut().map(|p| p(&f));
-                        let mut s = m.lock().unwrap();
-                        if !drop {
-                            s = cv.wait_while(s, |s| s.frame.is_some() && !s.stop).unwrap();
-                        }
-                        if s.stop {
-                            return;
-                        }
-                        if s.frame.is_some() {
-                            dr2.fetch_add(1, Ordering::Relaxed);
-                        }
-                        s.frame = Some((f, ms, pf));
-                        cv.notify_all();
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        m.lock().unwrap().err = Some(e);
-                        break;
-                    }
-                }
-            }
-            m.lock().unwrap().done = true;
-            cv.notify_all();
-        });
-        PrefetchSource { sh, th: Some(th), desc, read_ms: 0.0, dropped, prepped: None }
-    }
-    /// 위치 추적이 밀려 가져가기 전에 새 장면으로 바뀐 장면 수
-    pub fn dropped(&self) -> usize {
-        self.dropped.load(Ordering::Relaxed)
-    }
-    /// 마지막 next 장면에 읽기 스레드가 해 둔 prep 결과(한 번만 꺼낼 수 있음)
-    pub fn take_prepped(&mut self) -> Option<Features> {
-        self.prepped.take()
-    }
-}
-
-impl FrameSource for PrefetchSource {
-    fn next(&mut self) -> Result<Option<Frame>, String> {
-        let (m, cv) = &*self.sh;
-        let mut s = cv.wait_while(m.lock().unwrap(), |s| s.frame.is_none() && !s.done).unwrap();
-        match s.frame.take() {
-            Some((f, ms, pf)) => {
-                self.read_ms = ms;
-                self.prepped = pf;
-                cv.notify_all();
-                Ok(Some(f))
-            }
-            None => match s.err.take() {
-                Some(e) => Err(e),
-                None => Ok(None),
-            },
-        }
-    }
-    fn last_read_ms(&self) -> f64 {
-        self.read_ms
-    }
-    fn describe(&self) -> String {
-        self.desc.clone()
-    }
-}
-
-impl Drop for PrefetchSource {
-    fn drop(&mut self) {
-        let (m, cv) = &*self.sh;
-        m.lock().unwrap().stop = true;
-        cv.notify_all();
-        // 읽기 스레드는 지금 읽던 장면을 마치면 스스로 끝난다. 카메라 대기 중일 수 있어 끝난 것만 거둔다
-        if let Some(th) = self.th.take() {
-            if th.is_finished() {
-                let _ = th.join();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn gray_and_depth_rounding() {
-        // OpenCV 값: (255,0,0)BGR → 29, (0,255,0) → 150, (0,0,255) → 76
-        assert_eq!(to_gray(&[255, 0, 0, 0, 255, 0, 0, 0, 255], false), vec![29, 150, 76]);
+    fn depth_rounding() {
         assert_eq!(depth_to_mm(&[0, 2, 3, 7, 8, 65535], 5000.0), vec![0, 0, 1, 1, 2, 13107]);
     }
 
-    /// 전체 시퀀스를 OpenCV 결과와 비교: SLAM_IO_REF=<C++ 하네스 출력> SLAM_IO_TUM=<폴더>
-    /// 하네스 출력 = 장면마다 [회색 w·h][깊이 mm u16 w·h]
+    /// rsd_rec calib.json(walk1 의 실제 값 꼴)에서 적외선 보정: 열 우선 회전 → 행 우선
     #[test]
-    #[ignore]
-    fn match_opencv_whole_sequence() {
-        let (Ok(rf), Ok(dir)) = (std::env::var("SLAM_IO_REF"), std::env::var("SLAM_IO_TUM")) else { return };
-        let r = std::fs::read(rf).unwrap();
-        let mut src = TumSource::new(&dir, 0.0).unwrap();
-        let (mut off, mut n, mut ms) = (0usize, 0usize, 0.0);
-        while let Some(f) = src.next().unwrap() {
-            ms += src.last_read_ms();
-            let np = f.gray.len();
-            assert_eq!(&r[off..off + np], &f.gray[..], "회색 장면 {n}");
-            off += np;
-            let d: Vec<u8> = f.depth_mm.iter().flat_map(|v| v.to_le_bytes()).collect();
-            assert_eq!(&r[off..off + 2 * np], &d[..], "깊이 장면 {n}");
-            off += 2 * np;
-            n += 1;
-        }
-        assert_eq!(off, r.len());
-        common::info!("같은 장면 {n} 개, 읽기 평균 {:.2} ms", ms / n as f64);
+    fn stereo_calib_json() {
+        let j = r#"{
+  "depth_intrinsics": {"width": 640, "height": 480, "ppx": 321.706024, "ppy": 238.147339, "fx": 382.494873, "fy": 382.494873, "model": 4, "coeffs": [0, 0, 0, 0, 0]},
+  "color_intrinsics": {"width": 640, "height": 480, "ppx": 324.950439, "ppy": 241.556976, "fx": 614.201904, "fy": 614.689209, "model": 2, "coeffs": [0, 0, 0, 0, 0]},
+  "depth_to_color": {"rotation_col_major": [0.999734461, -0.0217354111, -0.00765662361, 0.0217765607, 0.999748647, 0.00533265807, 0.00753879128, -0.00549797667, 0.999956489], "translation_m": [0.014739234, -0.000185367098, 0.000469290564]},
+  "depth_png_per_m": 999.999939,
+  "stereo_baseline_m": 0.0499
+}"#;
+        let s = stereo_from_json(j).unwrap();
+        assert_eq!((s.w, s.h), (640, 480));
+        assert!((s.k[0] - 382.494873).abs() < 1e-6 && (s.k[3] - 238.147339).abs() < 1e-6);
+        assert!((s.baseline - 0.0499).abs() < 1e-9);
+        // 행 0 = 열 우선 배열의 0, 3, 6 번
+        assert!((s.color_from_ir[1] - 0.0217765607).abs() < 1e-9 && (s.color_from_ir[4] + 0.0217354111).abs() < 1e-9);
+        assert!((s.color_from_ir[3] - 0.014739234).abs() < 1e-9);
     }
 }

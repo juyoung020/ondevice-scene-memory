@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 보드(Raspberry Pi 5 + D435 + DX-M1) 실시간 실행: D435 → 위치 추적 → 물체 기억 → 뷰어(:8091) 한 프로세스.
-#   bash scripts/board_run.sh [--tum <TUM 폴더> | --rec <녹화 폴더>(카메라 + imu0.csv)](녹화 속도 그대로, RATE=0 이면 최대 속도) [ondevice 에 더 넘길 인자...]
-# 물체 기억에 넘기는 장면 간격: SEND_EVERY(기본 1 = 카메라 장면 모두, 2026-11-15 보드 23 kf/s 에서 장면 기다림 39 ms/kf 로 여유)
-# IMU 융합 모드가 기본(IMU=/dev/i2c-1, 장치가 없으면 카메라 전용). 카메라 전용으로: IMU= bash scripts/board_run.sh
-# 위치 프로그램에 더 줄 인자: SLAM_EXTRA(예: "--stats /tmp/st.csv")
-# 루프 클로저: RTAB-Map 낱말 + MegaLoc 후보 · XFeat 검증(모델 $M/megaloc_168x224.dxnn · megaloc_head_pca1024.bin · xfeat_480x640.dxnn, 없으면 시작하지 않음)
+#   bash scripts/board_run.sh [--rec <녹화 폴더>(rsd_rec --ir 녹화 + imu0.csv)](녹화 속도 그대로, RATE=0 이면 최대 속도) [ondevice 에 더 넘길 인자...]
+# 위치 추적 ORB-SLAM3(루프 클로저 · 지도 합치기 포함). 단어장은 ~/ext/ORB_SLAM3(ORB_SLAM3_DIR)
+# 물체 기억에 넘기는 장면 간격: SEND_EVERY(기본 1 = 카메라 장면 모두)
+# 위치 추적: 기본 ORB-SLAM3 스테레오(적외선 좌우). IMU 를 주면 스테레오-관성(IMU=/dev/i2c-1). 적외선 레이저(점무늬): 기본 끔, 켜려면 EMITTER=on
+# 위치 프로그램에 더 줄 인자: SLAM_EXTRA(예: "--poses /tmp/poses.txt")
 # 기본 모델(MODELS=~/models):
 #   - 분할: objectsam-416_640.dxnn (클래스 없는 "object", NPU). 이름은 SigLIP2 사진 벡터 → 실내 낱말 표(vocab/indoor.voc, 104 개)로 붙는다.
 #     전체 표(names.voc, 1,225 개)는 실제 녹화(어둡고 어수선한 사진)에서 몫이 비슷한 이름에 갈려 문턱을 거의 넘지 못했다
@@ -20,15 +20,12 @@ export ONDEVICE_MODELS=$M
 SEG=${SEG:-$M/objectsam-416_640.dxnn}
 EMB=${EMB:-$M/siglip2-vision_npu.dxnn}
 OUT=${OUT:-data/memory/live}
-IMU=${IMU-/dev/i2c-1}; [ -n "$IMU" ] && [ ! -e "$IMU" ] && IMU=
-SRC="--realsense ${IMU:+--imu $IMU} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1} --reset-file $OUT/reset.req ${SLAM_EXTRA:-}"
-if [ "${1:-}" = "--tum" ]; then SRC="--tum $2 --rate ${RATE:-1} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1}"; shift 2; fi
-# 녹화 재생(카메라 + IMU): --rec <녹화 폴더>. rec_dataset.sh 꼴(cam/ + imu0.csv)과 board_all.sh 꼴(폴더 바로 아래 calib.json + imu0.csv) 둘 다.
-# imu0.csv 가 있으면 실시간 --imu 와 같은 융합 길로, 없거나 IMU= 이면 카메라 전용
+IMU=${IMU-}; [ -n "$IMU" ] && [ ! -e "$IMU" ] && IMU=
+SRC="--realsense ${IMU:+--imu $IMU} ${EMITTER:+--emitter $EMITTER} --send-every ${SEND_EVERY:-1} --reset-file $OUT/reset.req ${SLAM_EXTRA:-}"
+# 녹화 재생(적외선 좌우 + IMU): --rec <녹화 폴더>(scripts/rec_ir.sh 꼴: calib.json · ir_times.txt · mav0/ · imu0.csv)
 if [ "${1:-}" = "--rec" ]; then
-  R=$2; shift 2; CAM=$R; [ -f "$R/cam/calib.json" ] && CAM=$R/cam
-  CSV=; [ -n "$IMU" ] && [ -f "$R/imu0.csv" ] && CSV=$R/imu0.csv
-  SRC="--rsdrec $CAM ${CSV:+--imu-csv $CSV} --rate ${RATE:-1} --config docs/rtabmap_pi.ini --send-every ${SEND_EVERY:-1} ${SLAM_EXTRA:-}"
+  R=$2; shift 2
+  SRC="--rsdrec $R ${IMU:+--imu-csv $R/imu0.csv} --rate ${RATE:-1} --send-every ${SEND_EVERY:-1} ${SLAM_EXTRA:-}"
 fi
 RT=${RT:-auto}
 VOCAB=${VOCAB:-vocab/indoor.voc}

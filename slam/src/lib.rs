@@ -1,35 +1,17 @@
-//! RTAB-Map 0.24.2 에서 우리 설정(docs/rtabmap_pi.ini)이 지나가는 경로를 Rust 로 옮긴 것.
-//! 원본: introlab/rtabmap 0.24.2 (BSD-3-Clause), OpenCV 4.10 (Apache-2.0) 의 해당 함수. 모듈마다 원본 파일·함수를 적는다.
+//! 위치 추적 부품. 물체 기억 · 점 지도 · 뷰어는 이 부품이 내는 장면 스트림(위치 · 루프 보정으로 움직인 노드)만 받는다.
 //!
-//! 흐름(장면마다): 입력(io) → 특징점(features) → 앞 장면과 짝짓기·PnP(register) → 위치 추적(odom)
-//!                 1 초에 1 번: 지도 노드 추가 · 루프 클로저(loopclose) · 그래프 최적화(graph) → 스트림(stream)
-pub mod features;
-pub mod graph;
-pub mod io;
-pub mod loopclose;
-pub mod odom;
-pub mod klt;
-pub mod params;
-pub mod register;
-pub mod stream;
+//! 흐름(장면마다): 입력(io: D435 · 녹화 재생, 적외선 좌우 · 컬러 · 정렬한 깊이) + IMU(imu)
+//!                 → 위치 백엔드(backend: ORB-SLAM3 스테레오-관성, orb3) → 스트림(stream)
 pub mod app;
 pub mod backend;
 pub mod bufpool;
-pub mod simd;
 pub mod imu;
-// 루프 · 재위치 신경망 경로(MegaLoc 후보 · XFeat 검증 · 중력 고정 검증, docs/loop_closure_npu.md), 앱 연결은 lcnet
-pub mod lcnet;
-pub mod place;
-pub mod xfeat;
-pub mod lcverify;
-pub mod nnrun;
+pub mod io;
+pub mod orb3;
+pub mod simd;
+pub mod stream;
 
-use nalgebra::{Isometry3, Point3};
-
-/// 강체 변환(회전 + 이동, 미터). RTAB-Map Transform 과 같은 뜻: 몸체 축(x 앞, y 왼쪽, z 위)
-pub type Pose = Isometry3<f64>;
-
-/// 핀홀 카메라(왜곡 없음). local = 몸체 → 광학 축(RTAB-Map CameraModel::localTransform, 보통 opticalRotation)
+/// 핀홀 카메라(왜곡 없음): 컬러(물체 기억 · 점 지도가 쓰는 격자)
 #[derive(Clone, Debug)]
 pub struct Camera {
     pub fx: f64,
@@ -38,20 +20,40 @@ pub struct Camera {
     pub cy: f64,
     pub width: u32,
     pub height: u32,
-    pub local: Pose,
-    /// BRIEF 를 점마다 방향(밝기 무게중심)으로 돌려 뽑음(IMU 모드: 굴려도 같은 설명자, `features::describe_oriented`). false = 원본 그대로
-    pub oriented: bool,
 }
 
-/// 한 장면: 회색조(특징점용), 컬러(스트림용, BGR 또는 RGB), 깊이(mm, 컬러 격자에 맞춤)
-/// 깊이 버퍼(장면 · 기준 장면 · 스트림이 복사 없이 나눠 듦). 마지막으로 놓는 쪽이 카메라 버퍼로 돌려줌
+/// 깊이 버퍼(장면 · 스트림이 복사 없이 나눠 듦). 마지막으로 놓는 쪽이 카메라 버퍼로 돌려줌
 pub type DepthBuf = std::sync::Arc<Vec<u16>>;
 
+/// 적외선 좌우(D435 Y8I: 깊이 크기, 정렬된 스테레오, 회색 8 비트)
+#[derive(Clone)]
+pub struct Ir {
+    pub left: Vec<u8>,
+    pub right: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    /// 적외선 시각(초, 장면 시각과 같은 시계)
+    pub t: f64,
+}
+
+/// 위치 백엔드가 적외선 좌우를 쓰는 데 필요한 보정값(입력이 알려 줌)
+#[derive(Clone, Debug)]
+pub struct StereoCalib {
+    /// 적외선 왼쪽 내부값 fx fy cx cy(깊이 내부값과 같음), 크기
+    pub k: [f64; 4],
+    pub w: u32,
+    pub h: u32,
+    /// 좌우 기준선(m)
+    pub baseline: f64,
+    /// 적외선 왼쪽(= 깊이) → 컬러: p_color = R p_ir + t, 3×4 행 우선
+    pub color_from_ir: [f64; 12],
+}
+
+/// 한 장면: 컬러(스트림용, BGR 또는 RGB), 깊이(mm, 컬러 격자에 맞춤), 적외선 좌우(있으면)
 #[derive(Clone)]
 pub struct Frame {
     pub id: i64,
     pub t: f64,
-    pub gray: Vec<u8>,
     pub color: Vec<u8>,
     pub color_is_rgb: bool,
     pub depth_mm: DepthBuf,
@@ -59,14 +61,14 @@ pub struct Frame {
     pub depth_raw: DepthBuf,
     pub depth_per_m: f32,
     pub cam: Camera,
+    pub ir: Option<Ir>,
 }
 
-/// 카메라 입력이면 버려지는 장면의 버퍼를 드라이버에 돌려줌(읽기 스레드가 덮어쓴 장면, 보내지 않은 장면, 기준 장면 등 어디서 버려지든)
+/// 카메라 입력이면 버려지는 장면의 버퍼를 드라이버에 돌려줌
 impl Drop for Frame {
     fn drop(&mut self) {
         if bufpool::enabled() {
             bufpool::give_rgb(std::mem::take(&mut self.color));
-            bufpool::give_gray(std::mem::take(&mut self.gray));
             bufpool::give_depth_buf(std::mem::take(&mut self.depth_mm));
             bufpool::give_depth_buf(std::mem::take(&mut self.depth_raw));
         }
@@ -82,23 +84,4 @@ impl Frame {
             std::mem::take(&mut self.depth_raw)
         }
     }
-}
-
-/// 특징점(OpenCV KeyPoint 와 같은 칸)
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeyPoint {
-    pub x: f32,
-    pub y: f32,
-    pub size: f32,
-    pub angle: f32,
-    pub response: f32,
-    pub octave: i32,
-}
-
-/// 한 장면의 특징: 특징점, 그 3D 점(몸체 축, 깊이 없으면 NaN), BRIEF 32 바이트 설명자
-#[derive(Clone, Default)]
-pub struct Features {
-    pub kps: Vec<KeyPoint>,
-    pub pts3d: Vec<Point3<f32>>,
-    pub desc: Vec<[u8; 32]>,
 }

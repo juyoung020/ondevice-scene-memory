@@ -7,8 +7,9 @@
 ## [Unreleased]
 
 ### Added
-- `slam::backend::SlamBackend`: 위치 프로그램을 갈아 끼우는 경계(같은 프로세스 처리 루프는 이 trait 만 봄, 지금 구현은 RTAB-Map 포팅판).
-- `rsd_rec --ir`: D435 적외선 좌우를 EuRoC 꼴(`mav0/cam0` · `mav0/cam1` · `ir_times.txt`)로 함께 녹화.
+- 위치 추적 ORB-SLAM3(D435 적외선 좌우 스테레오, IMU 를 주면 스테레오-관성): 루프 클로저 · 지도 합치기로 움직인 키프레임을 노드로 보내 물체 · 점 지도가 따라 다시 쌓인다(원본 수정은 `slam/cpp/ORB_SLAM3.patch`).
+- `slam::backend::SlamBackend`: 위치 프로그램을 갈아 끼우는 경계(같은 프로세스 처리 루프는 이 trait 만 봄).
+- `rsd_rec --ir` · `scripts/rec_ir.sh`: D435 적외선 좌우(EuRoC 꼴) + IMU 녹화.
 - 실행 끝 요약에 장면 지연(`scene_ms`) · 복사(`copies`) · 기다림 · 락(`waits`) · 스레드별 CPU · 깨어남(`threads`) · 뷰어 깨움 수.
 - 상태 줄 `mem kf …`: 25 키프레임마다 프로세스 메모리 · 메모리 기억 폴더 · 보관 장면 크기.
 - `--embed-jobs K`: 사진 벡터를 NPU 에 K 장(기본 3)까지 함께 올린다.
@@ -38,7 +39,8 @@
 - MegaLoc · XFeat NPU 모델(`megaloc_168x224.dxnn` 120.5 MB · `xfeat_480x640.dxnn` 1.0 MB, INT8, CPU 작업 없음)과 주성분 1,024 투영(`megaloc_head_pca1024.bin`), 보드 확인 `scripts/board_lc_check.sh`.
 
 ### Changed
-- **호환 변경:** 점 지도 기본값: 깊이 한계 4 m(`--max-depth` · `--pts-depth`, D435 깊이 오차가 4 m 에서 약 7 cm), 점이 되는 칸은 키프레임 1 장에서 보이면(`--pts-obs 1`). 멀리 있는 물체의 점도 바로 쌓인다.
+- **호환 변경:** 점 지도 기본값: 깊이 한계 4 m(`--max-depth` · `--pts-depth`), 점이 되는 칸은 키프레임 1 장에서 보이면(`--pts-obs 1`).
+- **호환 변경:** 적외선 레이저(점무늬) 기본 끔(`--emitter on` 으로 켬).
 - 점 지도를 옥트리 대신 청크로 쌓는다: 가까운 키프레임 점을 청크 기준 자세 좌표(i16 mm + u8 색)로 담고, 루프 클로저 · 수평 맞춤은 청크 자세만 고친다(긴 사무실 최대 RSS 2,411 → 1,587 MB, 점 지도 90 → 23 MB). 뷰어는 `/bstream` 칸 8 로 바뀐 청크 자세만 받는다.
 - 모델 폴더 규칙 하나(`$ONDEVICE_MODELS`, 보드 `~/models`, PC `models/` · WSL `/mnt/c/ondevice/models`)로 루프 클로저 모델을 찾는다.
 - 뷰어 청크 점은 `/bstream` 한 연결로(칸 9, 새 청크부터, 덩어리당 256 KB · 밀린 바이트만큼 줄임): 청크마다 파일 요청이 없어 느린 링크(Tailscale 중계)에서도 점이 쌓이고, 루프 보정 · 다시 쌓기는 자세만 바뀌어 받은 점을 그대로 둔다.
@@ -70,6 +72,7 @@
 - IMU 모드 특징 설명자를 점마다 방향으로 돌린 BRIEF(ORB 식)로 뽑고, 다시 잡기 · 지도 잇기는 PnP 후보 5 개까지 맞춰 본다: 흔들어도 새 지도를 덜 열고 빨리 다시 붙는다.
 
 ### Removed
+- **호환 변경:** RTAB-Map 포팅 위치 추적과 그 설정(`docs/rtabmap_pi.ini` · `--config` · `--Group/Name`), 신경망 루프(MegaLoc · XFeat), IMU 장면 사이 위치.
 - 채택한 동작을 끄고 켜던 옵션과 옛 경로: `--lc` · `--lc-dir`(낱말 루프만), `--pts-map` · `--chunk-keep`(옥트리 점 지도), `--geo`(깊이 서브맵 정합), `--imu-brief`(곧은 · 둘 다 BRIEF), `--no-bridge`, `--no-provisional`, `--map-inline`, `--no-boost`, `--seg-skip`, `--no-level`, `--no-rebuild`, `scripts/board_run.sh` 의 `LC=`.
 - `--seg-pipe`, `--seg-min-ms`, `--infer-min-ms`(분할 단계 스레드 · 보드 시간 흉내).
 - `scripts/board_imu_measure.sh`, `scripts/board_merge_check.sh`(`scripts/board_all.sh` 로 합침).

@@ -77,21 +77,21 @@ enum Src {
     Bytes(slam::stream::Reader<Box<dyn std::io::Read + Send>>),
 }
 
-/// 미리 푼 재생 장면: (장면, 읽기 ms, 미리 뽑은 특징)
-type Ahead = Result<Option<(slam::Frame, f64, Option<slam::Features>)>, String>;
+/// 미리 푼 재생 장면: (장면, 읽기 ms)
+type Ahead = Result<Option<(slam::Frame, f64)>, String>;
 
 /// 같은 프로세스 위치 프로그램(`--slam`): 스레드 없이 처리 루프가 장면마다 위치 추적을 부른다(백엔드는 `slam::backend`).
 /// 카메라는 장치 fd 가 루프 epoll 에 걸려 장면이 오면 루프가 깨고, 녹화 재생은 다음 장면 PNG 를 작업 풀이 한 장 앞서 푼다
 pub struct SlamSide {
     r: Option<Box<dyn slam::backend::SlamBackend>>,
-    camera: Option<(Box<dyn slam::io::FrameSource>, Option<slam::io::Prep>)>,
-    /// 재생 풀기 줄(입력 · 미리 할 일을 쥠)과 결과 줄
-    replay: Option<(common::rt::SharedLane<(Box<dyn slam::io::FrameSource>, Option<slam::io::Prep>)>, std::sync::mpsc::Receiver<Ahead>)>,
+    camera: Option<Box<dyn slam::io::FrameSource>>,
+    /// 재생 풀기 줄(입력을 쥠)과 결과 줄
+    replay: Option<(common::rt::SharedLane<Box<dyn slam::io::FrameSource>>, std::sync::mpsc::Receiver<Ahead>)>,
     /// 푼 장면이 줄에 있거나 푸는 중
     asked: bool,
     /// 찍은 속도 재생: (배속, 재생 시계), 아직 때가 안 된 장면
     pace: Option<(f64, std::sync::Arc<std::sync::OnceLock<(f64, std::time::Instant)>>)>,
-    held: Option<(slam::Frame, f64, Option<slam::Features>)>,
+    held: Option<(slam::Frame, f64)>,
     /// 결과를 늘 같게(최대 속도 재생): 받는 쪽이 줄을 비울 때만 다음 장면
     pub block: bool,
     ended: bool,
@@ -107,14 +107,14 @@ impl SlamSide {
     /// 위치 프로그램 준비(설정 · IMU · 입력 열기). waker: 재생 장면을 다 풀면 루프를 깨움
     pub fn new(a: slam::app::Args, waker: std::sync::Arc<common::rt::Waker>) -> Result<SlamSide, String> {
         let (block, max_frames) = (a.block_mode(), a.max_frames);
-        let (r, mut src, prep) = slam::backend::open(a)?;
+        let (r, mut src) = slam::backend::open(a)?;
         let pace = src.caller_paces();
         let (camera, replay, tx) = if src.fds().is_empty() {
             let (tx, rx) = std::sync::mpsc::channel::<Ahead>();
-            let lane = common::rt::SharedLane::new("replay", (src, prep), 0, None);
+            let lane = common::rt::SharedLane::new("replay", src, 0, None);
             (None, Some((lane, rx)), Some(tx))
         } else {
-            (Some((src, prep)), None, None)
+            (Some(src), None, None)
         };
         let mut side = SlamSide { r: Some(r), camera, replay, asked: false, pace, held: None, block, ended: false, max_frames, waker, tx, rest: Default::default() };
         side.ask();
@@ -123,7 +123,7 @@ impl SlamSide {
 
     /// 카메라 장치 fd(루프 epoll 에 건다). 재생이면 빔
     pub fn fds(&self) -> Vec<i32> {
-        self.camera.as_ref().map_or(vec![], |c| c.0.fds())
+        self.camera.as_ref().map_or(vec![], |c| c.fds())
     }
 
     /// 재생: 다음 장면 풀기를 작업 풀에 맡김(한 장 앞서)
@@ -134,14 +134,8 @@ impl SlamSide {
         }
         self.asked = true;
         let (tx, w) = (self.tx.clone().unwrap(), self.waker.clone());
-        lane.push(move |(src, prep)| {
-            let r = src.next().map(|o| {
-                o.map(|f| {
-                    let ms = src.last_read_ms();
-                    let pf = prep.as_mut().map(|p| p(&f));
-                    (f, ms, pf)
-                })
-            });
+        lane.push(move |src| {
+            let r = src.next().map(|o| o.map(|f| (f, src.last_read_ms())));
             let _ = tx.send(r);
             w.wake();
         });
@@ -149,7 +143,7 @@ impl SlamSide {
 
     /// 다음 장면 때까지 남은 시간(찍은 속도 재생에서 잡아 둔 장면)
     pub fn due(&self) -> Option<std::time::Duration> {
-        let (f, ..) = self.held.as_ref()?;
+        let (f, _) = self.held.as_ref()?;
         let (rate, clock) = self.pace.as_ref()?;
         let (t0, w0) = clock.get()?;
         Some(std::time::Duration::from_secs_f64(((f.t - t0) / rate - w0.elapsed().as_secs_f64()).max(0.0)))
@@ -166,15 +160,11 @@ impl SlamSide {
             self.end();
             return false;
         }
-        let item = if let Some((src, prep)) = self.camera.as_mut() {
+        let item = if let Some(src) = self.camera.as_mut() {
             match if wait { src.next().map(Some) } else { src.try_next() } {
                 Ok(None) => return false,
                 Ok(Some(None)) => None,
-                Ok(Some(Some(f))) => {
-                    let ms = src.last_read_ms();
-                    let pf = prep.as_mut().map(|p| p(&f));
-                    Some((f, ms, pf))
-                }
+                Ok(Some(Some(f))) => Some((f, src.last_read_ms())),
                 Err(e) => {
                     common::info!("slam 입력 오류: {e}");
                     None
@@ -216,19 +206,19 @@ impl SlamSide {
                 }
             }
         };
-        let Some((f, ms, pf)) = item else {
+        let Some((f, ms)) = item else {
             self.end();
             return false;
         };
         let r = self.r.as_mut().unwrap();
-        if !r.step(f, ms, pf) {
+        if !r.step(f, ms) {
             self.end();
             return false;
         }
         true
     }
 
-    /// 입력 끝: 위치 프로그램 끝 요약(끝 그래프 · 통계)
+    /// 입력 끝: 위치 프로그램 끝 요약(최종 위치 · 통계)
     fn end(&mut self) {
         self.ended = true;
         if let Some(mut r) = self.r.take() {
@@ -258,19 +248,6 @@ impl SlamSide {
                 return Err(());
             }
         }
-    }
-
-    /// IMU 모드 장면 사이 위치: 표본이 오면 깨울 손잡이를 단다(뷰어가 있을 때만)
-    pub fn set_imu_waker(&self, w: std::sync::Arc<common::rt::Waker>) -> bool {
-        match self.r.as_ref().and_then(|r| r.imu_ring()) {
-            Some(ring) => ring.waker.set(w).is_ok(),
-            None => false,
-        }
-    }
-
-    /// 가장 새 IMU 표본까지의 장면 사이 위치(카메라 시계 시각, IMU 시각, 카메라 광학 → 지도)
-    pub fn fast_pose(&self) -> Option<(f64, f64, slam::register::Tf)> {
-        self.r.as_ref()?.imu_ring()?.fast_next()
     }
 
     /// 실시간(카메라): 준비된 장면을 모두 위치 추적에(받는 쪽이 바빠도 위치는 장면마다, 줄이 차면 오래된 장면부터 버림).
@@ -352,14 +329,6 @@ impl StreamReader {
     pub fn service(&mut self) {
         if let Some(Src::Slam(s)) = self.src.as_mut() {
             s.service();
-        }
-    }
-
-    /// IMU 모드 장면 사이 위치(같은 프로세스 위치 프로그램)
-    pub fn fast_pose(&self) -> Option<(f64, f64, slam::register::Tf)> {
-        match self.src.as_ref() {
-            Some(Src::Slam(s)) => s.fast_pose(),
-            _ => None,
         }
     }
 

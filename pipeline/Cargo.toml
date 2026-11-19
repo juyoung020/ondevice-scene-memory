@@ -19,16 +19,16 @@ sgview = { path = "../viewer/sgview", default-features = false }
 # --features mimalloc: 할당기를 mimalloc 으로(장면마다 크고 작은 버퍼를 잡고 놓는 비용·조각남 줄임). 값은 같음
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
-# 리눅스(보드): --slam --realsense 의 D435 입력은 rsdriver(V4L2 직접)가 기본
+# 리눅스(보드): --slam 위치 추적은 ORB-SLAM3 스테레오-관성(ORB_SLAM3_DIR), D435 입력은 rsdriver(V4L2 직접)
 [target.'cfg(target_os = "linux")'.dependencies]
-slam = { path = "../slam", features = ["rsdriver"] }
+slam = { path = "../slam", features = ["rsdriver", "orb3"] }
 
 [features]
 default = ["onnx"]
-onnx = ["dep:ort", "dep:ndarray", "common/onnx", "sgview/search-onnx", "slam/onnx"]
+onnx = ["dep:ort", "dep:ndarray", "common/onnx", "sgview/search-onnx"]
 # 윈도우 PC 그래픽카드(DirectML)로 ONNX 모델 실행
 directml = ["onnx", "ort/directml"]
-dxrt = ["common/dxrt", "sgview/dxrt", "slam/dxrt"]
+dxrt = ["common/dxrt", "sgview/dxrt"]
 mimalloc = ["dep:mimalloc"]
 
 # 한 프로그램: ondevice [run] … = 물체 기억(memmap), ondevice slam … = 위치 프로그램, ondevice view … = 뷰어 서버

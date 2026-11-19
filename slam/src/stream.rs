@@ -1,5 +1,5 @@
 //! 장면 스트림 쓰기(형식: docs/bridge.md "스트림 형식"). 쓰기는 따로 스레드가 맡아 위치 추적이 memmap 을 기다리지 않는다.
-//! 원본: RTAB-Map 연결 프로그램(C++) stream_writer.cpp. 바이트까지 같게 쓴다(리틀 엔디언).
+//! 형식은 바이트 단위로 고정(리틀 엔디언): 파일 · 파이프로 남긴 스트림을 물체 기억이 --stream 으로 다시 읽는다.
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex};

@@ -127,6 +127,13 @@ pub fn depth_intrinsics_coeff(raw: &[u8], width: u32, height: u32) -> Result<Int
     Ok(k)
 }
 
+/// 적외선 좌우 기준선(m): 계수표 baseline(mm, 머리 16 + float3x3 넷 = 160 바이트 자리, 부호는 오른쪽 카메라 쪽)의 크기
+/// (펌웨어 5.16 의 계수표 응답은 512 바이트: 머리 · CRC 를 확인하고 baseline 자리까지만 요구)
+pub fn stereo_baseline_m(raw: &[u8]) -> Result<f32, String> {
+    check_calib(raw, 164)?;
+    Ok(f32_at(raw, 160).abs() * 0.001)
+}
+
 /// try_get_d400_intrinsic_by_resolution_new: 20 바이트 항목(u16 w, u16 h, fx, fy, ppx, ppy)의 나열
 pub fn depth_intrinsics_new(raw: &[u8], width: u32, height: u32) -> Option<Intrinsics> {
     for it in raw.chunks_exact(20) {

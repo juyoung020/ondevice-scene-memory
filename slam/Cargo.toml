@@ -3,21 +3,21 @@ name = "slam"
 version = "0.1.0"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2024"
-description = "RTAB-Map 0.24.2 의 우리가 쓰는 경로(F2F 위치 추적 · 루프 클로저 · 그래프 최적화)를 Rust 로 옮긴 것. 장면 스트림(또는 같은 프로세스의 메모리 큐)으로 물체 기억에 보낸다."
+description = "위치 추적 부품: D435 적외선 좌우 + IMU → ORB-SLAM3 스테레오-관성 → 장면 스트림(위치 · 루프 보정으로 움직인 노드). 같은 프로세스의 물체 기억에는 메모리 큐로 넘긴다."
+build = "build.rs"
 
 [dependencies]
 common = { path = "../common" }
-nalgebra = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 rsdriver = { path = "../rsdriver", optional = true }
-# 루프 · 재위치 신경망(PC): ONNX Runtime(common 과 같은 판)
-ort = { version = "=2.0.0-rc.15", optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [features]
 default = []
 # D435 입력(rsdriver: V4L2·UVC 직접)
 rsdriver = ["dep:rsdriver"]
-# 루프 · 재위치 신경망 실행기(nnrun): PC = ONNX Runtime, 보드 = DXRT
-onnx = ["dep:ort", "common/onnx"]
-dxrt = ["common/dxrt"]
+# ORB-SLAM3 스테레오-관성 백엔드(C++ 원본을 ORB_SLAM3_DIR 에서 링크, 기본 ~/ext/ORB_SLAM3)
+orb3 = []

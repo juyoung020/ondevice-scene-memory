@@ -11,7 +11,6 @@ const KEEP: usize = 4;
 static ON: AtomicBool = AtomicBool::new(false);
 static RGB: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static DEPTH: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
-static GRAY: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// 돌려받기 켜기(카메라 입력을 열 때)
 pub fn enable() {
@@ -34,15 +33,6 @@ fn put<T>(pool: &Mutex<Vec<Vec<T>>>, v: Vec<T>) {
     }
 }
 
-/// 다 쓴 장면 버퍼 돌려주기(받는 쪽 어디서 버려지든: 장면 구조체의 Drop 이 부름)
-pub fn give_gray(v: Vec<u8>) {
-    put(&GRAY, v);
-}
-
-pub fn take_gray(n: usize) -> Vec<u8> {
-    get(&GRAY, n)
-}
-
 /// 길이 n 이상 담을 수 있는 버퍼(돌려받은 것이 있으면 그것, 내용은 앞 장면 그대로 — 부르는 쪽이 모두 덮어씀). 없으면 빈 벡터
 fn get<T>(pool: &Mutex<Vec<Vec<T>>>, n: usize) -> Vec<T> {
     let mut p = pool.lock().unwrap();
@@ -52,6 +42,7 @@ fn get<T>(pool: &Mutex<Vec<Vec<T>>>, n: usize) -> Vec<T> {
     }
 }
 
+/// 다 쓴 장면 버퍼 돌려주기(받는 쪽 어디서 버려지든: 장면 구조체의 Drop 이 부름)
 pub fn give_rgb(v: Vec<u8>) {
     put(&RGB, v);
 }

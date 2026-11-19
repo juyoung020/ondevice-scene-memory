@@ -43,7 +43,7 @@ struct Args {
     no_skip: bool,
     looping: bool,
     scene_every: u32,
-    gt: Option<String>, // --gt <파일>: TUM 영상의 위치를 이 파일(TUM 형식)로(예: RTAB-Map 이 낸 위치)
+    gt: Option<String>, // --gt <파일>: TUM 영상의 위치를 이 파일(TUM 형식)로(예: 위치 프로그램이 낸 위치)
     npu_jobs: usize,    // --npu-jobs K: 스트림 분할 추론을 NPU 에 K 장까지 함께 올림(코어 여럿이 나눠 돎, 기본 4, 1 = 한 장씩)
     threads: String,    // --threads: 스레드 우선순위·코어 배치(auto · none · 역할=nice[:코어],…)
     slow: f32,          // --slow F: 보드 흉내, 본·점·다시 쌓기 스레드 일을 F 배로(코어를 붙잡고 기다림)
@@ -483,10 +483,6 @@ struct LoopIo {
     w_in: std::sync::Arc<common::rt::Waker>,
     /// 뷰어 버튼 · 뷰 줄이 깨움
     w_misc: std::sync::Arc<common::rt::Waker>,
-    /// IMU 표본이 깨움(뷰어가 있는 IMU 모드 실시간)
-    w_imu: std::sync::Arc<common::rt::Waker>,
-    /// 장면 사이 위치를 낼 pose.json
-    fast_out: Option<PathBuf>,
     /// 뷰어 서버(--serve): 듣는 소켓 · 연결이 이 루프 epoll 에
     server: Option<sgview::Server>,
     /// 비상 열 보호(선택 일만 줄임)
@@ -513,7 +509,6 @@ const STAGE_NAMES: [&str; 5] = ["track", "submit", "post", "misc", "memory_pool"
 const T_IN: u64 = 1;
 const T_NPU: u64 = 2;
 const T_MISC: u64 = 3;
-const T_IMU: u64 = 4;
 
 impl LoopIo {
     fn new(a: &Args, argv: &common::cli::Argv) -> LoopIo {
@@ -521,11 +516,10 @@ impl LoopIo {
         let w_in = poll.waker(T_IN);
         let w_npu = poll.waker(T_NPU);
         let w_misc = poll.waker(T_MISC);
-        let w_imu = poll.waker(T_IMU);
         let (npu_tx, npu_rx) = common::rt::done(w_npu);
         let wm = w_misc.clone();
         common::control::on_signal(move || wm.wake());
-        LoopIo { poll, w_in, w_misc, w_imu, fast_out: None, server: None, thermal: thermal::Thermal::from_args(argv), npu_tx, npu_rx, seg_async: false, toks: vec![], out: a.out.clone(), save_every: if a.serve.is_some() { a.save_every } else { 0.0 },
+        LoopIo { poll, w_in, w_misc, server: None, thermal: thermal::Thermal::from_args(argv), npu_tx, npu_rx, seg_async: false, toks: vec![], out: a.out.clone(), save_every: if a.serve.is_some() { a.save_every } else { 0.0 },
                  last_save: Instant::now(), turns: 0, turn_max: 0.0, turn_sum: 0.0, turn_t0: None, stage: [0.0; 5] }
     }
     fn waker(&self) -> std::sync::Arc<common::rt::Waker> {
@@ -572,9 +566,8 @@ impl LoopIo {
         if let Some(sv) = self.server.as_mut() {
             sv.tick(&mut self.poll);
         }
-        // 비상 열 보호: 1 단 = 신경망 루프(MegaLoc)를 노드 3 개에 하나로, 2 단 = 사진 벡터 묶음 늦춤. 분할 · 위치 추적은 그대로
+        // 비상 열 보호: 2 단 = 사진 벡터 묶음 늦춤. 분할 · 위치 추적은 그대로
         if let Some(l) = self.thermal.check() {
-            slam::lcnet::throttle(l >= 1);
             embed::throttle(l >= 2);
             common::info!("열 보호 {l} 단: {}", self.thermal.json());
         }
@@ -788,11 +781,6 @@ impl Driver {
             io.stage[0] += c_st.elapsed().as_secs_f64();
             let c_st = Instant::now();
             io.misc();
-            if let (Some(pp), Some(rd)) = (io.fast_out.as_ref(), self.rd.as_ref()) {
-                if let Some((t, ts, twc)) = rd.fast_pose() {
-                    fast_pose(pp, t, ts, &twc);
-                }
-            }
             if !busy.load(std::sync::atomic::Ordering::Acquire) {
                 if let Ok(mut b) = mem.try_lock() {
                     (b)(None);
@@ -976,7 +964,7 @@ impl Driver {
         let c1 = Instant::now();
         let lost = sf.lost();
         if sf.flags & stream::NEW_MAP != 0 {
-            common::info!("스트림 장면 {}: RTAB-Map 새 지도 {}", sf.seq, sf.map_id);
+            common::info!("스트림 장면 {}: 새 지도 {}", sf.seq, sf.map_id);
         }
         // 깊이는 u16 그대로 넘김(미터 값은 쓰는 곳에서 같은 식으로)
         let depth = Depth::Raw { d: std::mem::take(&mut sf.depth), per_m: sf.depth_per_m };
@@ -1186,7 +1174,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
     let mut grav_obs: Vec<V3> = vec![];
     // 바닥으로 기울기 고침(장면마다): 위치 그래프의 좌표가 지도 조각마다 기울어 있어도(새 지도 · 임시 위치 · 루프 클로저) 바닥이 수평이 되게
     let mut tilt_c: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    // 스트림: RTAB-Map 지도의 z 는 첫 장면 카메라 몸체의 위(IMU 없음)라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다
+    // 스트림: 지도 z 가 중력 위라는 표시(GRAVITY)가 없으면 z 는 첫 장면 카메라의 위라 처음 든 각도만큼 기울 수 있다 → 바닥 합의로 한 번 바로 세운다
     let mut leveled = a.stream.is_none();
     // 실시간 스트림: 위치는 받는 스레드가 바로 냄(early_pose)
     let early_pose_on = a.stream.is_some() && a.live > 0.0;
@@ -1805,20 +1793,6 @@ fn early_pose(pp: &Path, sf: &stream::StreamFrame) {
     }
     let Some((cam, pose)) = last.as_ref() else { return };
     out::write_direct(pp, out::json_bytes(&json!({"t": sf.t, "cam": cam, "pose": pose, "ok": ok, "wall": wall_ms()})));
-}
-
-/// 장면 사이 위치(IMU 회전, 200 Hz)를 pose.json 으로: early_pose 와 같은 좌표 바꾸기. 같은 프로세스 뷰어가 메모리에서 읽으므로 디스크에는 쓰지 않음
-fn fast_pose(pp: &Path, t: f64, ts: f64, twc: &slam::register::Tf) {
-    let Some((fix, z0v)) = *POSE_FIX.lock().unwrap() else { return };
-    if !sgview::memfs::enabled() {
-        return;
-    }
-    let a = twc.0.map(|v| v as f64);
-    let r0: M3 = [[a[0], a[1], a[2]], [a[4], a[5], a[6]], [a[8], a[9], a[10]]];
-    let (r, p) = (mm(&fix, &r0), mv(&fix, &[a[3], a[7], a[11]]));
-    let pwc = [p[0], p[1], p[2] - z0v];
-    let pose = [pwc[0], pwc[1], (r[1][2]).atan2(r[0][2])];
-    sgview::memfs::publish(pp, std::sync::Arc::new(out::json_bytes(&json!({"t": t, "cam": {"pos": pwc, "R": r}, "pose": pose, "ok": true, "ts": ts, "wall": wall_ms()}))));
 }
 
 static UPS: std::sync::Mutex<std::collections::BTreeMap<u64, V3>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -2824,10 +2798,6 @@ fn main() {
     // 카메라 장치 fd 는 루프 epoll 에, 녹화 재생은 작업 풀이 한 장 앞서 풂
     if let Some(sa) = a.slam.clone() {
         let side = stream::SlamSide::new(sa, io.w_in.clone()).unwrap_or_else(|e| panic!("--slam: {e}"));
-        // IMU 모드 실시간 + 뷰어: 표본이 올 때마다(200 Hz) 루프가 장면 사이 위치를 pose.json(메모리)으로
-        if a.live > 0.0 && a.serve.is_some() && side.set_imu_waker(io.w_imu.clone()) {
-            io.fast_out = Some(a.out.join("pose.json"));
-        }
         #[cfg(target_os = "linux")]
         for fd in side.fds() {
             io.poll.add_fd(fd, T_IN, false);

@@ -1,5 +1,5 @@
 //! RGB-D 영상(다른 카메라)을 TUM fr3 보정값(640×480, fx 535.4 fy 539.2 cx 320.1 cy 247.6, 깊이 5000/m)으로 다시 그려
-//! TUM 형식 폴더로: rgb_sync/·depth_sync/(시각.png, RTAB-Map rgbd_dataset 도구용) + rgb.txt·depth.txt(우리 memmap 용).
+//! TUM 형식 폴더로: rgb_sync/·depth_sync/(시각.png) + rgb.txt·depth.txt(우리 memmap 용).
 //!   rgbd2tum <원본 폴더(association.txt)> <출력 폴더(이름에 freiburg3 포함)> fx fy cx cy <깊이 배율(1 m 값, 예: 1000)> [정답 위치 파일]
 //! 화면 위치는 보정값 비율로 옮기고(컬러 쌍선형, 깊이 가까운 화소), 원본 시야 밖은 검정·깊이 0. 흑백 컬러는 3 채널로.
 use image::{ImageBuffer, Luma, Rgb, RgbImage};

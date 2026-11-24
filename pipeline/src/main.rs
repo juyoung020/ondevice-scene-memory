@@ -2086,6 +2086,8 @@ struct Ceil {
     z: Option<(Plane, f64)>,   // (천장 면, 정한 때 카메라 높이)
     cand: Option<(Plane, u32)>,
     rng: u64,
+    /// 정한 뒤: (위쪽 법선, 카메라에서 천장까지 높이) — 장면마다 카메라 기준으로 면을 다시 놓음(지도가 밀리거나 기울어도 그 장면에서 맞게)
+    rel: Option<(V3, f64)>,
 }
 
 impl Ceil {
@@ -2129,8 +2131,10 @@ impl Ceil {
                 common::info!("천장: 카메라 높이가 {:.2} m 바뀜 → 다시 찾음", cam[2] - cz);
                 self.z = None;
                 self.cand = None;
+                self.rel = None;
                 CEIL_TOP.lock().unwrap().take();
             } else {
+                self.follow(cam, w);
                 return false;
             }
         }
@@ -2153,11 +2157,38 @@ impl Ceil {
             if n >= CEIL_HITS {
                 common::info!("천장 정함: 카메라 위 {:.2} m, 기울기 {:.1}°, 면에서 {:.2} m 아래부터 자름", pl.1 - dot(&pl.0, cam), pl.0[2].clamp(-1.0, 1.0).acos().to_degrees(), CEIL_CUT_M);
                 self.z = Some((pl, cam[2]));
+                self.rel = Some((pl.0, pl.1 - dot(&pl.0, cam)));
                 *CEIL_TOP.lock().unwrap() = Some(pl);
                 return true;
             }
         }
         false
+    }
+}
+
+impl Ceil {
+    /// 정한 뒤 장면마다: 이 장면 위쪽 점에서 같은 천장(법선 20° · 높이 ± 0.3 m 안)이 보이면 그 면으로, 안 보이면 카메라 기준 높이로 면을 놓는다
+    fn follow(&mut self, cam: &V3, w: &[V3]) {
+        let Some((n0, h0)) = self.rel else { return };
+        let all_up: Vec<V3> = w.iter().filter(|p| dot(&n0, &sub(p, cam)) > h0 - 0.3).copied().collect();
+        let step = (all_up.len() / 3000).max(1);
+        let up: Vec<V3> = all_up.iter().step_by(step).copied().collect();
+        let need = ((w.len() as f64 * 0.01).max(150.0) / step as f64) as usize;
+        let seen = self.fit(&up).filter(|(pl, k)| *k >= need && dot(&pl.0, &n0) > 20f64.to_radians().cos() && (pl.1 - dot(&pl.0, cam) - h0).abs() < 0.3).map(|x| x.0);
+        let pl = match seen {
+            Some(pl) => {
+                // 보인 면으로 법선 · 높이를 천천히 따라감
+                let h = pl.1 - dot(&pl.0, cam);
+                let mut n = add(&n0.map(|x| x * 0.7), &pl.0.map(|x| x * 0.3));
+                let l = norm(&n);
+                n = n.map(|x| x / l);
+                self.rel = Some((n, h0 * 0.7 + h * 0.3));
+                pl
+            }
+            None => (n0, dot(&n0, cam) + h0),
+        };
+        self.z = self.z.map(|z| (pl, z.1));
+        *CEIL_TOP.lock().unwrap() = Some(pl);
     }
 }
 

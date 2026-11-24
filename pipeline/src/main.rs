@@ -547,6 +547,10 @@ impl LoopIo {
             (a, b) => a.or(b),
         };
         let t = min(min(t, self.server.as_ref().and_then(|s| s.timeout())), self.thermal.timeout());
+        #[cfg(target_os = "linux")]
+        for fd in std::mem::take(&mut *stream::NEW_FDS.lock().unwrap()) {
+            self.poll.add_fd(fd, T_IN, false);
+        }
         let mut toks = std::mem::take(&mut self.toks);
         self.poll.wait(&mut toks, t);
         if let Some(sv) = self.server.as_mut() {

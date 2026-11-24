@@ -2358,7 +2358,7 @@ fn run_in(a: Args, pool: Option<std::sync::Arc<rayon::ThreadPool>>) -> Result<i3
 }
 
 /// D435 입력: --driver rsdriver(V4L2 직접, 기본) | librealsense(--align 로 정렬 방식). 빌드에 든 것만 고를 수 있다
-fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
+pub fn open_camera(a: &Args) -> Result<Box<dyn FrameSource>, String> {
     #[cfg(feature = "rsdriver")]
     {
         Ok(Box::new(crate::io::RsDriverSource::new(a.w, a.h, a.color, a.fps, &a.serial, a.exposure_ms, a.gain, a.ae_cap_ms, &a.camera_profile)?))

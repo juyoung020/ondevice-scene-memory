@@ -103,12 +103,20 @@ pub struct SlamSide {
     tx: Option<std::sync::mpsc::Sender<Ahead>>,
     /// 끝난 뒤 남은 항목
     rest: std::collections::VecDeque<OutFrame>,
+    /// 카메라 다시 열기용 설정(USB 가 끊겼다 붙을 때)
+    args: slam::app::Args,
 }
+
+/// 다시 연 카메라의 새 장치 fd: 처리 루프가 다음 바퀴에 epoll 에 건다
+pub static NEW_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+/// 카메라를 다시 열려고 기다리는 최대 시간(초)
+const REOPEN_S: f64 = 60.0;
 
 impl SlamSide {
     /// 위치 프로그램 준비(설정 · IMU · 입력 열기). waker: 재생 장면을 다 풀면 루프를 깨움
     pub fn new(a: slam::app::Args, waker: std::sync::Arc<common::rt::Waker>) -> Result<SlamSide, String> {
         let (block, max_frames) = (a.block_mode(), a.max_frames);
+        let args = a.clone();
         let (r, mut src, prep) = slam::backend::open(a)?;
         let pace = src.caller_paces();
         let (camera, replay, tx) = if src.fds().is_empty() {
@@ -118,7 +126,7 @@ impl SlamSide {
         } else {
             (Some((src, prep)), None, None)
         };
-        let mut side = SlamSide { r: Some(r), camera, replay, asked: false, pace, held: None, block, ended: false, max_frames, waker, tx, rest: Default::default() };
+        let mut side = SlamSide { r: Some(r), camera, replay, asked: false, pace, held: None, block, ended: false, max_frames, waker, tx, rest: Default::default(), args };
         side.ask();
         Ok(side)
     }
@@ -178,7 +186,27 @@ impl SlamSide {
                     Some((f, ms, pf))
                 }
                 Err(e) => {
-                    common::info!("slam 입력 오류: {e}");
+                    // 카메라 USB 가 끊김: 다시 붙을 때까지(REOPEN_S 초) 다시 열어 보고, 열리면 같은 지도에 이어 감
+                    common::info!("slam 입력 오류: {e} → 카메라 다시 열기 시도");
+                    let t0 = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        match slam::app::open_camera(&self.args) {
+                            Ok(n) => {
+                                common::info!("카메라 다시 열림({:.1} 초): 같은 지도에 이어 감", t0.elapsed().as_secs_f64());
+                                NEW_FDS.lock().unwrap().extend(n.fds());
+                                *src = n;
+                                return false;
+                            }
+                            Err(e2) if t0.elapsed().as_secs_f64() < REOPEN_S => {
+                                let _ = e2;
+                            }
+                            Err(e2) => {
+                                common::info!("카메라를 {REOPEN_S} 초 안에 다시 열지 못함: {e2}");
+                                break;
+                            }
+                        }
+                    }
                     None
                 }
             }

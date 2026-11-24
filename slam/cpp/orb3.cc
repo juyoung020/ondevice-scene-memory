@@ -41,9 +41,11 @@ void *orb3_new(const char *voc, const char *settings) {
 
 // 컬러(8 비트 3 채널 w×h, 설정의 Camera.RGB 순서) + 같은 격자의 깊이(16 비트, 설정의 DepthMapFactor 단위)를 넣는다.
 // 돌려줌: 추적 상태(Tracking::eTrackingState). twc · 지도 id · 기준 키프레임 id(없으면 -1)를 채움
-int orb3_track(void *h, const uint8_t *rgb, const uint16_t *depth, int w, int hh, double t, double *twc, uint64_t *map_id,
-               int64_t *ref_kf) {
+// up: 이 장면의 IMU 위쪽(카메라 축 3 칸, 없으면 NULL): 새 지도의 세계 z · 지역 최적화의 중력 항
+int orb3_track(void *h, const uint8_t *rgb, const uint16_t *depth, int w, int hh, double t, const double *up, double *twc,
+               uint64_t *map_id, int64_t *ref_kf) {
     System *s = static_cast<System *>(h);
+    s->GetTracker()->SetUp(up ? Eigen::Vector3f((float)up[0], (float)up[1], (float)up[2]) : Eigen::Vector3f::Zero(), up != nullptr);
     cv::Mat C(hh, w, CV_8UC3, const_cast<uint8_t *>(rgb)), D(hh, w, CV_16UC1, const_cast<uint16_t *>(depth));
     const Sophus::SE3f tcw = s->TrackRGBD(C, D, t);
     put34(tcw.inverse(), twc);

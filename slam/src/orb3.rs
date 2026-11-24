@@ -4,7 +4,7 @@ use std::ffi::{c_char, c_int, c_void, CString};
 
 unsafe extern "C" {
     fn orb3_new(voc: *const c_char, settings: *const c_char) -> *mut c_void;
-    fn orb3_track(h: *mut c_void, rgb: *const u8, depth: *const u16, w: c_int, hh: c_int, t: f64, twc: *mut f64, map_id: *mut u64, ref_kf: *mut i64) -> c_int;
+    fn orb3_track(h: *mut c_void, rgb: *const u8, depth: *const u16, w: c_int, hh: c_int, t: f64, up: *const f64, twc: *mut f64, map_id: *mut u64, ref_kf: *mut i64) -> c_int;
     fn orb3_map_changed(h: *mut c_void) -> c_int;
     fn orb3_keyframes(h: *mut c_void, all: c_int, ids: *mut u64, maps: *mut u64, poses: *mut f64, cap: c_int) -> c_int;
     fn orb3_graft(h: *mut c_void, from: u64, into: u64, s: *const f64) -> c_int;
@@ -40,14 +40,14 @@ impl System {
         Ok(System(h))
     }
 
-    /// 컬러(3 채널, 설정의 Camera.RGB 순서) + 같은 격자 깊이(설정의 DepthMapFactor 단위)
-    pub fn track(&mut self, rgb: &[u8], depth: &[u16], w: u32, h: u32, t: f64) -> Track {
+    /// 컬러(3 채널, 설정의 Camera.RGB 순서) + 같은 격자 깊이(설정의 DepthMapFactor 단위) + IMU 위쪽(카메라 축 단위 벡터)
+    pub fn track(&mut self, rgb: &[u8], depth: &[u16], w: u32, h: u32, t: f64, up: Option<[f64; 3]>) -> Track {
         let n = (w * h) as usize;
         assert!(rgb.len() >= n * 3 && depth.len() >= n);
         let mut o = Track { state: 0, twc: [0.0; 12], map_id: 0, ref_kf: None };
         let mut kf = -1i64;
         // SAFETY: 버퍼 크기는 위에서 확인, 출력 칸은 이 함수의 지역 값
-        o.state = unsafe { orb3_track(self.0, rgb.as_ptr(), depth.as_ptr(), w as c_int, h as c_int, t, o.twc.as_mut_ptr(), &mut o.map_id, &mut kf) };
+        o.state = unsafe { orb3_track(self.0, rgb.as_ptr(), depth.as_ptr(), w as c_int, h as c_int, t, up.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()), o.twc.as_mut_ptr(), &mut o.map_id, &mut kf) };
         o.ref_kf = (kf >= 0).then_some(kf as u64);
         o
     }

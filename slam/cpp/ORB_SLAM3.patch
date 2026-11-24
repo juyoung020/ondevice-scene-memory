@@ -46,6 +46,36 @@ index e751e48..384bc9b 100644
  #if !defined(SOPHUS_DISABLE_ENSURES)
  #include "formatstring.hpp"
  #endif //!defined(SOPHUS_DISABLE_ENSURES)
+diff --git a/include/Frame.h b/include/Frame.h
+index 572073f..2f68de6 100644
+--- a/include/Frame.h
++++ b/include/Frame.h
+@@ -321,6 +321,11 @@ private:
+     bool mbImuPreintegrated;
+ 
+     std::mutex *mpMutexImu;
++public:
++    // IMU 로 본 위쪽(카메라 축 단위 벡터), mbUp = 있음
++    Eigen::Vector3f mUpCam = Eigen::Vector3f::Zero();
++    bool mbUp = false;
++private:
+ 
+ public:
+     GeometricCamera* mpCamera, *mpCamera2;
+diff --git a/include/KeyFrame.h b/include/KeyFrame.h
+index 1b8d1c4..fb54df2 100644
+--- a/include/KeyFrame.h
++++ b/include/KeyFrame.h
+@@ -284,6 +284,9 @@ public:
+     }
+ 
+     Map* GetMap();
++    // IMU 로 본 위쪽(카메라 축), 지역 최적화의 중력 항
++    Eigen::Vector3f mUpCam = Eigen::Vector3f::Zero();
++    bool mbUp = false;
+     void UpdateMap(Map* pMap);
+ 
+     void SetNewBias(const IMU::Bias &b);
 diff --git a/include/LoopClosing.h b/include/LoopClosing.h
 index c9ccb26..3f84de7 100644
 --- a/include/LoopClosing.h
@@ -98,10 +128,10 @@ index 872c86e..11bda2f 100644
      std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
  
 diff --git a/include/Tracking.h b/include/Tracking.h
-index 863c98e..b39d230 100644
+index 863c98e..79e7529 100644
 --- a/include/Tracking.h
 +++ b/include/Tracking.h
-@@ -57,6 +57,10 @@ class Tracking
+@@ -57,6 +57,14 @@ class Tracking
  {  
  
  public:
@@ -109,10 +139,14 @@ index 863c98e..b39d230 100644
 +    bool RequestGraft(unsigned long from_id, unsigned long into_id, const Sophus::SE3f &S);
 +    // 지도 스레드가 쌓인 키프레임을 다 처리할 때까지 기다림(최대 속도 재생: 실시간보다 지도 쪽이 늘 따라옴, 최대 2 초)
 +    void WaitMappingIdle();
++    // 다음 장면의 IMU 위쪽(카메라 축). ok = 거짓이면 없음
++    void SetUp(const Eigen::Vector3f &up, bool ok) { mUpNext = up; mbUpNext = ok; }
++    Eigen::Vector3f mUpNext = Eigen::Vector3f::Zero();
++    bool mbUpNext = false;
      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
      Tracking(System* pSys, ORBVocabulary* pVoc, FrameDrawer* pFrameDrawer, MapDrawer* pMapDrawer, Atlas* pAtlas,
               KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor, Settings* settings, const string &_nameSeq=std::string());
-@@ -211,7 +215,13 @@ protected:
+@@ -211,7 +219,13 @@ protected:
      bool TrackWithMotionModel();
      bool PredictStateIMU();
  
@@ -127,6 +161,31 @@ index 863c98e..b39d230 100644
  
      void UpdateLocalMap();
      void UpdateLocalPoints();
+diff --git a/src/Frame.cc b/src/Frame.cc
+index a04c312..081ff11 100644
+--- a/src/Frame.cc
++++ b/src/Frame.cc
+@@ -65,7 +65,7 @@ Frame::Frame(const Frame &frame)
+      mfScaleFactor(frame.mfScaleFactor), mfLogScaleFactor(frame.mfLogScaleFactor),
+      mvScaleFactors(frame.mvScaleFactors), mvInvScaleFactors(frame.mvInvScaleFactors), mNameFile(frame.mNameFile), mnDataset(frame.mnDataset),
+      mvLevelSigma2(frame.mvLevelSigma2), mvInvLevelSigma2(frame.mvInvLevelSigma2), mpPrevFrame(frame.mpPrevFrame), mpLastKeyFrame(frame.mpLastKeyFrame),
+-     mbIsSet(frame.mbIsSet), mbImuPreintegrated(frame.mbImuPreintegrated), mpMutexImu(frame.mpMutexImu),
++     mbIsSet(frame.mbIsSet), mbImuPreintegrated(frame.mbImuPreintegrated), mpMutexImu(frame.mpMutexImu), mUpCam(frame.mUpCam), mbUp(frame.mbUp),
+      mpCamera(frame.mpCamera), mpCamera2(frame.mpCamera2), Nleft(frame.Nleft), Nright(frame.Nright),
+      monoLeft(frame.monoLeft), monoRight(frame.monoRight), mvLeftToRightMatch(frame.mvLeftToRightMatch),
+      mvRightToLeftMatch(frame.mvRightToLeftMatch), mvStereo3Dpoints(frame.mvStereo3Dpoints),
+diff --git a/src/KeyFrame.cc b/src/KeyFrame.cc
+index 293ab48..5cefe34 100644
+--- a/src/KeyFrame.cc
++++ b/src/KeyFrame.cc
+@@ -61,6 +61,7 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
+     mvLeftToRightMatch(F.mvLeftToRightMatch),mvRightToLeftMatch(F.mvRightToLeftMatch), mTlr(F.GetRelativePoseTlr()),
+     mvKeysRight(F.mvKeysRight), NLeft(F.Nleft), NRight(F.Nright), mTrl(F.GetRelativePoseTrl()), mnNumberOfOpt(0), mbHasVelocity(false)
+ {
++    mUpCam = F.mUpCam; mbUp = F.mbUp;
+     mnId=nNextId++;
+ 
+     mGrid.resize(mnGridCols);
 diff --git a/src/KeyFrameDatabase.cc b/src/KeyFrameDatabase.cc
 index 13b4da6..7faed5e 100644
 --- a/src/KeyFrameDatabase.cc
@@ -226,6 +285,49 @@ index 1cf802c..3def89f 100644
      {
          KeyFrame* pKFi = it->first;
          if(spKF.find(pKFi) != spKF.end())
+diff --git a/src/Optimizer.cc b/src/Optimizer.cc
+index b785be3..abaa940 100644
+--- a/src/Optimizer.cc
++++ b/src/Optimizer.cc
+@@ -44,6 +44,21 @@
+ 
+ namespace ORB_SLAM3
+ {
++
++// 중력 항: 키프레임 카메라에서 본 세계 z(= R_cw · z) 가 IMU 위쪽과 같게(수치 미분)
++class EdgeGravityUp : public g2o::BaseUnaryEdge<3, Eigen::Vector3d, g2o::VertexSE3Expmap>
++{
++public:
++    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
++    bool read(std::istream&) { return false; }
++    bool write(std::ostream&) const { return false; }
++    void computeError()
++    {
++        const g2o::VertexSE3Expmap* v = static_cast<const g2o::VertexSE3Expmap*>(_vertices[0]);
++        _error = v->estimate().rotation() * Eigen::Vector3d::UnitZ() - _measurement;
++    }
++};
++
+ bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
+ {
+     return (a.second < b.second);
+@@ -1225,6 +1240,16 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
+         pCurrentMap->msOptKFs.insert(pKFi->mnId);
+     }
+     num_OptKF = lLocalKeyFrames.size();
++    // 중력 항(IMU 위쪽이 있는 지역 키프레임): 1° ≈ 재투영 1.7 화소 무게
++    for(KeyFrame* pKFi : lLocalKeyFrames)
++    {
++        if(!pKFi->mbUp || pKFi->mnId==pMap->GetInitKFid()) continue;
++        EdgeGravityUp* e = new EdgeGravityUp();
++        e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFi->mnId)));
++        e->setMeasurement(pKFi->mUpCam.normalized().cast<double>());
++        e->setInformation(Eigen::Matrix3d::Identity() * 1e4);
++        optimizer.addEdge(e);
++    }
+ 
+     // Set Fixed KeyFrame vertices
+     for(list<KeyFrame*>::iterator lit=lFixedCameras.begin(), lend=lFixedCameras.end(); lit!=lend; lit++)
 diff --git a/src/Settings.cc b/src/Settings.cc
 index 93a50be..a7835d5 100644
 --- a/src/Settings.cc
@@ -249,7 +351,7 @@ index 93a50be..a7835d5 100644
              output << "\t-Stereo depth threshold : " << settings.thDepth_ << endl;
  
 diff --git a/src/Tracking.cc b/src/Tracking.cc
-index 5191451..8fed47c 100644
+index 5191451..de53e79 100644
 --- a/src/Tracking.cc
 +++ b/src/Tracking.cc
 @@ -39,6 +39,8 @@ using namespace std;
@@ -261,7 +363,15 @@ index 5191451..8fed47c 100644
  
  
  Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Atlas *pAtlas, KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor, Settings* settings, const string &_nameSeq):
-@@ -1809,6 +1811,7 @@ void Tracking::Track()
+@@ -1557,6 +1559,7 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
+     vdORBExtract_ms.push_back(mCurrentFrame.mTimeORB_Ext);
+ #endif
+ 
++    mCurrentFrame.mUpCam = mUpNext; mCurrentFrame.mbUp = mbUpNext;
+     Track();
+ 
+     return mCurrentFrame.GetPose();
+@@ -1809,6 +1812,7 @@ void Tracking::Track()
          return;
      }
  
@@ -269,7 +379,7 @@ index 5191451..8fed47c 100644
      Map* pCurrentMap = mpAtlas->GetCurrentMap();
      if(!pCurrentMap)
      {
-@@ -1963,16 +1966,11 @@ void Tracking::Track()
+@@ -1963,16 +1967,11 @@ void Tracking::Track()
                      {
                          mState = LOST;
                      }
@@ -287,7 +397,7 @@ index 5191451..8fed47c 100644
                  }
              }
              else
-@@ -2001,9 +1999,18 @@ void Tracking::Track()
+@@ -2001,9 +2000,18 @@ void Tracking::Track()
                      {
                          // Relocalization
                          bOK = Relocalization();
@@ -308,7 +418,7 @@ index 5191451..8fed47c 100644
                          {
                              mState = LOST;
                              Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
-@@ -2016,7 +2023,7 @@ void Tracking::Track()
+@@ -2016,7 +2024,7 @@ void Tracking::Track()
  
                      Verbose::PrintMess("A new map is started...", Verbose::VERBOSITY_NORMAL);
  
@@ -317,7 +427,7 @@ index 5191451..8fed47c 100644
                      {
                          mpSystem->ResetActiveMap();
                          Verbose::PrintMess("Reseting current map...", Verbose::VERBOSITY_NORMAL);
-@@ -2127,6 +2134,9 @@ void Tracking::Track()
+@@ -2127,6 +2135,9 @@ void Tracking::Track()
                  bOK = TrackLocalMap();
  
              }
@@ -327,7 +437,7 @@ index 5191451..8fed47c 100644
              if(!bOK)
                  cout << "Fail to track local map!" << endl;
          }
-@@ -2270,7 +2280,7 @@ void Tracking::Track()
+@@ -2270,7 +2281,7 @@ void Tracking::Track()
          // Reset if the camera get lost soon after initialization
          if(mState==LOST)
          {
@@ -336,7 +446,7 @@ index 5191451..8fed47c 100644
              {
                  mpSystem->ResetActiveMap();
                  return;
-@@ -2291,6 +2301,9 @@ void Tracking::Track()
+@@ -2291,6 +2302,9 @@ void Tracking::Track()
          if(!mCurrentFrame.mpReferenceKF)
              mCurrentFrame.mpReferenceKF = mpReferenceKF;
  
@@ -346,7 +456,20 @@ index 5191451..8fed47c 100644
          mLastFrame = Frame(mCurrentFrame);
      }
  
-@@ -3606,15 +3619,16 @@ void Tracking::UpdateLocalKeyFrames()
+@@ -2366,6 +2380,12 @@ void Tracking::StereoInitialization()
+             Vwb0.setZero();
+             mCurrentFrame.SetImuPoseVelocity(Rwb0, twb0, Vwb0);
+         }
++        else if(mCurrentFrame.mbUp)
++        {
++            // 새 지도의 세계 z 를 IMU 위쪽으로(지도마다 수평, 지도 사이 변환은 방위 · 이동만)
++            const Eigen::Matrix3f Rwc = Eigen::Quaternionf::FromTwoVectors(mCurrentFrame.mUpCam.normalized(), Eigen::Vector3f::UnitZ()).toRotationMatrix();
++            mCurrentFrame.SetPose(Sophus::SE3f(Rwc.transpose(), Eigen::Vector3f::Zero()));
++        }
+         else
+             mCurrentFrame.SetPose(Sophus::SE3f());
+ 
+@@ -3606,15 +3626,16 @@ void Tracking::UpdateLocalKeyFrames()
      }
  }
  
@@ -365,7 +488,7 @@ index 5191451..8fed47c 100644
  
      if(vpCandidateKFs.empty()) {
          Verbose::PrintMess("There are not candidates", Verbose::VERBOSITY_NORMAL);
-@@ -4124,3 +4138,149 @@ void Tracking::Release()
+@@ -4124,3 +4145,159 @@ void Tracking::Release()
  #endif
  
  } //namespace ORB_SLAM
@@ -416,6 +539,14 @@ index 5191451..8fed47c 100644
 +    }
 +}
 +
++// 두 지도 모두 세계 z 가 중력 위라 옮겨 붙이는 변환은 z 축 방위 + 이동만 남김
++static Sophus::SE3f YawOnly(const Sophus::SE3f &S)
++{
++    const Eigen::Matrix3f R = S.rotationMatrix();
++    const float yaw = atan2(R(1, 0), R(0, 0));
++    return Sophus::SE3f(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix(), S.translation());
++}
++
 +void Tracking::DoPendingGraft()
 +{
 +    if(!mpPendFrom) return;
@@ -425,6 +556,7 @@ index 5191451..8fed47c 100644
 +    std::unique_lock<std::mutex> busy(mpLoopClosing->mMutexBusy, std::try_to_lock);
 +    if(!busy.owns_lock() || mpLoopClosing->isRunningGBA()) { mpPendFrom = pFrom; mpPendInto = pInto; return; }
 +    const bool moveCam = pFrom == mpAtlas->GetCurrentMap();
++    mPendS = YawOnly(mPendS);
 +    GraftMap(pFrom, pInto, mPendS);
 +    if(moveCam)
 +    {
@@ -433,8 +565,9 @@ index 5191451..8fed47c 100644
 +    }
 +}
 +
-+void Tracking::GraftMap(Map* pFrom, Map* pInto, const Sophus::SE3f &S)
++void Tracking::GraftMap(Map* pFrom, Map* pInto, const Sophus::SE3f &S0)
 +{
++    const Sophus::SE3f S = YawOnly(S0);
 +    while(mpLocalMapper->KeyframesInQueue() > 0 && !mpLocalMapper->isFinished()) usleep(1000);
 +    mpLocalMapper->RequestStop();
 +    while(!mpLocalMapper->isStopped() && !mpLocalMapper->isFinished()) usleep(1000);

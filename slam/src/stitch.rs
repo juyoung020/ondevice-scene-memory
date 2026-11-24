@@ -73,10 +73,10 @@ pub struct Stitch {
 
 const Q8: f32 = 127.0;
 /// 후보 수(다른 지도만), MegaLoc 내적 최소
-const TOPK: usize = 6;
-const MIN_SCORE: f32 = 0.3;
+const TOPK: usize = 12;
+const MIN_SCORE: f32 = 0.25;
 /// 받을 맞은 점 수(틀린 짝은 부르는 쪽이 두 번 같은 변환으로 거름)
-const MIN_INLIERS: usize = 30;
+const MIN_INLIERS: usize = 20;
 
 impl Stitch {
     pub fn start(models: &str) -> Result<Stitch, String> {
@@ -224,7 +224,7 @@ impl State {
             xfeat::detect(&maps, self.cfg.kps, 0.05, &mut self.xsc, &mut q);
         }
         // 교실은 4 m 넘는 벽 · 문이 많아 8 m 까지(먼 점은 4 자유도 가설 · 재투영 오차로 걸러짐)
-        let vp = lcverify::Params { min_inliers: MIN_INLIERS, zmax: 8.0, ..self.cfg.verify.clone() };
+        let vp = lcverify::Params { min_inliers: MIN_INLIERS, zmax: 8.0, px: 4.0, px_hyp: 10.0, refine6: false, ..self.cfg.verify.clone() };
         let x3: Vec<Option<V3>> = q.kps.iter().map(|&p| lcverify::backproject(&n.depth, w, h, 1000.0, &n.k, p, vp.zmin, vp.zmax)).collect();
         // 후보: 지금 다른 지도에 든 예전 장면
         let my_map = n.maps.get(&n.kf).copied();

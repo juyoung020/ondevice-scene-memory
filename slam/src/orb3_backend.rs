@@ -73,6 +73,14 @@ fn rot_to_z(u: [f64; 3]) -> T34 {
     [kx * kx * v + c, kx * ky * v, ky * s, 0.0, kx * ky * v, ky * ky * v + c, -kx * s, 0.0, -ky * s, kx * s, c, 0.0]
 }
 
+/// 단위 벡터 a 를 b 로 돌리는 가장 짧은 회전
+fn rot_between(a: [f64; 3], b: [f64; 3]) -> T34 {
+    // a → z, z → b
+    let ra = rot_to_z(a);
+    let rb = rot_to_z(b);
+    mul(&inv(&rb), &ra)
+}
+
 /// TUM 줄: t x y z qx qy qz qw
 pub fn tum_line(t: f64, p: &T34) -> String {
     let (m00, m01, m02, m10, m11, m12, m20, m21, m22) = (p[0], p[1], p[2], p[4], p[5], p[6], p[8], p[9], p[10]);
@@ -111,7 +119,10 @@ pub struct Orb3 {
     /// IMU → 카메라 회전, t_imu = t_cam + shift
     r_ci: M34,
     shift: f64,
-    imu: Vec<[f64; 4]>,
+    imu: Vec<[f64; 5]>,
+    /// 앞 장면의 ORB 위치 · 그 뒤 자이로 회전 크기 합(rad)
+    prev_twc: Option<T34>,
+    gyro_ang: f64,
     q: VecDeque<OutFrame>,
     cap: usize,
     block: bool,
@@ -146,8 +157,10 @@ pub struct Orb3 {
     map_kfs: HashMap<u64, usize>,
     kfmap_t: f64,
     /// 확인을 기다리는 잇기: (into, from, into ← from, 시각)
-    pend: Option<(u64, u64, T34, f64)>,
+    pend: Vec<(u64, u64, T34, f64)>,
     n_graft: i64,
+    /// 지도별 가속도 합(그 지도 ORB 좌표) · 표본 수
+    gw: HashMap<u64, ([f64; 3], u64)>,
     /// 위치가 나온 장면: (시각, 기준 키프레임, 키프레임에서 본 장면 위치)
     tracked: Vec<(f64, u64, T34)>,
     settings_path: std::path::PathBuf,
@@ -161,6 +174,9 @@ pub struct Orb3 {
     n_nodes: i64,
     n_regrav: i64,
     n_switch: i64,
+    /// 최근 1 초 가속도 평균 크기, 기울기 튐으로 거른 장면
+    acc_g: Option<f64>,
+    n_spike: i64,
     n_repin: i64,
     dropped: i64,
     s_track: Vec<f64>,
@@ -207,6 +223,8 @@ impl Orb3 {
             r_ci: calib.r_ci,
             shift: calib.shift,
             imu: Vec::new(),
+            prev_twc: None,
+            gyro_ang: 0.0,
             q: VecDeque::new(),
             cap: a.queue.max(1),
             block: a.block_mode(),
@@ -233,8 +251,9 @@ impl Orb3 {
             kfmap: Arc::new(HashMap::new()),
             map_kfs: HashMap::new(),
             kfmap_t: f64::MIN,
-            pend: None,
+            pend: Vec::new(),
             n_graft: 0,
+            gw: HashMap::new(),
             tracked: Vec::new(),
             settings_path,
             t_run: Instant::now(),
@@ -247,6 +266,8 @@ impl Orb3 {
             n_nodes: 0,
             n_regrav: 0,
             n_switch: 0,
+            acc_g: None,
+            n_spike: 0,
             n_repin: 0,
             dropped: 0,
             s_track: Vec::new(),
@@ -418,6 +439,13 @@ impl Orb3 {
         m
     }
 
+    /// 지도별 중력(그 지도 ORB 좌표 위 방향): 가속도 400 표본(2 초) 이상 모였을 때
+    fn gdir(&self, m: u64) -> Option<[f64; 3]> {
+        let (g, n) = self.gw.get(&m)?;
+        let l = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        (*n >= 400 && l > 0.0).then(|| g.map(|x| x / l))
+    }
+
     /// 지도 잇기 결과: 두 번 같은 변환이 나오면 작은 지도를 큰 지도로 옮겨 붙이기 부탁
     fn on_hit(&mut self, h: stitch::Hit, t: f64) {
         let all = self.all_kfs(t);
@@ -428,25 +456,52 @@ impl Orb3 {
         // 질의 카메라의 b 지도 위치 = 후보 카메라(b) × (질의 ← 후보)⁻¹ → b ← a = 그것 × (질의 카메라의 a 위치)⁻¹
         let q_a = mul(&pa, &h.q_rel);
         let c_b = mul(&pb, &h.c_rel);
-        let s_ba = mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a));
+        let mut s_ba = mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a));
+        // 두 지도 각자의 중력(그 지도 좌표로 모은 가속도)이 있으면 변환의 기울기를 중력에 맞춤(질의 카메라 자리를 축으로)
+        if let (Some(ga), Some(gb)) = (self.gdir(ma), self.gdir(mb)) {
+            let ga_b = rot_vec(&s_ba, ga);
+            let r = rot_between(ga_b, gb);
+            let p = mul(&s_ba, &q_a);
+            let pc = [p[3], p[7], p[11]];
+            let rp = rot_vec(&r, pc);
+            let mut fix = r;
+            (fix[3], fix[7], fix[11]) = (pc[0] - rp[0], pc[1] - rp[1], pc[2] - rp[2]);
+            s_ba = mul(&fix, &s_ba);
+        }
         common::info!("지도 잇기 후보: 지도 {ma} 장면 {:.2} ↔ 지도 {mb} 장면 {:.2} (맞은 점 {}, MegaLoc {:.2})", h.t, h.c_t, h.inliers, h.score);
-        let agree = match self.pend {
-            Some((pi, pf, ps, pt)) if t - pt < 15.0 && ((pi, pf) == (mb, ma) || (pi, pf) == (ma, mb)) => {
+        // 같은 두 지도의 최근(60 초) 후보 가운데 하나라도 같은 변환이면 받음(사이에 틀린 후보가 끼어도 됨)
+        self.pend.retain(|p| t - p.3 < 60.0);
+        let mut best = (f64::MAX, f64::MAX);
+        for &(pi, pf, ps, _) in &self.pend {
+            if (pi, pf) == (mb, ma) || (pi, pf) == (ma, mb) {
                 let s = if (pi, pf) == (mb, ma) { ps } else { inv(&ps) };
                 let (d, r) = moved(&s, &s_ba);
-                common::info!("지도 잇기: 앞 후보와의 차 {d:.3} m · {:.2}°", r.to_degrees());
-                d < 0.25 && r < 6f64.to_radians()
+                if d + r < best.0 + best.1 {
+                    best = (d, r);
+                }
             }
-            _ => false,
-        };
-        if !agree {
-            self.pend = Some((mb, ma, s_ba, t));
+        }
+        let agree = best.0 < 0.2 && best.1 < 4f64.to_radians();
+        if best.0 < f64::MAX {
+            common::info!("지도 잇기: 가장 가까운 앞 후보와의 차 {:.3} m · {:.2}°", best.0, best.1.to_degrees());
+        }
+        // 맞은 점이 아주 많으면(60 개 이상) 한 번으로, 아니면 두 번 같은 변환이 나와야
+        if !agree && h.inliers < 60 {
+            self.pend.push((mb, ma, s_ba, t));
             return;
         }
-        self.pend = None;
+        self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
         let (na, nb) = (self.map_kfs.get(&ma).copied().unwrap_or(0), self.map_kfs.get(&mb).copied().unwrap_or(0));
         let ok = if na <= nb { self.sys.graft(ma, mb, &s_ba) } else { self.sys.graft(mb, ma, &inv(&s_ba)) };
         if ok {
+            // 옮긴 지도의 중력 합을 받는 지도 좌표로 더함
+            let (from, into, s) = if na <= nb { (ma, mb, s_ba) } else { (mb, ma, inv(&s_ba)) };
+            if let Some((g, n)) = self.gw.remove(&from) {
+                let gi = rot_vec(&s, g);
+                let e = self.gw.entry(into).or_insert(([0.0; 3], 0));
+                e.0 = [e.0[0] + gi[0], e.0[1] + gi[1], e.0[2] + gi[2]];
+                e.1 += n;
+            }
             self.n_graft += 1;
             common::info!("위치: 지도 {} 를 지도 {} 에 옮겨 붙임(신경망 장소 인식, 두 번 같은 변환)", if na <= nb { ma } else { mb }, if na <= nb { mb } else { ma });
         }
@@ -466,7 +521,7 @@ impl Orb3 {
                 r.feed(ring, f.t + self.shift);
             }
             let imu = &mut self.imu;
-            ring.drain(|s| imu.push([s.t, s.a[0] as f64, s.a[1] as f64, s.a[2] as f64]));
+            ring.drain(|s| imu.push([s.t, s.a[0] as f64, s.a[1] as f64, s.a[2] as f64, (s.w[0] * s.w[0] + s.w[1] * s.w[1] + s.w[2] * s.w[2]).sqrt() as f64]));
         }
         for s in &self.imu {
             let a = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
@@ -486,7 +541,17 @@ impl Orb3 {
         if self.block {
             self.sys.wait_idle();
         }
-        let tr = self.sys.track(&f.color, &f.depth_mm, w, h, f.t);
+        // IMU 위쪽: 최근 1 초 가속도 평균(카메라 축)
+        let up = (self.acc.len() >= 20).then(|| {
+            let m = self.acc.iter().fold([0.0; 3], |s, x| [s[0] + x.1[0], s[1] + x.1[1], s[2] + x.1[2]]);
+            let l = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+            m.map(|v| v / l)
+        });
+        self.acc_g = (self.acc.len() >= 20).then(|| {
+            let m = self.acc.iter().fold([0.0; 3], |s, x| [s[0] + x.1[0], s[1] + x.1[1], s[2] + x.1[2]]).map(|v| v / self.acc.len() as f64);
+            (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt()
+        });
+        let tr = self.sys.track(&f.color, &f.depth_mm, w, h, f.t, up);
         self.s_track.push(c0.elapsed().as_secs_f64() * 1e3);
         let changed = self.sys.map_changed();
         let mut flags = 0u32;
@@ -498,11 +563,36 @@ impl Orb3 {
             self.last_map = Some(tr.map_id);
         }
         let ok = tr.state == OK && tr.twc.iter().all(|x| x.is_finite());
+        // 앞 장면과의 회전이 그사이 자이로 회전보다 3° 넘게 크면 한 장면짜리 튐(번진 장면에서 최적화가 잘못 수렴)
+        for s in &self.imu {
+            self.gyro_ang += s[4] / 200.0;
+        }
+        let spike = ok
+            && self.prev_twc.is_some_and(|p| {
+                let (_, a) = moved(&p, &tr.twc);
+                a > self.gyro_ang * 1.5 + 3f64.to_radians()
+            });
+        // 튐 다음 장면은 비교하지 않음(지도가 옮겨 붙어 좌표가 바뀐 때도 한 장만 거름)
+        self.prev_twc = (ok && !spike && self.last_map == Some(tr.map_id)).then_some(tr.twc);
+        self.gyro_ang = 0.0;
+        if spike {
+            self.n_spike += 1;
+        }
+        let ok = ok && !spike;
         if ok && (changed || tr.map_id != self.kfs_map || f.t - self.kfs_t >= SWEEP_S || tr.ref_kf.is_some_and(|k| !self.kfs.contains_key(&k))) {
             self.read_kfs(f.t);
         }
         if ok {
             self.update_frame();
+        }
+        if ok {
+            let e = self.gw.entry(tr.map_id).or_insert(([0.0; 3], 0));
+            for s in &self.imu {
+                let a = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
+                let v = rot_vec(&tr.twc, [a[0] as f64, a[1] as f64, a[2] as f64]);
+                e.0 = [e.0[0] + v[0], e.0[1] + v[1], e.0[2] + v[2]];
+                e.1 += 1;
+            }
         }
         let mut regrav = false;
         if ok && self.trusted {
@@ -530,7 +620,10 @@ impl Orb3 {
             }
             let m = self.acc.iter().fold([0.0; 3], |s, x| [s[0] + x.1[0], s[1] + x.1[1], s[2] + x.1[2]]).map(|v| v / self.acc.len() as f64);
             let g = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
-            if let (Some(k), true) = (tr.ref_kf, (g - 9.81).abs() < 2.0) {
+            if let (Some(k), true) = ((anchor > 0).then(|| (anchor - 1) as u64), (g - 9.81).abs() < 2.0) {
+                if !self.kfmap.contains_key(&k) {
+                    self.all_kfs(f.t);
+                }
                 let p = self.kfmap.contains_key(&k).then(|| self.sys_kf_pose(k)).flatten();
                 if let Some(pk) = p {
                     self.last_node_t = f.t;
@@ -685,8 +778,8 @@ impl SlamBackend for Orb3Backend {
             s.n, s.n as f64 / wall.max(1e-9), s.tracked.len(), maps.len(), maps
         );
         common::info!(
-            "보냄: 지도에 넣음 {} · 맡아 둠 {} · 놓침 {} · 새 지도 {} · 큰 지도 바뀜 {} · 중력 다시 맞춤 {} · 다시 못 박음 {} · 기준 옮김 {} · 그래프 블록 {}(노드 {}) · 밀려 버린 장면 {}",
-            s.n_sent_ok, s.n_held, s.n_lost, s.n_newmap, s.n_corr, s.n_regrav, s.n_repin, s.n_switch, s.n_graph, s.n_nodes, s.dropped
+            "보냄: 지도에 넣음 {} · 맡아 둠 {} · 놓침 {} · 새 지도 {} · 큰 지도 바뀜 {} · 중력 다시 맞춤 {} · 다시 못 박음 {} · 기준 옮김 {} · 기울기 튐 {} · 그래프 블록 {}(노드 {}) · 밀려 버린 장면 {}",
+            s.n_sent_ok, s.n_held, s.n_lost, s.n_newmap, s.n_corr, s.n_regrav, s.n_repin, s.n_switch, s.n_spike, s.n_graph, s.n_nodes, s.dropped
         );
         common::info!("ms/장 위치추적 {}", summary(&s.s_track));
         common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}", s.stitch.sent, s.stitch.hits, s.n_graft);

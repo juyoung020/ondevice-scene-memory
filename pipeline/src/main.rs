@@ -2059,11 +2059,68 @@ fn smooth_depth(d: &[f32], w: usize, u: usize, v: usize) -> f32 {
     s / n as f32
 }
 
-/// 점 격자 → 청크 점 지도(카메라 좌표 그대로 넘기면 청크가 자기 기준 자세 좌표로 바꿔 담음)
-fn chunk_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, cm: &mut chunks::ChunkMap, kf: u32, seq: Option<u64>) {
+/// 천장 높이: 카메라보다 CEIL_MIN_M 넘게 위의 높이 칸(CEIL_BIN_M) 하나에 장면 점이 몰리면(넓은 수평 면) 그 높이를 후보로,
+/// CEIL_HITS 장면 연속 같은 높이(± CEIL_BIN_M)면 천장으로 정한다. 정한 뒤로는 천장 − CEIL_CUT_M 위 점은 지도에 넣지 않는다.
+/// 카메라가 정한 때보다 CEIL_FLOOR_M 넘게 오르내리면(층이 바뀜) 다시 찾는다. 지도 z 는 위쪽(바닥 맞춤 · IMU 중력)
+const CEIL_MIN_M: f64 = 0.4;
+const CEIL_BIN_M: f64 = 0.05;
+const CEIL_HITS: u32 = 3;
+const CEIL_CUT_M: f64 = 0.1;
+const CEIL_FLOOR_M: f64 = 1.5;
+
+#[derive(Default)]
+struct Ceil {
+    z: Option<(f64, f64)>,   // (천장 높이, 정한 때 카메라 높이)
+    cand: Option<(f64, u32)>, // (후보 높이, 연속 장면 수)
+}
+
+impl Ceil {
+    /// 이 장면 점(지도 좌표 높이)으로 천장을 찾거나 확인한다
+    fn observe(&mut self, cam_z: f64, zs: &[f64]) {
+        if let Some((_, cz)) = self.z {
+            if (cam_z - cz).abs() > CEIL_FLOOR_M {
+                common::info!("천장: 카메라 높이가 {:.2} m 바뀜 → 다시 찾음", cam_z - cz);
+                *self = Ceil::default();
+            } else {
+                return;
+            }
+        }
+        let lo = cam_z + CEIL_MIN_M;
+        let mut bins: HashMap<i64, u32> = HashMap::new();
+        for &z in zs.iter().filter(|&&z| z > lo) {
+            *bins.entry((z / CEIL_BIN_M).floor() as i64).or_default() += 1;
+        }
+        // 가장 낮은 '몰린' 칸(이웃 칸 합이 장면 점의 4 % 넘고 200 개 넘음)
+        let need = ((zs.len() as f64 * 0.04) as u32).max(200);
+        let mut keys: Vec<i64> = bins.keys().copied().collect();
+        keys.sort_unstable();
+        let hit = keys.into_iter().find(|b| bins[b] + bins.get(&(b + 1)).copied().unwrap_or(0) >= need).map(|b| b as f64 * CEIL_BIN_M);
+        self.cand = match (hit, self.cand) {
+            (Some(h), Some((c, n))) if (h - c).abs() <= CEIL_BIN_M => Some((c.min(h), n + 1)),
+            (Some(h), _) => Some((h, 1)),
+            (None, c) => c,
+        };
+        if let Some((c, n)) = self.cand {
+            if n >= CEIL_HITS {
+                common::info!("천장 정함: 지도 높이 {:.2} m (카메라 + {:.2} m), 위 {:.2} m 부터 자름", c, c - cam_z, c - CEIL_CUT_M);
+                self.z = Some((c, cam_z));
+            }
+        }
+    }
+    /// 이 높이보다 위면 버림(천장을 아직 못 정했으면 무한)
+    fn cut(&self) -> f64 {
+        self.z.map_or(f64::INFINITY, |(c, _)| c - CEIL_CUT_M)
+    }
+}
+
+/// 점 격자 → 청크 점 지도(카메라 좌표 그대로 넘기면 청크가 자기 기준 자세 좌표로 바꿔 담음). 천장 위 점은 빼고 넣는다
+#[allow(clippy::too_many_arguments)]
+fn chunk_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, cm: &mut chunks::ChunkMap, kf: u32, seq: Option<u64>, ceil: &mut Ceil) {
     let [fx, fy, cx, cy] = k;
     let ax: Vec<f64> = (0..g.gw).map(|gx| ((g.off[0] + gx * g.step) as f64 - cx) / fx).collect();
-    let it = (0..g.gh).flat_map(|gy| {
+    // 지도 높이 = r 셋째 줄 · 카메라 점 + 카메라 높이
+    let wz = |pc: &V3| r[2][0] * pc[0] + r[2][1] * pc[1] + r[2][2] * pc[2] + pwc[2];
+    let pts: Vec<(V3, [u8; 3], f32)> = (0..g.gh).flat_map(|gy| {
         let ay = ((g.off[1] + gy * g.step) as f64 - cy) / fy;
         let ax = &ax;
         (0..g.gw).filter_map(move |gx| {
@@ -2071,8 +2128,11 @@ fn chunk_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, cm: &mut chunks::Chu
             let z = g.d[i] as f64;
             (z > 0.0).then(|| ([ax[gx] * z, ay * z, z], [g.rgb[i * 3], g.rgb[i * 3 + 1], g.rgb[i * 3 + 2]], z as f32))
         })
-    });
-    cm.add(kf, seq, r, pwc, it);
+    }).collect();
+    let zs: Vec<f64> = pts.iter().map(|p| wz(&p.0)).collect();
+    ceil.observe(pwc[2], &zs);
+    let top = ceil.cut();
+    cm.add(kf, seq, r, pwc, pts.into_iter().zip(zs).filter(|(_, z)| *z <= top).map(|(p, _)| p));
 }
 
 /// 장면 버퍼를 쥔 채 쓰다가 버려질 때 카메라 입력에 돌려줌(Deref 로 안의 값을 그대로 씀)
@@ -2133,6 +2193,7 @@ struct PtsSt {
     t_add: f64,
     t_write: f64,
     nf: u32,
+    ceil: Ceil,
 }
 
 /// 점 줄: 점 고르기·청크 넣기·청크 파일 쓰기를 작업 풀에서 차례대로(스레드 없음). 루프는 장면을 넘기기만 한다.
@@ -2152,7 +2213,7 @@ impl PtsWorker {
     fn new(a: std::sync::Arc<Args>, k: [f64; 4], wait: bool) -> PtsWorker {
         let (json_tx, json_rx) = std::sync::mpsc::channel();
         let chunks = chunks::ChunkMap::new(a.scene_vox, a.pts_obs);
-        let st = PtsSt { a, k, chunks, json_tx, t_grid: 0.0, t_add: 0.0, t_write: 0.0, nf: 0 };
+        let st = PtsSt { a, k, chunks, json_tx, t_grid: 0.0, t_add: 0.0, t_write: 0.0, nf: 0, ceil: Ceil::default() };
         PtsWorker { lane: common::rt::Lane::new("pts", st, 0), json_rx, json: std::cell::RefCell::new(serde_json::Value::Null), wait,
                     dropped: 0, gap: (PTS_GAP_M, PTS_GAP_DEG.to_radians()), last: None, skipped: 0 }
     }
@@ -2188,7 +2249,7 @@ impl PtsWorker {
                 let _ = z.pts.set(Some(g.pack()));
             }
             let c1 = Instant::now();
-            chunk_points(s.k, &g, &r, &pwc, &mut s.chunks, kf, seq);
+            chunk_points(s.k, &g, &r, &pwc, &mut s.chunks, kf, seq, &mut s.ceil);
             (s.t_grid, s.t_add, s.nf) = (s.t_grid + (c1 - c0).as_secs_f64(), s.t_add + c1.elapsed().as_secs_f64(), s.nf + 1);
             out::slow(c0);
         });
@@ -2212,7 +2273,7 @@ impl PtsWorker {
         let poses: HashMap<u64, (M3, V3)> = snap.iter().map(|(kf, r, p)| (kf.seq, (*r, *p))).collect();
         let snap: Vec<_> = snap.iter().map(|(kf, r, p)| (kf.clone(), *r, *p)).collect();
         self.lane.push(move |s: &mut PtsSt| {
-            let cm = &mut s.chunks;
+            let (cm, ceil) = (&mut s.chunks, &mut s.ceil);
             let n = cm.repose(&poses);
             if std::env::var("MEMMAP_PTS_LOG").is_ok() {
                 common::info!("청크 자세 고침: {n} 개 / 지금까지 {} 개 {:.1} ms", cm.n_repose, cm.t_repose * 1e3);
@@ -2222,7 +2283,7 @@ impl PtsWorker {
                     continue;
                 }
                 if let Some(g) = kf.pts_wait().as_ref().map(PtsGrid::from_z) {
-                    chunk_points(s.k, &g, r, p, cm, 0x8000_0000 | kf.seq as u32, Some(kf.seq));
+                    chunk_points(s.k, &g, r, p, cm, 0x8000_0000 | kf.seq as u32, Some(kf.seq), ceil);
                 }
             }
         });

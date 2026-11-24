@@ -194,6 +194,14 @@ pub fn ply(dst: &Path, pts: Vec<([f32; 3], [u8; 3])>) {
 pub fn png_rgb(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
     write_lazy(dst, Box::new(move || common::img::png_rgb(w, h, &px)));
 }
+/// 물체 대표 사진: JPEG(품질 75, 한 장 몇 KB)
+pub fn jpg_rgb(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
+    write_lazy(dst, Box::new(move || {
+        let mut b = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut b, 75).encode(&px, w, h, image::ExtendedColorType::Rgb8).unwrap();
+        b
+    }));
+}
 pub fn png_gray(dst: &Path, w: u32, h: u32, px: Arc<Vec<u8>>) {
     write_lazy(dst, Box::new(move || common::img::png_gray(w, h, &px)));
 }

@@ -160,21 +160,21 @@ impl ChunkMap {
         self.n_dup += dup;
     }
 
-    /// 세계 높이 z 가 top 보다 위인 점을 모든 청크에서 지움(천장을 정한 순간 그 전에 쌓인 천장 점): 지운 점 수
-    pub fn cut_above(&mut self, top: f64) -> usize {
+    /// above 가 참인(천장 면 근처 · 위) 점을 모든 청크에서 지움(천장을 정한 순간 그 전에 쌓인 천장 점): 지운 점 수
+    pub fn cut_above(&mut self, above: &dyn Fn(&V3) -> bool) -> usize {
         let mut n = 0;
         for c in &mut self.chunks {
-            let wz = |q: [f64; 3]| (c.r[2][0] * q[0] + c.r[2][1] * q[1] + c.r[2][2] * q[2]) / 1000.0 + c.p[2];
+            let wz = |q: [f64; 3]| !above(&add(&mv(&c.r, &q.map(|x| x / 1000.0)), &c.p));
             let before = n;
             if let Some(acc) = c.acc.as_mut() {
                 let l = acc.len();
                 acc.retain(|_, a| {
                     let k = a.n.max(1) as f64;
-                    wz([a.s[0] as f64 / k, a.s[1] as f64 / k, a.s[2] as f64 / k]) <= top
+                    wz([a.s[0] as f64 / k, a.s[1] as f64 / k, a.s[2] as f64 / k])
                 });
                 n += l - acc.len();
             } else {
-                let keep: Vec<bool> = c.pts.iter().map(|q| wz([q[0] as f64, q[1] as f64, q[2] as f64]) <= top).collect();
+                let keep: Vec<bool> = c.pts.iter().map(|q| wz([q[0] as f64, q[1] as f64, q[2] as f64])).collect();
                 let l = c.pts.len();
                 let mut it = keep.iter();
                 c.pts.retain(|_| *it.next().unwrap());

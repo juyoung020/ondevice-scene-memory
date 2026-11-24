@@ -13,12 +13,14 @@ pub struct Tum {
     /// 수평 맞춤 회전(세계 → 수평 세계)
     pub level: M3,
     pub k: [f64; 4],
+    /// 깊이 PNG 값 ÷ 이 수 = 미터(TUM 5000, calib.json 이 있으면 1 / depth_unit_m)
+    pub depth_div: f32,
 }
 
 impl Tum {
     /// 카메라 입력용 빈 시퀀스(내부 보정값만)
     pub fn empty(k: [f64; 4]) -> Tum {
-        Tum { dir: PathBuf::new(), rgb: vec![], depth: vec![], ts: vec![], ps: vec![], qs: vec![], level: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], k }
+        Tum { dir: PathBuf::new(), rgb: vec![], depth: vec![], ts: vec![], ps: vec![], qs: vec![], level: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], k, depth_div: 5000.0 }
     }
 
     /// gt: 위치 파일(TUM 형식). 없으면 폴더의 groundtruth.txt(다른 SLAM 이 낸 위치를 넣을 때 씀)
@@ -58,8 +60,19 @@ impl Tum {
         }
         let level = rot_between(&up, &[0.0, 0.0, 1.0]);
         // 시퀀스별 카메라 보정(TUM 문서): freiburg1 · freiburg2 · freiburg3
-        let k = common::tum::camera_k(&dir.to_string_lossy());
-        Tum { dir: dir.to_path_buf(), rgb, depth, ts, ps, qs, level, k }
+        let mut k = common::tum::camera_k(&dir.to_string_lossy());
+        let mut depth_div = 5000.0f32;
+        // 우리 녹화(rsdriver): calib.json 의 컬러 내부값 · 깊이 단위를 씀
+        if let Some(c) = std::fs::read_to_string(dir.join("calib.json")).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+            let ci = &c["color_intrinsics"];
+            if let (Some(fx), Some(fy), Some(cx), Some(cy)) = (ci["fx"].as_f64(), ci["fy"].as_f64(), ci["ppx"].as_f64(), ci["ppy"].as_f64()) {
+                k = [fx, fy, cx, cy];
+            }
+            if let Some(u) = c["depth_unit_m"].as_f64() {
+                depth_div = (1.0 / u) as f32;
+            }
+        }
+        Tum { dir: dir.to_path_buf(), rgb, depth, ts, ps, qs, level, k, depth_div }
     }
 
     /// 시각 t 의 카메라 포즈(수평 세계): (위치, OpenCV 카메라 → 세계 회전)
@@ -77,6 +90,6 @@ impl Tum {
         let j = if i == 0 { 0 } else if i >= self.depth.len() { self.depth.len() - 1 } else if (self.depth[i].0 - t).abs() < (t - self.depth[i - 1].0).abs() { i } else { i - 1 };
         let img = image::open(self.dir.join(&self.depth[j].1)).ok()?.into_luma16();
         let (w, h) = img.dimensions();
-        Some((w, h, img.into_raw().into_iter().map(|v| v as f32 / 5000.0).collect()))
+        Some((w, h, img.into_raw().into_iter().map(|v| v as f32 / self.depth_div).collect()))
     }
 }

@@ -37,6 +37,7 @@
 - GitHub 릴리즈 `recordings-v1`(완료), `recordings-v2`: 2026-11-19 밤 노트북(`C:\Users\rlawn\rec\recordings-v2\upload.sh`)에서 남은 조각 올리는 중. 확인: `gh release view recordings-v2 --json assets -q '.assets[] | "\(.name) \(.size)"'` — 조각 8 개(`ir_loop_off.tar.part-00/01`, `ir_loop_on.tar.part-00/01`, `ir_off1/ir_off2/ir_on1.tar.part-00`) + `SHA256SUMS`. 빠진 게 있으면 노트북에서 `bash ~/rec/recordings-v2/upload.sh` 다시(같은 이름 덮어씀). 합치기: `cat X.tar.part-* > X.tar && sha256sum -c`.
 
 ## 남은 문제 (2026-11-19 실시간 6,876 장 기준)
+- 위치 추적 이슈 전체(다시 붙지 않음 · 기울기 · 루프 보정 0 · 녹화 빈틈 · 멈춤)와 원인 · 할 일: [`pose_issues.md`](pose_issues.md)
 - **"살짝 층"**: 새 지도는 2 번 생겼고 둘 다 1 초 안에 다시 이어짐(합치기는 됨). 원인은 **루프 보정 크기** — 방 안을 돌다 원래 자리를 알아봤을 때 노드를 0.61 m · 0.26 m 옮김(방 한 바퀴에 수십 cm 밀림). 점 지도 청크(`chunks.rs` `CHUNK_M` 0.6 m · `CHUNK_DEG` 25° · `CHUNK_KF` 30)가 노드 하나에 묶여 통째로 옮겨져, 덩어리 안의 다른 보정을 못 따라감.
 - 물체 id `#100…`, `#500…` 은 다시 쌓기 때 붙는 번호(`mem.next + 100_000`)이지 중복 표시가 아님.
 

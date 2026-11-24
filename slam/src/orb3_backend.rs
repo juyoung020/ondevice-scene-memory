@@ -3,8 +3,8 @@
 //! 좌표: 보내는 세계 = 기준 키프레임에 못 박은 좌표(처음 10 키프레임을 넘긴 지도의 첫 키프레임). ORB-SLAM3 가 지도를 합치거나
 //!   옮겨 붙여 그 지도 좌표가 통째로 바뀌어도, 기준 키프레임의 보낸 위치가 그대로이게 `A`(보내는 세계 ← ORB 지도)를 다시 구한다.
 //!   기준 키프레임이 지워지면 이미 보낸 다른 키프레임으로 다시 못 박는다.
-//! 중력: 기준 지도에 있는 장면 동안의 가속도(IMU → 카메라 → 기준 키프레임 카메라 축)를 모두 더한 방향이 위. 3 초 넘게 모이면 세계 z 를
-//!   그 방향으로 돌리고(GRAVITY), 그 뒤에도 0.3° 넘게 바뀌면 다시 돌려 노드를 모두 다시 보낸다. 오래 더하면 움직임 가속도는 상쇄된다.
+//! 중력: 장면마다 IMU 위쪽(1 초 평균 가속도)을 ORB-SLAM3 에 넘겨, 원본 패치가 새 지도를 위쪽 = z 로 시작하고 지역 최적화의 중력 항으로
+//!   지도 안 기울기 표류를 막는다. 지도 사이 옮겨 붙이기는 방위 · 이동만. 그래서 보내는 세계 z 가 곧 위(GRAVITY).
 //! 노드 = ORB-SLAM3 키프레임(노드 id = 키프레임 id + 1). 장면의 기준 노드 = 그 장면의 기준 키프레임.
 //!   기준 지도의 노드는 그대로, 아직 기준 지도와 합쳐지지 않은 지도(빈틈 뒤 새 지도)의 노드와 장면은 맡아 둠(HELD):
 //!   받는 쪽이 보관해 두었다가, ORB-SLAM3 가 그 지도를 기준 지도에 옮겨 붙여 노드가 맡아 둠 없이 다시 오면 고친 위치로 지도에 넣는다.
@@ -46,39 +46,11 @@ pub fn inv(a: &T34) -> T34 {
     o
 }
 
-fn rot_vec(a: &T34, v: [f64; 3]) -> [f64; 3] {
-    [0, 1, 2].map(|i| a[i * 4] * v[0] + a[i * 4 + 1] * v[1] + a[i * 4 + 2] * v[2])
-}
-
 /// 두 위치의 이동(m) · 회전(rad) 차
 fn moved(a: &T34, b: &T34) -> (f64, f64) {
     let d = ((a[3] - b[3]).powi(2) + (a[7] - b[7]).powi(2) + (a[11] - b[11]).powi(2)).sqrt();
     let tr: f64 = (0..3).map(|i| (0..3).map(|k| a[i * 4 + k] * b[i * 4 + k]).sum::<f64>()).sum();
     (d, ((tr - 1.0) * 0.5).clamp(-1.0, 1.0).acos())
-}
-
-/// 단위 벡터 u 를 +z 로 돌리는 회전(가장 짧은 회전)
-fn rot_to_z(u: [f64; 3]) -> T34 {
-    let n = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-    let u = u.map(|x| x / n);
-    // 축 = u × z, 각 = acos(u·z)
-    let (ax, ay) = (u[1], -u[0]);
-    let s = (ax * ax + ay * ay).sqrt();
-    let c = u[2];
-    if s < 1e-12 {
-        return if c > 0.0 { [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0] };
-    }
-    let (kx, ky) = (ax / s, ay / s);
-    let v = 1.0 - c;
-    [kx * kx * v + c, kx * ky * v, ky * s, 0.0, kx * ky * v, ky * ky * v + c, -kx * s, 0.0, -ky * s, kx * s, c, 0.0]
-}
-
-/// 단위 벡터 a 를 b 로 돌리는 가장 짧은 회전
-fn rot_between(a: [f64; 3], b: [f64; 3]) -> T34 {
-    // a → z, z → b
-    let ra = rot_to_z(a);
-    let rb = rot_to_z(b);
-    mul(&inv(&rb), &ra)
 }
 
 /// TUM 줄: t x y z qx qy qz qw
@@ -103,10 +75,6 @@ pub fn tum_line(t: f64, p: &T34) -> String {
 
 /// 기준 지도로 칠 지도의 최소 키프레임 수
 const REF_MIN_KF: usize = 10;
-/// 중력을 정하기까지 모을 가속도 시간(초, 200 Hz)
-const GRAV_MIN_S: f64 = 3.0;
-/// 중력 다시 돌리기 문턱(rad)
-const GRAV_REDO: f64 = 0.3 * std::f64::consts::PI / 180.0;
 /// 노드 다시 보내기: 이만큼(초)마다 움직인 노드를 훑음, 움직임 문턱(m, rad)
 const SWEEP_S: f64 = 1.0;
 const SWEEP_M: f64 = 0.01;
@@ -120,8 +88,9 @@ pub struct Orb3 {
     r_ci: M34,
     shift: f64,
     imu: Vec<[f64; 5]>,
-    /// 앞 장면의 ORB 위치 · 그 뒤 자이로 회전 크기 합(rad)
-    prev_twc: Option<T34>,
+    /// 앞 장면의 보낸 좌표 위치 · 그 뒤 자이로 회전 크기 합(rad)
+    prev_out: Option<T34>,
+    spike_run: u32,
     gyro_ang: f64,
     q: VecDeque<OutFrame>,
     cap: usize,
@@ -141,8 +110,6 @@ pub struct Orb3 {
     kfs_map: u64,
     kfs_t: f64,
     /// 기준 키프레임 카메라 축으로 모은 가속도 합 · 표본 수, 정한 위 방향
-    g_sum: [f64; 3],
-    g_n: u64,
     g_dir: Option<[f64; 3]>,
     last_sweep: f64,
     last_map: Option<u64>,
@@ -159,8 +126,6 @@ pub struct Orb3 {
     /// 확인을 기다리는 잇기: (into, from, into ← from, 시각)
     pend: Vec<(u64, u64, T34, f64)>,
     n_graft: i64,
-    /// 지도별 가속도 합(그 지도 ORB 좌표) · 표본 수
-    gw: HashMap<u64, ([f64; 3], u64)>,
     /// 위치가 나온 장면: (시각, 기준 키프레임, 키프레임에서 본 장면 위치)
     tracked: Vec<(f64, u64, T34)>,
     settings_path: std::path::PathBuf,
@@ -223,7 +188,8 @@ impl Orb3 {
             r_ci: calib.r_ci,
             shift: calib.shift,
             imu: Vec::new(),
-            prev_twc: None,
+            prev_out: None,
+            spike_run: 0,
             gyro_ang: 0.0,
             q: VecDeque::new(),
             cap: a.queue.max(1),
@@ -238,8 +204,6 @@ impl Orb3 {
             kfs: HashMap::new(),
             kfs_map: u64::MAX,
             kfs_t: f64::MIN,
-            g_sum: [0.0; 3],
-            g_n: 0,
             g_dir: None,
             last_sweep: f64::MIN,
             last_map: None,
@@ -253,7 +217,6 @@ impl Orb3 {
             kfmap_t: f64::MIN,
             pend: Vec::new(),
             n_graft: 0,
-            gw: HashMap::new(),
             tracked: Vec::new(),
             settings_path,
             t_run: Instant::now(),
@@ -342,7 +305,7 @@ impl Orb3 {
                 }
                 common::info!("위치: 지금 지도 {} (키프레임 {} 개)가 기준 지도 {:?} (키프레임 {n_ref} 개)보다 커져 기준을 옮김", self.kfs_map, self.kfs.len(), ref_map);
                 self.ref_kf = None;
-                (self.g_sum, self.g_n, self.g_dir) = ([0.0; 3], 0, None);
+                self.g_dir = None;
                 self.n_switch += 1;
             } else {
                 return;
@@ -359,42 +322,13 @@ impl Orb3 {
         }
     }
 
-    /// 이 장면 동안의 가속도를 기준 키프레임 카메라 축으로 더하고, 충분하면 위 방향을 정하거나 다시 돌림. 돌렸으면 true
-    fn add_gravity(&mut self, twc: &T34) -> bool {
-        let Some((id, out)) = self.ref_kf else { return false };
-        let Some(p_ref) = self.kfs.get(&id) else { return false };
-        // 기준 키프레임 카메라 ← 지금 카메라
-        let rel = mul(&inv(p_ref), twc);
-        for s in &self.imu {
-            let ac = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
-            let v = rot_vec(&rel, [ac[0] as f64, ac[1] as f64, ac[2] as f64]);
-            for i in 0..3 {
-                self.g_sum[i] += v[i];
-            }
-            self.g_n += 1;
-        }
-        if (self.g_n as f64) < GRAV_MIN_S * 200.0 {
+    /// 중력: ORB-SLAM3 지도 좌표는 원본 패치로 z 가 IMU 위(새 지도를 IMU 위쪽으로 시작, 지역 최적화 중력 항)라 기준 지도가 정해지면 바로 GRAVITY.
+    /// 처음 정할 때 true(노드를 맡아 둠 없이 모두 다시 보냄)
+    fn add_gravity(&mut self) -> bool {
+        if self.g_dir.is_some() || self.ref_kf.is_none() {
             return false;
         }
-        let n = (self.g_sum.iter().map(|x| x * x).sum::<f64>()).sqrt();
-        let u = self.g_sum.map(|x| x / n);
-        if let Some(d) = self.g_dir {
-            let c = (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]).clamp(-1.0, 1.0);
-            if c.acos() < GRAV_REDO {
-                return false;
-            }
-        }
-        // 기준 키프레임의 보낸 회전 = 위(기준 카메라 축 u)를 +z 로 보내는 회전, 위치는 그대로
-        let r = rot_to_z(u);
-        let mut o = r;
-        (o[3], o[7], o[11]) = (out[3], out[7], out[11]);
-        if self.g_dir.is_some() {
-            self.n_regrav += 1;
-        }
-        common::info!("위치: 중력 방향 {} (가속도 {:.1} 초)", if self.g_dir.is_some() { "다시 맞춤" } else { "정함" }, self.g_n as f64 / 200.0);
-        self.g_dir = Some(u);
-        self.ref_kf = Some((id, o));
-        self.a = mul(&o, &inv(p_ref));
+        self.g_dir = Some([0.0, 0.0, 1.0]);
         true
     }
 
@@ -439,13 +373,6 @@ impl Orb3 {
         m
     }
 
-    /// 지도별 중력(그 지도 ORB 좌표 위 방향): 가속도 400 표본(2 초) 이상 모였을 때
-    fn gdir(&self, m: u64) -> Option<[f64; 3]> {
-        let (g, n) = self.gw.get(&m)?;
-        let l = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
-        (*n >= 400 && l > 0.0).then(|| g.map(|x| x / l))
-    }
-
     /// 지도 잇기 결과: 두 번 같은 변환이 나오면 작은 지도를 큰 지도로 옮겨 붙이기 부탁
     fn on_hit(&mut self, h: stitch::Hit, t: f64) {
         let all = self.all_kfs(t);
@@ -456,18 +383,7 @@ impl Orb3 {
         // 질의 카메라의 b 지도 위치 = 후보 카메라(b) × (질의 ← 후보)⁻¹ → b ← a = 그것 × (질의 카메라의 a 위치)⁻¹
         let q_a = mul(&pa, &h.q_rel);
         let c_b = mul(&pb, &h.c_rel);
-        let mut s_ba = mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a));
-        // 두 지도 각자의 중력(그 지도 좌표로 모은 가속도)이 있으면 변환의 기울기를 중력에 맞춤(질의 카메라 자리를 축으로)
-        if let (Some(ga), Some(gb)) = (self.gdir(ma), self.gdir(mb)) {
-            let ga_b = rot_vec(&s_ba, ga);
-            let r = rot_between(ga_b, gb);
-            let p = mul(&s_ba, &q_a);
-            let pc = [p[3], p[7], p[11]];
-            let rp = rot_vec(&r, pc);
-            let mut fix = r;
-            (fix[3], fix[7], fix[11]) = (pc[0] - rp[0], pc[1] - rp[1], pc[2] - rp[2]);
-            s_ba = mul(&fix, &s_ba);
-        }
+        let s_ba = mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a));
         common::info!("지도 잇기 후보: 지도 {ma} 장면 {:.2} ↔ 지도 {mb} 장면 {:.2} (맞은 점 {}, MegaLoc {:.2})", h.t, h.c_t, h.inliers, h.score);
         // 같은 두 지도의 최근(60 초) 후보 가운데 하나라도 같은 변환이면 받음(사이에 틀린 후보가 끼어도 됨)
         self.pend.retain(|p| t - p.3 < 60.0);
@@ -494,14 +410,6 @@ impl Orb3 {
         let (na, nb) = (self.map_kfs.get(&ma).copied().unwrap_or(0), self.map_kfs.get(&mb).copied().unwrap_or(0));
         let ok = if na <= nb { self.sys.graft(ma, mb, &s_ba) } else { self.sys.graft(mb, ma, &inv(&s_ba)) };
         if ok {
-            // 옮긴 지도의 중력 합을 받는 지도 좌표로 더함
-            let (from, into, s) = if na <= nb { (ma, mb, s_ba) } else { (mb, ma, inv(&s_ba)) };
-            if let Some((g, n)) = self.gw.remove(&from) {
-                let gi = rot_vec(&s, g);
-                let e = self.gw.entry(into).or_insert(([0.0; 3], 0));
-                e.0 = [e.0[0] + gi[0], e.0[1] + gi[1], e.0[2] + gi[2]];
-                e.1 += n;
-            }
             self.n_graft += 1;
             common::info!("위치: 지도 {} 를 지도 {} 에 옮겨 붙임(신경망 장소 인식, 두 번 같은 변환)", if na <= nb { ma } else { mb }, if na <= nb { mb } else { ma });
         }
@@ -563,40 +471,38 @@ impl Orb3 {
             self.last_map = Some(tr.map_id);
         }
         let ok = tr.state == OK && tr.twc.iter().all(|x| x.is_finite());
-        // 앞 장면과의 회전이 그사이 자이로 회전보다 3° 넘게 크면 한 장면짜리 튐(번진 장면에서 최적화가 잘못 수렴)
         for s in &self.imu {
             self.gyro_ang += s[4] / 200.0;
         }
-        let spike = ok
-            && self.prev_twc.is_some_and(|p| {
-                let (_, a) = moved(&p, &tr.twc);
-                a > self.gyro_ang * 1.5 + 3f64.to_radians()
-            });
-        // 튐 다음 장면은 비교하지 않음(지도가 옮겨 붙어 좌표가 바뀐 때도 한 장만 거름)
-        self.prev_twc = (ok && !spike && self.last_map == Some(tr.map_id)).then_some(tr.twc);
-        self.gyro_ang = 0.0;
-        if spike {
-            self.n_spike += 1;
-        }
-        let ok = ok && !spike;
         if ok && (changed || tr.map_id != self.kfs_map || f.t - self.kfs_t >= SWEEP_S || tr.ref_kf.is_some_and(|k| !self.kfs.contains_key(&k))) {
             self.read_kfs(f.t);
         }
         if ok {
             self.update_frame();
         }
-        if ok {
-            let e = self.gw.entry(tr.map_id).or_insert(([0.0; 3], 0));
-            for s in &self.imu {
-                let a = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
-                let v = rot_vec(&tr.twc, [a[0] as f64, a[1] as f64, a[2] as f64]);
-                e.0 = [e.0[0] + v[0], e.0[1] + v[1], e.0[2] + v[2]];
-                e.1 += 1;
+        // 튐 거르기: 보낼 좌표에서 앞 장면과의 회전이 그사이 자이로 회전 × 1.5 + 3° 보다 크거나 30 cm 넘게 뛰면 그 장면은 놓침
+        // (번진 장면에서 최적화가 잘못 수렴 · 지도 좌표가 바뀐 첫 장면)
+        let pose_now = mul(&self.a, &tr.twc);
+        let spike = ok
+            && self.prev_out.is_some_and(|p| {
+                let (d, a) = moved(&p, &pose_now);
+                a > self.gyro_ang * 1.5 + 3f64.to_radians() || d > 0.3
+            });
+        // 튀면 마지막 좋은 장면을 그대로 두고 자이로 회전을 이어 더함. 5 장 넘게 이어지면(좌표가 바뀐 것) 지금 장면부터 다시
+        if spike {
+            self.n_spike += 1;
+            self.spike_run += 1;
+            if self.spike_run > 5 {
+                (self.prev_out, self.gyro_ang, self.spike_run) = (Some(pose_now), 0.0, 0);
             }
+        } else {
+            self.prev_out = ok.then_some(pose_now);
+            (self.gyro_ang, self.spike_run) = (0.0, 0);
         }
+        let ok = ok && !spike;
         let mut regrav = false;
         if ok && self.trusted {
-            regrav = self.add_gravity(&tr.twc);
+            regrav = self.add_gravity();
         }
         let usable = ok && self.trusted && self.g_dir.is_some();
         let mut anchor = 0u32;
@@ -832,15 +738,6 @@ mod tests {
             for c in 0..4 {
                 assert!((i[r * 4 + c] - if c == r { 1.0 } else { 0.0 }).abs() < 1e-12);
             }
-        }
-        // 아무 방향이나 +z 로
-        for u in [[0.3, -0.5, 0.8], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]] {
-            let r = rot_to_z(u);
-            let v = rot_vec(&r, u);
-            let n = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-            assert!((v[2] / n - 1.0).abs() < 1e-9, "{u:?} → {v:?}");
-            let (_, ang) = moved(&mul(&r, &inv(&r)), &crate::stream::IDENTITY);
-            assert!(ang < 1e-6);
         }
     }
 }

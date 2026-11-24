@@ -60,6 +60,114 @@ struct Stored {
     kps: Vec<[f32; 2]>,
     desc: Vec<i8>,
     x3: Vec<Option<V3>>,
+    /// 깊이 작은 격자(DW × DH, mm)와 그 격자의 내부값
+    small_d: Vec<u16>,
+    k: Intr,
+}
+
+/// 깊이 맞춤 검사용 작은 격자(8 화소마다)
+const DS: usize = 8;
+
+/// 두 장면 깊이가 변환 t_qc(질의 ← 후보)로 겹치는지: 후보 격자 점을 질의 영상에 투영해 질의 깊이와 비교.
+/// 돌려줌: (겹친 칸 비율, 겹친 칸 가운데 깊이가 맞는 비율). 맞음 = |차| < 5 cm + 깊이의 3 %
+fn depth_agree(qd: &[u16], cd: &[u16], w: usize, h: usize, kq: &Intr, kc: &Intr, t: &T34) -> (f64, f64) {
+    let (gw, gh) = (w / DS, h / DS);
+    let (mut n, mut over, mut good) = (0usize, 0usize, 0usize);
+    for v in 0..gh {
+        for u in 0..gw {
+            let z = cd[v * gw + u] as f64 / 1000.0;
+            if !(z > 0.2 && z < 6.0) {
+                continue;
+            }
+            n += 1;
+            let (px, py) = ((u * DS + DS / 2) as f64, (v * DS + DS / 2) as f64);
+            let x = [(px - kc.cx) * z / kc.fx, (py - kc.cy) * z / kc.fy, z];
+            let y = [0, 1, 2].map(|i| t[i * 4] * x[0] + t[i * 4 + 1] * x[1] + t[i * 4 + 2] * x[2] + t[i * 4 + 3]);
+            if y[2] < 0.2 {
+                continue;
+            }
+            let (qu, qv) = (kq.fx * y[0] / y[2] + kq.cx, kq.fy * y[1] / y[2] + kq.cy);
+            if qu < 0.0 || qv < 0.0 {
+                continue;
+            }
+            let (gu, gv) = ((qu as usize) / DS, (qv as usize) / DS);
+            if gu >= gw || gv >= gh {
+                continue;
+            }
+            let zq = qd[gv * gw + gu] as f64 / 1000.0;
+            if !(zq > 0.2 && zq < 6.0) {
+                continue;
+            }
+            over += 1;
+            if (zq - y[2]).abs() < 0.05 + 0.03 * y[2] {
+                good += 1;
+            }
+        }
+    }
+    (over as f64 / n.max(1) as f64, good as f64 / over.max(1) as f64)
+}
+
+/// 깊이 ICP(투영 짝 · 점 대 점, Kabsch): 후보 격자 점을 질의 영상에 투영해 같은 칸 질의 점과 짝짓고 강체 변환을 다시 구함.
+/// 짝 거리 문턱 0.3 → 0.15 → 0.08 m, 각 4 번. 짝이 30 개 미만이면 그대로
+fn icp(qd: &[u16], cd: &[u16], w: usize, h: usize, kq: &Intr, kc: &Intr, t0: &T34) -> T34 {
+    use nalgebra::{Matrix3, Vector3};
+    let (gw, gh) = (w / DS, h / DS);
+    let pt = |d: &[u16], k: &Intr, u: usize, v: usize| -> Option<Vector3<f64>> {
+        let z = d[v * gw + u] as f64 / 1000.0;
+        (z > 0.2 && z < 6.0).then(|| Vector3::new(((u * DS + DS / 2) as f64 - k.cx) * z / k.fx, ((v * DS + DS / 2) as f64 - k.cy) * z / k.fy, z))
+    };
+    let mut t = *t0;
+    for &th in &[0.3, 0.3, 0.3, 0.3, 0.15, 0.15, 0.15, 0.15, 0.08, 0.08, 0.08, 0.08] {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for v in 0..gh {
+            for u in 0..gw {
+                let Some(x) = pt(cd, kc, u, v) else { continue };
+                let y = Vector3::new(
+                    t[0] * x[0] + t[1] * x[1] + t[2] * x[2] + t[3],
+                    t[4] * x[0] + t[5] * x[1] + t[6] * x[2] + t[7],
+                    t[8] * x[0] + t[9] * x[1] + t[10] * x[2] + t[11],
+                );
+                if y[2] < 0.2 {
+                    continue;
+                }
+                let (qu, qv) = (kq.fx * y[0] / y[2] + kq.cx, kq.fy * y[1] / y[2] + kq.cy);
+                if qu < 0.0 || qv < 0.0 || (qu as usize) / DS >= gw || (qv as usize) / DS >= gh {
+                    continue;
+                }
+                let Some(q) = pt(qd, kq, (qu as usize) / DS, (qv as usize) / DS) else { continue };
+                if (q - y).norm() < th {
+                    a.push(x);
+                    b.push(q);
+                }
+            }
+        }
+        if a.len() < 30 {
+            return t;
+        }
+        let n = a.len() as f64;
+        let ca = a.iter().sum::<Vector3<f64>>() / n;
+        let cb = b.iter().sum::<Vector3<f64>>() / n;
+        let mut hm = Matrix3::zeros();
+        for (x, y) in a.iter().zip(&b) {
+            hm += (x - ca) * (y - cb).transpose();
+        }
+        let svd = hm.svd(true, true);
+        let (u, vt) = (svd.u.unwrap(), svd.v_t.unwrap());
+        let mut r = vt.transpose() * u.transpose();
+        if r.determinant() < 0.0 {
+            let mut v = vt.transpose();
+            v.column_mut(2).neg_mut();
+            r = v * u.transpose();
+        }
+        let tr = cb - r * ca;
+        t = [r[(0, 0)], r[(0, 1)], r[(0, 2)], tr[0], r[(1, 0)], r[(1, 1)], r[(1, 2)], tr[1], r[(2, 0)], r[(2, 1)], r[(2, 2)], tr[2]];
+    }
+    t
+}
+
+fn small_depth(d: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let (gw, gh) = (w / DS, h / DS);
+    (0..gh).flat_map(|v| (0..gw).map(move |u| d[(v * DS + DS / 2) * w + u * DS + DS / 2])).collect()
 }
 
 pub struct Stitch {
@@ -77,6 +185,10 @@ const TOPK: usize = 12;
 const MIN_SCORE: f32 = 0.25;
 /// 받을 맞은 점 수(틀린 짝은 부르는 쪽이 두 번 같은 변환으로 거름)
 const MIN_INLIERS: usize = 20;
+/// 깊이 맞춤: 후보 깊이 점 가운데 질의 영상 안에 들어 깊이가 있는 비율 · 그 가운데 깊이가 맞는 비율
+const DEPTH_OVERLAP: f64 = 0.2;
+const DEPTH_AGREE: f64 = 0.6;
+// (ICP 뒤 강의실 녹화에서 영상으로 같은 곳인 짝 0.67–0.99, 다른 모니터 줄 짝 0.29–0.59)
 
 impl Stitch {
     pub fn start(models: &str) -> Result<Stitch, String> {
@@ -237,6 +349,7 @@ impl State {
             use std::io::Write as _;
             let _ = writeln!(l, "{:.3} node map {:?} cands {:?}", n.t, my_map, cands.iter().map(|c| (c.0, (c.1 * 100.0).round() / 100.0)).collect::<Vec<_>>());
         }
+        let qsmall = small_depth(&n.depth, w, h);
         let mut hit = None;
         let mut b = XFeatures::default();
         for &(cid, score) in &cands {
@@ -266,13 +379,24 @@ impl State {
                     }
                     t[i * 4 + 3] = v.t[i];
                 }
+                // 깊이 ICP 로 다듬고, 깊이 전체가 같은 변환으로 겹치는지(반복되는 책상 · 모니터 줄에서 한 줄 어긋난 짝은 벽 · 바닥 깊이가 안 맞음)
+                let t0 = t;
+                t = icp(&qsmall, &c.small_d, w, h, &n.k, &c.k, &t0);
+                let (ov, ag) = depth_agree(&qsmall, &c.small_d, w, h, &n.k, &c.k, &t);
+                if let Some(l) = self.log.as_mut() {
+                    use std::io::Write as _;
+                    let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2}", n.t, c.t);
+                }
+                if ov < DEPTH_OVERLAP || ag < DEPTH_AGREE {
+                    continue;
+                }
                 hit = Some(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score });
                 break;
             }
         }
         self.db.add(self.nodes.len() as i64, &self.desc);
         let desc: Vec<i8> = q.desc.iter().map(|&v| (v * Q8).round().clamp(-127.0, 127.0) as i8).collect();
-        self.nodes.push(Stored { t: n.t, kf: n.kf, rel: n.rel, up: n.up, kps: q.kps, desc, x3 });
+        self.nodes.push(Stored { t: n.t, kf: n.kf, rel: n.rel, up: n.up, kps: q.kps, desc, x3, small_d: qsmall, k: n.k });
         hit
     }
 }

@@ -286,7 +286,7 @@ index 1cf802c..3def89f 100644
          KeyFrame* pKFi = it->first;
          if(spKF.find(pKFi) != spKF.end())
 diff --git a/src/Optimizer.cc b/src/Optimizer.cc
-index b785be3..abaa940 100644
+index b785be3..03f9cbf 100644
 --- a/src/Optimizer.cc
 +++ b/src/Optimizer.cc
 @@ -44,6 +44,21 @@
@@ -311,14 +311,24 @@ index b785be3..abaa940 100644
  bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
  {
      return (a.second < b.second);
-@@ -1225,6 +1240,16 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
+@@ -1217,7 +1232,8 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
+         Sophus::SE3<float> Tcw = pKFi->GetPose();
+         vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
+         vSE3->setId(pKFi->mnId);
+-        vSE3->setFixed(pKFi->mnId==pMap->GetInitKFid());
++        // 첫 키프레임도 중력 항이 있으면 풀어 둠(지도를 만들 때 잰 위쪽이 틀렸어도 기울기가 바로잡히게, 고정 키프레임이 기준을 잡음)
++        vSE3->setFixed(pKFi->mnId==pMap->GetInitKFid() && (!pKFi->mbUp || lFixedCameras.empty()));
+         optimizer.addVertex(vSE3);
+         if(pKFi->mnId>maxKFid)
+             maxKFid=pKFi->mnId;
+@@ -1225,6 +1241,16 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
          pCurrentMap->msOptKFs.insert(pKFi->mnId);
      }
      num_OptKF = lLocalKeyFrames.size();
 +    // 중력 항(IMU 위쪽이 있는 지역 키프레임): 1° ≈ 재투영 1.7 화소 무게
 +    for(KeyFrame* pKFi : lLocalKeyFrames)
 +    {
-+        if(!pKFi->mbUp || pKFi->mnId==pMap->GetInitKFid()) continue;
++        if(!pKFi->mbUp) continue;
 +        EdgeGravityUp* e = new EdgeGravityUp();
 +        e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFi->mnId)));
 +        e->setMeasurement(pKFi->mUpCam.normalized().cast<double>());

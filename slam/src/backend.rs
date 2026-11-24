@@ -39,8 +39,7 @@ impl SlamBackend for crate::app::Runner {
     }
 }
 
-/// 같은 프로세스 처리 루프용 백엔드와 장면 입력(원래 입력, 미리 할 일)을 연다
+/// 같은 프로세스 처리 루프용 백엔드와 장면 입력: ORB-SLAM3 RGB-D(`orb3_backend`)
 pub fn open(a: crate::app::Args) -> Result<(Box<dyn SlamBackend>, Box<dyn FrameSource>, Option<Prep>), String> {
-    let (r, src, prep) = crate::app::Runner::new(a, true, None)?;
-    Ok((Box::new(r), src, prep))
+    crate::orb3_backend::open(a)
 }

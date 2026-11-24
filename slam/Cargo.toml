@@ -3,7 +3,10 @@ name = "slam"
 version = "0.1.0"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2024"
-description = "RTAB-Map 0.24.2 의 우리가 쓰는 경로(F2F 위치 추적 · 루프 클로저 · 그래프 최적화)를 Rust 로 옮긴 것. 장면 스트림(또는 같은 프로세스의 메모리 큐)으로 물체 기억에 보낸다."
+description = "위치 추적: ORB-SLAM3 RGB-D(cpp/orb3.cc 래퍼, 같은 프로세스 백엔드)와 RTAB-Map 0.24.2 경로를 Rust 로 옮긴 것(`ondevice slam`). 장면 스트림(또는 같은 프로세스의 메모리 큐)으로 물체 기억에 보낸다."
+build = "build.rs"
+# 링크 폴더를 실행 파일(pipeline)에 rpath 로 넘김(DEP_ORB3_RPATH)
+links = "orb3"
 
 [dependencies]
 common = { path = "../common" }
@@ -13,6 +16,9 @@ rayon = "1"
 rsdriver = { path = "../rsdriver", optional = true }
 # 루프 · 재위치 신경망(PC): ONNX Runtime(common 과 같은 판)
 ort = { version = "=2.0.0-rc.15", optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [features]
 default = []

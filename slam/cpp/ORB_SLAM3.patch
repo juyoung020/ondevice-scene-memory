@@ -1,0 +1,517 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 016e743..e688917 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,12 +14,12 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+ 
+ # Check C++11 or C++0x support
+ include(CheckCXXCompilerFlag)
+-CHECK_CXX_COMPILER_FLAG("-std=c++11" COMPILER_SUPPORTS_CXX11)
++CHECK_CXX_COMPILER_FLAG("-std=c++17" COMPILER_SUPPORTS_CXX17)
+ CHECK_CXX_COMPILER_FLAG("-std=c++0x" COMPILER_SUPPORTS_CXX0X)
+-if(COMPILER_SUPPORTS_CXX11)
+-   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
++if(COMPILER_SUPPORTS_CXX17)
++   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
+    add_definitions(-DCOMPILEDWITHC11)
+-   message(STATUS "Using flag -std=c++11.")
++   message(STATUS "Using flag -std=c++17.")
+ elseif(COMPILER_SUPPORTS_CXX0X)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
+    add_definitions(-DCOMPILEDWITHC0X)
+diff --git a/Thirdparty/Sophus/CMakeLists.txt b/Thirdparty/Sophus/CMakeLists.txt
+index 933445b..774154d 100644
+--- a/Thirdparty/Sophus/CMakeLists.txt
++++ b/Thirdparty/Sophus/CMakeLists.txt
+@@ -20,7 +20,7 @@ IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+ ELSEIF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    SET(CMAKE_CXX_FLAGS_DEBUG  "-O0 -g")
+    SET(CMAKE_CXX_FLAGS_RELEASE "-O3")
+-   SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Werror -Wextra -std=c++11 -Wno-deprecated-declarations -ftemplate-backtrace-limit=0")
++   SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Werror -Wextra -std=c++17 -Wno-deprecated-declarations -ftemplate-backtrace-limit=0")
+    SET(CMAKE_CXX_FLAGS_COVERAGE "${CMAKE_CXX_FLAGS_DEBUG} --coverage -fno-inline -fno-inline-small-functions -fno-default-inline")
+    SET(CMAKE_EXE_LINKER_FLAGS_COVERAGE "${CMAKE_EXE_LINKER_FLAGS_DEBUG} --coverage")
+    SET(CMAKE_SHARED_LINKER_FLAGS_COVERAGE "${CMAKE_SHARED_LINKER_FLAGS_DEBUG} --coverage")
+diff --git a/Thirdparty/Sophus/sophus/common.hpp b/Thirdparty/Sophus/sophus/common.hpp
+index e751e48..384bc9b 100644
+--- a/Thirdparty/Sophus/sophus/common.hpp
++++ b/Thirdparty/Sophus/sophus/common.hpp
+@@ -12,6 +12,9 @@
+ 
+ #include <Eigen/Core>
+ 
++// ORB-SLAM3: 수가 아닌 값에서 프로그램을 끝내지 않고 추적 쪽이 놓침으로 다룸
++#define SOPHUS_DISABLE_ENSURES
++#include <iostream>
+ #if !defined(SOPHUS_DISABLE_ENSURES)
+ #include "formatstring.hpp"
+ #endif //!defined(SOPHUS_DISABLE_ENSURES)
+diff --git a/include/LoopClosing.h b/include/LoopClosing.h
+index c9ccb26..3f84de7 100644
+--- a/include/LoopClosing.h
++++ b/include/LoopClosing.h
+@@ -45,6 +45,8 @@ class Map;
+ class LoopClosing
+ {
+ public:
++    // 루프 · 합치기 처리 중 잠김(추적 스레드의 지도 옮겨 붙이기가 그 사이에 끼지 않게)
++    std::mutex mMutexBusy;
+ 
+     typedef pair<set<KeyFrame*>,int> ConsistentGroup;    
+     typedef map<KeyFrame*,g2o::Sim3,std::less<KeyFrame*>,
+@@ -223,7 +225,7 @@ protected:
+     bool mbFixScale;
+ 
+ 
+-    bool mnFullBAIdx;
++    int mnFullBAIdx;
+ 
+ 
+ 
+diff --git a/include/Settings.h b/include/Settings.h
+index beab7de..281c5e9 100644
+--- a/include/Settings.h
++++ b/include/Settings.h
+@@ -162,8 +162,8 @@ namespace ORB_SLAM3 {
+         /*
+          * Visual stuff
+          */
+-        GeometricCamera* calibration1_, *calibration2_;   //Camera calibration
+-        GeometricCamera* originalCalib1_, *originalCalib2_;
++        GeometricCamera* calibration1_ = nullptr, *calibration2_ = nullptr;   //Camera calibration
++        GeometricCamera* originalCalib1_ = nullptr, *originalCalib2_ = nullptr;
+         std::vector<float> vPinHoleDistorsion1_, vPinHoleDistorsion2_;
+ 
+         cv::Size originalImSize_, newImSize_;
+diff --git a/include/System.h b/include/System.h
+index 872c86e..11bda2f 100644
+--- a/include/System.h
++++ b/include/System.h
+@@ -174,6 +174,9 @@ public:
+     // Information from most recent processed frame
+     // You can call this right after TrackMonocular (or stereo or RGBD)
+     int GetTrackingState();
++    Atlas* GetAtlas() { return mpAtlas; }
++    Tracking* GetTracker() { return mpTracker; }
++    LoopClosing* GetLoopCloser() { return mpLoopCloser; }
+     std::vector<MapPoint*> GetTrackedMapPoints();
+     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
+ 
+diff --git a/include/Tracking.h b/include/Tracking.h
+index 863c98e..b39d230 100644
+--- a/include/Tracking.h
++++ b/include/Tracking.h
+@@ -57,6 +57,10 @@ class Tracking
+ {  
+ 
+ public:
++    // 밖(신경망 장소 인식)에서 찾은 두 지도 사이 변환으로 옮겨 붙이기를 부탁(다음 장면 시작에 함). S: into 좌표 ← from 좌표
++    bool RequestGraft(unsigned long from_id, unsigned long into_id, const Sophus::SE3f &S);
++    // 지도 스레드가 쌓인 키프레임을 다 처리할 때까지 기다림(최대 속도 재생: 실시간보다 지도 쪽이 늘 따라옴, 최대 2 초)
++    void WaitMappingIdle();
+     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+     Tracking(System* pSys, ORBVocabulary* pVoc, FrameDrawer* pFrameDrawer, MapDrawer* pMapDrawer, Atlas* pAtlas,
+              KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor, Settings* settings, const string &_nameSeq=std::string());
+@@ -211,7 +215,13 @@ protected:
+     bool TrackWithMotionModel();
+     bool PredictStateIMU();
+ 
+-    bool Relocalization();
++    bool Relocalization(Map* pMap = nullptr);
++    // 다른 지도와 겹치면 작은 지도를 큰 지도 좌표로 옮겨 합침
++    void TryGraft();
++    void GraftMap(Map* pFrom, Map* pInto, const Sophus::SE3f &S_into_from);
++    Map* mpGraftMap = nullptr; Sophus::SE3f mGraftS; unsigned long mnGraftFrame = 0; unsigned long mnGraftTry = 0;
++    Map* mpPendFrom = nullptr; Map* mpPendInto = nullptr; Sophus::SE3f mPendS; bool mbPendMoveCam = false;
++    void DoPendingGraft();
+ 
+     void UpdateLocalMap();
+     void UpdateLocalPoints();
+diff --git a/src/KeyFrameDatabase.cc b/src/KeyFrameDatabase.cc
+index 13b4da6..7faed5e 100644
+--- a/src/KeyFrameDatabase.cc
++++ b/src/KeyFrameDatabase.cc
+@@ -1,3 +1,4 @@
++#include <atomic>
+ /**
+ * This file is part of ORB-SLAM3
+ *
+@@ -733,6 +734,9 @@ void KeyFrameDatabase::DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &v
+ vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map* pMap)
+ {
+     list<KeyFrame*> lKFsSharingWords;
++    // 부를 때마다 새 표지(같은 장면으로 지도별로 여러 번 불러도 됨), 단어 세기부터 이 지도만
++    static std::atomic<unsigned long> sQuery{1ul << 40};
++    const unsigned long q = sQuery++;
+ 
+     // Search all keyframes that share a word with current frame
+     {
+@@ -745,10 +749,11 @@ vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map
+             for(list<KeyFrame*>::iterator lit=lKFs.begin(), lend= lKFs.end(); lit!=lend; lit++)
+             {
+                 KeyFrame* pKFi=*lit;
+-                if(pKFi->mnRelocQuery!=F->mnId)
++                if(pKFi->mnRelocQuery!=q)
+                 {
++                    if(pKFi->GetMap() != pMap) continue;
+                     pKFi->mnRelocWords=0;
+-                    pKFi->mnRelocQuery=F->mnId;
++                    pKFi->mnRelocQuery=q;
+                     lKFsSharingWords.push_back(pKFi);
+                 }
+                 pKFi->mnRelocWords++;
+@@ -804,7 +809,7 @@ vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map
+         for(vector<KeyFrame*>::iterator vit=vpNeighs.begin(), vend=vpNeighs.end(); vit!=vend; vit++)
+         {
+             KeyFrame* pKF2 = *vit;
+-            if(pKF2->mnRelocQuery!=F->mnId)
++            if(pKF2->mnRelocQuery!=q)
+                 continue;
+ 
+             accScore+=pKF2->mRelocScore;
+diff --git a/src/LoopClosing.cc b/src/LoopClosing.cc
+index 319afb5..00519c2 100644
+--- a/src/LoopClosing.cc
++++ b/src/LoopClosing.cc
+@@ -98,6 +98,7 @@ void LoopClosing::Run()
+         //----------------------------
+ 
+ 
++        std::unique_lock<std::mutex> lockBusy(mMutexBusy);
+         if(CheckNewKeyFrames())
+         {
+             if(mpLastCurrentKF)
+@@ -296,6 +297,7 @@ void LoopClosing::Run()
+             mpLastCurrentKF = mpCurrentKF;
+         }
+ 
++        lockBusy.unlock();
+         ResetIfRequested();
+ 
+         if(CheckFinish()){
+diff --git a/src/Map.cc b/src/Map.cc
+index f1f8cd0..1713bc2 100644
+--- a/src/Map.cc
++++ b/src/Map.cc
+@@ -359,7 +359,8 @@ void Map::SetLastMapChange(int currentChangeId)
+ void Map::PreSave(std::set<GeometricCamera*> &spCams)
+ {
+     int nMPWithoutObs = 0;
+-    for(MapPoint* pMPi : mspMapPoints)
++    const std::set<MapPoint*> spMPCopy = mspMapPoints; // EraseObservation → SetBadFlag 가 순회 중인 집합에서 점을 지우던 것
++    for(MapPoint* pMPi : spMPCopy)
+     {
+         if(!pMPi || pMPi->isBad())
+             continue;
+@@ -390,7 +391,7 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
+ 
+     // Backup of MapPoints
+     mvpBackupMapPoints.clear();
+-    for(MapPoint* pMPi : mspMapPoints)
++    for(MapPoint* pMPi : std::set<MapPoint*>(mspMapPoints))
+     {
+         if(!pMPi || pMPi->isBad())
+             continue;
+diff --git a/src/MapPoint.cc b/src/MapPoint.cc
+index 1cf802c..3def89f 100644
+--- a/src/MapPoint.cc
++++ b/src/MapPoint.cc
+@@ -578,7 +578,8 @@ void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
+     mBackupObservationsId1.clear();
+     mBackupObservationsId2.clear();
+     // Save the id and position in each KF who view it
+-    for(std::map<KeyFrame*,std::tuple<int,int> >::const_iterator it = mObservations.begin(), end = mObservations.end(); it != end; ++it)
++    const std::map<KeyFrame*,std::tuple<int,int> > obsCopy = mObservations; // 순회 중 EraseObservation 이 원본을 지워 반복자가 깨지던 것
++    for(std::map<KeyFrame*,std::tuple<int,int> >::const_iterator it = obsCopy.begin(), end = obsCopy.end(); it != end; ++it)
+     {
+         KeyFrame* pKFi = it->first;
+         if(spKF.find(pKFi) != spKF.end())
+diff --git a/src/Settings.cc b/src/Settings.cc
+index 93a50be..a7835d5 100644
+--- a/src/Settings.cc
++++ b/src/Settings.cc
+@@ -550,7 +550,7 @@ namespace ORB_SLAM3 {
+             output << " ]" << endl;
+         }
+ 
+-        if(settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO){
++        if((settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO) && settings.originalCalib2_){
+             output << "\t-Camera 2 parameters (";
+             if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
+                 output << "Pinhole";
+@@ -603,7 +603,7 @@ namespace ORB_SLAM3 {
+         output << "\t-Sequence FPS: " << settings.fps_ << endl;
+ 
+         //Stereo stuff
+-        if(settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO){
++        if((settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO) && settings.originalCalib2_){
+             output << "\t-Stereo baseline: " << settings.b_ << endl;
+             output << "\t-Stereo depth threshold : " << settings.thDepth_ << endl;
+ 
+diff --git a/src/Tracking.cc b/src/Tracking.cc
+index 5191451..8fed47c 100644
+--- a/src/Tracking.cc
++++ b/src/Tracking.cc
+@@ -39,6 +39,8 @@ using namespace std;
+ 
+ namespace ORB_SLAM3
+ {
++static const double LOST_NEWMAP_S = 1.0;
++
+ 
+ 
+ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Atlas *pAtlas, KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor, Settings* settings, const string &_nameSeq):
+@@ -1809,6 +1811,7 @@ void Tracking::Track()
+         return;
+     }
+ 
++    DoPendingGraft();
+     Map* pCurrentMap = mpAtlas->GetCurrentMap();
+     if(!pCurrentMap)
+     {
+@@ -1963,16 +1966,11 @@ void Tracking::Track()
+                     {
+                         mState = LOST;
+                     }
+-                    else if(pCurrentMap->KeyFramesInMap()>10)
++                    else
+                     {
+-                        // cout << "KF in map: " << pCurrentMap->KeyFramesInMap() << endl;
+                         mState = RECENTLY_LOST;
+                         mTimeStampLost = mCurrentFrame.mTimeStamp;
+                     }
+-                    else
+-                    {
+-                        mState = LOST;
+-                    }
+                 }
+             }
+             else
+@@ -2001,9 +1999,18 @@ void Tracking::Track()
+                     {
+                         // Relocalization
+                         bOK = Relocalization();
+-                        //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
++                        if(!bOK)
++                        {
++                            // 다른 지도에 다시 잡히면 그 지도로 옮김(놓친 지도는 나중에 TryGraft 가 합침)
++                            Map* pCur = mpAtlas->GetCurrentMap();
++                            for(Map* pM : mpAtlas->GetAllMaps())
++                            {
++                                if(pM == pCur || pM->KeyFramesInMap() == 0) continue;
++                                if(Relocalization(pM)) { mpAtlas->ChangeMap(pM); mpLastKeyFrame = static_cast<KeyFrame*>(NULL); bOK = true; break; }
++                            }
++                        }
+                         //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
+-                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>3.0f && !bOK)
++                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>LOST_NEWMAP_S && !bOK)
+                         {
+                             mState = LOST;
+                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
+@@ -2016,7 +2023,7 @@ void Tracking::Track()
+ 
+                     Verbose::PrintMess("A new map is started...", Verbose::VERBOSITY_NORMAL);
+ 
+-                    if (pCurrentMap->KeyFramesInMap()<10)
++                    if (pCurrentMap->KeyFramesInMap()==0)
+                     {
+                         mpSystem->ResetActiveMap();
+                         Verbose::PrintMess("Reseting current map...", Verbose::VERBOSITY_NORMAL);
+@@ -2127,6 +2134,9 @@ void Tracking::Track()
+                 bOK = TrackLocalMap();
+ 
+             }
++            // 최적화가 수가 아닌 값(NaN)을 내면 놓친 것으로(키프레임 · 지도에 넣지 않음)
++            if(bOK && !mCurrentFrame.GetPose().matrix().allFinite())
++                bOK = false;
+             if(!bOK)
+                 cout << "Fail to track local map!" << endl;
+         }
+@@ -2270,7 +2280,7 @@ void Tracking::Track()
+         // Reset if the camera get lost soon after initialization
+         if(mState==LOST)
+         {
+-            if(pCurrentMap->KeyFramesInMap()<=10)
++            if(pCurrentMap->KeyFramesInMap()==0)
+             {
+                 mpSystem->ResetActiveMap();
+                 return;
+@@ -2291,6 +2301,9 @@ void Tracking::Track()
+         if(!mCurrentFrame.mpReferenceKF)
+             mCurrentFrame.mpReferenceKF = mpReferenceKF;
+ 
++        if(mState==OK && !mbOnlyTracking)
++            TryGraft();
++
+         mLastFrame = Frame(mCurrentFrame);
+     }
+ 
+@@ -3606,15 +3619,16 @@ void Tracking::UpdateLocalKeyFrames()
+     }
+ }
+ 
+-bool Tracking::Relocalization()
++bool Tracking::Relocalization(Map* pMap)
+ {
++    if(!pMap) pMap = mpAtlas->GetCurrentMap();
+     Verbose::PrintMess("Starting relocalization", Verbose::VERBOSITY_NORMAL);
+     // Compute Bag of Words Vector
+     mCurrentFrame.ComputeBoW();
+ 
+     // Relocalization is performed when tracking is lost
+     // Track Lost: Query KeyFrame Database for keyframe candidates for relocalisation
+-    vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame, mpAtlas->GetCurrentMap());
++    vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame, pMap);
+ 
+     if(vpCandidateKFs.empty()) {
+         Verbose::PrintMess("There are not candidates", Verbose::VERBOSITY_NORMAL);
+@@ -4124,3 +4138,149 @@ void Tracking::Release()
+ #endif
+ 
+ } //namespace ORB_SLAM
++
++namespace ORB_SLAM3
++{
++
++// 지금 지도가 다른 지도에 재위치되면(같은 변환 두 번) 작은 지도를 큰 지도 좌표로 옮겨 하나로 합침.
++// 빈틈 뒤 새 지도가 생겨도 예전 지도를 다시 보는 순간 한 지도로 이어짐.
++void Tracking::TryGraft()
++{
++    if(mpAtlas->CountMaps() < 2 || mCurrentFrame.mnId < mnGraftTry + 3) return;
++    // 지도 잠금을 잡은 채라 전체 최적화 잠금은 보지 않음(그 스레드가 거꾸로 잡음), 합칠 때(DoPendingGraft) 확인
++    mnGraftTry = mCurrentFrame.mnId;
++    Map* pCur = mpAtlas->GetCurrentMap();
++    const Sophus::SE3f Tcw_cur = mCurrentFrame.GetPose();
++    const Frame saved(mCurrentFrame);
++    const unsigned int savedReloc = mnLastRelocFrameId;
++    vector<Map*> vpMaps = mpAtlas->GetAllMaps();
++    sort(vpMaps.begin(), vpMaps.end(), [](Map* a, Map* b){ return a->KeyFramesInMap() > b->KeyFramesInMap(); });
++    for(Map* pM : vpMaps)
++    {
++        if(pM == pCur || pM->IsBad() || pM->KeyFramesInMap() == 0) continue;
++        const bool ok = Relocalization(pM);
++        const Sophus::SE3f Tcw_m = mCurrentFrame.GetPose();
++        mCurrentFrame = Frame(saved);
++        mnLastRelocFrameId = savedReloc;
++        if(!ok) continue;
++        // S: pM 좌표 <- 지금 지도 좌표
++        const Sophus::SE3f S = Tcw_m.inverse() * Tcw_cur;
++        if(mpGraftMap != pM || mCurrentFrame.mnId > mnGraftFrame + 30)
++        {
++            mpGraftMap = pM; mGraftS = S; mnGraftFrame = mCurrentFrame.mnId;
++            return;
++        }
++        const Sophus::SE3f D = mGraftS.inverse() * S;
++        const float dt = D.translation().norm();
++        const float da = D.so3().log().norm() * 180.f / M_PI;
++        mGraftS = S; mnGraftFrame = mCurrentFrame.mnId;
++        if(dt > 0.10f || da > 2.0f) return;
++        cout << "GRAFT map " << pCur->GetId() << " (" << pCur->KeyFramesInMap() << " kf) <-> map " << pM->GetId()
++             << " (" << pM->KeyFramesInMap() << " kf) dt=" << dt << " da=" << da << endl;
++        // 지도 잠금을 잡은 채라 다음 장면 시작(잠그기 전)에 합침
++        // 늘 지금 지도를 옮김(다른 스레드가 쥔 키프레임 · 지도는 지금 지도 쪽만 바뀜)
++        mpPendFrom = pCur; mpPendInto = pM; mPendS = S; mbPendMoveCam = true;
++        mpGraftMap = nullptr;
++        return;
++    }
++}
++
++void Tracking::DoPendingGraft()
++{
++    if(!mpPendFrom) return;
++    Map* pFrom = mpPendFrom; Map* pInto = mpPendInto; mpPendFrom = mpPendInto = nullptr;
++    if(pFrom->IsBad() || pInto->IsBad()) return;
++    // 루프 · 합치기 · 전체 최적화 중이면 다음 장면에 다시
++    std::unique_lock<std::mutex> busy(mpLoopClosing->mMutexBusy, std::try_to_lock);
++    if(!busy.owns_lock() || mpLoopClosing->isRunningGBA()) { mpPendFrom = pFrom; mpPendInto = pInto; return; }
++    const bool moveCam = pFrom == mpAtlas->GetCurrentMap();
++    GraftMap(pFrom, pInto, mPendS);
++    if(moveCam)
++    {
++        mLastFrame.SetPose(mLastFrame.GetPose() * mPendS.inverse());
++        mpAtlas->ChangeMap(pInto);
++    }
++}
++
++void Tracking::GraftMap(Map* pFrom, Map* pInto, const Sophus::SE3f &S)
++{
++    while(mpLocalMapper->KeyframesInQueue() > 0 && !mpLocalMapper->isFinished()) usleep(1000);
++    mpLocalMapper->RequestStop();
++    while(!mpLocalMapper->isStopped() && !mpLocalMapper->isFinished()) usleep(1000);
++    {
++        unique_lock<mutex> l1(pFrom->mMutexMapUpdate);
++        unique_lock<mutex> l2(pInto->mMutexMapUpdate);
++        const Sophus::SE3f Sinv = S.inverse();
++        vector<KeyFrame*> vpFrom = pFrom->GetAllKeyFrames();
++        set<KeyFrame*> sFrom(vpFrom.begin(), vpFrom.end());
++        KeyFrame* pOrigin = nullptr;
++        for(KeyFrame* pKF : vpFrom)
++        {
++            if(!pKF) continue;
++            if(!pKF->isBad() && (!pOrigin || pKF->mnId < pOrigin->mnId)) pOrigin = pKF;
++            pKF->SetPose(pKF->GetPose() * Sinv);
++            pKF->UpdateMap(pInto);
++            pInto->AddKeyFrame(pKF);
++            pFrom->EraseKeyFrame(pKF);
++        }
++        for(MapPoint* pMP : pFrom->GetAllMapPoints())
++        {
++            if(!pMP) continue;
++            pMP->SetWorldPos(S * pMP->GetWorldPos());
++            pMP->SetNormalVector(S.so3() * pMP->GetNormal());
++            pMP->UpdateMap(pInto);
++            pInto->AddMapPoint(pMP);
++            pFrom->EraseMapPoint(pMP);
++        }
++        // 옮긴 지도의 뿌리를 합친 지도의 가장 가까운 키프레임에 매달아 나무 하나로
++        if(pOrigin && !pOrigin->GetParent())
++        {
++            KeyFrame* pBest = nullptr; float best = 1e9;
++            const Eigen::Vector3f c = pOrigin->GetCameraCenter();
++            for(KeyFrame* pKF : pInto->GetAllKeyFrames())
++            {
++                if(!pKF || pKF->isBad() || sFrom.count(pKF)) continue;
++                const float d = (pKF->GetCameraCenter() - c).norm();
++                if(d < best) { best = d; pBest = pKF; }
++            }
++            if(pBest) pOrigin->ChangeParent(pBest);
++        }
++        mpAtlas->SetMapBad(pFrom);
++        pInto->IncreaseChangeIndex();
++        pInto->InformNewBigChange();
++    }
++    mpAtlas->RemoveBadMaps();
++    mpLocalMapper->Release();
++}
++
++} // namespace ORB_SLAM3
++
++namespace ORB_SLAM3
++{
++bool Tracking::RequestGraft(unsigned long from_id, unsigned long into_id, const Sophus::SE3f &S)
++{
++    Map *pFrom = nullptr, *pInto = nullptr;
++    for(Map* m : mpAtlas->GetAllMaps())
++    {
++        if(m->GetId() == from_id) pFrom = m;
++        if(m->GetId() == into_id) pInto = m;
++    }
++    if(!pFrom || !pInto || pFrom == pInto || mpPendFrom) return false;
++    cout << "GRAFT(ext) map " << from_id << " (" << pFrom->KeyFramesInMap() << " kf) -> map " << into_id << " (" << pInto->KeyFramesInMap() << " kf)" << endl;
++    mPendS = S; mbPendMoveCam = true; mpPendInto = pInto; mpPendFrom = pFrom;
++    return true;
++}
++}
++
++namespace ORB_SLAM3
++{
++void Tracking::WaitMappingIdle()
++{
++    for(int i = 0; i < 4000; i++)
++    {
++        if(mpLocalMapper->isStopped() || mpLocalMapper->isFinished()) return;
++        if(mpLocalMapper->KeyframesInQueue() == 0 && mpLocalMapper->AcceptKeyFrames()) return;
++        usleep(500);
++    }
++}
++}

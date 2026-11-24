@@ -1648,6 +1648,7 @@ dependencies = [
 name = "slam"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "common",
  "image",
  "nalgebra",

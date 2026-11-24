@@ -423,6 +423,8 @@ mod engine {
         lc_links: VecDeque<(i32, i32, Tf, [f64; 2])>,
         lc_recv: VecDeque<crate::lcnet::LcOut>,
         lc_last: i32,
+        /// 신경망 루프에 알리는 지도 번호(새 지도마다 +1)
+        lc_map: u32,
         /// 최대 속도 재생: 노드마다 루프 결과를 기다려 결정적으로
         pub lc_block: bool,
         /// 통계: 보낸 노드 · 결과 · 맞은 루프 · 지도에 들어간 루프, ms 합(MegaLoc · XFeat · 짝 + 검증), 후보 · 검증 수
@@ -494,6 +496,7 @@ mod engine {
                 lc_links: VecDeque::new(),
                 lc_recv: VecDeque::new(),
                 lc_last: 0,
+                lc_map: 0,
                 lc_block: false,
                 lc_stats: LcStats::default(),
             }
@@ -655,10 +658,10 @@ mod engine {
             }
         }
 
-        /// IMU: 중력 쪽으로 기울기를 고친 장면 수 · 각 합(°)
-        pub fn imu_grav(&self) -> Option<(usize, f64)> {
+        /// IMU: 중력 쪽으로 기울기를 고친 장면 수 · 각 합(°) · 다시 시작한 자리에서 한 번에 맞춘 수
+        pub fn imu_grav(&self) -> Option<(usize, f64, usize)> {
             match &self.odom {
-                Odom::Klt(o) if o.imu.is_some() => Some((o.n_grav, o.grav_deg)),
+                Odom::Klt(o) if o.imu.is_some() => Some((o.n_grav, o.grav_deg, o.n_relevel)),
                 _ => None,
             }
         }
@@ -866,7 +869,7 @@ mod engine {
             let job = self.slam.jobs() + 1;
             let lc_node = node && self.lc.is_some() && !f.color.is_empty();
             if let (true, Some(p)) = (lc_node, pose) {
-                let n = crate::lcnet::LcNode { id: 0, stamp: f.t, color: f.color.clone(), bgr: !f.color_is_rgb, depth: f.depth_mm.clone(), pose: p.to_pose(), cam: f.cam.clone() };
+                let n = crate::lcnet::LcNode { id: 0, stamp: f.t, color: f.color.clone(), bgr: !f.color_is_rgb, depth: f.depth_mm.clone(), pose: p.to_pose(), cam: f.cam.clone(), map: self.lc_map };
                 self.lc_wait.push((job, n));
             }
             if had {
@@ -997,6 +1000,7 @@ mod engine {
             (!c.is_null()).then_some(c)
         }
         pub fn trigger_new_map(&mut self) -> i32 {
+            self.lc_map += 1;
             self.slam.trigger_new_map()
         }
         pub fn reset(&mut self) {
@@ -1341,7 +1345,6 @@ pub struct Runner {
     last_merge_try: f64,
     newmap_t: f64,
     prev_map_small: bool,
-    accepted: bool,
     n_accept: i64,
     max_corr: (f32, f32),
     last_good_t: f64,
@@ -1388,8 +1391,12 @@ pub struct Runner {
     prev_stamp: f64,
     prev_corr: Tf,
     prov: Tf,
+    /// 믿는 지도들의 (첫 노드 id, 표시 변환): 처음 지도 (0, 그대로) + 받아들인 새 지도마다 하나
+    bases: Vec<(i32, Tf)>,
     prov_nodes: std::collections::BTreeSet<i32>,
     last_sent_world: Option<Tf>,
+    /// 그 장면의 위치 추적 위치(몸체 → 위치 추적 좌표)
+    last_sent_odom: Option<Tf>,
     fast_prev: Option<(f64, [f32; 3])>,
     fast_vel: [f32; 3],
     tilt_map: f32,
@@ -1628,7 +1635,7 @@ impl Runner {
         let n_bridge_fix = 0i64;
         let last_merge_try = f64::MIN;
         let newmap_t = f64::MIN; // 마지막으로 새 지도를 연 장면 시각
-        let (prev_map_small, accepted, n_accept) = (false, false, 0i64);
+        let (prev_map_small, n_accept) = (false, 0i64);
         let max_corr = (0f32, 0f32);
         let last_good_t = f64::MAX; // 마지막으로 위치를 낸 장면 시각
         let n_bridge_ok = 0i64;
@@ -1678,8 +1685,10 @@ impl Runner {
         // 표시 변환(prov)으로 바로 보낸다(화면이 멈추지 않음). slam 그래프에는 아무 제약도 넣지 않는다(표시 전용).
         // 루프 클로저로 이어지면 노드가 참 위치로 다시 가고(움직임 → memmap 다시 쌓기) 그 장면들도 고친 위치로 다시 놓인다.
         let prov = Tf::IDENTITY;
+        let bases = vec![(0, Tf::IDENTITY)];
         let prov_nodes: std::collections::BTreeSet<i32> = Default::default();
         let last_sent_world: Option<Tf> = None; // 마지막으로 보낸 장면의 몸체 위치(표시 좌표)
+        let last_sent_odom: Option<Tf> = None;
         // IMU: 장면 사이 위치 기준의 지도 좌표 속도(앞 장면 위치 · 시각, 이동 평균)
         let (fast_prev, fast_vel): (Option<(f64, [f32; 3])>, [f32; 3]) = (None, [0.0; 3]);
         let tilt_map = -1f32;
@@ -1716,7 +1725,6 @@ impl Runner {
             last_merge_try,
             newmap_t,
             prev_map_small,
-            accepted,
             n_accept,
             max_corr,
             last_good_t,
@@ -1763,8 +1771,10 @@ impl Runner {
             prev_stamp,
             prev_corr,
             prov,
+            bases,
             prov_nodes,
             last_sent_world,
+            last_sent_odom,
             fast_prev,
             fast_vel,
             tilt_map,
@@ -1807,6 +1817,8 @@ impl Runner {
             self.prev_corr = Tf::IDENTITY;
             self.anchored = true;
             self.good_id = -1;
+            self.prov = Tf::IDENTITY;
+            self.bases = vec![(0, Tf::IDENTITY)];
             self.refs.clear();
             self.lost_since = -1.0;
             self.fresh = true;
@@ -2087,26 +2099,42 @@ impl Runner {
         // 놓친 사이 움직임을 모르는 임시 위치로 바로 쌓으면 같은 표면이 어긋난 채 두 겹으로 남는다
         // 맡겨 두기: 기본은 이어질 때까지(--imu-hold-wait 초를 주면 그만큼 기다린 뒤, 앞 지도가 작으면 바로) 새 지도를 받아들여 쌓는다(맡겼던 장면도 그 지도 위치로).
         // 나중에 이어지면 노드가 움직여 다시 쌓기가 고친 위치로 옮긴다
-        if self.anchored || new_map {
-            self.accepted = false;
-        }
         let accept = self.prev_map_small || fr.t - self.newmap_t > self.a.imu_hold_wait;
-        if self.imu_on && !self.anchored && accept && !self.accepted {
-            self.accepted = true;
-            self.n_accept += 1;
-            common::info!("장면 {n}: 이어지지 않은 새 지도를 받아들임({:.1} 초 기다림) → 바로 쌓기", fr.t - self.newmap_t);
-        }
-        let map_hold = self.imu_on && !self.anchored && !self.accepted;
-        let hold_g = map_hold;
         if !self.anchored && new_map {
             // 새 지도 첫 장면 = 마지막으로 보낸 위치(그사이 움직임 모름): 표시 변환을 그에 맞춤
-            if let (Some(w), Some(p)) = (self.last_sent_world, pose.as_ref()) {
-                self.prov = w.mul(&corr.unwrap_or(Tf::IDENTITY).mul(p).inverse());
+            if let (Some((w, po)), Some(p)) = (self.last_sent_world.zip(self.last_sent_odom), pose.as_ref()) {
+                let a = corr.unwrap_or(Tf::IDENTITY).mul(p);
+                self.prov = if self.eng.gravity_aligned() {
+                    // 중력으로 맞춘 지도(IMU): 자리는 마지막으로 보낸 자리, 자세는 위치 추적이 놓친 사이 이어 온 그대로(자이로 회전 · 중력 맞춤).
+                    // 표시 변환은 수직축 회전(방위) + 이동만: 새 지도가 놓친 사이 카메라가 돈 만큼 기운 채 쌓이지 않는다
+                    let m = w.mul(&po.inverse()).mul(&corr.unwrap_or(Tf::IDENTITY).inverse());
+                    let yaw = (m.0[4] - m.0[1]).atan2(m.0[0] + m.0[5]);
+                    let (sn, cs) = yaw.sin_cos();
+                    let rz = Tf([cs, -sn, 0.0, 0.0, sn, cs, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+                    let ra = rz.mul(&a);
+                    Tf([cs, -sn, 0.0, w.x() - ra.x(), sn, cs, 0.0, w.y() - ra.y(), 0.0, 0.0, 1.0, w.z() - ra.z()])
+                } else {
+                    w.mul(&a.inverse())
+                };
             }
         }
-        if self.anchored {
-            self.prov = Tf::IDENTITY;
+        // 받아들임: 이 새 지도가 이제 믿는 지도다(앞 지도가 작았거나 기다릴 만큼 기다림). 표시 변환은 이어 붙인 그대로 두고 바로 쌓으며,
+        // 뒤에 놓치면 이 지도에 다시 이어져야 한다. 믿는 지도 노드(good_id)는 이 지도의 첫 노드부터 다시 잡는다
+        if self.imu_on && !self.anchored && accept {
+            self.n_accept += 1;
+            common::info!("장면 {n}: 이어지지 않은 새 지도를 받아들임({:.1} 초 기다림) → 믿는 지도로 바로 쌓기", fr.t - self.newmap_t);
+            self.bases.push((self.eng.map_start, self.prov));
+            self.anchored = true;
+            self.good_id = -1;
         }
+        if self.anchored {
+            // 믿는 지도의 표시 변환 = 이어진 노드 가운데 가장 오래된 노드가 속한 지도의 것(그래프 좌표가 그 노드에 고정됨)
+            if let Some(&lo) = lp.keys().find(|&&k| k > 0) {
+                self.prov = self.bases.iter().rev().find(|b| b.0 <= lo).map_or(Tf::IDENTITY, |b| b.1);
+            }
+        }
+        let map_hold = self.imu_on && !self.anchored;
+        let hold_g = map_hold;
         let lost = pose.is_none() || info.lost;
         self.n_lost += lost as i64;
 
@@ -2173,6 +2201,7 @@ impl Runner {
             let body = self.prov.mul(&corr.unwrap_or(Tf::IDENTITY).mul(pose.as_ref().unwrap()));
             if !lost {
                 self.last_sent_world = Some(body);
+                self.last_sent_odom = pose;
                 if self.imu_on {
                     let p = [body.0[3], body.0[7], body.0[11]];
                     match self.fast_prev {
@@ -2265,11 +2294,11 @@ impl Runner {
 
     /// 끝: 출력 닫기 · 끝 그래프 · 요약 줄. src_dropped: 입력에서 밀려 버린 장면 수
     pub fn finish(self, src_dropped: usize) -> Result<i32, String> {
-        let Runner { t_run, in_proc, calib, imu_replay, imu_ring, imu_on, skipped, stress_counts, replay_max, intermediate, detection_rate, reloc_min, mut eng, klt_path, reloc_wait, bridge, n_bridge, n_global, n_reloc_bridge, global_tried, n_reloc_tilt, n_loop_rejected, n_merge_try, nq, bridge_t, n_bridge_fix, last_merge_try, newmap_t, prev_map_small, accepted, n_accept, max_corr, last_good_t, n_bridge_ok, since_imu, n_imu_hold, n_imu_reject, n_fast_rot, n_weak, n_map_held, refs, ref_next, lost_since, good_t0, good_t1, restart, n_reloc, s_reloc, mut writer, poses_f, stats_f, optical, s_read, s_odom, s_slam, s_send, s_total, n, n_lost, n_newmap, n_loop, n_corr, n_graph, n_graph_nodes, sent_nodes, held_nodes, held_last, n_held, n_joined, map_id, fresh, anchored, good_id, prev_stamp, prev_corr, prov, prov_nodes, last_sent_world, fast_prev, fast_vel, tilt_map, tilt_map_max, n_prov, a } = self;
+        let Runner { t_run, in_proc, calib, imu_replay, imu_ring, imu_on, skipped, stress_counts, replay_max, intermediate, detection_rate, reloc_min, mut eng, klt_path, reloc_wait, bridge, n_bridge, n_global, n_reloc_bridge, global_tried, n_reloc_tilt, n_loop_rejected, n_merge_try, nq, bridge_t, n_bridge_fix, last_merge_try, newmap_t, prev_map_small, n_accept, max_corr, last_good_t, n_bridge_ok, since_imu, n_imu_hold, n_imu_reject, n_fast_rot, n_weak, n_map_held, refs, ref_next, lost_since, good_t0, good_t1, restart, n_reloc, s_reloc, mut writer, poses_f, stats_f, optical, s_read, s_odom, s_slam, s_send, s_total, n, n_lost, n_newmap, n_loop, n_corr, n_graph, n_graph_nodes, sent_nodes, held_nodes, held_last, n_held, n_joined, map_id, fresh, anchored, good_id, prev_stamp, prev_corr, prov, bases, prov_nodes, last_sent_world, last_sent_odom, fast_prev, fast_vel, tilt_map, tilt_map_max, n_prov, a } = self;
         let _ = (&in_proc, &calib, &imu_replay, &imu_on, &replay_max, &intermediate, &detection_rate, &reloc_min, &klt_path, &reloc_wait, &n_bridge, &global_tried, &bridge_t,
-                 &last_merge_try, &newmap_t, &prev_map_small, &accepted, &last_good_t, &since_imu,
+                 &last_merge_try, &newmap_t, &prev_map_small, &last_good_t, &since_imu,
                  &refs, &ref_next, &lost_since, &good_t0, &good_t1, &restart, &sent_nodes, &held_nodes, &held_last, &map_id, &fresh, &anchored, &good_id, &prev_stamp, &prev_corr,
-                 &prov, &prov_nodes, &last_sent_world, &fast_prev, &fast_vel, &a);
+                 &prov, &bases, &prov_nodes, &last_sent_world, &last_sent_odom, &fast_prev, &fast_vel, &a);
         let wall = t_run.elapsed().as_secs_f64();
         if let Some(r) = &imu_ring {
             r.closed.store(true, Ordering::Relaxed); // 읽기 · 재생 · 위치 내기 스레드 끝냄
@@ -2312,8 +2341,8 @@ impl Runner {
             common::info!("{s}");
             common::info!("IMU: 영상이 IMU 회전과 어긋나 버린 장면 {n_imu_reject}, 위치만 보내고 지도에 안 쌓은 장면 {n_imu_hold}(이어 붙임 · 어긋남 뒤 {IMU_SETTLE} 장 포함, 번짐 {n_fast_rot} · 영상 근거 약함 {n_weak}), 이어지지 않은 새 지도라 맡겨 둔 장면 {n_map_held}, 기다리다 받아들인 새 지도 {n_accept}");
             common::info!("IMU: 보낸 위치 기준 지도 기울기 마지막 {tilt_map:.1}° · 최대 {tilt_map_max:.1}°, 장면 사이 위치 {} 개({:.0} 개/초)", crate::imu::FAST_N.load(Ordering::Relaxed), crate::imu::FAST_N.load(Ordering::Relaxed) as f64 / wall.max(1e-9));
-            if let Some((ng, gd)) = eng.imu_grav() {
-                common::info!("IMU: 가만히 있을 때 기울기를 중력 쪽으로 고친 장면 {ng}(합 {gd:.1}°), 중력과 어긋나 버린 다시 잡기 {n_reloc_tilt}");
+            if let Some((ng, gd, nr)) = eng.imu_grav() {
+                common::info!("IMU: 기울기를 중력 쪽으로 고친 장면 {ng}(합 {gd:.1}°, 다시 시작한 자리에서 한 번에 맞춤 {nr}), 중력과 어긋나 버린 다시 잡기 {n_reloc_tilt}");
             }
         }
         {

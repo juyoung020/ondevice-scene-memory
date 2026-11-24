@@ -221,8 +221,14 @@ impl Calib {
     }
 }
 
-/// 놓친 뒤 다시 시작할 때 마지막 성공 장면부터 자이로 회전으로 자세를 이어 가는 최대 빈틈(초). 치우침 0.01 rad/s 가 남아도 1.7° 안
-pub const RESTART_MAX: f64 = 3.0;
+/// 놓친 뒤 다시 시작할 때 마지막 성공 장면부터 자이로 회전으로 자세를 이어 가는 최대 빈틈(초). 링(10 초) 안에서 가장 길게:
+/// 치우침 0.005 rad/s 가 남아도 2.3° 안이고, 기울기(roll · pitch)는 다시 시작한 장면에서 중력으로 바로 맞춘다
+pub const RESTART_MAX: f64 = 8.0;
+
+/// 중력 방향 거르기: 가속도 쪽으로 끌어당기는 세기(표본당, 200 Hz 에서 시간 상수 약 1.25 초)
+const GRAV_GAIN: f32 = 0.004;
+/// 가속도 크기가 g 에서 이만큼(m/s²) 안일 때만 중력 방향으로 씀(걷는 동안의 가속 · 충격은 뺌)
+const GRAV_TRUST: f32 = 1.5;
 
 /// 적분 구간 안에서 허용하는 표본 간격(초, 200 Hz 의 4 칸)
 pub const MAX_GAP: f64 = 0.02;
@@ -346,9 +352,12 @@ pub struct Fusion {
     have_m: bool,
     /// 자이로 치우침(IMU 축)
     pub bias: [f32; 4],
-    /// 가속도 저역 통과(IMU 축)
+    /// 중력 반대(위) 방향 × g(IMU 축): 자이로 회전으로 장면 사이를 따라가고 가속도로 천천히 끌어당김(돌려도 늦지 않음)
     acc_lp: [f32; 4],
     lp_init: bool,
+    /// 중력 방향 거르기에 넣은 마지막 표본 시각 · 다시 맞춘 뒤(처음 · 표본 빈틈 뒤) 넣은 믿을 만한 표본 수
+    lp_t: f64,
+    lp_n: u32,
     /// 저역 통과에 넣은 다음 표본 번호
     seen: u64,
     /// 영상이 다 실패했을 때 IMU 회전으로 이어 붙이는 최대 시간(초)
@@ -365,7 +374,7 @@ pub struct Fusion {
 
 impl Fusion {
     pub fn new(ring: Arc<Ring>, calib: Calib, bridge_max: f64) -> Fusion {
-        Fusion { ring, calib, m: M34_I, mt: M34_I, have_m: false, bias: [0.0; 4], acc_lp: [0.0; 4], lp_init: false, seen: 0, bridge_max, bias_static: false, n_bias_upd: 0, n_gap: Default::default(), bias0: [0.0; 4], n_bias_reset: 0 }
+        Fusion { ring, calib, m: M34_I, mt: M34_I, have_m: false, bias: [0.0; 4], acc_lp: [0.0; 4], lp_init: false, lp_t: 0.0, lp_n: 0, seen: 0, bridge_max, bias_static: false, n_bias_upd: 0, n_gap: Default::default(), bias0: [0.0; 4], n_bias_reset: 0 }
     }
 
     /// (받은 표본 수, 링이 가득 차 버린 수, 읽기 실패 수)
@@ -408,6 +417,8 @@ impl Fusion {
             let var = sw2 / kf - mw.iter().map(|x| x * x).sum::<f64>();
             let g = (sa.iter().map(|x| (x / kf).powi(2)).sum::<f64>()).sqrt();
             self.acc_lp = [(sa[0] / kf) as f32, (sa[1] / kf) as f32, (sa[2] / kf) as f32, 0.0];
+            self.lp_t = tl;
+            self.lp_n = k as u32;
             if var < 0.03f64.powi(2) && (g - 9.80665).abs() < 0.5 {
                 self.bias = [mw[0] as f32, mw[1] as f32, mw[2] as f32, 0.0];
                 self.bias0 = self.bias;
@@ -416,10 +427,27 @@ impl Fusion {
             common::info!("IMU: 시작 표본 {k} 개, 중력 {g:.2} m/s², 자이로 치우침 {}", if self.bias_static { format!("{:.4} {:.4} {:.4} rad/s(가만히 있어 평균)", mw[0], mw[1], mw[2]) } else { "0(움직이는 중, 영상으로 고침)".into() });
             self.lp_init = true;
         } else {
-            // 저역 통과(200 Hz 에서 시간 상수 약 0.5 초)
+            // 중력 방향: 표본마다 자이로 회전만큼 돌리고(세계에 고정된 벡터를 몸체에서 보면 dv/dt = −ω × v) 가속도 쪽으로 조금 끌어당김.
+            // 표본이 0.1 초 넘게 비었으면(읽기 멈춤 · 녹화 빈틈) 그사이 회전을 모르므로 그 뒤 표본의 평균으로 다시 맞춘다
             for s in a.iter().chain(b.iter()) {
-                for i in 0..3 {
-                    self.acc_lp[i] += 0.01 * (s.a[i] - self.acc_lp[i]);
+                let dt = (s.t - self.lp_t) as f32;
+                self.lp_t = s.t;
+                if !(dt > 0.0 && dt < 0.1) {
+                    self.lp_n = 0;
+                } else {
+                    let w = [s.w[0] - self.bias[0], s.w[1] - self.bias[1], s.w[2] - self.bias[2]];
+                    let v = self.acc_lp;
+                    self.acc_lp[0] -= dt * (w[1] * v[2] - w[2] * v[1]);
+                    self.acc_lp[1] -= dt * (w[2] * v[0] - w[0] * v[2]);
+                    self.acc_lp[2] -= dt * (w[0] * v[1] - w[1] * v[0]);
+                }
+                let g = (s.a[0] * s.a[0] + s.a[1] * s.a[1] + s.a[2] * s.a[2]).sqrt();
+                if (g - 9.80665).abs() < GRAV_TRUST || self.lp_n == 0 {
+                    self.lp_n = self.lp_n.saturating_add(1);
+                    let k = (1.0 / self.lp_n as f32).max(GRAV_GAIN);
+                    for i in 0..3 {
+                        self.acc_lp[i] += k * (s.a[i] - self.acc_lp[i]);
+                    }
                 }
             }
         }
@@ -458,6 +486,14 @@ impl Fusion {
         let u = m34_vec(&self.m, &self.acc_lp);
         let n = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
         (n > 5.0).then(|| [u[0] / n, u[1] / n, u[2] / n, 0.0])
+    }
+
+    /// 몸체 축의 위 방향(움직이는 중에도): 다시 맞춘 뒤 믿을 만한 표본이 20 개(0.1 초) 넘게 들어갔을 때만
+    pub fn up_settled(&self) -> Option<[f32; 4]> {
+        if self.lp_n < 20 {
+            return None;
+        }
+        self.up_body()
     }
 
     /// 몸체 축의 위 방향을 가만히 있을 때만(최근 50 ms 표본: 자이로 0.2 rad/s 안, 가속도 크기 g ± 0.4 m/s²). 저역 통과와 달리 회전에 늦지 않음
@@ -597,13 +633,13 @@ impl CsvReplay {
         self.drop.iter().any(|&(a, b)| t >= a && t < b)
     }
 
-    /// IMU 시각 t 까지의 표본을 링(과 장면 사이 위치 칸)에 넣는다. t − 2 초보다 오래된 표본은 건너뜀(위치 추적이 보는 범위는 최대 1.3 초 전)
+    /// IMU 시각 t 까지의 표본을 링(과 장면 사이 위치 칸)에 넣는다. 위치 추적이 보는 범위(다시 시작 때 RESTART_MAX 초 전)보다 오래된 표본은 건너뜀
     pub fn feed(&mut self, ring: &Ring, t: f64) {
         let mut pushed = false;
         while self.i < self.s.len() && self.s[self.i].t <= t {
             let s = self.s[self.i];
             self.i += 1;
-            if s.t < t - 2.0 || self.dropped(s.t) {
+            if s.t < t - (RESTART_MAX + 1.0) || self.dropped(s.t) {
                 continue;
             }
             ring.push(s);

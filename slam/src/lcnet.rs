@@ -69,6 +69,8 @@ pub struct LcNode {
     /// 위치 추적 자세(몸체, 위치 추적 좌표). 위쪽 = 이 좌표의 z
     pub pose: Pose,
     pub cam: Camera,
+    /// 지도 번호(위치 추적이 다시 시작할 때마다 새 번호): 다른 지도의 노드는 방금 것이어도 후보
+    pub map: u32,
 }
 
 /// 맞은 루프: from(질의) → to(예전 노드) 몸체 변환
@@ -92,6 +94,8 @@ pub struct LcOut {
     /// 검증은 맞았지만 위치 추적과 같은 말이라(보정 없음) 버린 수 · 받아들이는 간격 안이라 건너뛴 노드인지
     pub redundant: usize,
     pub gap: bool,
+    /// 맞은 루프를 깊이 ICP 가 확인 · 다듬었는지
+    pub icp: bool,
     /// ms: MegaLoc(전처리 + 신경망 + 집계) · XFeat(전처리 + 신경망 + 점) · 짝 + 검증
     pub ms: [f64; 3],
 }
@@ -105,6 +109,9 @@ struct Stored {
     kps: Vec<[f32; 2]>,
     desc: Vec<i8>,
     x3: Vec<Option<V3>>,
+    map: u32,
+    /// 깊이 성긴 격자(DSUB 화소마다 한 점, mm): 검증된 상대 자세를 깊이 ICP 로 확인 · 다듬는 데
+    sub: Vec<u16>,
 }
 
 enum Msg {
@@ -203,7 +210,8 @@ struct State {
     /// 마지막으로 받아들인 루프의 노드 시각 · 최근에 이은 예전 노드(노드 시각, id)
     last_hit: f64,
     recent_to: std::collections::VecDeque<(f64, i32)>,
-    /// 시험용 기록(환경 변수 LC_LOG = 파일): 맞은 루프마다 시각 · id · 점수 · 맞은 점 · 광학 좌표 r · t
+    /// 시험용 기록(환경 변수 LC_LOG = 파일): 검증해 본 후보마다 시각 둘 · id 둘 · 점수 · 맞은 점 · 가설 맞은 점 · 특징 통과 · ICP 통과 ·
+    /// ICP 짝 비율 · 잔차 · 잔차 상한 · 최소 고윳값 · 특징 자세(12) · ICP 자세(12, X_q = T X_d)
     log: Option<std::fs::File>,
 }
 
@@ -216,6 +224,15 @@ const SAME_DEG: f32 = 2.0;
 const MIN_GAP_S: f64 = 2.0;
 /// 이 시간(초) 안에 이미 루프로 이은 예전 노드는 다시 잇지 않음
 const SAME_TO_S: f64 = 30.0;
+/// 깊이 ICP 격자 간격(화소): 640×480 → 80×60 칸(노드당 9.6 KB)
+const DSUB: usize = 8;
+/// 특징 검증이 약할 때(맞은 점 WEAK_INLIERS 이상 min_inliers 미만) 깊이 ICP 가 같은 자세를 내면 받아들임:
+/// 짝 비율 · 특징 자세와의 차 한도(m, °). TUM 5 녹화(흐림 포함) 정답 대조: 이 조건을 지난 맞은 점 19 – 38 의 6 개는 2 – 8 cm,
+/// 맞은 점 7 – 11 은 ICP 를 지나도 14 – 26 cm 가 섞여 15 부터
+const WEAK_INLIERS: usize = 15;
+const ICP_RATIO: f64 = 0.35;
+const ICP_AGREE_M: f64 = 0.10;
+const ICP_AGREE_DEG: f64 = 4.0;
 
 impl State {
     fn open(cfg: &LcConfig) -> Result<State, String> {
@@ -308,7 +325,7 @@ impl State {
         // 후보 → 검증
         let me = n.stamp;
         let skip = self.cfg.skip_s;
-        let stamps: std::collections::HashMap<i64, f64> = self.nodes.iter().map(|s| (s.id as i64, s.stamp)).collect();
+        let stamps: std::collections::HashMap<i64, (f64, u32)> = self.nodes.iter().map(|s| (s.id as i64, (s.stamp, s.map))).collect();
         while self.recent_to.front().is_some_and(|r| me - r.0 > SAME_TO_S) {
             self.recent_to.pop_front();
         }
@@ -318,10 +335,13 @@ impl State {
         let cands = if o.gap {
             vec![]
         } else {
-            self.db.topk(&self.desc, self.cfg.topk, |id| !recent.contains(&id) && stamps.get(&id).is_some_and(|&t| (me - t).abs() > skip))
+            // 같은 지도의 가까운 시각 노드는 위치 추적이 이미 이음. 다른 지도(놓친 뒤 새 지도) 노드는 방금 것도 후보: 놓치기 직전 장면이 가장 잘 겹친다
+            self.db.topk(&self.desc, self.cfg.topk, |id| !recent.contains(&id) && stamps.get(&id).is_some_and(|&(t, m)| m != n.map || (me - t).abs() > skip))
         };
         o.cands = cands.iter().filter(|c| c.1 >= self.cfg.min_score).count();
         let mut b = XFeatures::default();
+        let mut qsub = Vec::new();
+        crate::klt::sub_depth_n(&n.depth, w, h, DSUB, &mut qsub);
         for &(cid, score) in &cands {
             if score < self.cfg.min_score {
                 break;
@@ -335,32 +355,47 @@ impl State {
             let kq: Vec<[f32; 2]> = self.pairs.iter().map(|p| q.kps[p.0 as usize]).collect();
             let xq: Vec<Option<V3>> = self.pairs.iter().map(|p| x3[p.0 as usize]).collect();
             let xd: Vec<Option<V3>> = self.pairs.iter().map(|p| c.x3[p.1 as usize]).collect();
-            if let Some(v) = lcverify::verify(&kq, &xq, &xd, up, c.up, &k, vp)
-                && v.accepted
-            {
-                // 광학 좌표 X_q = r X_d + t → 몸체 링크 = L · T · L⁻¹
-                let mut a = [0f32; 12];
-                for i in 0..3 {
-                    for j in 0..3 {
-                        a[i * 4 + j] = v.r[i][j] as f32;
-                    }
-                    a[i * 4 + 3] = v.t[i] as f32;
+            let Some(v) = lcverify::verify(&kq, &xq, &xd, up, c.up, &k, vp) else { continue };
+            // 광학 좌표 X_q = r X_d + t
+            let mut a = [0f32; 12];
+            for i in 0..3 {
+                for j in 0..3 {
+                    a[i * 4 + j] = v.r[i][j] as f32;
                 }
-                if let Some(f) = self.log.as_mut() {
-                    use std::io::Write as _;
-                    let _ = writeln!(f, "{:.6} {:.6} {} {} {:.4} {} {:?} {:?}", n.stamp, c.stamp, n.id, c.id, score, v.inliers, v.r, v.t);
-                }
+                a[i * 4 + 3] = v.t[i] as f32;
+            }
+            let feat = Tf(a);
+            // 깊이 ICP: 특징 자세에서 시작해 두 장의 깊이 면을 맞춤(질의 광학 → 후보 광학). 특징점과 무관한 두 번째 근거:
+            // 틀린 특징 자세(TUM 정답 대조: 맞은 점 16 · 19 에 31 · 68 cm)는 면이 안 맞거나 ICP 가 다른 자세로 가서 걸러진다
+            let fit = (v.inliers >= WEAK_INLIERS).then(|| crate::klt::icp_fit(&c.sub, &qsub, w / DSUB, h / DSUB, DSUB, &[k.fx, k.fy, k.cx, k.cy], &feat.inverse())).flatten();
+            let icp = fit.as_ref().map(|f| {
+                let d = feat.mul(&f.t);
+                (f.t.inverse(), f.ratio >= ICP_RATIO && f.rms <= f.rms_max && f.min_eig >= 1e-3 && (d.norm_sq().sqrt() as f64) < ICP_AGREE_M && (d.angle_to(&Tf::IDENTITY).to_degrees() as f64) < ICP_AGREE_DEG)
+            });
+            let icp_ok = icp.is_some_and(|x| x.1);
+            if let Some(f) = self.log.as_mut() {
+                use std::io::Write as _;
+                let (ft, st) = match (&fit, &icp) {
+                    (Some(f), Some(i)) => (i.0, format!("{:.3} {:.4} {:.4} {:.2e}", f.ratio, f.rms, f.rms_max, f.min_eig)),
+                    _ => (Tf::NULL, "0 0 0 0".into()),
+                };
+                let _ = writeln!(f, "{:.6} {:.6} {} {} {:.4} {} {} {} {} {st} {:?} {:?}", n.stamp, c.stamp, n.id, c.id, score, v.inliers, v.hyp_inliers, v.accepted as u8, icp_ok as u8, feat.0, ft.0);
+            }
+            // 받아들임: 특징만으로 충분(맞은 점 min_inliers 이상)하거나, 약한 특징 검증(WEAK_INLIERS 이상)을 깊이 ICP 가 같은 자세로 확인
+            if v.accepted || icp_ok {
+                // 링크는 특징 자세 그대로(정답 대조에서 80×60 깊이 ICP 자세가 더 정확하지는 않음: 둘 다 1 – 8 cm). 몸체 링크 = L · T · L⁻¹
                 let l = Tf::from_pose(&n.cam.local);
-                let t = l.mul(&Tf(a)).mul(&l.inverse());
+                let t = l.mul(&feat).mul(&l.inverse());
                 // 위치 추적의 상대 자세(from⁻¹ · to)와 같은 말이면 지도에 보탤 보정이 없음 → 버리고 이 노드는 끝
                 let odo = Tf::from_pose(&(n.pose.inverse() * c.pose));
                 let err = odo.inverse().mul(&t);
-                if err.norm_sq().sqrt() < SAME_M && err.angle_to(&Tf::IDENTITY).to_degrees() < SAME_DEG {
+                if c.map == n.map && err.norm_sq().sqrt() < SAME_M && err.angle_to(&Tf::IDENTITY).to_degrees() < SAME_DEG {
                     o.redundant += 1;
                     break;
                 }
                 self.last_hit = me;
                 self.recent_to.push_back((me, c.id));
+                o.icp = icp_ok;
                 o.hit = Some(LcHit { from: n.id, to: c.id, t, score, inliers: v.inliers });
                 break;
             }
@@ -369,7 +404,7 @@ impl State {
         // 표에 넣기
         self.db.add(n.id as i64, &self.desc);
         let desc: Vec<i8> = q.desc.iter().map(|&v| (v * Q8).round().clamp(-127.0, 127.0) as i8).collect();
-        self.nodes.push(Stored { id: n.id, stamp: n.stamp, pose: n.pose, up, kps: q.kps, desc, x3 });
+        self.nodes.push(Stored { id: n.id, stamp: n.stamp, pose: n.pose, up, kps: q.kps, desc, x3, map: n.map, sub: qsub });
         o
     }
 }

@@ -230,14 +230,19 @@ fn refine(tcw: &Tf, k: &[f64; 4], w: &[[f32; 3]], uv: &[[f32; 2]], idx: &[usize]
 const SUB: usize = 4;
 
 fn sub_depth(depth: &[u16], w: usize, h: usize, out: &mut Vec<u16>) -> usize {
-    let (ws, hs) = (w / SUB, h / SUB);
+    sub_depth_n(depth, w, h, SUB, out)
+}
+
+/// 깊이 성긴 격자(sub 화소마다 한 점, 칸 가운데 화소, mm). 돌려줌: 깊이가 있는 칸 수
+pub(crate) fn sub_depth_n(depth: &[u16], w: usize, h: usize, sub: usize, out: &mut Vec<u16>) -> usize {
+    let (ws, hs) = (w / sub, h / sub);
     out.clear();
     out.reserve(ws * hs);
     let mut n = 0;
     for j in 0..hs {
-        let row = &depth[(j * SUB + SUB / 2) * w..];
+        let row = &depth[(j * sub + sub / 2) * w..];
         for i in 0..ws {
-            let d = row[i * SUB + SUB / 2];
+            let d = row[i * sub + sub / 2];
             let d = if d == u16::MAX { 0 } else { d };
             n += (d > 0) as usize;
             out.push(d);
@@ -248,13 +253,13 @@ fn sub_depth(depth: &[u16], w: usize, h: usize, out: &mut Vec<u16>) -> usize {
 
 /// 격자 칸 (i, j) 의 광학 축 3D 점(m)
 #[inline]
-fn vtx(d: &[u16], ws: usize, i: usize, j: usize, k: &[f64; 4]) -> Option<Vector3<f64>> {
+fn vtx(d: &[u16], ws: usize, sub: usize, i: usize, j: usize, k: &[f64; 4]) -> Option<Vector3<f64>> {
     let z = d[j * ws + i];
     if z == 0 || z > 6000 {
         return None;
     }
     let z = z as f64 * 1e-3;
-    let (u, v) = ((i * SUB + SUB / 2) as f64, (j * SUB + SUB / 2) as f64);
+    let (u, v) = ((i * sub + sub / 2) as f64, (j * sub + sub / 2) as f64);
     Some(Vector3::new((u - k[2]) * z / k[0], (v - k[3]) * z / k[1], z))
 }
 
@@ -265,15 +270,38 @@ fn icp(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: &T
 
 /// min_ratio: 짝이 된 점 비율 하한, min_eig: 6 방향 구속(정규화 최소 고윳값) 하한
 fn icp_q(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: &Tf, min_ratio: f64, min_eig: f64) -> Option<Tf> {
+    // 받아들임: 짝 25 % 이상, 잔차 3 cm 아래(D435 깊이 잡음), 6 방향 모두 잡힘(평평한 벽 하나면 미끄러짐)
+    let f = icp_fit(prev, cur, ws, hs, SUB, k, t_init)?;
+    if std::env::var("KLT_PROF").is_ok() {
+        eprintln!("icp ratio {:.2} rms {:.4} min_e {:.2e}", f.ratio, f.rms, f.min_eig);
+    }
+    (f.ratio >= min_ratio && f.rms <= f.rms_max && f.min_eig >= min_eig).then_some(f.t)
+}
+
+/// 깊이 ICP 한 번의 결과와 질
+pub(crate) struct IcpFit {
+    /// 이번 광학 → 앞 광학
+    pub t: Tf,
+    /// 짝이 된 점 비율(이번 격자의 깊이 있는 표본 대비)
+    pub ratio: f64,
+    /// 점-평면 잔차 RMS(m) 와 깊이에 따른 상한(스테레오 깊이 잡음의 2.5 배, 1 – 4 cm)
+    pub rms: f64,
+    pub rms_max: f64,
+    /// 6 방향 구속(정규화 최소 고윳값): 평평한 면 하나뿐이면 작다
+    pub min_eig: f64,
+}
+
+/// 점-평면 ICP 본체. 격자는 sub 화소마다 한 점(ws × hs 칸), k = 원래 화소의 fx fy cx cy
+pub(crate) fn icp_fit(prev: &[u16], cur: &[u16], ws: usize, hs: usize, sub: usize, k: &[f64; 4], t_init: &Tf) -> Option<IcpFit> {
     let (mut r, mut t) = rt_from_tf(t_init);
     // 앞 장면 법선(이웃 격자 차의 외적)
     let normal = |i: usize, j: usize| -> Option<(Vector3<f64>, Vector3<f64>)> {
         if i == 0 || j == 0 || i + 1 >= ws || j + 1 >= hs {
             return None;
         }
-        let c = vtx(prev, ws, i, j, k)?;
-        let a = vtx(prev, ws, i + 1, j, k)? - vtx(prev, ws, i - 1, j, k)?;
-        let b = vtx(prev, ws, i, j + 1, k)? - vtx(prev, ws, i, j - 1, k)?;
+        let c = vtx(prev, ws, sub, i, j, k)?;
+        let a = vtx(prev, ws, sub, i + 1, j, k)? - vtx(prev, ws, sub, i - 1, j, k)?;
+        let b = vtx(prev, ws, sub, i, j + 1, k)? - vtx(prev, ws, sub, i, j - 1, k)?;
         if a.norm() > 0.1 * c[2] || b.norm() > 0.1 * c[2] {
             return None; // 깊이 끊김
         }
@@ -284,7 +312,7 @@ fn icp_q(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: 
     let mut pts = Vec::with_capacity(ws * hs / 4);
     for j in (1..hs - 1).step_by(2) {
         for i in (1..ws - 1).step_by(2) {
-            if let Some(p) = vtx(cur, ws, i, j, k) {
+            if let Some(p) = vtx(cur, ws, sub, i, j, k) {
                 pts.push(p);
             }
         }
@@ -315,7 +343,7 @@ fn icp_q(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: 
             if u < 0.0 || v < 0.0 {
                 continue;
             }
-            let (i, j) = ((u / SUB as f64) as usize, (v / SUB as f64) as usize);
+            let (i, j) = ((u / sub as f64) as usize, (v / sub as f64) as usize);
             if i >= ws || j >= hs {
                 continue;
             }
@@ -345,16 +373,9 @@ fn icp_q(prev: &[u16], cur: &[u16], ws: usize, hs: usize, k: &[f64; 4], t_init: 
             break;
         }
     }
-    // 받아들임: 짝 25 % 이상, 잔차 3 cm 아래(D435 깊이 잡음), 6 방향 모두 잡힘(평평한 벽 하나면 미끄러짐)
     let eig = h.symmetric_eigen().eigenvalues;
     let min_e = eig.iter().cloned().fold(f64::MAX, f64::min) / good.max(1) as f64;
-    if std::env::var("KLT_PROF").is_ok() {
-        eprintln!("icp good {good}/{} rms {rms:.4} min_e {min_e:.2e}", pts.len());
-    }
-    if (good as f64) < min_ratio * pts.len() as f64 || rms > rms_max || min_e < min_eig {
-        return None;
-    }
-    Some(tf_from_rt(&r, &t))
+    Some(IcpFit { t: tf_from_rt(&r, &t), ratio: good as f64 / pts.len() as f64, rms, rms_max, min_eig: min_e })
 }
 
 /// 일꾼 스레드에 넘기는 키프레임 기술자 일
@@ -458,8 +479,9 @@ pub struct OdometryKlt {
     cur_sub: Vec<u16>,
     /// IMU 융합(None = 카메라 전용, 결과가 IMU 없는 판과 비트까지 같음)
     pub imu: Option<crate::imu::Fusion>,
-    /// 다음 첫 장면을 중력으로 수평 맞춤(처음 · 원점 리셋 뒤)
+    /// 다음 첫 장면을 중력으로 수평 맞춤(처음 · 원점 리셋 뒤) · IMU 표본을 기다린 장면 수
     level_pending: bool,
+    level_wait: u32,
     /// 지금 지도가 중력으로 수평 맞춰져 있음(지도 z = 위)
     pub gravity_aligned: bool,
     /// IMU 회전으로 이어 붙인 장면 수
@@ -473,6 +495,10 @@ pub struct OdometryKlt {
     pub imu_rate: f32,
     /// 영상 결과를 IMU 와 어긋나 연달아 버린 장면 수(IMU_TRUST_MAX 에 닿으면 IMU 쪽을 의심: 치우침 되돌리고 영상을 받음)
     imu_streak: u32,
+    /// IMU: 다시 시작한 장면에서 중력 방향이 아직 안 잡혀(표본 빈틈 바로 뒤) 기울기를 못 맞춤 → 잡히는 대로 한 번에 맞춤
+    relevel_pending: bool,
+    /// IMU: 다시 시작한 자리에서 기울기를 중력으로 한 번에 맞춘 수
+    pub n_relevel: usize,
     /// 같은 자리에서 다시 시작(놓친 뒤)할 때 마지막 성공 장면 시각: 첫 장면에서 그 뒤 자이로 회전으로 자세를 이어 감(0 = 없음)
     restart_t: f64,
     /// IMU: 다시 시작한 첫 장면 자세를 자이로 회전으로 이어 간 수
@@ -518,6 +544,7 @@ impl OdometryKlt {
             cur_sub: Vec::new(),
             imu: None,
             level_pending: true,
+            level_wait: 0,
             gravity_aligned: false,
             by_imu: 0,
             n_grav: 0,
@@ -527,6 +554,8 @@ impl OdometryKlt {
             imu_streak: 0,
             restart_t: 0.0,
             imu_restarts: 0,
+            relevel_pending: false,
+            n_relevel: 0,
             par: p.get_bool("OdomKlt/Parallel", false), // 기본 한 스레드: 전체 프로그램에선 rayon 풀을 memmap 이 같이 써서 기다림이 길어짐(보드 walk1 밀려 버린 장면 284 → 150)
         }
     }
@@ -551,7 +580,8 @@ impl OdometryKlt {
         if !same_place {
             self.prev_sub.clear();
         }
-        self.restart_t = if same_place { self.prev_t } else { 0.0 };
+        // 다시 시작한 첫 장면이 점이 모자라 실패하면 prev_t 가 없다: 그때는 자세를 이어 온 시각(restart_t)을 그대로 둠
+        self.restart_t = if !same_place { 0.0 } else if self.prev_t > 0.0 { self.prev_t } else { self.restart_t };
         self.velocity = Tf::NULL;
         self.prev_t = 0.0;
     }
@@ -758,22 +788,38 @@ impl OdometryKlt {
         Some((pose, ids_in, uv_in, q))
     }
 
-    /// IMU: 지도가 중력으로 맞춰져 있고 장비가 가만히 있으면(IMU 위 방향이 바로 잼) 위치 추적 자세의 기울기(roll · pitch)를
-    /// 중력 쪽으로 장면당 어긋남의 5 % (최대 0.3°)씩 돌린다. 카메라 자리를 축으로 자세 · 따라가는 점 · 되찾기 키프레임을 함께 돌려
-    /// 다음 장면 PnP 가 되돌리지 않게 한다(영상만으로는 기울기가 쌓여 가기만 함). 20° 넘게 어긋나면 IMU 쪽을 믿지 않고 두고, 방위(yaw)는 그대로
+    /// IMU: 지도가 중력으로 맞춰져 있으면 위치 추적 자세의 기울기(roll · pitch)를 중력 쪽으로 돌린다(영상만으로는 기울기가 쌓여 가기만 함).
+    /// 가만히 있을 때(IMU 위 방향을 바로 잼)는 장면당 어긋남의 5 % (최대 0.3°), 움직일 때(자이로로 따라간 중력 방향)는 2 % (최대 0.15°),
+    /// 5° 넘게 어긋나 있으면(다시 시작한 뒤 등) 장면당 20 % (최대 3°)로 빨리. 방위(yaw)는 그대로
     fn gravity_fix(&mut self) {
         if !self.gravity_aligned {
             return;
         }
-        let Some(u) = self.imu.as_ref().and_then(|u| u.up_static()) else { return };
-        let w = crate::simd::m34_vec(&crate::imu::m34_of_tf(&self.pose), &u);
+        let Some(imu) = self.imu.as_ref() else { return };
+        let (u, frac, cap) = match (imu.up_static(), imu.up_settled()) {
+            (Some(u), _) => (u, 0.05f32, 0.3f32),
+            (None, Some(u)) => (u, 0.02, 0.15),
+            _ => return,
+        };
+        if std::mem::take(&mut self.relevel_pending) {
+            self.n_relevel += self.tilt_correct(&u, 1.0, 180.0) as usize;
+            return;
+        }
+        self.tilt_correct(&u, frac, cap);
+    }
+
+    /// 몸체 축 위 방향 u 가 지도 z 가 되도록 카메라 자리를 축으로 자세 · 따라가는 점 · 되찾기 키프레임을 함께 돌린다
+    /// (다음 장면 PnP 가 되돌리지 않게). 어긋남의 frac 만큼, 장면당 최대 cap_deg(5° 넘게 어긋나 있으면 20 % · 3° 까지). 돌렸으면 true
+    fn tilt_correct(&mut self, u: &[f32; 4], frac: f32, cap_deg: f32) -> bool {
+        let w = crate::simd::m34_vec(&crate::imu::m34_of_tf(&self.pose), u);
         let (cx, cy) = (w[1], -w[0]); // w × ẑ
         let s = (cx * cx + cy * cy).sqrt();
         let ang = s.atan2(w[2]);
-        if !(ang > 1e-4 && ang < 0.35) {
-            return;
+        if !(ang > 1e-4) {
+            return false;
         }
-        let a = (ang * 0.05).min(0.3f32.to_radians());
+        let (frac, cap_deg) = if ang > 5f32.to_radians() { (frac.max(0.2), cap_deg.max(3.0)) } else { (frac, cap_deg) };
+        let a = (ang * frac).min(cap_deg.to_radians());
         let rc = crate::simd::so3_exp([cx / s * a, cy / s * a, 0.0, 0.0]);
         let c = [self.pose.x(), self.pose.y(), self.pose.z()];
         let rcc = crate::simd::m34_vec(&rc, &[c[0], c[1], c[2], 0.0]);
@@ -787,6 +833,7 @@ impl OdometryKlt {
         }
         self.n_grav += 1;
         self.grav_deg += a.to_degrees() as f64;
+        true
     }
 
     pub fn process(&mut self, f: &Frame) -> OdomResult {
@@ -820,13 +867,26 @@ impl OdometryKlt {
                 if restart_t > 0.0 && f.t - restart_t <= crate::imu::RESTART_MAX {
                     imu_rot = u.rotation(restart_t, f.t);
                 }
-                if std::mem::take(&mut self.level_pending) && self.pose == Tf::IDENTITY {
-                    if let Some(up) = u.up_body() {
-                        self.pose = crate::imu::tf_of(&crate::imu::rot_between(&up, &[0.0, 0.0, 1.0, 0.0]), [0.0; 3]);
-                        self.gravity_aligned = true;
-                        common::info!("IMU: 첫 장면을 중력으로 수평 맞춤({:.1}° 기울어 있었음)", up[2].clamp(-1.0, 1.0).acos().to_degrees());
+                if self.level_pending && self.pose == Tf::IDENTITY {
+                    match u.up_body() {
+                        Some(up) => {
+                            self.pose = crate::imu::tf_of(&crate::imu::rot_between(&up, &[0.0, 0.0, 1.0, 0.0]), [0.0; 3]);
+                            self.gravity_aligned = true;
+                            common::info!("IMU: 첫 장면을 중력으로 수평 맞춤({:.1}° 기울어 있었음)", up[2].clamp(-1.0, 1.0).acos().to_degrees());
+                        }
+                        // IMU 표본이 아직 모자람(시작 0.2 초): 중력을 알 때까지 시작하지 않는다. 기운 채 시작하면 그 지도는 끝까지 중력에 안 맞음.
+                        // 1 초(30 장) 넘게 안 오면 IMU 없이 시작
+                        None if self.level_wait < 30 => {
+                            self.level_wait += 1;
+                            self.restart_t = restart_t;
+                            self.spare = Some(cur);
+                            return self.result(Tf::NULL, Self::eye(9999.0), 0, 0, false);
+                        }
+                        None => common::info!("IMU: 표본이 오지 않아 첫 장면을 수평 맞춤 없이 시작"),
                     }
                 }
+                self.level_pending = false;
+                self.level_wait = 0;
             }
             let rot_b = imu_rot.map(|r| crate::imu::tf_of(&r, [0.0; 3]));
             if !self.prev_sub.is_empty() && !f.depth_mm.is_empty() && sub_depth(&f.depth_mm, w, h, &mut self.cur_sub) > 1000 {
@@ -842,6 +902,14 @@ impl OdometryKlt {
                 self.pose = self.pose.mul(&r);
                 self.imu_restarts += 1;
             }
+            // IMU: 다시 시작한 자리의 기울기(roll · pitch)는 중력으로 바로 맞춘다. 놓친 사이 회전을 자이로로 못 이어 갔어도(긴 빈틈 · 표본 빈틈)
+            // 새 지도가 기운 채 시작하지 않는다(방위만 모름). 중력 방향이 아직 안 잡혔으면 잡히는 장면에서 맞춤
+            if self.gravity_aligned && restart_t > 0.0 {
+                match self.imu.as_ref().and_then(|u| u.up_settled()) {
+                    Some(u) => self.n_relevel += self.tilt_correct(&u, 1.0, 180.0) as usize,
+                    None => self.relevel_pending = true,
+                }
+            }
             self.top_up(f);
             let nd = if f.depth_mm.is_empty() { 0 } else { sub_depth(&f.depth_mm, w, h, &mut self.prev_sub) };
             // 어두워 점이 모자라도 깊이가 있으면 시작(깊이 ICP 로 이어 감)
@@ -849,6 +917,10 @@ impl OdometryKlt {
                 self.tracks.clear();
                 self.prev_sub.clear();
                 self.spare = Some(cur);
+                // 자세는 이 장면까지 이어 왔다: 다음 시도는 여기서부터
+                if restart_t > 0.0 {
+                    self.restart_t = f.t;
+                }
                 return self.result(Tf::NULL, Self::eye(9999.0), 0, 0, false);
             }
             self.prev = Some(cur);
@@ -962,6 +1034,11 @@ impl OdometryKlt {
                 if let Some(tpo) = icp(&self.prev_sub, &self.cur_sub, w / SUB, h / SUB, &k4, &init).filter(|tpo| !disagree(&self.pose.mul(&local.mul(tpo).mul(&linv)))) {
                     let transform = local.mul(&tpo).mul(&linv);
                     let pose = self.pose.mul(&transform);
+                    if let (Some(r), true) = (&imu_rot, std::env::var("IMU_DBG").is_ok()) {
+                        let (a, b) = (crate::imu::so3_log(r), crate::imu::so3_log(&crate::imu::m34_of_tf(&transform)));
+                        let d = |v: [f32; 4]| v.map(|x| x.to_degrees() / dt as f32);
+                        eprintln!("imu {:?} vis {:?} °/s icp", d(a), d(b));
+                    }
                     if dt > 0.0 {
                         let v = transform.xyz_rpy();
                         let d = |x: f32| (x as f64 / dt) as f32;

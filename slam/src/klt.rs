@@ -467,6 +467,9 @@ pub struct OdometryKlt {
     /// IMU: 가만히 있을 때 기울기(roll · pitch)를 중력 쪽으로 고친 장면 수 · 고친 각 합(°)
     pub n_grav: usize,
     pub grav_deg: f64,
+    /// IMU: 다시 시작할 때 기울기를 중력으로 다시 맞춘 수 · 고친 각 합(°)
+    pub n_relevel: usize,
+    pub relevel_deg: f64,
     /// 이번 장면에서 영상 결과를 IMU 회전과 어긋나 버렸는지 · 그런 장면 수
     pub imu_rejected: bool,
     /// IMU: 이번 장면 앞 구간의 자이로 회전 속도(°/s, IMU 회전이 없으면 0)
@@ -522,6 +525,8 @@ impl OdometryKlt {
             by_imu: 0,
             n_grav: 0,
             grav_deg: 0.0,
+            n_relevel: 0,
+            relevel_deg: 0.0,
             imu_rejected: false,
             imu_rate: 0.0,
             imu_streak: 0,
@@ -841,6 +846,22 @@ impl OdometryKlt {
             if let (false, Some(r)) = (self.bridge_verified, rot_b) {
                 self.pose = self.pose.mul(&r);
                 self.imu_restarts += 1;
+            }
+            // IMU: 놓친 뒤 다시 시작(빈틈이 길어 자이로로 못 이은 경우 포함)이면 기울기(roll · pitch)를 중력으로 다시 맞춤(방향 · 위치는 그대로).
+            // 빈틈 동안 카메라가 돈 만큼 새 지도가 기울어 시작하던 것(녹화 빈틈 4 – 8 초 뒤 지도 기울기 8 → 22°)을 막음
+            if restart_t > 0.0 && self.gravity_aligned && !self.bridge_verified {
+                if let Some(up) = self.imu.as_ref().and_then(|u| u.up_static().or_else(|| u.up_body())) {
+                    let r = crate::imu::m34_of_tf(&self.pose);
+                    let wu = crate::simd::m34_vec(&r, &up);
+                    let fix = crate::imu::rot_between(&wu, &[0.0, 0.0, 1.0, 0.0]);
+                    let tn = [self.pose.0[3], self.pose.0[7], self.pose.0[11]];
+                    let rr = crate::imu::tf_of(&fix, [0.0; 3]).mul(&crate::imu::tf_of(&r, [0.0; 3]));
+                    self.pose = crate::imu::tf_of(&crate::imu::m34_of_tf(&rr), tn);
+                    self.n_relevel += 1;
+                    let d = wu[2].clamp(-1.0, 1.0).acos().to_degrees() as f64;
+                    self.relevel_deg += d;
+                    common::info!("IMU: 다시 시작 — 기울기 {d:.1}° 를 중력으로 다시 맞춤");
+                }
             }
             self.top_up(f);
             let nd = if f.depth_mm.is_empty() { 0 } else { sub_depth(&f.depth_mm, w, h, &mut self.prev_sub) };

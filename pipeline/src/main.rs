@@ -1433,7 +1433,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
             // 바닥 높이: 화면 아래쪽 점이 카메라 아래로 얼마나 떨어졌나(95 %) → 카메라 높이, 짧게 평활
             let back = |u: usize, v: usize| -> Option<V3> {
                 let z = depth.at(v * w + u) as f64;
-                (z > 0.2 && z < 6.0).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
+                (z > 0.2 && z < MAX_DEPTH_M).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
             };
             let mut below = vec![];
             let up_c = [r[2][0], r[2][1], r[2][2]]; // 세계 z 를 카메라 좌표로(Rᵀ·ẑ)
@@ -2024,7 +2024,7 @@ fn pts_grid(a: &Args, k: [f64; 4], depth: &Depth, rgb: &[u8], w: usize, h: usize
             for gx in 0..gw {
                 let u = off[0] + gx * step;
                 let z = win[2 * w + u] as f64;
-                if !(z > 0.2 && z < 6.0) {
+                if !(z > 0.2 && z < MAX_DEPTH_M) {
                     continue;
                 }
                 if u < 2 || u + 2 >= w {
@@ -2062,6 +2062,13 @@ fn smooth_depth(d: &[f32], w: usize, u: usize, v: usize) -> f32 {
 /// 천장 높이: 카메라보다 CEIL_MIN_M 넘게 위의 높이 칸(CEIL_BIN_M) 하나에 장면 점이 몰리면(넓은 수평 면) 그 높이를 후보로,
 /// CEIL_HITS 장면 연속 같은 높이(± CEIL_BIN_M)면 천장으로 정한다. 정한 뒤로는 천장 − CEIL_CUT_M 위 점은 지도에 넣지 않는다.
 /// 카메라가 정한 때보다 CEIL_FLOOR_M 넘게 오르내리면(층이 바뀜) 다시 찾는다. 지도 z 는 위쪽(바닥 맞춤 · IMU 중력)
+/// 카메라 깊이를 이 거리(m)까지만 씀(D435 깊이 오차 약 6.7 cm @ 4 m)
+const MAX_DEPTH_M: f64 = 4.0;
+/// 정한 천장 자르는 높이(f64 비트, 못 정했으면 무한): 점 줄이 쓰고 물체 쪽이 읽음
+static CEIL_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x7FF0_0000_0000_0000);
+fn ceil_top() -> f64 {
+    f64::from_bits(CEIL_TOP.load(std::sync::atomic::Ordering::Relaxed))
+}
 const CEIL_MIN_M: f64 = 0.4;
 const CEIL_BIN_M: f64 = 0.05;
 const CEIL_HITS: u32 = 3;
@@ -2076,13 +2083,14 @@ struct Ceil {
 
 impl Ceil {
     /// 이 장면 점(지도 좌표 높이)으로 천장을 찾거나 확인한다
-    fn observe(&mut self, cam_z: f64, zs: &[f64]) {
+    fn observe(&mut self, cam_z: f64, zs: &[f64]) -> bool {
         if let Some((_, cz)) = self.z {
             if (cam_z - cz).abs() > CEIL_FLOOR_M {
                 common::info!("천장: 카메라 높이가 {:.2} m 바뀜 → 다시 찾음", cam_z - cz);
                 *self = Ceil::default();
+                CEIL_TOP.store(f64::INFINITY.to_bits(), std::sync::atomic::Ordering::Relaxed);
             } else {
-                return;
+                return false;
             }
         }
         let lo = cam_z + CEIL_MIN_M;
@@ -2104,8 +2112,11 @@ impl Ceil {
             if n >= CEIL_HITS {
                 common::info!("천장 정함: 지도 높이 {:.2} m (카메라 + {:.2} m), 위 {:.2} m 부터 자름", c, c - cam_z, c - CEIL_CUT_M);
                 self.z = Some((c, cam_z));
+                CEIL_TOP.store((c - CEIL_CUT_M).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                return true;
             }
         }
+        false
     }
     /// 이 높이보다 위면 버림(천장을 아직 못 정했으면 무한)
     fn cut(&self) -> f64 {
@@ -2130,8 +2141,12 @@ fn chunk_points(k: [f64; 4], g: &PtsGrid, r: &M3, pwc: &V3, cm: &mut chunks::Chu
         })
     }).collect();
     let zs: Vec<f64> = pts.iter().map(|p| wz(&p.0)).collect();
-    ceil.observe(pwc[2], &zs);
+    let locked = ceil.observe(pwc[2], &zs);
     let top = ceil.cut();
+    if locked {
+        let n = cm.cut_above(top);
+        common::info!("천장: 이미 쌓인 점 {n} 개 지움");
+    }
     cm.add(kf, seq, r, pwc, pts.into_iter().zip(zs).filter(|(_, z)| *z <= top).map(|(p, _)| p));
 }
 
@@ -2349,7 +2364,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     let [fx, fy, cx, cy] = k;
     let back = |u: usize, v: usize| -> Option<V3> {
         let z = depth.at(v * w + u) as f64;
-        (z > 0.2 && z < 6.0).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
+        (z > 0.2 && z < MAX_DEPTH_M).then(|| [(u as f64 - cx) / fx * z, (v as f64 - cy) / fy * z, z])
     };
     let to_w = |pc: &V3| add(&mv(&r, pc), &pwc);
 
@@ -2433,7 +2448,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
         zs.extend(pix.iter().map(|q| q.2));
         let mid = zs.len() / 2;
         let med = *zs.select_nth_unstable_by(mid, |x, y| x.partial_cmp(y).unwrap()).1; // 정렬 대신 선택(같은 값)
-        if med > 5.0 {
+        if med > MAX_DEPTH_M {
             continue;
         }
         pts.clear();
@@ -2448,6 +2463,10 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             continue;
         }
         let border = [x1 <= 1, y1 <= 1, x2 + 1 >= w, y2 + 1 >= h].iter().filter(|b| **b).count();
+        // 천장(정한 높이 위)에 걸친 검출은 물체로 넣지 않음(천장 조명·에어컨 등이 천장 면을 끌고 옴)
+        if pts.iter().map(|q| q.0[2]).sum::<f64>() / pts.len().max(1) as f64 > ceil_top() {
+            continue;
+        }
         if let Some(why) = fragment(&pts, floor_z, pwc[2], border) {
             if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() {
                 println!("fragdbg {why}");

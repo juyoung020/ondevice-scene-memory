@@ -2134,9 +2134,11 @@ impl Ceil {
                 return false;
             }
         }
-        let step = (w.len() / 4000).max(1);
-        let up: Vec<V3> = w.iter().step_by(step).filter(|p| p[2] > cam[2] + CEIL_MIN_M).copied().collect();
-        let need = ((w.len() / step) as f64 * 0.04).max(200.0) as usize;
+        // 위쪽 점은 다 모으고(천장은 화면 일부만 차지하기 쉬움) 맞추기는 최대 3,000 개로, 붙은 점 수는 위쪽 점 전체 기준으로 환산
+        let all_up: Vec<V3> = w.iter().filter(|p| p[2] > cam[2] + CEIL_MIN_M).copied().collect();
+        let step = (all_up.len() / 3000).max(1);
+        let up: Vec<V3> = all_up.iter().step_by(step).copied().collect();
+        let need = ((w.len() as f64 * 0.02).max(300.0) / step as f64) as usize;
         let f = self.fit(&up);
         if std::env::var("CEIL_DEBUG").is_ok() {
             println!("ceildbg up {} need {} best {:?}", up.len(), need, f.map(|(p, n)| (n, p.0[2], p.1 - dot(&p.0, cam))));

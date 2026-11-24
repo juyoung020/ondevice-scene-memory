@@ -9,6 +9,7 @@ unsafe extern "C" {
     fn orb3_keyframes(h: *mut c_void, all: c_int, ids: *mut u64, maps: *mut u64, poses: *mut f64, cap: c_int) -> c_int;
     fn orb3_graft(h: *mut c_void, from: u64, into: u64, s: *const f64) -> c_int;
     fn orb3_wait_idle(h: *mut c_void);
+    fn orb3_kf_now(h: *mut c_void, id: u64, twc: *mut f64, map: *mut u64) -> c_int;
     fn orb3_free(h: *mut c_void);
 }
 
@@ -82,6 +83,13 @@ impl System {
 
 impl System {
     /// 지도 스레드가 쌓인 키프레임을 다 처리할 때까지 기다림(최대 속도 재생: 결과가 PC 속도에 덜 매이게)
+    pub fn kf_now(&mut self, id: u64) -> Option<(u64, [f64; 12])> {
+        let (mut t, mut m) = ([0f64; 12], 0u64);
+        // SAFETY: t 는 12 칸
+        (unsafe { orb3_kf_now(self.0, id, t.as_mut_ptr(), &mut m) } != 0).then_some((m, t))
+    }
+
+    /// 지도 스레드가 쌓인 키프레임을 다 처리할 때까지 기다림
     pub fn wait_idle(&mut self) {
         // SAFETY: 살아 있는 핸들
         unsafe { orb3_wait_idle(self.0) }

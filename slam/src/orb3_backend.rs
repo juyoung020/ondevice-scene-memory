@@ -434,7 +434,8 @@ impl Orb3 {
             Some((pi, pf, ps, pt)) if t - pt < 15.0 && ((pi, pf) == (mb, ma) || (pi, pf) == (ma, mb)) => {
                 let s = if (pi, pf) == (mb, ma) { ps } else { inv(&ps) };
                 let (d, r) = moved(&s, &s_ba);
-                d < 0.15 && r < 3f64.to_radians()
+                common::info!("지도 잇기: 앞 후보와의 차 {d:.3} m · {:.2}°", r.to_degrees());
+                d < 0.25 && r < 6f64.to_radians()
             }
             _ => false,
         };
@@ -471,7 +472,7 @@ impl Orb3 {
             let a = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
             self.acc.push_back((s[0] - self.shift, [a[0] as f64, a[1] as f64, a[2] as f64]));
         }
-        while self.acc.front().is_some_and(|x| f.t - x.0 > 0.5) {
+        while self.acc.front().is_some_and(|x| f.t - x.0 > 1.0) {
             self.acc.pop_front();
         }
         // 최대 속도 재생(받는 쪽을 기다림)은 잇기 결과도 기다려 실시간처럼 제때 반영
@@ -515,15 +516,15 @@ impl Orb3 {
                 self.last_sweep = f.t;
                 self.send_nodes(regrav, !usable);
             }
-            if let Some(k) = tr.ref_kf.filter(|k| self.sent.contains_key(k)) {
+            // 기준 노드: 장면의 기준 키프레임, 아직 지도에 안 들어간 새 키프레임이면(지도 스레드가 처리 전) 지금 지도에서 보낸 가장 새 키프레임
+            let k = tr.ref_kf.filter(|k| self.sent.contains_key(k) && self.kfs.contains_key(k)).or_else(|| self.kfs.keys().filter(|k| self.sent.contains_key(k)).max().copied());
+            if let Some(k) = k {
                 anchor = (k + 1) as u32;
-                if let Some(p) = self.kfs.get(&k) {
-                    self.tracked.push((f.t, k, mul(&inv(p), &tr.twc)));
-                }
+                self.tracked.push((f.t, k, mul(&inv(&self.kfs[&k]), &tr.twc)));
             }
         }
-        // 지도 잇기에 장면 보내기(0.5 초마다, IMU 위쪽이 믿을 만할 때)
-        if ok && f.t - self.last_node_t >= 0.5 && self.acc.len() >= 20 {
+        // 지도 잇기에 장면 보내기(0.25 초마다, 1 초 평균 가속도로 본 IMU 위쪽이 믿을 만할 때)
+        if ok && f.t - self.last_node_t >= 0.25 && self.acc.len() >= 20 {
             if f.t - self.kfmap_t >= 1.0 || changed {
                 self.all_kfs(f.t);
             }
@@ -644,23 +645,30 @@ impl SlamBackend for Orb3Backend {
             r.closed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let wall = s.t_run.elapsed().as_secs_f64();
-        // 끝난 지도: 모든 지도의 키프레임. 기준 키프레임이 든 지도 = 한 덩어리 지도
+        // 끝난 지도: 장면마다 기준 키프레임의 지금 위치(지워졌으면 부모를 따라감) · 지도. 가장 많은 장면이 든 지도 = 한 덩어리 지도
         let all = s.sys.keyframes(true);
-        let main_map = s.ref_kf.and_then(|(id, _)| all.iter().find(|x| x.0 == id).map(|x| x.1));
-        let kmap: HashMap<u64, (u64, T34)> = all.iter().map(|(id, m, p)| (*id, (*m, *p))).collect();
-        let a_end = main_map.and_then(|_| s.ref_kf.and_then(|(id, out)| kmap.get(&id).map(|(_, p)| mul(&out, &inv(p))))).unwrap_or(s.a);
-        let (mut in_main, mut other, mut gone) = (0usize, 0usize, 0usize);
-        let mut lines = Vec::new();
+        let mut per: Vec<(f64, u64, T34)> = Vec::new();
+        let mut gone = 0usize;
         for (t, kf, rel) in &s.tracked {
-            match kmap.get(kf) {
-                Some((m, p)) if Some(*m) == main_map => {
-                    in_main += 1;
-                    lines.push(tum_line(*t, &mul(&a_end, &mul(p, rel))));
-                }
-                Some(_) => other += 1,
+            match s.sys.kf_now(*kf) {
+                Some((m, p)) => per.push((*t, m, mul(&p, rel))),
                 None => gone += 1,
             }
         }
+        let mut cnt: HashMap<u64, usize> = HashMap::new();
+        for x in &per {
+            *cnt.entry(x.1).or_default() += 1;
+        }
+        let main_map = cnt.iter().max_by_key(|x| *x.1).map(|x| *x.0);
+        let ref_map = s.ref_kf.and_then(|(id, _)| s.sys.kf_now(id));
+        // 보낸 세계 ← 끝 ORB 지도(기준 키프레임이 큰 지도에 있으면 그 못 박음, 아니면 지금 값)
+        let a_end = match ref_map {
+            Some((m, p)) if Some(m) == main_map => mul(&s.ref_kf.unwrap().1, &inv(&p)),
+            _ => s.a,
+        };
+        let in_main = per.iter().filter(|x| Some(x.1) == main_map).count();
+        let other = per.len() - in_main;
+        let lines: Vec<String> = per.iter().filter(|x| Some(x.1) == main_map).map(|x| tum_line(x.0, &mul(&a_end, &x.2))).collect();
         if !s.final_path.is_empty() {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&s.final_path).map_err(|e| format!("{}: {e}", s.final_path))?);
             let _ = writeln!(f, "# timestamp x y z qx qy qz qw (컬러 카메라 광학 → 지도, 끝난 기준 지도)");

@@ -223,7 +223,8 @@ impl State {
             let maps = xfeat::Maps { feats: self.xf.out(&self.out_xf, "feats"), kpts: self.xf.out(&self.out_xf, "kpts"), heat: self.xf.out(&self.out_xf, "heat") };
             xfeat::detect(&maps, self.cfg.kps, 0.05, &mut self.xsc, &mut q);
         }
-        let vp = lcverify::Params { min_inliers: MIN_INLIERS, ..self.cfg.verify.clone() };
+        // 교실은 4 m 넘는 벽 · 문이 많아 8 m 까지(먼 점은 4 자유도 가설 · 재투영 오차로 걸러짐)
+        let vp = lcverify::Params { min_inliers: MIN_INLIERS, zmax: 8.0, ..self.cfg.verify.clone() };
         let x3: Vec<Option<V3>> = q.kps.iter().map(|&p| lcverify::backproject(&n.depth, w, h, 1000.0, &n.k, p, vp.zmin, vp.zmax)).collect();
         // 후보: 지금 다른 지도에 든 예전 장면
         let my_map = n.maps.get(&n.kf).copied();

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <unordered_map>
 
 using namespace ORB_SLAM3;
 
@@ -18,6 +19,12 @@ static void put34(const Sophus::SE3f &t, double *o) {
     const Eigen::Matrix<float, 3, 4> m = t.matrix3x4();
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 4; j++) o[i * 4 + j] = m(i, j);
+}
+
+// 장면의 기준 키프레임(나중에 지워져도 부모를 따라 끝 위치를 구하려고 남김. ORB-SLAM3 는 키프레임을 지우지 않고 나쁨 표시만 함)
+static std::unordered_map<uint64_t, KeyFrame *> &kfs() {
+    static std::unordered_map<uint64_t, KeyFrame *> m;
+    return m;
 }
 
 extern "C" {
@@ -44,6 +51,7 @@ int orb3_track(void *h, const uint8_t *rgb, const uint16_t *depth, int w, int hh
     *map_id = m ? m->GetId() : 0;
     KeyFrame *kf = s->GetTracker()->mCurrentFrame.mpReferenceKF;
     *ref_kf = kf ? (int64_t)kf->mnId : -1;
+    if (kf) kfs()[kf->mnId] = kf;
     return s->GetTrackingState();
 }
 
@@ -85,6 +93,23 @@ int orb3_graft(void *h, uint64_t from, uint64_t into, const double *s) {
 
 // 지도 스레드가 쌓인 키프레임을 다 처리할 때까지 기다림(최대 속도 재생)
 void orb3_wait_idle(void *h) { static_cast<System *>(h)->GetTracker()->WaitMappingIdle(); }
+
+// 기준 키프레임 id 의 지금 위치(키프레임 카메라 → 세계)와 지도 id. 지워진 키프레임은 부모를 따라감(원본 SaveTrajectory 와 같음). 없으면 0
+int orb3_kf_now(void *h, uint64_t id, double *twc, uint64_t *map) {
+    (void)h;
+    auto it = kfs().find(id);
+    if (it == kfs().end()) return 0;
+    KeyFrame *k = it->second;
+    Sophus::SE3f trw;
+    while (k && k->isBad()) {
+        trw = trw * k->mTcp;
+        k = k->GetParent();
+    }
+    if (!k || !k->GetMap()) return 0;
+    put34((trw * k->GetPose()).inverse(), twc);
+    *map = k->GetMap()->GetId();
+    return 1;
+}
 
 void orb3_free(void *h) {
     System *s = static_cast<System *>(h);

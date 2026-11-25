@@ -65,8 +65,31 @@ slice_fn!(sqrt_s, |x| x.sqrt());
 slice_fn!(neg_s, |x| -*x);
 
 /// 줄 하나 softmax(제자리)
-/// (최대 · 합은 16 칸 갈래로 나눠 더함: 벡터로 돌게)
-pub fn softmax_row(row: &mut [f32]) {
+/// 줄(길이 d)마다 softmax(제자리), 이 CPU 의 넓은 벡터로
+pub fn softmax_rows(v: &mut [f32], d: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "avx512f,avx512vl,avx512dq,avx512bw,avx2")]
+        unsafe fn w512(v: &mut [f32], d: usize) {
+            v.chunks_mut(d).for_each(softmax_row)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn w2(v: &mut [f32], d: usize) {
+            v.chunks_mut(d).for_each(softmax_row)
+        }
+        match level() {
+            // SAFETY: 기능 확인함
+            3 => return unsafe { w512(v, d) },
+            2 => return unsafe { w2(v, d) },
+            _ => {}
+        }
+    }
+    v.chunks_mut(d).for_each(softmax_row)
+}
+
+/// 줄 하나 softmax(제자리). 최대 · 합은 16 칸 갈래로 나눠 더함(벡터로 돌게)
+#[inline(always)]
+fn softmax_row(row: &mut [f32]) {
     let mut ml = [f32::NEG_INFINITY; 16];
     let mut ch = row.chunks_exact(16);
     for c in &mut ch {

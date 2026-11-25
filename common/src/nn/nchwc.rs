@@ -24,7 +24,14 @@ pub fn bk() -> usize {
 
 /// (묶음 수 최대, 묶음 수별 화소 수 최대)
 fn caps() -> (usize, [usize; 5]) {
-    if bk() == 16 { (4, [0, 12, 8, 8, 6]) } else { (2, [0, 12, 6, 0, 0]) }
+    if bk() == 16 { (4, [0, 16, 8, 8, 6]) } else { (2, [0, 12, 6, 0, 0]) }
+}
+
+/// 남은 화소 rem 에서 이번 타일 화소 수(AVX-512 묶음 1 은 16 또는 12 이하 꼬리)
+#[inline(always)]
+fn pxn(fb: usize, rem: usize) -> usize {
+    let m = caps().1[fb];
+    if rem >= m { m } else { rem.min(if m == 16 { 12 } else { m }) }
 }
 
 struct P<T>(*mut T);
@@ -51,7 +58,7 @@ pub fn to_blocked(t: &Tensor) -> Result<Tensor, String> {
     let (hw, ncb) = (h * w, c.div_ceil(b));
     let v = t.fv()?;
     let mut o = buf::take::<f32>(nb * ncb * hw * b);
-    const PC: usize = 1024;
+    const PC: usize = 256;
     let npc = hw.div_ceil(PC);
     let op = P(o.as_mut_ptr());
     pool::for_each(nb * ncb * npc, &|i| {
@@ -86,7 +93,7 @@ pub fn to_plain(t: &Tensor) -> Result<Tensor, String> {
     let (hw, ncb) = (h * w, c.div_ceil(b));
     let v = t.fv()?;
     let mut o = buf::take::<f32>(nb * c * hw);
-    const PC: usize = 1024;
+    const PC: usize = 256;
     let npc = hw.div_ceil(PC);
     let op = P(o.as_mut_ptr());
     pool::for_each(nb * ncb * npc, &|i| {
@@ -235,8 +242,8 @@ struct Kp {
     /// 1×1: 입력을 이만큼(칸) 앞서 미리 읽기(0 = 안 함, x86 만)
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pf: usize,
-    /// NCHW 출력(채널이 B/4 이하): 채널 l 의 화소 q 자리 = out + l·ss + q, 쓰는 채널 = sm 비트(0 = NCHWc)
-    sm: u32,
+    /// NCHW 출력: 이 무리 첫 묶음부터 채널 c 의 화소 q 자리 = out + c·ss + q, c < sm 만 씀(0 = NCHWc)
+    sm: usize,
     ss: usize,
     /// 합 시작값(null = 0): ip + f·ifs + q·ios
     ip: *const f32,
@@ -244,24 +251,26 @@ struct Kp {
     ios: usize,
 }
 
-/// x · sigmoid(x) 를 [`super::exp`] · [`super::sigmoid`] 와 같은 차례(곱셈 · 덧셈 따로)로
+/// x · sigmoid(x): [`super::exp`] 와 같은 다항식을 FMA 로, 나눗셈은 역수 근사 + 뉴턴 한 번(상대 오차 ~1e-7)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn silu512(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
     use std::arch::x86_64::*;
     let s = _mm512_set1_ps;
     let z = _mm512_min_ps(_mm512_max_ps(_mm512_sub_ps(_mm512_setzero_ps(), x), s(-87.0)), s(88.0));
-    let t = _mm512_add_ps(_mm512_mul_ps(z, s(std::f32::consts::LOG2_E)), s(12_582_912.0));
+    let t = _mm512_fmadd_ps(z, s(std::f32::consts::LOG2_E), s(12_582_912.0));
     let n = _mm512_sub_ps(t, s(12_582_912.0));
-    let r = _mm512_add_ps(_mm512_sub_ps(z, _mm512_mul_ps(n, s(0.693_359_4))), _mm512_mul_ps(n, s(2.121_944_4e-4)));
+    let r = _mm512_fmadd_ps(n, s(2.121_944_4e-4), _mm512_fnmadd_ps(n, s(0.693_359_4), z));
     let mut p = s(1.987_569_1e-4);
     for c in [1.398_199_9e-3, 8.333_452e-3, 4.166_579_6e-2, 1.666_666_5e-1, 5.000_000_1e-1] {
-        p = _mm512_add_ps(_mm512_mul_ps(p, r), s(c));
+        p = _mm512_fmadd_ps(p, r, s(c));
     }
-    let y = _mm512_add_ps(_mm512_add_ps(_mm512_mul_ps(_mm512_mul_ps(p, r), r), r), s(1.0));
+    let y = _mm512_add_ps(_mm512_fmadd_ps(_mm512_mul_ps(p, r), r, r), s(1.0));
     let e = _mm512_castsi512_ps(_mm512_slli_epi32::<23>(_mm512_add_epi32(_mm512_sub_epi32(_mm512_castps_si512(t), _mm512_set1_epi32(0x4B40_0000)), _mm512_set1_epi32(127))));
-    let ex = _mm512_mul_ps(y, e);
-    _mm512_mul_ps(x, _mm512_div_ps(s(1.0), _mm512_add_ps(s(1.0), ex)))
+    let d = _mm512_fmadd_ps(y, e, s(1.0));
+    let rc = _mm512_rcp14_ps(d);
+    let rc = _mm512_mul_ps(rc, _mm512_fnmadd_ps(d, rc, s(2.0)));
+    _mm512_mul_ps(x, rc)
 }
 
 /// 커널 하나하나를 따로 둔 함수로(큰 분기 함수에 모두 펼치면 누적이 레지스터에 머물지 못하는 판이 생김)
@@ -334,15 +343,13 @@ unsafe fn ep512<const FB: usize, const PX: usize>(p: &Kp, acc: &[[std::arch::x86
                 _mm512_storeu_ps(out.add(f * p.fs + q * p.os), v);
             }
         }
-    }
-    if plain {
-        // NCHW: 채널마다 화소 PX 개를 모아(16 칸 간격 읽기) 이어 씀
-        let idx = _mm512_mullo_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32(16));
-        let m = ((1u32 << PX) - 1) as __mmask16;
-        for l in 0..16 {
-            if p.sm >> l & 1 != 0 {
+        if plain {
+            // NCHW: 채널마다 화소 PX 개를 모아(16 칸 간격 읽기) 이어 씀
+            let idx = _mm512_mullo_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32(16));
+            let m = ((1u32 << PX) - 1) as __mmask16;
+            for l in 0..16.min(p.sm.saturating_sub(f * 16)) {
                 let v = _mm512_mask_i32gather_ps::<4>(_mm512_setzero_ps(), m, idx, st.as_ptr().cast::<f32>().add(l) as _);
-                _mm512_mask_storeu_ps(out.add(l * p.ss), m, v);
+                _mm512_mask_storeu_ps(out.add((f * 16 + l) * p.ss), m, v);
             }
         }
     }
@@ -401,8 +408,9 @@ unsafe fn tneon<const FB: usize, const PX: usize, const BI: usize, const NI: usi
                     let mut a = [0f32; 4];
                     vst1q_f32(a.as_mut_ptr(), v);
                     for (l, &x) in a.iter().enumerate() {
-                        if p.sm >> (h * 4 + l) & 1 != 0 {
-                            *out.add((h * 4 + l) * p.ss + q) = x;
+                        let c = f * 8 + h * 4 + l;
+                        if c < p.sm {
+                            *out.add(c * p.ss + q) = x;
                         }
                     }
                 } else {
@@ -469,7 +477,7 @@ macro_rules! px_arms {
 macro_rules! fb_arms {
     ($t:ident, $bi:literal, $ni:literal, $fb:expr, $px:expr, $args:tt) => {
         match $fb {
-            1 => px_arms!($t, 1, $bi, $ni, $px, $args, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+            1 => px_arms!($t, 1, $bi, $ni, $px, $args, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16),
             2 => px_arms!($t, 2, $bi, $ni, $px, $args, 1, 2, 3, 4, 5, 6, 7, 8),
             3 => px_arms!($t, 3, $bi, $ni, $px, $args, 1, 2, 3, 4, 5, 6, 7, 8),
             _ => px_arms!($t, 4, $bi, $ni, $px, $args, 1, 2, 3, 4, 5, 6),
@@ -690,7 +698,8 @@ impl Out {
 
     /// 커널이 끝 처리까지 해서 출력에 바로 쓸 수 있으면 그 번호([`Kp::ea`]), 아니면 0
     fn direct(&self) -> u8 {
-        if matches!(self.mode, Mode::T { .. }) {
+        // ConvTranspose 는 출력 묶음 무리가 한 탭 안일 때(화소 간격 kw · B)
+        if matches!(self.mode, Mode::T { .. }) && self.ncb % caps().0 != 0 {
             return 0;
         }
         let a = match self.act {
@@ -736,7 +745,7 @@ impl Out {
                 Mode::Blk => std::ptr::copy_nonoverlapping(t.as_ptr(), self.p.add(((bb * self.ncb + cb) * self.ohw + pix) * b), px * b),
                 Mode::Plain => {
                     for l in 0..lanes {
-                        let d = self.p.add((bb * self.co + l) * self.ohw + pix);
+                        let d = self.p.add((bb * self.co + cb * b + l) * self.ohw + pix);
                         for q in 0..px {
                             *d.add(q) = t[q * b + l];
                         }
@@ -768,7 +777,7 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
     let b = bk();
     let (fbm, pxm) = caps();
     let (kh, kw) = (g.kh, g.kw);
-    let flat = kh == 1 && kw == 1 && g.sh == 1 && g.sw == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w;
+    let flat = kh == 1 && kw == 1 && g.sh == 1 && g.sw == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w && !matches!(out.mode, Mode::T { .. });
     let (rows, rw) = if flat { (1, g.oh * g.ow) } else { (g.oh, g.ow) };
     let xch = if flat { 240 } else { rw };
     let nseg = rw.div_ceil(xch);
@@ -790,7 +799,17 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
     let bl = s.c - (s.ngi - 1) * s.bi;
     let plain = matches!(out.mode, Mode::Plain);
     // 출력 자리(묶음 v, 화소 pix)
-    let dst = |bb: usize, v: usize, pix: usize| if plain { unsafe { out.p.add(bb * out.co * out.ohw + pix) } } else { unsafe { out.p.add(((bb * out.ncb + v) * out.ohw + pix) * b) } };
+    let dst = |bb: usize, v: usize, pix: usize| unsafe {
+        match out.mode {
+            Mode::Plain => out.p.add((bb * out.co + v * b) * out.ohw + pix),
+            Mode::Blk => out.p.add(((bb * out.ncb + v) * out.ohw + pix) * b),
+            Mode::T { kh: th, kw: tw, w, ow } => {
+                let (tap, cb) = (v / out.ncb, v % out.ncb);
+                out.p.add(((bb * out.ncb + cb) * out.ohw + (pix / w * th + tap / tw) * ow + pix % w * tw + tap % tw) * b)
+            }
+        }
+    };
+    let (eo, os) = if let Mode::T { kw: tw, .. } = out.mode { (out.ncb, tw * b) } else { (usize::MAX, b) };
     let task = |t: usize| {
         simd::run(|| {
             let (ui, fi) = (t / fs, t % fs);
@@ -811,7 +830,7 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
                     for fg in f0..f1 {
                         let v = fg * fbm;
                         let fb = fbm.min(nvb - v);
-                        let eb = if ea > 0 { out.bias.as_ref().map_or(std::ptr::null(), |bs| bs[v * b..].as_ptr()) } else { std::ptr::null() };
+                        let eb = if ea > 0 { out.bias.as_ref().map_or(std::ptr::null(), |bs| bs[v % eo * b..].as_ptr()) } else { std::ptr::null() };
                         let mut kp = Kp {
                             g: s.g[bb * s.ngi..].as_ptr(),
                             off0: 0,
@@ -819,7 +838,7 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
                             gi1: s.ngi,
                             bi: s.bi,
                             nl: 0,
-                            sm: if plain { (1u32 << out.co) - 1 } else { 0 },
+                            sm: if plain { out.co - v * b } else { 0 },
                             ss: out.ohw,
                             kys,
                             kxs,
@@ -830,7 +849,7 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
                             ea,
                             eb,
                             fs: out.ohw * b,
-                            os: b,
+                            os,
                             pf: if flat && s.bi == b { 2 * pxm[fb] * b } else { 0 },
                             ip: std::ptr::null(),
                             ifs: 0,
@@ -846,7 +865,7 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
                                 kp.gi1 = ((bt + 1) * gpb).min(s.ngi);
                                 let mut ox = xa;
                                 while ox < xb {
-                                    let px = pxm[fb].min(xb - ox);
+                                    let px = pxn(fb, xb - ox);
                                     let sp = sc[(ox - xa) * b..].as_mut_ptr();
                                     kp.off0 = ox * s.bi;
                                     kp.ip = if bt == 0 { std::ptr::null() } else { sp };
@@ -875,7 +894,7 @@ fn gconv(s: &Src, g: &ConvGeo, wp: &[f32], nvb: usize, out: &Out) {
                                 let (a, c, i) = krange(ox, g.sw, g.dw, g.pl, g.w, kw);
                                 (1, a, c, i)
                             } else {
-                                (pxm[fb].min(xb - ox).min(oxh - ox), 0, kw, ox * g.sw - g.pl)
+                                (pxn(fb, (xb - ox).min(oxh - ox)), 0, kw, ox * g.sw - g.pl)
                             };
                             let empty = ky0 >= ky1 || kx0 >= kx1;
                             kp.off0 = if empty { 0 } else { iy0 * rs + ix0 * s.bi };
@@ -972,7 +991,7 @@ pub(crate) fn conv_t(n: &Node, ins: &[Option<&Tensor>]) -> R {
     if !blk {
         return Err("ConvTranspose 출력 채널이 너무 적음".into());
     }
-    let out = Out::new(o.as_mut_ptr(), Mode::T { kh, kw, w, ow }, co, oh * ow, h * w, bias, &n.act);
+    let out = Out::new(o.as_mut_ptr(), Mode::T { kh, kw, w, ow }, co, oh * ow, w, bias, &n.act);
     gconv(&s, &g, pre.pack(s.bi), pre.co / bk(), &out);
     Ok(vec![mk(vec![s.nb, co, oh, ow], o, true)])
 }

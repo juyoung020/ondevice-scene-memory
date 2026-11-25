@@ -850,6 +850,7 @@ impl Model {
 
     fn run_in(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         let prof = std::env::var_os("NN_PROF").is_some();
+        let tr = std::time::Instant::now();
         let mut tm: HashMap<String, f64> = HashMap::new();
         let mut vals: Vec<Option<Tensor>> = vec![None; self.consts.len()];
         if inputs.len() != self.inputs.len() {
@@ -918,6 +919,7 @@ impl Model {
         if prof {
             let mut v: Vec<_> = tm.into_iter().collect();
             v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            eprintln!("nn run {:.2} ms, nodes {:.2}", tr.elapsed().as_secs_f64() * 1e3, v.iter().map(|x| x.1).sum::<f64>() * 1e3);
             eprintln!("nn prof ms: {}", v.iter().map(|(k, t)| format!("{k} {:.2}", t * 1e3)).collect::<Vec<_>>().join(", "));
         }
         self.outputs

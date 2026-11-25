@@ -38,6 +38,7 @@
 - MegaLoc · XFeat NPU 모델(`megaloc_168x224.dxnn` 120.5 MB · `xfeat_480x640.dxnn` 1.0 MB, INT8, CPU 작업 없음)과 주성분 1,024 투영(`megaloc_head_pca1024.bin`), 보드 확인 `scripts/board_lc_check.sh`.
 
 ### Changed
+- ONNX 실행기(`common::nn`) 합성곱을 모델 전체 NCHWc 배치(채널 16 개 묶음, NEON 8 개)로 바꿨다: MLAS 식 커널, 1×1 입력 채널 나눠 더하기, ConvTranspose · 채널별 · 풀링 · Resize · Concat · Split · 원소별이 배치 그대로 읽고, 모르는 노드 앞에서만 NCHW 로. ObjectSAM 1 스레드 53.3 → 42.0 ms(ort 40.1), 4 · 8 스레드는 ort 보다 빠름, 출력은 ort 와 코사인 1.0000000. 측정은 `docs/ort_port.md`.
 - 지나온 길이 장면 그래프 층을 켜지 않아도 바닥에 늘 보인다(Agent trajectory 로 끄고 켬).
 - **호환 변경:** IMU 모드에서 위치를 놓쳐 생긴 새 지도는 원래 지도와 이어질 때까지 맡아 두고 쌓지 않는다(`--imu-hold-wait` 기본 끝없음): 끝내 안 이어진 새 지도가 같은 책상 · 물체를 어긋난 자리에 한 번 더 남기던 것.
 - **호환 변경:** 점 지도 기본값: 깊이 한계 4 m(`--max-depth` · `--pts-depth`, D435 깊이 오차가 4 m 에서 약 7 cm), 점이 되는 칸은 키프레임 1 장에서 보이면(`--pts-obs 1`). 멀리 있는 물체의 점도 바로 쌓인다.

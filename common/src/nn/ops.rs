@@ -188,7 +188,7 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
             }
             let d = t.shape[a];
             let mut v = copy(t.fv()?);
-            pool::chunks_mut(&mut v, d * (PAR / d.max(1)).max(1), |_, rows| rows.chunks_mut(d).for_each(vmath::softmax_row));
+            pool::chunks_mut(&mut v, d * (PAR / d.max(1)).max(1), |_, rows| vmath::softmax_rows(rows, d));
             Ok(vec![Tensor::f(t.shape.clone(), v)])
         }
         "TopK" => {
@@ -622,6 +622,36 @@ fn strided_t(t: &Tensor, out: Vec<usize>, ist: &[usize], base: usize) -> Tensor 
 }
 
 fn transpose(t: &Tensor, perm: &[usize]) -> Tensor {
+    let r = perm.len();
+    // 끝 두 축만 바꾸는 것(앞은 그대로): 32 × 32 조각씩(읽기 · 쓰기 모두 캐시 줄 단위)
+    if r >= 2 && perm[r - 2] == r - 1 && perm[r - 1] == r - 2 && perm[..r - 2].iter().enumerate().all(|(i, &p)| p == i) {
+        if let Data::F(v) = &t.data {
+            let (m, n) = (t.shape[r - 2], t.shape[r - 1]);
+            let nb: usize = t.shape[..r - 2].iter().product();
+            let mut o = buf::take::<f32>(v.len());
+            const T: usize = 32;
+            let (tm, tn) = (m.div_ceil(T), n.div_ceil(T));
+            let op = Ptr(o.as_mut_ptr());
+            pool::for_each(nb * tm, &|k| {
+                let (b, i0) = (k / tm, (k % tm) * T);
+                let (src, i1) = (&v[b * m * n..(b + 1) * m * n], (i0 + T).min(m));
+                let d = op.at(b * m * n);
+                for j in 0..tn {
+                    let (j0, j1) = (j * T, (j * T + T).min(n));
+                    for ii in i0..i1 {
+                        let row = &src[ii * n + j0..ii * n + j1];
+                        for (k, &x) in row.iter().enumerate() {
+                            // SAFETY: (b, jj, ii) 칸은 일마다 겹치지 않음
+                            unsafe { *d.add((j0 + k) * m + ii) = x };
+                        }
+                    }
+                }
+            });
+            let mut out = t.shape.clone();
+            out.swap(r - 2, r - 1);
+            return Tensor::f(out, o);
+        }
+    }
     let st = strides(&t.shape);
     let out: Vec<usize> = perm.iter().map(|&p| t.shape[p]).collect();
     let ist: Vec<usize> = perm.iter().map(|&p| st[p]).collect();

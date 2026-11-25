@@ -300,21 +300,28 @@ pub fn gemm(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink
         BUF.with(|bf| {
             let mut bf = bf.borrow_mut();
             let (pb, ob) = &mut *bf;
-            for p in pg * per..((pg + 1) * per).min(np) {
-                ob.resize(rows, [0.0; NB]);
-                match &b {
-                    Panels::Packed(all) => unsafe { kern(&ap[r0 * k..], k, rows, mr, all[p * k * NB..(p + 1) * k * NB].as_ptr(), std::ptr::null(), ob) },
-                    Panels::Make(f) => {
-                        pb.resize(k * NB, 0.0);
-                        f(p, pb);
-                        unsafe { kern(&ap[r0 * k..], k, rows, mr, pb.as_ptr(), std::ptr::null(), ob) }
+            let (p0, p1) = (pg * per, ((pg + 1) * per).min(np));
+            // 펴 둔 판 · 바로 읽기에서 판이 여럿이면 줄 띠(2 묶음)마다 판들을 지나감: 출력 줄 흐름이 동시에 띠 줄 수만큼만
+            // (64 줄을 한꺼번에 쓰면 출력이 캐시를 넘을 때 줄마다 떨어진 쓰기 흐름 64 개로 느려짐)
+            let band = if p1 - p0 > 1 && !matches!(b, Panels::Make(_)) { 2 * mr } else { rows };
+            let mut rb = 0;
+            while rb < rows {
+                let rr = band.min(rows - rb);
+                let a0 = &ap[(r0 + rb) * k..];
+                for p in p0..p1 {
+                    ob.resize(rr, [0.0; NB]);
+                    match &b {
+                        Panels::Packed(all) => unsafe { kern(a0, k, rr, mr, all[p * k * NB..(p + 1) * k * NB].as_ptr(), std::ptr::null(), ob) },
+                        Panels::Make(f) => {
+                            pb.resize(k * NB, 0.0);
+                            f(p, pb);
+                            unsafe { kern(a0, k, rr, mr, pb.as_ptr(), std::ptr::null(), ob) }
+                        }
+                        Panels::Direct { base, offs } => unsafe { kdir(a0, k, rr, mr, base.as_ptr().add(p * NB), offs.as_ptr(), ob) },
                     }
-                    Panels::Direct { base, offs } => {
-                        debug_assert!(offs.iter().all(|&o| o + p * NB + NB <= base.len()));
-                        unsafe { kdir(&ap[r0 * k..], k, rows, mr, base.as_ptr().add(p * NB), offs.as_ptr(), ob) }
-                    }
+                    sink.put(r0 + rb, p * NB, NB.min(n - p * NB), ob);
                 }
-                sink.put(r0, p * NB, NB.min(n - p * NB), ob);
+                rb += rr;
             }
         });
     });
@@ -357,4 +364,11 @@ impl RowMajor<'_> {
             unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), self.out.add((r0 + i) * self.ldc + c0), w) };
         }
     }
+}
+
+/// 판 하나를 바로 읽기로: B[j][c] = bp[offs[j] + c](c < NB), A 는 [`pack_a`] 의 m 줄 전부 → out[m]
+/// (부르는 쪽이 NB 개 읽어도 되는 꼬리를 보장)
+pub unsafe fn direct_panel(ap: &[f32], m: usize, k: usize, bp: *const f32, offs: &[usize], out: &mut [[f32; NB]]) {
+    let (_, kdir, _) = kernel();
+    kdir(ap, k, m, mr_for(m), bp, offs.as_ptr(), out)
 }

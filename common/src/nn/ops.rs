@@ -995,7 +995,7 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 .flat_map(|ci| (0..kh).flat_map(move |ky| (0..kw).map(move |kx| ((ci * st + ky % st) * st + kx % st) * plane + (ky / st) * wq + kx / st)))
                 .collect();
             let planes = g.c * st * st;
-            let need = (offs.iter().max().unwrap() + np * NB + 16).max(planes * plane);
+            let need = (offs.iter().max().unwrap() + np * NB + 2 * NB).max(planes * plane);
             // 1×1 · 보폭 1 · 덧댐 0 이고 끝 판이 입력 안에서 끝나면 입력을 그대로 읽음(복사 없음)
             if kh == 1 && kw == 1 && st == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w && need <= chw {
                 for b in 0..nb {
@@ -1048,8 +1048,13 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                     }
                 }
                 let tg = std::time::Instant::now();
-                let sink = ConvDirectSink { out: out[b * co * ohw..].as_mut_ptr(), wp: wq, ow: g.ow, ohw, nv, bias, act: n.act.clone() };
-                gemm::gemm(ap, co, kk, np * NB, Panels::Direct { base: &xp, offs: &offs }, &sink);
+                if co <= 16 {
+                    // 출력 채널이 적으면 출력 줄마다 32 칸씩 바로(버리는 열 · 조각 계산 없음)
+                    conv_rows(ap, co, &xp, &offs, bias, &n.act, &mut out[b * co * ohw..(b + 1) * co * ohw], g.oh, g.ow, wq);
+                } else {
+                    let sink = ConvDirectSink { out: out[b * co * ohw..].as_mut_ptr(), wp: wq, ow: g.ow, ohw, nv, bias, act: n.act.clone() };
+                    gemm::gemm(ap, co, kk, np * NB, Panels::Direct { base: &xp, offs: &offs }, &sink);
+                }
                 if std::env::var("NN_PROF").as_deref() == Ok("3") {
                     eprintln!("    conv s{st} {co}x{kk} n{nv}: 평면 {:.3} ms, 행렬곱 {:.3} ms", (tg - tb).as_secs_f64() * 1e3, tg.elapsed().as_secs_f64() * 1e3);
                 }
@@ -1230,6 +1235,39 @@ impl ConvDirectSink<'_> {
     }
 }
 
+
+/// 출력 채널 m 이 적은 합성곱: 출력 줄 oy · 32 칸 x0 마다 행렬곱 판 하나(B 줄 = 평면 + offs + oy·wq + x0)
+#[allow(clippy::too_many_arguments)]
+fn conv_rows(ap: &[f32], m: usize, xp: &[f32], offs: &[usize], bias: Option<&[f32]>, act: &Act, out: &mut [f32], oh: usize, ow: usize, wq: usize) {
+    let ohw = oh * ow;
+    let op = Ptr(out.as_mut_ptr());
+    let per = (PAR / (ow * m).max(1)).max(1);
+    pool::for_each(oh.div_ceil(per), &|t| {
+        simd::run(|| {
+            let mut tile = [[0f32; NB]; 16];
+            let tile = &mut tile[..m];
+            for oy in t * per..((t + 1) * per).min(oh) {
+                let mut x0 = 0;
+                while x0 < ow {
+                    let len = NB.min(ow - x0);
+                    // SAFETY: 평면 버퍼는 끝에 NB 이상 꼬리
+                    unsafe { gemm::direct_panel(ap, m, offs.len(), xp.as_ptr().add(oy * wq + x0), offs, tile) };
+                    if let Some(b) = bias {
+                        for (c, r) in tile.iter_mut().enumerate() {
+                            r.iter_mut().for_each(|x| *x += b[c]);
+                        }
+                    }
+                    act.apply_in(tile.as_flattened_mut());
+                    for (c, r) in tile.iter().enumerate() {
+                        // SAFETY: 줄 · 칸이 일마다 겹치지 않음
+                        unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), op.at(c * ohw + oy * ow + x0), len) };
+                    }
+                    x0 += NB;
+                }
+            }
+        })
+    });
+}
 
 struct ConvTSink<'a> {
     out: *mut f32,

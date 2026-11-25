@@ -304,10 +304,25 @@ impl MergeLba for Lba {
         if !d.is_empty() {
             self.why.push(format!("맞춤 BA 앞 {d:?}"));
         }
+        if rust_mode() {
+            // Rust 맞춤 BA(orb3ba::mlba)로 풀고 원본 뒤 상태와 비교 — 다음 단계는 원본 값으로 이어감
+            let (mut ext, mut marks) = (Default::default(), Default::default());
+            slam::orb3sys::mergeops::RsMergeLba { ext: &mut ext, marks: &mut marks }.run(a, main, adjust, fixed);
+            let d = strip(diff(&a.kfs, &a.mps, &af, &trf(&self.tr)));
+            if !d.is_empty() {
+                self.why.push(format!("Rust 맞춤 BA 뒤 {d:?}"));
+            }
+        }
         apply(a, &af);
     }
 }
+/// ORBLOOP_RUST_MERGE=1: 맞춤 BA · 본질 그래프도 Rust 로 풀어 원본 결과와 비교
+fn rust_mode() -> bool {
+    std::env::var_os("ORBLOOP_RUST_MERGE").is_some()
+}
+
 struct Ess {
+    bef: BTreeMap<KfId, Se3>,
     rec: Option<(KfId, [Vec<KfId>; 3], Vec<Option<MpId>>, DMap, DMap)>,
     why: Vec<String>,
     tr: Tr,
@@ -329,6 +344,14 @@ impl MergeEssential for Ess {
         let d = strip(diff(&a.kfs, &a.mps, &b, &trf(&self.tr)));
         if !d.is_empty() {
             self.why.push(format!("본질 그래프 앞 {d:?}"));
+        }
+        if rust_mode() {
+            let mut e = slam::orb3sys::mergeops::RsMergeEss { bef: std::mem::take(&mut self.bef) };
+            e.run(a, cur, f, fc, nf, nmp);
+            let d = strip(diff(&a.kfs, &a.mps, &af, &trf(&self.tr)));
+            if !d.is_empty() {
+                self.why.push(format!("Rust 본질 그래프 뒤 {d:?}"));
+            }
         }
         apply(a, &af);
     }
@@ -411,7 +434,8 @@ fn merge_local_matches_original() {
             // 원본은 합치기 덤프가 ChangeId 뒤라 합칠 지도 번호가 지금 지도 번호로 보임
             tr.set((merge_map, cur_map));
             let mut lba = Lba { rec: Some((lm, la, lf, lb, laf)), why: Vec::new(), tr: tr.clone() };
-            let mut ess = Ess { rec: ess_rec, why: Vec::new(), tr: tr.clone() };
+            let bef = a.kfs.iter().filter(|(_, k)| k.map == cur_map).map(|(id, k)| (*id, k.tcw)).collect();
+            let mut ess = Ess { bef, rec: ess_rec, why: Vec::new(), tr: tr.clone() };
             let mut why_rel = Vec::new();
             let inp = MergeIn { cur, matched, scw, gba_running: gba };
             let out = merge_local(&inp, &mut a, &mut lba, &mut ess, &mut |a: &Atlas, _mm, _cm| {

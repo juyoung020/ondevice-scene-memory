@@ -269,9 +269,17 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - 맞추며 알게 된 원본 동작: NonCorrectedSim3 는 `unit_quaternion().cast<double>()`(정규화 없음), Sic 는 `SE3f.cast<double>()`(double 재정규화). 보정 자세는 `SE3d(q, t/s).cast<float>()` = double 정규화 뒤 float 로 내려 다시 정규화(`G2oSim3::to_se3f`). UpdateNormalAndDepth 는 기준 키프레임이 관측에 없으면 0 번 점의 층을 씀.
 - 하네스 원본: `slam/tools/orb3_loop_dump/`(reloc_dump · loop_dump · correct_dump · mlp_srv(MLPnP · OptimizeSim3 FFI) · build_ref(id).sh · mk_refid.sh), 덤프 `~/orbloop_reloc/`.
 
+### MergeLocal — `orb3loop/merge.rs`
+- 옮긴 것: 관성 없음 · RGB-D 갈래 전부(현재 키프레임 연결 → 지금 창 · 합칠 창(공시 25, 5 번까지 넓힘) → 보정 Sim3(SE3d 곱은 Sophus 식 + double 재정규화) · 점 위치 · 법선(Rcor) → 창 키프레임 · 점을 합칠 지도로 → 지금 지도 나쁨 · 현재 지도 바꿈 → 원래 첫 키프레임 첫 연결 끔 → 신장 트리 뒤집기 → SearchAndFuse → 연결 갱신 → 맞춤 BA → 본질 그래프 → 남은 키프레임 · 점 옮김 → 합침 가장자리 → ChangeId · 나쁜 지도 지움). BA 둘은 트레잇 `MergeLba` · `MergeEssential`(합치기 판 본질 그래프는 CV 619450e `orb3cv::sim3opt::build_eg_merge` 판을 끼울 자리). Replace 는 `mapdata::mp_replace`(지도 점 집합에서 빼기 포함 — CorrectLoop 도 같게 바꿈).
+- 원본과 다른 점: 맞춤 BA 뒤 Release → 곧 RequestStop 사이에 지도 스레드가 도는 틈을 두지 않음. 지도 번호 바꾸기는 끝에서 한 번에.
+- 대조(`slam/tests/orb3loop_merge.rs`, `merge_dump`, 번호 순 기준 빌드): 합치기 하나마다 Atlas 통째(지도 목록 · 모든 지도의 키프레임 · 점)를 들어갈 때 · 맞춤 BA 앞뒤 · 본질 그래프 앞뒤 · 끝 Release 앞에 덤프, BA 둘은 원본 결과를 넣음. 덤프 쪽에서 첫 Release 를 막음(그 틈 없애기).
+  - 패치의 GRAFT 가 먼저 지도를 합쳐 MergeLocal 이 거의 안 불려서 입력 만들 때 `NOGRAFT=1`(TryGraft 끔). CV 의 room 순서(0:300,650:1250,30:350 · 0:500,1000:1350,100:600)는 GRAFT 켠 채로는 이 하네스에서 합치기가 안 생김.
+  - TUM fr1_360 0-800 → room 0-1362(KF 217↔98), room 700-1362 → 360 → room 0-700: **2 / 2 같음**(맞춤 BA 앞 상태 · 입력 창, 본질 그래프 입력 목록 · 앞 상태, 끝 지도 전부, 지도 목록 · 현재 지도 · 합침 가장자리 · GBA). 강의실 두 구간 실행은 원본이 `pthread_mutex_lock` 단언으로 죽어 못 씀.
+- 지도별 재위치(④): 재위치 덤프에 지도 번호별 시도가 들어 있음 — 지도 0 · 1 · 2 에서 139 · 77 · 20 번(성공 3 · 1 · 3), 모두 같음. 작은 지도 유지(KeyFramesInMap()==0 판단)는 TRACK 판 `track.rs` 에 이미 있음.
+
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
-- `LoopClosing::MergeLocal`, `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
+- `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
 - KeyFrameDatabase 대조는 실제 BoW + 만든 공시성 시나리오. 실제 실행 중 질의를 가로챈 대조는 안 함.
 - 강의실 녹화(ds_1118)는 BoW 단계만; Sim3 · 고유 풀이 대조는 TUM fr1_room 실행 하나.
 

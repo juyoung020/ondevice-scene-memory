@@ -6,3 +6,7 @@ pub mod crand;
 pub mod eig4;
 pub mod sim3;
 pub mod reloc;
+pub mod detect;
+pub mod graph;
+pub mod correct;
+pub mod merge;

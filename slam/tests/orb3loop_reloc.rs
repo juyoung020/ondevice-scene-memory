@@ -107,6 +107,8 @@ struct Tally {
     rel_n: u64,
     ok_n: u64,
     pnp_ok: u64,
+    /// 지도 번호별 (시도, 성공)
+    per_map: BTreeMap<u64, (u64, u64)>,
     bad: Vec<String>,
 }
 
@@ -265,7 +267,7 @@ fn run(path: &str, srv: &mut Srv, t: &mut Tally, rust: bool) {
         assert_eq!(r.u32(), 0x434c4552, "RELC 자리 아님");
         let fid = r.u64();
         let ts = r.f64();
-        let _map = r.u64();
+        let map_id = r.u64();
         let (fx, fy, cx, cy, invfx, invfy, bf, bb, thd) = (r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32());
         let (min_x, max_x, min_y, max_y, giw, gih) = (r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32());
         let nlevels = r.i32();
@@ -403,6 +405,9 @@ fn run(path: &str, srv: &mut Srv, t: &mut Tally, rust: bool) {
         }
         t.rel_n += 1;
         t.ok_n += ret as u64;
+        let e = t.per_map.entry(map_id).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += ret as u64;
         if why.is_empty() {
             t.rel_same += 1;
         } else if t.bad.len() < 8 {
@@ -426,6 +431,7 @@ fn check(rust: bool) {
         if rust { "Rust MLPnP" } else { "원본 MLPnP FFI" },
         t.rel_n, t.ok_n, t.rel_same, t.iter_n, t.pnp_ok, t.iter_same, t.match_same
     );
+    eprintln!("  지도별 (시도, 성공): {:?}", t.per_map);
     for s in &t.bad {
         eprintln!("  {s}");
     }

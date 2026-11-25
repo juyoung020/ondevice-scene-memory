@@ -143,6 +143,8 @@ pub struct KeyFrame {
     pub map: MapId,
     pub timestamp: f64,
     pub keys: Vec<KeyPoint>,
+    /// mvKeys(왜곡 보정 전 x, y). UnprojectStereo 가 씀
+    pub keys_raw: Vec<[f32; 2]>,
     pub desc: Vec<Desc>,
     pub u_right: Vec<f32>,
     pub depth: Vec<f32>,
@@ -166,6 +168,10 @@ pub struct KeyFrame {
     pub tcp: Se3,
     /// 우리 패치: IMU 위쪽(카메라 좌표, mbUp · mUpCam). 없으면 None
     pub up_cam: Option<V3>,
+    /// !mbFirstConnection(처음 연결로 부모를 정했음) · mbNotErase · mbToBeErased
+    pub first_conn_done: bool,
+    pub not_erase: bool,
+    pub to_be_erased: bool,
 }
 
 /// MapPoint
@@ -208,6 +214,14 @@ pub struct Map {
     pub origin_kf: Option<KfId>,
     pub bad: bool,
     pub change_id: i32,
+    /// mnInitKFid · mnMaxKFid · mpKFlowerID · mvpReferenceMapPoints · mnBigChangeIdx · mnMapChangeNotified
+    /// (kfs · mps 는 원본 std::set 처럼 id 순 정렬을 유지한다)
+    pub init_kf_id: KfId,
+    pub max_kf_id: KfId,
+    pub lower_kf: Option<KfId>,
+    pub ref_mps: Vec<MpId>,
+    pub big_change_idx: i32,
+    pub change_notified: i32,
 }
 
 /// Atlas: 지도들 + 키프레임 · 지도 점 저장소. 원본의 std::set<KeyFrame*>(포인터 주소 순)은 id 순으로 바꾼다

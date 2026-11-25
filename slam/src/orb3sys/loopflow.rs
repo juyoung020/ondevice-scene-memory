@@ -34,16 +34,17 @@ pub trait LoopOps<M>: Send {
     fn detect(&mut self, map: &MapUpdate<M>, kf: u64) -> Found;
     /// 합치기 받아들임(관성 지도의 척도 0.9~1.1 검사 · IMU 초기화 전 거절). false 면 Run 이 합치기 후보를 버리고 다음 키프레임으로(`continue`)
     fn merge_accept(&mut self, map: &M) -> MergeVerdict;
-    /// MergeLocal(지도 스레드 멈춤 · 지도 잠금 안). 돌려준 값이 Some(지도 id) 면 그 지도로 전역 BA
-    fn merge_local(&mut self, map: &mut M) -> Option<u64>;
+    /// MergeLocal(지도 스레드 멈춤 · 지도 잠금 안). `gba_running` = 들어올 때 전역 BA 가 돌고 있었나(bRelaunchBA).
+    /// 돌려준 값이 Some(지도 id) 면 그 지도로 전역 BA
+    fn merge_local(&mut self, map: &mut M, gba_running: bool) -> Option<u64>;
     /// 루프 받아들임(관성 지도의 기울기 검사, mg2oLoopScw 고침 포함)
     fn loop_accept(&mut self, map: &M) -> bool;
     /// CorrectLoop 의 계산 부분(지도 스레드 멈춤 · 지도 잠금 안). Some(지도 id) 면 전역 BA
     fn correct_loop(&mut self, map: &mut M) -> Option<u64>;
     /// 합치기 후보 표지 지우기(SetErase · 일치 수 · 짝 목록 비우기)
-    fn clear_merge(&mut self, map: &M);
+    fn clear_merge(&mut self, map: &mut M);
     /// 루프 후보 표지 지우기
-    fn clear_loop(&mut self, map: &M);
+    fn clear_loop(&mut self, map: &mut M);
     /// 이번 키프레임을 mpLastCurrentKF 로
     fn done(&mut self, kf: u64);
 }
@@ -76,6 +77,8 @@ struct GbaState {
     stop: Mutex<Arc<AtomicBool>>,
     /// mbRunningGBA · mbFinishedGBA: 살아 있는 BA 스레드 수
     running: AtomicU64,
+    /// mMutexBusy 자리: 고치기 · 합치기 중
+    busy: AtomicBool,
     /// 통계: 결과를 넣은 수 · 버린 수
     applied: AtomicU64,
     dropped: AtomicU64,
@@ -107,11 +110,17 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
             idx: AtomicU64::new(0),
             stop: Mutex::new(Arc::new(AtomicBool::new(false))),
             running: AtomicU64::new(0),
+            busy: AtomicBool::new(false),
             applied: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             handles: Mutex::new(Vec::new()),
         });
         LoopFlow { map, mapper, queue, gba: Arc::new(gba), st }
+    }
+
+    /// 고치기 · 합치기 · 전역 BA 중인가(패치 DoPendingGraft 의 mMutexBusy · isRunningGBA 검사)
+    pub fn busy(&self) -> bool {
+        self.st.busy.load(Ordering::SeqCst) || self.gba_running()
     }
 
     /// 전역 BA 가 돌고 있나(isRunningGBA)
@@ -161,6 +170,12 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
 
     /// CorrectLoop 의 멈춤 · 잠금 순서
     fn correct_loop(&self, ops: &mut impl LoopOps<M>, kf: u64) {
+        self.st.busy.store(true, Ordering::SeqCst);
+        self.correct_loop_in(ops, kf);
+        self.st.busy.store(false, Ordering::SeqCst);
+    }
+
+    fn correct_loop_in(&self, ops: &mut impl LoopOps<M>, kf: u64) {
         let tok = self.mapper.request_stop();
         self.abort_gba();
         if !tok.wait() {
@@ -178,6 +193,13 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
 
     /// MergeLocal 의 멈춤 · 잠금 순서(전역 BA 중단이 멈춤 요청보다 먼저)
     fn merge_local(&self, ops: &mut impl LoopOps<M>, kf: u64) {
+        self.st.busy.store(true, Ordering::SeqCst);
+        self.merge_local_in(ops, kf);
+        self.st.busy.store(false, Ordering::SeqCst);
+    }
+
+    fn merge_local_in(&self, ops: &mut impl LoopOps<M>, kf: u64) {
+        let was = self.gba_running();
         self.abort_gba();
         let tok = self.mapper.request_stop();
         if !tok.wait() {
@@ -185,7 +207,7 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
         }
         let gba = {
             let mut g = self.map.lock();
-            ops.merge_local(&mut g)
+            ops.merge_local(&mut g, was)
         };
         drop(tok);
         if let Some(map_id) = gba {
@@ -202,7 +224,8 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
             if f.merge {
                 let v = ops.merge_accept(&self.map.lock());
                 if v == MergeVerdict::Abort {
-                    ops.clear_merge(&self.map.lock());
+                    ops.clear_merge(&mut self.map.lock());
+                    self.queue.done();
                     continue;
                 }
                 if v == MergeVerdict::Merge {
@@ -211,9 +234,9 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
                     s.merges += 1;
                     s.gba_started += (self.st.handles.lock().unwrap_or_else(|e| e.into_inner()).len() - before) as u64;
                 }
-                ops.clear_merge(&self.map.lock());
+                ops.clear_merge(&mut self.map.lock());
                 if looped {
-                    ops.clear_loop(&self.map.lock());
+                    ops.clear_loop(&mut self.map.lock());
                     looped = false;
                 }
             }
@@ -224,9 +247,10 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
                     s.loops += 1;
                     s.gba_started += (self.st.handles.lock().unwrap_or_else(|e| e.into_inner()).len() - before) as u64;
                 }
-                ops.clear_loop(&self.map.lock());
+                ops.clear_loop(&mut self.map.lock());
             }
             ops.done(kf);
+            self.queue.done();
         }
         self.join_gba();
         s.gba_applied = self.st.applied.load(Ordering::SeqCst);
@@ -280,7 +304,7 @@ mod tests {
             let kf = self.cur;
             self.plan(kf).1
         }
-        fn merge_local(&mut self, m: &mut FakeMap) -> Option<u64> {
+        fn merge_local(&mut self, m: &mut FakeMap, _gba: bool) -> Option<u64> {
             assert!(self.mapper.is_stopped(), "합치기 때 지도 스레드가 멈춰 있어야");
             m.log.push("merge".into());
             self.gba_map
@@ -295,8 +319,8 @@ mod tests {
             m.poses += 1;
             self.gba_map
         }
-        fn clear_merge(&mut self, _m: &FakeMap) {}
-        fn clear_loop(&mut self, _m: &FakeMap) {}
+        fn clear_merge(&mut self, _m: &mut FakeMap) {}
+        fn clear_loop(&mut self, _m: &mut FakeMap) {}
         fn done(&mut self, _kf: u64) {}
     }
 

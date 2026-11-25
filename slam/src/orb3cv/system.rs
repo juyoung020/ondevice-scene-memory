@@ -88,7 +88,7 @@ impl SystemInit {
 }
 
 /// put34: SE3f.matrix3x4() 행 우선 f64
-fn put34(t: &Se3) -> [f64; 12] {
+pub fn put34(t: &Se3) -> [f64; 12] {
     let r = t.rot();
     let mut o = [0.0; 12];
     for i in 0..3 {

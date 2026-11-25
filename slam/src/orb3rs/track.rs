@@ -11,7 +11,7 @@
 //! 공통 타입(types.rs)에 없는 원본 칸은 [`TrackExt`] 옆 표에 둔다(통합 때 타입으로 옮길 후보):
 //! MapPoint::nObs · mnTrackReferenceForFrame, KeyFrame::mnTrackReferenceForFrame · mbNotErase, Map::mnInitKFid.
 use super::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// System::eSensor
 pub mod sensor {
@@ -44,19 +44,11 @@ pub const LOST_NEWMAP_S: f64 = 0.2;
 /// 공통 타입 밖의 원본 칸(옆 표)
 #[derive(Clone, Debug, Default)]
 pub struct TrackExt {
-    /// MapPoint::nObs(관측 수: 깊이 있는 관측 2, 없으면 1)
-    pub mp_nobs: HashMap<MpId, i32>,
     pub mp_track_ref: HashMap<MpId, u64>,
     pub kf_track_ref: HashMap<KfId, u64>,
-    pub kf_not_erase: HashSet<KfId>,
-    pub map_init_kf: HashMap<MapId, KfId>,
 }
 
 impl TrackExt {
-    #[inline]
-    pub fn nobs(&self, mp: MpId) -> i32 {
-        *self.mp_nobs.get(&mp).unwrap_or(&0)
-    }
     #[inline]
     pub fn kf_ref(&self, kf: KfId) -> u64 {
         *self.kf_track_ref.get(&kf).unwrap_or(&0)
@@ -140,7 +132,7 @@ pub fn tracked_map_points(atlas: &Atlas, ext: &TrackExt, kf: KfId, min_obs: i32)
         let m = &atlas.mps[mp];
         if !m.bad {
             if check {
-                if ext.nobs(*mp) >= min_obs {
+                if m.n_obs >= min_obs {
                     n += 1;
                 }
             } else {
@@ -330,23 +322,11 @@ pub fn update_local_points(t: &mut Tracker, cur_id: u64, atlas: &Atlas, ext: &mu
     }
 }
 
-// ---------------- Sophus / Eigen 산술(원본 연산 순서, -march=native 의 곱합 합치기 포함) ----------------
+// ---------------- Sophus / Eigen 산술(원본 연산 순서, 기준 빌드 -ffp-contract=off: 곱합 합치기 없음) ----------------
 
-/// Eigen QuaternionBase::toRotationMatrix (행 우선 r[i][j]). 원본 빌드(-O3 -march=native, GCC 곱합 합치기)와
-/// 비트가 같도록 합치는 자리를 맞춤(덤프로 칸마다 확인): 비대각 a·b ± c·d → fma(±c, d, a·b),
-/// 대각 (1,1) · (2,2) 는 fma(tx, x, ·), (0,0) 은 합치지 않음.
+/// Eigen QuaternionBase::toRotationMatrix (행 우선 r[i][j])
 pub fn quat_to_rot(q: [f32; 4]) -> [[f32; 3]; 3] {
-    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
-    let tx = 2.0 * x;
-    let ty = 2.0 * y;
-    let tz = 2.0 * z;
-    let tyy = ty * y;
-    let tzz = tz * z;
-    [
-        [1.0 - (tyy + tzz), (-tz).mul_add(w, ty * x), ty.mul_add(w, tz * x)],
-        [tz.mul_add(w, ty * x), 1.0 - tx.mul_add(x, tzz), (-tx).mul_add(w, tz * y)],
-        [(-ty).mul_add(w, tz * x), tx.mul_add(w, tz * y), 1.0 - tx.mul_add(x, tyy)],
-    ]
+    Se3 { q, t: [0.0; 3] }.rot()
 }
 
 /// Sophus SO3 생성자의 normalize(): coeffs /= sqrt(squaredNorm), 합은 Eigen Packet4f 줄이기 순서 (x+z)+(y+w)
@@ -357,25 +337,9 @@ pub fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
     [q[0] / l, q[1] / l, q[2] / l, q[3] / l]
 }
 
-#[inline]
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    // GCC 곱합 합치기: a*b - c*d → fma(a, b, -(c*d))
-    [
-        a[1].mul_add(b[2], -(a[2] * b[1])),
-        a[2].mul_add(b[0], -(a[0] * b[2])),
-        a[0].mul_add(b[1], -(a[1] * b[0])),
-    ]
-}
-
 /// Sophus SO3::operator*(point): uv = v×p; uv += uv; p + w·uv + v×uv
 pub fn quat_rotate(q: [f32; 4], p: [f32; 3]) -> [f32; 3] {
-    let v = [q[0], q[1], q[2]];
-    let mut uv = cross(v, p);
-    for k in 0..3 {
-        uv[k] += uv[k];
-    }
-    let c = cross(v, uv);
-    [q[3].mul_add(uv[0], p[0]) + c[0], q[3].mul_add(uv[1], p[1]) + c[1], q[3].mul_add(uv[2], p[2]) + c[2]]
+    Se3 { q, t: [0.0; 3] }.rotate(&p)
 }
 
 /// Frame::UpdatePoseMatrices 의 (mRwc, mOw): Twc = Tcw.inverse()
@@ -386,15 +350,14 @@ pub fn pose_inverse_matrices(tcw: &Se3) -> ([[f32; 3]; 3], [f32; 3]) {
     (quat_to_rot(qi), ow)
 }
 
-/// Frame::UnprojectStereo: x3D = Rwc·(x,y,z) + Ow. 행 내적은 Eigen 이 a0b0 + (a1b1 + a2b2) 로 펼치고 GCC 가
-/// 합쳐 fma(r0, x, fma(r2, z, r1·y)) 가 됨(덤프 39,427 점 모두 이 꼴로 확인).
+/// Frame::UnprojectStereo: x3D = Rwc·(x,y,z) + Ow. 행 내적은 Eigen 이 a0b0 + (a1b1 + a2b2) 로 펼침
 pub fn unproject(rwc: &[[f32; 3]; 3], ow: &[f32; 3], cam: &Camera, u: f32, v: f32, z: f32) -> [f32; 3] {
     let x = (u - cam.cx) * z * cam.invfx;
     let y = (v - cam.cy) * z * cam.invfy;
     let p = [x, y, z];
     let mut r = [0f32; 3];
     for i in 0..3 {
-        let s = rwc[i][0].mul_add(p[0], rwc[i][2].mul_add(p[2], rwc[i][1] * p[1]));
+        let s = rwc[i][0] * p[0] + (rwc[i][1] * p[1] + rwc[i][2] * p[2]);
         r[i] = s + ow[i];
     }
     r
@@ -459,8 +422,9 @@ pub trait TrackOps {
     fn create_map_in_atlas(&mut self);
     fn reset_active_map(&mut self);
     fn change_map(&mut self, map: MapId);
-    fn need_new_keyframe(&mut self) -> bool;
-    fn create_new_keyframe(&mut self);
+    fn need_new_keyframe(&mut self, t: &Tracker) -> bool;
+    /// 새 키프레임 id 를 돌려줌. None = 지도 스레드가 멈춰 있어 SetNotStop 거절(원본은 만들지 않고 돌아감, 추적 칸도 그대로)
+    fn create_new_keyframe(&mut self) -> Option<KfId>;
     fn try_graft(&mut self);
     /// 지도 표: (id, 키프레임 수) — 원본 GetAllMaps 순서
     fn all_maps(&mut self) -> Vec<(MapId, i32)>;
@@ -569,9 +533,14 @@ pub fn track_flow(t: &mut Tracker, frame_id: u64, ts: f64, ops: &mut dyn TrackOp
         let both = ops.last_frame_set() && ops.cur_frame_set();
         t.velocity = both;
         ops.post_track_cleanup(both);
-        let need = ops.need_new_keyframe();
+        let need = ops.need_new_keyframe(t);
         if need && (ok || (t.insert_kfs_lost && t.state == state::RECENTLY_LOST && is_imu(t.sensor))) {
-            ops.create_new_keyframe();
+            // CreateNewKeyFrame 끝: mpReferenceKF · mnLastKeyFrameId · mpLastKeyFrame
+            if let Some(kf) = ops.create_new_keyframe() {
+                t.reference_kf = Some(kf);
+                t.last_kf_frame_id = frame_id;
+                t.last_kf = Some(kf);
+            }
         }
     }
     if t.state == state::LOST {
@@ -585,4 +554,261 @@ pub fn track_flow(t: &mut Tracker, frame_id: u64, ts: f64, ops: &mut dyn TrackOp
     if t.state == state::OK && !t.only_tracking {
         ops.try_graft();
     }
+}
+
+// ---------------- Tracking 단계(장면 · 지도 점 자료 위) ----------------
+
+use super::matcher::Matcher;
+use crate::orb3loop::reloc::pose_optimization_frame;
+
+/// Tracking::CheckReplacedInLastFrame: 앞 장면 점 중 대체된 것(GetReplaced)을 새 점으로
+pub fn check_replaced_in_last_frame(last: &mut Frame, mps: &BTreeMap<MpId, MapPoint>) {
+    for s in last.map_points.iter_mut() {
+        if let Some(m) = *s {
+            if let Some(r) = mps.get(&m).and_then(|p| p.replaced) {
+                *s = Some(r);
+            }
+        }
+    }
+}
+
+/// 자세 최적화 뒤 이상치 버리기(TrackReferenceKeyFrame · TrackWithMotionModel 공통, 왼쪽 영상만).
+/// `reset_in_view` = mbTrackInView 도 끔(TrackReferenceKeyFrame 만). 돌려줌: 관측 있는 남은 짝 수
+fn discard_outliers(cur: &mut Frame, mps: &mut BTreeMap<MpId, MapPoint>, reset_in_view: bool) -> i32 {
+    let mut map = 0;
+    for i in 0..cur.keys.len() {
+        let Some(m) = cur.map_points[i] else { continue };
+        if cur.outlier[i] {
+            cur.map_points[i] = None;
+            cur.outlier[i] = false;
+            let p = mps.get_mut(&m).unwrap();
+            if reset_in_view {
+                p.track_in_view = false;
+            }
+            p.last_frame_seen = cur.id;
+        } else if mps[&m].n_obs > 0 {
+            map += 1;
+        }
+    }
+    map
+}
+
+/// Tracking::TrackReferenceKeyFrame(관성 아님). BoW(ComputeBoW)는 부르는 쪽이 채움. `last_pose` = mLastFrame.GetPose()
+pub fn track_reference_keyframe(cur: &mut Frame, last_pose: Se3, rkf: &KeyFrame, mps: &mut BTreeMap<MpId, MapPoint>) -> bool {
+    let m = Matcher::new(0.7, true);
+    let (n, v) = m.search_by_bow_kf_frame(rkf, cur, mps);
+    if n < 15 {
+        return false;
+    }
+    cur.map_points = v;
+    cur.set_pose(last_pose);
+    pose_optimization_frame(cur, mps);
+    discard_outliers(cur, mps, true) >= 10
+}
+
+/// Tracking::UpdateLastFrame(지도 만들기 모드: 위치만) + TrackWithMotionModel(관성 아님).
+/// `ref_pose` = mLastFrame.mpReferenceKF->GetPose(), `tlr` = mlRelativeFramePoses.back(), `velocity` = mVelocity
+#[allow(clippy::too_many_arguments)]
+pub fn track_with_motion_model(cur: &mut Frame, last: &mut Frame, ref_pose: Se3, tlr: Se3, velocity: Se3, sensor: i32, mps: &mut BTreeMap<MpId, MapPoint>) -> bool {
+    let m = Matcher::new(0.9, true);
+    last.set_pose(tlr.mul(&ref_pose));
+    cur.set_pose(velocity.mul(&last.tcw.unwrap()));
+    cur.map_points.iter_mut().for_each(|s| *s = None);
+    let th = if sensor == sensor::STEREO { 7.0 } else { 15.0 };
+    let mono = sensor == sensor::MONOCULAR || sensor == sensor::IMU_MONOCULAR;
+    let mut n = m.search_by_projection_last(cur, last, mps, th, mono);
+    if n < 20 {
+        cur.map_points.iter_mut().for_each(|s| *s = None);
+        n = m.search_by_projection_last(cur, last, mps, 2.0 * th, mono);
+    }
+    if n < 20 {
+        return false;
+    }
+    pose_optimization_frame(cur, mps);
+    discard_outliers(cur, mps, false) >= 10
+}
+
+/// Tracking::SearchLocalPoints(관성 아님). `far` = (mbFarPoints, mThFarPoints)
+pub fn search_local_points(t: &Tracker, cur: &mut Frame, mps: &mut BTreeMap<MpId, MapPoint>, far: (bool, f32)) -> i32 {
+    for s in cur.map_points.iter_mut() {
+        if let Some(m) = *s {
+            let p = mps.get_mut(&m).unwrap();
+            if p.bad {
+                *s = None;
+            } else {
+                p.visible += 1;
+                p.last_frame_seen = cur.id;
+                p.track_in_view = false;
+            }
+        }
+    }
+    let mut n_to_match = 0;
+    for &m in &t.local_mps {
+        let p = mps.get_mut(&m).unwrap();
+        if p.last_frame_seen == cur.id || p.bad {
+            continue;
+        }
+        if cur.is_in_frustum(p, 0.5) {
+            p.visible += 1;
+            n_to_match += 1;
+        }
+    }
+    if n_to_match == 0 {
+        return 0;
+    }
+    let mut th = if t.sensor == sensor::RGBD || t.sensor == sensor::IMU_RGBD { 3.0 } else { 1.0 };
+    if is_imu(t.sensor) {
+        th = 10.0;
+    }
+    if cur.id < t.last_reloc_frame_id.wrapping_add(2) {
+        th = 5.0;
+    }
+    if t.state == state::LOST || t.state == state::RECENTLY_LOST {
+        th = 15.0;
+    }
+    Matcher::new(0.8, true).search_by_projection_local(cur, &t.local_mps, mps, th, far.0, far.1)
+}
+
+/// TrackLocalMap 의 자세 최적화 뒤 부분: 점 찾음 수 올림 · 맞은 수(mnMatchesInliers) · 성공 판단
+pub fn track_local_map_finish(t: &mut Tracker, cur: &mut Frame, mps: &mut BTreeMap<MpId, MapPoint>) -> bool {
+    let id = cur.id;
+    let mut inl = 0;
+    for i in 0..cur.keys.len() {
+        let Some(m) = cur.map_points[i] else { continue };
+        if !cur.outlier[i] {
+            let p = mps.get_mut(&m).unwrap();
+            p.found += 1;
+            if t.only_tracking || p.n_obs > 0 {
+                inl += 1;
+            }
+        } else if t.sensor == sensor::STEREO {
+            cur.map_points[i] = None;
+        }
+    }
+    t.matches_inliers = inl;
+    if id < t.last_reloc_frame_id.wrapping_add(t.max_frames as i64 as u64) && inl < 50 {
+        return false;
+    }
+    if inl > 10 && t.state == state::RECENTLY_LOST {
+        return true;
+    }
+    if t.sensor == sensor::IMU_MONOCULAR {
+        return inl >= 50;
+    }
+    if t.sensor == sensor::IMU_STEREO || t.sensor == sensor::IMU_RGBD {
+        return inl >= 15;
+    }
+    inl >= 30
+}
+
+/// Tracking::TrackLocalMap(관성 아님): UpdateLocalMap → SearchLocalPoints → PoseOptimization → 점 통계 · 판단.
+/// `order` = UpdateLocalKeyFrames 의 키프레임 순서 열쇠
+pub fn track_local_map(t: &mut Tracker, cur: &mut Frame, atlas: &mut Atlas, ext: &mut TrackExt, order: &dyn Fn(KfId) -> u64, far: (bool, f32)) -> bool {
+    let id = cur.id;
+    let mut rk = cur.ref_kf;
+    update_local_keyframes(t, cur, id, &mut rk, atlas, ext, order);
+    cur.ref_kf = rk;
+    update_local_points(t, id, atlas, ext);
+    search_local_points(t, cur, &mut atlas.mps, far);
+    pose_optimization_frame(cur, &atlas.mps);
+    track_local_map_finish(t, cur, &mut atlas.mps)
+}
+
+/// MapPoint(Pos, pRefKF, pMap) + AddObservation(kf, i) + KeyFrame::AddMapPoint + ComputeDistinctiveDescriptors
+/// + UpdateNormalAndDepth + Atlas::AddMapPoint. 돌려줌: 새 점 번호
+pub fn new_kf_map_point(atlas: &mut Atlas, kf: KfId, i: usize, pos: [f32; 3]) -> MpId {
+    let id = atlas.next_mp;
+    atlas.next_mp += 1;
+    let k = &atlas.kfs[&kf];
+    let map = k.map;
+    let mut mp = MapPoint { id, map, pos, first_frame: k.frame_id, first_kf: kf, ref_kf: kf, visible: 1, found: 1, ..Default::default() };
+    mp.add_observation(k, i);
+    atlas.kfs.get_mut(&kf).unwrap().map_points[i] = Some(id);
+    mp.compute_distinctive_descriptors(&atlas.kfs);
+    atlas.mps.insert(id, mp);
+    super::mapdata::mp_update_normal_and_depth(atlas, id);
+    if let Some(mi) = atlas.maps.iter_mut().find(|x| x.id == map) {
+        mi.add_map_point(id);
+    }
+    id
+}
+
+/// Tracking::StereoInitialization(RGB-D, 관성 · 위쪽 벡터 없음): 점 500 개 넘으면 원점 자세로 첫 키프레임과 깊이 점들을 만듦.
+/// 돌려줌: 첫 키프레임(지도 스레드에 넣는 것은 부르는 쪽). 지역 키프레임 · 점, 기준 · 마지막 키프레임도 채움
+pub fn stereo_initialization(t: &mut Tracker, cur: &mut Frame, atlas: &mut Atlas) -> Option<KfId> {
+    if cur.keys.len() <= 500 {
+        return None;
+    }
+    cur.set_pose(Se3::new([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
+    let map = atlas.maps[atlas.current].id;
+    let kf = atlas.next_kf;
+    atlas.next_kf += 1;
+    atlas.kfs.insert(kf, KeyFrame::from_frame(kf, map, cur));
+    // Atlas::AddKeyFrame → Map::AddKeyFrame(첫 키프레임이면 mnInitKFid)
+    let cur_map = atlas.current;
+    atlas.maps[cur_map].add_keyframe(kf);
+    let (rwc, ow) = pose_inverse_matrices(cur.tcw.as_ref().unwrap());
+    let cam = cur.ctx.cam;
+    for i in 0..cur.keys.len() {
+        let z = cur.depth[i];
+        if z > 0.0 {
+            let k = &cur.keys[i];
+            let x = unproject(&rwc, &ow, &cam, k.x, k.y, z);
+            let id = new_kf_map_point(atlas, kf, i, x);
+            cur.map_points[i] = Some(id);
+        }
+    }
+    t.last_kf_frame_id = cur.id;
+    t.last_kf = Some(kf);
+    t.local_kfs.push(kf);
+    // mpAtlas->GetAllMapPoints(): 지금 지도 점(번호 순 집합)
+    let mut all: Vec<MpId> = atlas.maps[atlas.current].mps.clone();
+    all.sort_unstable();
+    t.local_mps = all;
+    t.reference_kf = Some(kf);
+    cur.ref_kf = Some(kf);
+    t.state = state::OK;
+    Some(kf)
+}
+
+/// Tracking::CreateNewKeyFrame(RGB-D, 관성 아님) 중 키프레임 · 새 점 만들기(지도 스레드 멈춤 확인 · 넣기는 부르는 쪽)
+pub fn create_new_keyframe(cur: &mut Frame, th_depth: f32, atlas: &mut Atlas) -> KfId {
+    let map = atlas.maps[atlas.current].id;
+    let kf = atlas.next_kf;
+    atlas.next_kf += 1;
+    atlas.kfs.insert(kf, KeyFrame::from_frame(kf, map, cur));
+    cur.ref_kf = Some(kf);
+    let (rwc, ow) = pose_inverse_matrices(cur.tcw.as_ref().unwrap());
+    cur.rwc = rwc;
+    cur.ow = ow;
+    let cam = cur.ctx.cam;
+    let (pts, cleared) = {
+        let mps = &atlas.mps;
+        new_keyframe_points(cur, &rwc, &ow, &cam, th_depth, 100, &|m| mps.get(&m).map(|p| p.n_obs).unwrap_or(0))
+    };
+    for c in cleared {
+        cur.map_points[c] = None;
+    }
+    for (i, x) in pts {
+        let id = new_kf_map_point(atlas, kf, i, x);
+        cur.map_points[i] = Some(id);
+    }
+    kf
+}
+
+/// Track() 끝 단계 중 속도와 VO 짝 정리: 두 장면 자세가 있으면 mVelocity = Tcw · Twl, 관측 없는 점 칸 비움
+pub fn update_motion_and_clean(cur: &mut Frame, last: Option<&Frame>, mps: &BTreeMap<MpId, MapPoint>) -> Option<Se3> {
+    let v = match (cur.tcw, last.and_then(|l| l.tcw)) {
+        (Some(c), Some(l)) => Some(c.mul(&l.inverse())),
+        _ => None,
+    };
+    for i in 0..cur.keys.len() {
+        if let Some(m) = cur.map_points[i] {
+            if mps.get(&m).map(|p| p.n_obs).unwrap_or(0) < 1 {
+                cur.outlier[i] = false;
+                cur.map_points[i] = None;
+            }
+        }
+    }
+    v
 }

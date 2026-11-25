@@ -485,6 +485,9 @@ mod eig_stages {
             }
             eprintln!("{d}: Hessenberg {}/{} · Francis {}/{} · 두 행 {}/{} · 고유벡터 {}/{}",
                 cnt[1][1], cnt[1][0] + cnt[1][1], cnt[2][1], cnt[2][0] + cnt[2][1], cnt[3][1], cnt[3][0] + cnt[3][1], cnt[4][1], cnt[4][0] + cnt[4][1]);
+            for t in 1..5 {
+                assert!(cnt[t][1] > 0 && cnt[t][0] == 0, "단계 {t} 다름 {} / {}", cnt[t][0], cnt[t][0] + cnt[t][1]);
+            }
         }
     }
 }

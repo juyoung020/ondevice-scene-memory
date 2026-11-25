@@ -1,16 +1,15 @@
 //! Eigen 3.4.0 EigenSolver<Matrix4f>(RealSchur · HessenbergDecomposition · Householder · JacobiRotation)를
-//! 원본 libORB_SLAM3(GCC 13 -O3 -march=native, Zen 5)이 실제로 계산하는 순서 그대로 옮긴 것.
-//! GCC 가 곱셈 · 덧셈을 FMA 로 합친 자리는 같은 플래그로 다시 컴파일한 GIMPLE(-fdump-tree-optimized)에서
-//! 읽어 `mul_add` 로 똑같이 합친다(합치지 않은 자리는 그냥 곱하고 더함). 행렬은 열 우선 [f32; 16].
+//! 기준 빌드(-ffp-contract=off, docs/orb3_port.md 공통 규칙)가 계산하는 순서 그대로 옮긴 것: 곱한 뒤 더함(FMA 없음).
+//! 덧셈 묶음 순서는 GIMPLE(-fdump-tree-optimized)에서 읽은 Eigen 전개 순서. 행렬은 열 우선 [f32; 16].
 
 #[inline(always)]
-fn fma(a: f32, b: f32, c: f32) -> f32 {
-    a.mul_add(b, c)
+fn madd(a: f32, b: f32, c: f32) -> f32 {
+    a * b + c
 }
 /// c - a*b (한 번 반올림, GIMPLE .FNMA)
 #[inline(always)]
-fn fnma(a: f32, b: f32, c: f32) -> f32 {
-    (-a).mul_add(b, c)
+fn msub(a: f32, b: f32, c: f32) -> f32 {
+    c - a * b
 }
 #[inline(always)]
 fn ix(r: usize, c: usize) -> usize {
@@ -20,12 +19,16 @@ fn ix(r: usize, c: usize) -> usize {
 const EPS: f32 = f32::EPSILON;
 const MINP: f32 = f32::MIN_POSITIVE;
 
-/// 동적 길이 내적(Redux, 스칼라 경로): 첫 곱 + 이어지는 FMA
+/// 동적 길이 내적(Redux, 스칼라 경로): 첫 곱 + 이어지는 곱 더함
 #[inline]
 fn dot_dyn(n: usize, a: impl Fn(usize) -> f32, b: impl Fn(usize) -> f32) -> f32 {
+    dot_dyn_t(false, n, a, b)
+}
+/// f = true: Eigen gemv 커널(pmadd = _mm*_fmadd_ps 내장 함수라 -ffp-contract=off 에서도 FMA)
+fn dot_dyn_t(f: bool, n: usize, a: impl Fn(usize) -> f32, b: impl Fn(usize) -> f32) -> f32 {
     let mut r = a(0) * b(0);
     for k in 1..n {
-        r = fma(a(k), b(k), r);
+        r = if f { a(k).mul_add(b(k), r) } else { madd(a(k), b(k), r) };
     }
     r
 }
@@ -40,7 +43,7 @@ fn make_householder_dyn(v: &[f32]) -> ([f32; 3], f32, f32) {
     if tsq <= MINP {
         (ess, 0.0, c0)
     } else {
-        let mut beta = fma(c0, c0, tsq).sqrt();
+        let mut beta = madd(c0, c0, tsq).sqrt();
         if c0 >= 0.0 {
             beta = -beta;
         }
@@ -55,12 +58,12 @@ fn make_householder_dyn(v: &[f32]) -> ([f32; 3], f32, f32) {
 /// 고정 길이 3/2 makeHouseholder (performFrancisQRStep 안)
 fn make_householder_fix(v: &[f32]) -> ([f32; 2], f32, f32) {
     let c0 = v[0];
-    let tsq = if v.len() == 3 { fma(v[2], v[2], v[1] * v[1]) } else { v[1] * v[1] };
+    let tsq = if v.len() == 3 { madd(v[2], v[2], v[1] * v[1]) } else { v[1] * v[1] };
     let mut ess = [0f32; 2];
     if tsq <= MINP {
         (ess, 0.0, c0)
     } else {
-        let mut beta = fma(c0, c0, tsq).sqrt();
+        let mut beta = madd(c0, c0, tsq).sqrt();
         if c0 >= 0.0 {
             beta = -beta;
         }
@@ -88,14 +91,14 @@ fn hh_left(m: &mut [f32; 16], r0: usize, c0: usize, rows: usize, cols: usize, es
     for j in 0..cols {
         let c = c0 + j;
         let t = if fixed && rows == 3 {
-            fma(ess[1], m[ix(r0 + 2, c)], ess[0] * m[ix(r0 + 1, c)])
+            madd(ess[1], m[ix(r0 + 2, c)], ess[0] * m[ix(r0 + 1, c)])
         } else {
             dot_dyn(rows - 1, |k| ess[k], |k| m[ix(r0 + 1 + k, c)])
         };
         tmp[j] = t + m[ix(r0, c)];
     }
     for j in 0..cols {
-        m[ix(r0, c0 + j)] = fnma(tau, tmp[j], m[ix(r0, c0 + j)]);
+        m[ix(r0, c0 + j)] = msub(tau, tmp[j], m[ix(r0, c0 + j)]);
     }
     let mut te = [0f32; 3];
     for k in 0..rows - 1 {
@@ -104,7 +107,7 @@ fn hh_left(m: &mut [f32; 16], r0: usize, c0: usize, rows: usize, cols: usize, es
     for j in 0..cols {
         for k in 0..rows - 1 {
             let p = ix(r0 + 1 + k, c0 + j);
-            m[p] = fnma(te[k], tmp[j], m[p]);
+            m[p] = msub(te[k], tmp[j], m[p]);
         }
     }
 }
@@ -125,33 +128,33 @@ fn hh_right(m: &mut [f32; 16], r0: usize, c0: usize, rows: usize, cols: usize, e
     for i in 0..rows {
         let r = r0 + i;
         let t = if fixed && cols == 3 {
-            fma(m[ix(r, c0 + 2)], ess[1], m[ix(r, c0 + 1)] * ess[0])
+            madd(m[ix(r, c0 + 2)], ess[1], m[ix(r, c0 + 1)] * ess[0])
         } else {
-            dot_dyn(cols - 1, |k| m[ix(r, c0 + 1 + k)], |k| ess[k])
+            dot_dyn_t(true, cols - 1, |k| m[ix(r, c0 + 1 + k)], |k| ess[k])
         };
         tmp[i] = t + m[ix(r, c0)];
     }
     for i in 0..rows {
-        m[ix(r0 + i, c0)] = fnma(tau, tmp[i], m[ix(r0 + i, c0)]);
+        m[ix(r0 + i, c0)] = msub(tau, tmp[i], m[ix(r0 + i, c0)]);
     }
     for i in 0..rows {
         let tt = tau * tmp[i];
         for k in 0..cols - 1 {
             let p = ix(r0 + i, c0 + 1 + k);
-            m[p] = fnma(tt, ess[k], m[p]);
+            m[p] = msub(tt, ess[k], m[p]);
         }
     }
 }
 
-/// apply_rotation_in_the_plane(x, y, (c, s)) : x' = c*x + s*y, y' = -s*x + c*y (첫 곱이 FMA)
+/// apply_rotation_in_the_plane(x, y, (c, s)) : x' = c*x + s*y, y' = -s*x + c*y (곱 더함 순서)
 fn rot_plane(m: &mut [f32; 16], xs: &[usize], ys: &[usize], c: f32, s: f32) {
     if c == 1.0 && s == 0.0 {
         return;
     }
     for (&px, &py) in xs.iter().zip(ys) {
         let (xi, yi) = (m[px], m[py]);
-        m[px] = fma(c, xi, s * yi);
-        m[py] = fma(-s, xi, c * yi);
+        m[px] = madd(c, xi, s * yi);
+        m[py] = madd(-s, xi, c * yi);
     }
 }
 
@@ -163,7 +166,7 @@ fn make_givens(p: f32, q: f32) -> (f32, f32) {
         (0.0, if q < 0.0 { 1.0 } else { -1.0 })
     } else if p.abs() > q.abs() {
         let t = q / p;
-        let mut u = fma(t, t, 1.0).sqrt();
+        let mut u = madd(t, t, 1.0).sqrt();
         if p < 0.0 {
             u = -u;
         }
@@ -171,7 +174,7 @@ fn make_givens(p: f32, q: f32) -> (f32, f32) {
         (c, -t * c)
     } else {
         let t = p / q;
-        let mut u = fma(t, t, 1.0).sqrt();
+        let mut u = madd(t, t, 1.0).sqrt();
         if q < 0.0 {
             u = -u;
         }
@@ -220,7 +223,7 @@ impl Schur {
     pub fn split_off_two_rows(&mut self, iu: usize) {
         let t = &mut self.t;
         let p = (t[ix(iu - 1, iu - 1)] - t[ix(iu, iu)]) * 0.5;
-        let q = fma(p, p, t[ix(iu, iu - 1)] * t[ix(iu - 1, iu)]);
+        let q = madd(p, p, t[ix(iu, iu - 1)] * t[ix(iu - 1, iu)]);
         t[ix(iu, iu)] += self.exshift;
         t[ix(iu - 1, iu - 1)] += self.exshift;
         if q >= 0.0 {
@@ -259,7 +262,7 @@ impl Schur {
         }
         if iter == 30 {
             let h = (sh[1] - sh[0]) * 0.5;
-            let mut s = fma(h, h, sh[2]);
+            let mut s = madd(h, h, sh[2]);
             if s > 0.0 {
                 s = s.sqrt();
                 if sh[1] < sh[0] {
@@ -284,7 +287,7 @@ impl Schur {
             let tmm = t[ix(im, im)];
             let r = sh[0] - tmm;
             let s = sh[1] - tmm;
-            let v0 = (r.mul_add(s, -sh[2])) / t[ix(im + 1, im)] + t[ix(im, im + 1)];
+            let v0 = (r * s - sh[2]) / t[ix(im + 1, im)] + t[ix(im, im + 1)];
             let v1 = ((t[ix(im + 1, im + 1)] - tmm) - r) - s;
             let v2 = t[ix(im + 2, im + 1)];
             let v = [v0, v1, v2];
@@ -450,7 +453,7 @@ pub fn eigen_solver4(a: &[f32; 16]) -> Eig4 {
             t0 /= mx;
             t1 /= mx;
             let p0 = p / mx;
-            let z = mx * fma(p0, p0, t0 * t1).abs().sqrt();
+            let z = mx * madd(p0, p0, t0 * t1).abs().sqrt();
             out.eval_re[i] = tt[ix(i + 1, i + 1)] + p;
             out.eval_im[i] = z;
             out.eval_re[i + 1] = p + tt[ix(i + 1, i + 1)];
@@ -522,7 +525,7 @@ pub fn do_compute_eigenvectors(ev: &mut [f32; 16], t: &mut [f32; 16], eval_re: &
             for r in 0..4 {
                 let mut acc = ev[ix(r, 0)] * t[ix(0, j)];
                 for k in 1..=j {
-                    acc = fma(ev[ix(r, k)], t[ix(k, j)], acc);
+                    acc = ev[ix(r, k)].mul_add(t[ix(k, j)], acc); // 행렬 곱(gemv): Eigen pmadd 는 기준 빌드에서도 FMA
                 }
                 tmp[r] = acc;
             }

@@ -117,6 +117,12 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - 스레드 · 잠금 `orb3sys::threads`(교착을 구조로 없앤 판, CV 포터의 스레드 설계와 맞출 기준안): 원본 멈춤 신호의 세 문제 — ① `RequestStop` 깃발 하나에 `Release` 를 누가 부르든 함께 내림(루프 닫기와 옮겨 붙이기가 같이 세우면 먼저 끝난 쪽이 다른 쪽 작업 중에 지도 스레드를 다시 돌림) ② `usleep` 바쁜 대기 ③ 지도 갱신 잠금을 쥔 채 멈춤을 기다리는 자리(패치 DoPendingGraft 는 Track() 안, 지역 BA 는 같은 잠금을 잡으러 감). 이 판: 멈춤은 `StopToken` 세는 표(마지막 토큰이 놓일 때만 다시 돎), 기다림은 모두 Condvar(끝도 깨움), 지도 갱신 잠금은 `MapUpdate` 로만 잡고 쥔 채 멈춤 · 한가함 · 대기열을 기다리면 바로 패닉. 결과에 닿는 순서는 원본대로(대기열을 먼저 비우고 멈춤, 멈춘 뒤 SetNotStop(true) 거절, Release 때 대기열 비움, 새 키프레임이 오면 BA 중단 깃발). 시험 4 개(`cargo test -p slam --lib orb3sys`): 토큰 둘 · 대기열 먼저 · 잠금 쥔 기다림 패닉 · 세 스레드 3,000 장면 섞어 돌리기 시간 안에 끝남.
 - TRACK 재생 길이 문제: 새 덤프(`~/orbtrack_out/ds.bin`, 1.5 GB, CNMP · TRIA 등 새 칸)를 읽는 재생 도구는 TRACK 작업 트리(`C:\ondevice-orb-track`)에 아직 커밋 전. 커밋된 옛 도구로 읽으면 기록 길이가 안 맞아 패닉 → 릴리스 `panic = "abort"` 라 WSL 이 1.5 GB 코어 덤프를 `wsl-crashes` 에 남김(지움). 큰 덤프를 읽는 시험은 `ulimit -c 0` 을 붙여 돌린다. TRACK 이 새 도구를 커밋하면 받아서 다시 대조.
 - 원본 대조 전체 재생(강의실 녹화)은 Rust System 이 들어온 뒤: 지금 통합판의 System 은 원본 라이브러리 그대로라 같은 것끼리 비교가 됨.
+- 받은 브랜치(3 차): BA 5f6ea69(g2o Levenberg · 슈어 · LDLT · LBA 간선 3 종) · LOOP 3a68a19(Relocalization 흐름 `orb3loop::reloc`, 멈춤 조사 기록). 병합 뒤 BA 시험(`full_calls` 강의실 · desk2 · room, 단계 0 · 4, se3) · LOOP 9 개 · orb3sys 4 개 통과. BA 의 `stage_first_iteration` 이 입력 없을 때 건너뛰던 것을 실패로 바꿈. `loopclose::refdump::*_digiteo2` 2 개 실패는 옛 gtsam 루프 모듈(이번 병합과 무관, 전부터).
+- **LocalBundleAdjustment 전체 Rust(`slam::orb3ba::lba`)**: 지역 · 고정 키프레임 고르기 → 그래프(`build_graph`) → `optimize_stop(10)`(g2o 강제 멈춤 깃발 = 반복 시작 · Levenberg 시도 사이) → 이상치 관측 지우기(단안 먼저 · 스테레오) → 자세 · 점 되써 넣기 · `mp_update_normal_and_depth` · 지도 변경 번호. 원본 `KeyFrame` 패치 칸 mbUp · mUpCam 은 `KeyFrame::up_cam`. 원본 표시 칸(mnBALocalForKF · mnBAFixedForKF)은 함수 안 집합으로.
+  - 비교: 저장소 밖 하네스 WSL `~/opt/orb3_lba`(BA 하네스의 덤프 판 Optimizer 에 LBA 앞 · 뒤 지도 상태 덤프를 더함, `run.sh 이름 녹화 장수 호출수 [imu] [설정]`) → `~/orblba_ref/{desk2,room,ds}_{w,ba}.bin`. 시험 `ORB3LBA=~/orblba_ref/desk2:~/orblba_ref/room:~/orblba_ref/ds cargo test --release -p slam --lib orb3ba::lba_tests`: 그래프(정점 · 간선 비트) · 반복 수 · 지운 관측 · 지역 키프레임 자세 · 점 칸 · 점 위치 · 법선 · 거리 · 관측 수 · 기준 키프레임 **37 호출 전부 비트 동일**(TUM desk2 12 · room 12 · 강의실 중력 항 포함 13).
+  - 원본의 관측 순회(`map<KeyFrame*,…>`)는 포인터 순서라 번호 순과 다르다(실측: 점 관측 순서 [2, 0, 1]) — 간선 추가 순서 · 법선 합 순서 · 기준 키프레임 넘김(begin())이 이 순서를 따른다. Rust 기본은 번호 순(`MapPoint::obs`), 시험만 `ObsOrder` 로 덤프의 포인터 순서를 넣어 나머지를 비트 비교. 실제 실행 결과는 원본 판에서도 할당 주소에 따라 달라지는 자리라 궤적 대조 때 이 차이가 남는다(pose-parb 의 번호 순 비교자가 확정되면 원본도 같아짐).
+  - 공통 함수 고침: `localmap::mp_erase_observation` 에 원본의 `if(mpRefKF==pKF) mpRefKF=mObservations.begin()->first` 를 넣음(빠져 있었음).
+  - 남은 엮기: `LocalMapperOps::local_ba` 를 이것으로 — ProcessNewKeyFrame · CreateNewMapPoints · SearchInNeighbors(TRACK 작업 트리에 미커밋) 가 들어오면 `Mapper` 위에 Rust LocalMapping 구현을 만든다.
 - 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀. 다음 단계는 System 흐름(추적 · 지도 · 루프 스레드)을 Rust 모듈로 엮어 `orb3_backend` 를 바꿔 끼우는 것 — 아직 안 옮긴 것: LocalMapping 의 BA 호출부(BA 포터 대기), LoopClosing 흐름 · CorrectLoop · MergeLocal, MLPnPsolver · Relocalization.
 
 ## 정확도 브랜치 따라가기
@@ -264,7 +270,7 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 | g2o 경로: SparseOptimizer · OptimizationAlgorithmLevenberg(Raul 멈춤 조건 · 시도 10 번) · BlockSolver<6,3> 슈어 소거 · LinearSolverEigen(SimplicialLDLT + AMD) | `slam::orb3ba::{solver, ldlt}` | **비트 동일**: 실제 LBA 호출 33 개(강의실 ds_1118_121652 9 · TUM desk2 12 · room 12) 전부 끝 정점 값 · 간선 χ² · 반복 수 같음 |
 | 간선: EdgeSE3ProjectXYZ(단안) · EdgeStereoSE3ProjectXYZ · 우리 EdgeGravityUp(수치 미분) — 오차 · 야코비안 · 2차 형식 | `orb3ba::edges` | 첫 반복 단계 비교(오차 · χ² · 간선마다 야코비안 · 누적 블록 35 만 값) 전부 같음 |
 | SE3Quat exp · oplus · 사원수 곱 · 회전 | `orb3ba::se3` | 무작위 3 만 건(작은 · 중간 · 큰 회전) 전부 같음 |
-| LocalBundleAdjustment 그래프 만들기 · 이상치 정리 · 되써 넣기 | 남음(공통 자료 구조 `orb3rs::types` 받은 뒤) | |
+| LocalBundleAdjustment 그래프 만들기 · 이상치 정리 · 되써 넣기 | `orb3ba::lba`(통합 담당) | **비트 동일** 37 호출(통합 상태 절) |
 | GlobalBundleAdjustemnt · OptimizeEssentialGraph(Sim3, BlockSolver<7,3>) · OptimizeSim3(BlockSolverX + 밀집) · 합치기용 BA | 남음 | |
 
 ### 쓰는 법

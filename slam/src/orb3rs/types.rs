@@ -164,6 +164,8 @@ pub struct KeyFrame {
     pub merge_edges: Vec<KfId>,
     /// mTcp(나쁨 표시 때 부모 기준 위치)
     pub tcp: Se3,
+    /// 우리 패치: IMU 위쪽(카메라 좌표, mbUp · mUpCam). 없으면 None
+    pub up_cam: Option<V3>,
 }
 
 /// MapPoint

@@ -505,6 +505,11 @@ fn dot6(a: &[f64], b: &[f64]) -> f64 {
 /// 원본 LBA 의 optimizer.initializeOptimization(); optimizer.optimize(iters)
 /// (OptimizationAlgorithmLevenberg::solve, Raul 의 멈춤 조건 · 시도 10 번 포함)
 pub fn optimize(p: &Problem, iters: usize) -> Outcome {
+    optimize_stop(p, iters, &|| false)
+}
+
+/// `optimizer.setForceStopFlag(pbStopFlag)` 판: 반복 시작마다 · Levenberg 시도 사이에 `terminate()` 를 본다.
+pub fn optimize_stop(p: &Problem, iters: usize, stop: &dyn Fn() -> bool) -> Outcome {
     let mut s = Sys::new(p);
     let mut sc = s.schur_pattern();
     let tau = 1e-5;
@@ -513,6 +518,9 @@ pub fn optimize(p: &Problem, iters: usize) -> Outcome {
     let mut nbad = 0;
     let mut it = 0;
     for i in 0..iters {
+        if stop() {
+            break;
+        }
         s.compute_errors();
         let mut cur = s.robust_chi2();
         let ini = cur;
@@ -555,7 +563,7 @@ pub fn optimize(p: &Problem, iters: usize) -> Outcome {
                 s.est = saved;
             }
             q += 1;
-            if !(rho < 0.0 && q < 10) {
+            if !(rho < 0.0 && q < 10 && !stop()) {
                 break;
             }
         }

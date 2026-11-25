@@ -48,7 +48,7 @@ pub fn mp_set_bad(mp: MpId, atlas: &mut Atlas, _ext: &mut TrackExt) {
     }
 }
 
-/// MapPoint::EraseObservation(kf): 관측 무게 빼고, nObs ≤ 2 면 SetBadFlag
+/// MapPoint::EraseObservation(kf): 관측 무게 빼고, 기준 키프레임이면 다음 관측으로, nObs ≤ 2 면 SetBadFlag
 pub fn mp_erase_observation(mp: MpId, kf: KfId, atlas: &mut Atlas, ext: &mut TrackExt) {
     let bad = {
         let m = atlas.mps.get_mut(&mp).unwrap();
@@ -62,6 +62,12 @@ pub fn mp_erase_observation(mp: MpId, kf: KfId, atlas: &mut Atlas, ext: &mut Tra
         }
         let m = atlas.mps.get_mut(&mp).unwrap();
         m.obs.remove(&kf);
+        // if(mpRefKF==pKF) mpRefKF=mObservations.begin()->first (비면 begin() 이 end — 곧 나쁨이 되므로 그대로 둠)
+        if m.ref_kf == kf {
+            if let Some((&first, _)) = m.obs.iter().next() {
+                m.ref_kf = first;
+            }
+        }
         let n = ext.mp_nobs.entry(mp).or_insert(0);
         *n -= w;
         *n <= 2

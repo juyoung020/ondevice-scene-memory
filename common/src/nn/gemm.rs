@@ -120,11 +120,11 @@ unsafe fn tile_neon<const M: usize, const D: bool>(a: *const f32, k: usize, mr: 
     }
 }
 
-/// 줄 묶음 여럿(rows 줄)을 판 하나에 통과. `a` 는 [`pack_a`] 모양(첫 줄부터)
+/// 줄 묶음 여럿(rows 줄)을 판 하나에 통과. `a` 는 [`pack_a`] 모양(첫 줄부터, 묶음 mr 줄)
 macro_rules! rows_through {
-    ($name:ident, $tile:ident, $mr:literal, $($attr:tt)*) => {
+    ($name:ident, $tile:ident, $($attr:tt)*) => {
         $($attr)*
-        unsafe fn $name<const D: bool>(a: &[f32], k: usize, rows: usize, bp: *const f32, offs: *const usize, out: &mut [[f32; NB]]) {
+        unsafe fn $name<const D: bool>(a: &[f32], k: usize, rows: usize, mr: usize, bp: *const f32, offs: *const usize, out: &mut [[f32; NB]]) {
             let a = a.as_ptr();
             // k 를 KC 씩: 판 조각(KC · NB)이 L1 에 머문 채 모든 줄 묶음이 지나감
             let mut k0 = 0;
@@ -133,25 +133,24 @@ macro_rules! rows_through {
                 let add = k0 > 0;
                 let (pk, ok) = if D { (bp, offs.add(k0)) } else { (bp.add(k0 * NB), offs) };
                 let mut r = 0;
-                while r + $mr <= rows {
-                    $tile::<$mr, D>(a.add(r * k + k0 * $mr), kl, $mr, pk, ok, &mut out[r..], add);
-                    r += $mr;
-                }
-                let m = rows - r;
-                let (x, o) = (a.add(r * k + k0 * m), &mut out[r..]);
-                match m {
-                    0 => {}
-                    1 => $tile::<1, D>(x, kl, m, pk, ok, o, add),
-                    2 => $tile::<2, D>(x, kl, m, pk, ok, o, add),
-                    3 => $tile::<3, D>(x, kl, m, pk, ok, o, add),
-                    4 => $tile::<4, D>(x, kl, m, pk, ok, o, add),
-                    5 => $tile::<5, D>(x, kl, m, pk, ok, o, add),
-                    6 => $tile::<6, D>(x, kl, m, pk, ok, o, add),
-                    7 => $tile::<7, D>(x, kl, m, pk, ok, o, add),
-                    8 => $tile::<8, D>(x, kl, m, pk, ok, o, add),
-                    9 => $tile::<9, D>(x, kl, m, pk, ok, o, add),
-                    10 => $tile::<10, D>(x, kl, m, pk, ok, o, add),
-                    _ => $tile::<11, D>(x, kl, m, pk, ok, o, add),
+                while r < rows {
+                    let m = mr.min(rows - r);
+                    let (x, o) = (a.add(r * k + k0 * m), &mut out[r..]);
+                    match m {
+                        1 => $tile::<1, D>(x, kl, m, pk, ok, o, add),
+                        2 => $tile::<2, D>(x, kl, m, pk, ok, o, add),
+                        3 => $tile::<3, D>(x, kl, m, pk, ok, o, add),
+                        4 => $tile::<4, D>(x, kl, m, pk, ok, o, add),
+                        5 => $tile::<5, D>(x, kl, m, pk, ok, o, add),
+                        6 => $tile::<6, D>(x, kl, m, pk, ok, o, add),
+                        7 => $tile::<7, D>(x, kl, m, pk, ok, o, add),
+                        8 => $tile::<8, D>(x, kl, m, pk, ok, o, add),
+                        9 => $tile::<9, D>(x, kl, m, pk, ok, o, add),
+                        10 => $tile::<10, D>(x, kl, m, pk, ok, o, add),
+                        11 => $tile::<11, D>(x, kl, m, pk, ok, o, add),
+                        _ => $tile::<12, D>(x, kl, m, pk, ok, o, add),
+                    }
+                    r += m;
                 }
                 k0 += kl;
             }
@@ -161,15 +160,15 @@ macro_rules! rows_through {
 
 const KC: usize = 256;
 
-rows_through!(rows_scalar, tile_scalar, 3, #[inline(never)]);
+rows_through!(rows_scalar, tile_scalar, #[inline(never)]);
 #[cfg(target_arch = "x86_64")]
-rows_through!(rows_avx512, tile_avx512, 12, #[target_feature(enable = "avx512f")]);
+rows_through!(rows_avx512, tile_avx512, #[target_feature(enable = "avx512f")]);
 #[cfg(target_arch = "x86_64")]
-rows_through!(rows_avx2, tile_avx2, 3, #[target_feature(enable = "avx2,fma")]);
+rows_through!(rows_avx2, tile_avx2, #[target_feature(enable = "avx2,fma")]);
 #[cfg(target_arch = "aarch64")]
-rows_through!(rows_neon, tile_neon, 3, #[target_feature(enable = "neon")]);
+rows_through!(rows_neon, tile_neon, #[target_feature(enable = "neon")]);
 
-type Rows = unsafe fn(&[f32], usize, usize, *const f32, *const usize, &mut [[f32; NB]]);
+type Rows = unsafe fn(&[f32], usize, usize, usize, *const f32, *const usize, &mut [[f32; NB]]);
 /// (펴 둔 판, 바로 읽기, MR)
 type Kern = (Rows, Rows, usize);
 
@@ -192,27 +191,43 @@ fn kernel() -> Kern {
     })
 }
 
-/// 줄 묶음 크기(이 CPU 커널)
-pub fn mr() -> usize {
-    kernel().2
+/// m 줄에 쓸 줄 묶음 크기: 커널 최대(AVX-512 12, 그 밖 3)의 절반 이상에서 버리는 줄(마지막 묶음의 빈 줄)이 가장 적은 것
+/// (16 · 32 · 64 채널 → 8, 193 토큰 → 11). 큰 묶음과 작은 묶음의 FMA 비율은 거의 같고, 남는 줄 묶음이 느리다
+pub fn mr_for(m: usize) -> usize {
+    let mx = kernel().2;
+    let mut best = mx;
+    for t in (mx.div_ceil(2)..=mx).rev() {
+        if m.div_ceil(t) * t < m.div_ceil(best) * best {
+            best = t;
+        }
+    }
+    best
 }
 
 /// A[m, k](줄 사이 lda) → MR 줄 묶음마다 [k][묶음 줄 수]
 pub fn pack_a(a: &[f32], m: usize, k: usize, lda: usize) -> Vec<f32> {
-    let mr = mr();
-    let mut p = super::buf::zeros::<f32>(m * k);
-    let mut r0 = 0;
-    while r0 < m {
+    let mr = mr_for(m);
+    let mut p = super::buf::take::<f32>(m * k);
+    // 묶음 차례로(끝 묶음만 줄 수가 적음), 크면 묶음들을 나눠 맡김
+    let tiles = m.div_ceil(mr);
+    let body = |t: usize, dst: &mut [f32]| {
+        let r0 = t * mr;
         let rr = mr.min(m - r0);
-        let t = &mut p[r0 * k..(r0 + rr) * k];
         for i in 0..rr {
             let row = &a[(r0 + i) * lda..(r0 + i) * lda + k];
             for (j, &v) in row.iter().enumerate() {
-                t[j * rr + i] = v;
+                dst[j * rr + i] = v;
             }
         }
-        r0 += rr;
+    };
+    if m * k > 1 << 16 {
+        super::pool::chunks_mut(&mut p, mr * k, body);
+    } else {
+        for (t, d) in p.chunks_mut(mr * k).enumerate() {
+            body(t, d);
+        }
     }
+    let _ = tiles;
     p
 }
 
@@ -264,7 +279,8 @@ pub trait Sink: Sync {
 
 /// C = A · B, A 는 [`pack_a`], 결과는 sink 로. 일은 (판, 줄 덩어리) 로 나눔
 pub fn gemm(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink) {
-    let (kern, kdir, mr) = kernel();
+    let (kern, kdir, _) = kernel();
+    let mr = mr_for(m);
     let np = n.div_ceil(NB);
     let th = super::pool::threads();
     // 판이 모자라면 줄도 나눔(MR 배수)
@@ -287,15 +303,15 @@ pub fn gemm(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink
             for p in pg * per..((pg + 1) * per).min(np) {
                 ob.resize(rows, [0.0; NB]);
                 match &b {
-                    Panels::Packed(all) => unsafe { kern(&ap[r0 * k..], k, rows, all[p * k * NB..(p + 1) * k * NB].as_ptr(), std::ptr::null(), ob) },
+                    Panels::Packed(all) => unsafe { kern(&ap[r0 * k..], k, rows, mr, all[p * k * NB..(p + 1) * k * NB].as_ptr(), std::ptr::null(), ob) },
                     Panels::Make(f) => {
                         pb.resize(k * NB, 0.0);
                         f(p, pb);
-                        unsafe { kern(&ap[r0 * k..], k, rows, pb.as_ptr(), std::ptr::null(), ob) }
+                        unsafe { kern(&ap[r0 * k..], k, rows, mr, pb.as_ptr(), std::ptr::null(), ob) }
                     }
                     Panels::Direct { base, offs } => {
                         debug_assert!(offs.iter().all(|&o| o + p * NB + NB <= base.len()));
-                        unsafe { kdir(&ap[r0 * k..], k, rows, base.as_ptr().add(p * NB), offs.as_ptr(), ob) }
+                        unsafe { kdir(&ap[r0 * k..], k, rows, mr, base.as_ptr().add(p * NB), offs.as_ptr(), ob) }
                     }
                 }
                 sink.put(r0, p * NB, NB.min(n - p * NB), ob);
@@ -316,21 +332,29 @@ unsafe impl Sync for RowMajor<'_> {}
 
 impl Sink for RowMajor<'_> {
     fn put(&self, r0: usize, c0: usize, w: usize, rows: &mut [[f32; NB]]) {
+        super::simd::run(|| self.put_in(r0, c0, w, rows))
+    }
+}
+
+impl RowMajor<'_> {
+    #[inline(always)]
+    fn put_in(&self, r0: usize, c0: usize, w: usize, rows: &mut [[f32; NB]]) {
+        // 편향 → 활성(덩어리 통째, 남는 열도 계산만 함) → 줄마다 복사
         for (i, r) in rows.iter_mut().enumerate() {
-            let row = r0 + i;
-            let v = &mut r[..w];
             if let Some(cb) = self.col_bias {
-                for (x, b) in v.iter_mut().zip(&cb[c0..c0 + w]) {
+                for (x, b) in r[..w].iter_mut().zip(&cb[c0..c0 + w]) {
                     *x += b;
                 }
             }
             if let Some(rb) = self.row_bias {
-                let b = rb[row];
-                v.iter_mut().for_each(|x| *x += b);
+                let b = rb[r0 + i];
+                r.iter_mut().for_each(|x| *x += b);
             }
-            self.act.apply(v);
+        }
+        self.act.apply_in(rows.as_flattened_mut());
+        for (i, r) in rows.iter().enumerate() {
             // SAFETY: 일마다 (줄, 열) 칸이 겹치지 않음
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.out.add(row * self.ldc + c0), w) };
+            unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), self.out.add((r0 + i) * self.ldc + c0), w) };
         }
     }
 }

@@ -1,10 +1,10 @@
 //! 노드 하나 실행
 use super::gemm::{self, NB, Panels, RowMajor, Sink};
-use super::{Act, Data, erf, Node, Pre, Tensor, exp, sigmoid};
-use super::{buf, pool};
+use super::{Act, Data, Node, Pre, Tensor};
+use super::{buf, pool, simd, vmath};
 
 fn copy(v: &[f32]) -> Vec<f32> {
-    let mut o = buf::zeros::<f32>(v.len());
+    let mut o = buf::take::<f32>(v.len());
     o.copy_from_slice(v);
     o
 }
@@ -33,13 +33,13 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
     let x = || need(ins, 0);
     match n.op.as_str() {
         "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" => binary(&n.op, need(ins, 0)?, need(ins, 1)?, n.ai("fmod", 0) != 0),
-        "Relu" => unary(x()?, |v| v.max(0.0)),
-        "Sigmoid" => unary(x()?, sigmoid),
-        "Tanh" => unary(x()?, f32::tanh),
-        "Sqrt" => unary(x()?, f32::sqrt),
-        "Erf" => unary(x()?, erf),
-        "Neg" => unary(x()?, |v| -v),
-        "Exp" => unary(x()?, exp),
+        "Relu" => unary_s(x()?, vmath::relu),
+        "Sigmoid" => unary_s(x()?, vmath::sigmoid_s),
+        "Tanh" => unary_s(x()?, vmath::tanh_s),
+        "Sqrt" => unary_s(x()?, vmath::sqrt_s),
+        "Erf" => unary_s(x()?, vmath::erf_s),
+        "Neg" => unary_s(x()?, vmath::neg_s),
+        "Exp" => unary_s(x()?, vmath::exp_s),
         "Identity" => Ok(vec![x()?.clone()]),
         "Cast" => {
             let t = x()?;
@@ -177,16 +177,7 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
             }
             let d = t.shape[a];
             let mut v = copy(t.fv()?);
-            pool::chunks_mut(&mut v, d * (PAR / d.max(1)).max(1), |_, rows| for row in rows.chunks_mut(d) {
-                let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut s = 0.0;
-                for x in row.iter_mut() {
-                    *x = exp(*x - m);
-                    s += *x;
-                }
-                let k = 1.0 / s;
-                row.iter_mut().for_each(|x| *x *= k);
-            });
+            pool::chunks_mut(&mut v, d * (PAR / d.max(1)).max(1), |_, rows| rows.chunks_mut(d).for_each(vmath::softmax_row));
             Ok(vec![Tensor::f(t.shape.clone(), v)])
         }
         "TopK" => {
@@ -238,15 +229,6 @@ pub(crate) fn in_place(n: &Node) -> bool {
 
 /// [`in_place`] 노드: x = 첫 입력(넘겨 받음), rest = 나머지 입력
 pub(crate) fn exec_own(n: &Node, mut x: Tensor, rest: &[Option<&Tensor>]) -> R {
-    let f32_un = |f: fn(f32) -> f32, x: &mut Tensor| -> Result<(), String> {
-        let Data::F(v) = &mut x.data else { return Err("f32 텐서가 필요".into()) };
-        if v.len() > PAR {
-            pool::chunks_mut(v, PAR, |_, c| c.iter_mut().for_each(|a| *a = f(*a)));
-        } else {
-            v.iter_mut().for_each(|a| *a = f(*a));
-        }
-        Ok(())
-    };
     match n.op.as_str() {
         "Reshape" | "Flatten" | "Squeeze" | "Unsqueeze" | "Identity" => {
             // 모양만 계산(값은 그대로 옮김)
@@ -258,63 +240,24 @@ pub(crate) fn exec_own(n: &Node, mut x: Tensor, rest: &[Option<&Tensor>]) -> R {
             x.shape = shape;
             Ok(vec![x])
         }
-        "Relu" => f32_un(|a| a.max(0.0), &mut x).map(|_| vec![x]),
-        "Sigmoid" => f32_un(sigmoid, &mut x).map(|_| vec![x]),
-        "Tanh" => f32_un(f32::tanh, &mut x).map(|_| vec![x]),
-        "Sqrt" => f32_un(f32::sqrt, &mut x).map(|_| vec![x]),
-        "Erf" => f32_un(erf, &mut x).map(|_| vec![x]),
-        "Neg" => f32_un(|a| -a, &mut x).map(|_| vec![x]),
-        "Exp" => f32_un(exp, &mut x).map(|_| vec![x]),
+        "Relu" => f32_un_s(vmath::relu, &mut x).map(|_| vec![x]),
+        "Sigmoid" => f32_un_s(vmath::sigmoid_s, &mut x).map(|_| vec![x]),
+        "Tanh" => f32_un_s(vmath::tanh_s, &mut x).map(|_| vec![x]),
+        "Sqrt" => f32_un_s(vmath::sqrt_s, &mut x).map(|_| vec![x]),
+        "Erf" => f32_un_s(vmath::erf_s, &mut x).map(|_| vec![x]),
+        "Neg" => f32_un_s(vmath::neg_s, &mut x).map(|_| vec![x]),
+        "Exp" => f32_un_s(vmath::exp_s, &mut x).map(|_| vec![x]),
         "Add" | "Sub" | "Mul" | "Div" => {
             let b = need(rest, 0)?;
             let same_out = bshape(&x.shape, &b.shape).map(|s| s == x.shape).unwrap_or(false);
             match (&mut x.data, &b.data) {
                 (Data::F(v), Data::F(w)) if same_out => {
-                    let op: fn(f32, f32) -> f32 = match n.op.as_str() {
-                        "Add" => |p, q| p + q,
-                        "Sub" => |p, q| p - q,
-                        "Mul" => |p, q| p * q,
-                        _ => |p, q| p / q,
-                    };
-                    if w.len() == v.len() {
-                        if v.len() > PAR {
-                            pool::chunks_mut(v, PAR, |c, ch| ch.iter_mut().enumerate().for_each(|(i, a)| *a = op(*a, w[c * PAR + i])));
-                        } else {
-                            v.iter_mut().zip(w.iter()).for_each(|(a, &q)| *a = op(*a, q));
-                        }
-                    } else if w.len() == 1 {
-                        let q = w[0];
-                        if v.len() > PAR {
-                            pool::chunks_mut(v, PAR, |_, ch| ch.iter_mut().for_each(|a| *a = op(*a, q)));
-                        } else {
-                            v.iter_mut().for_each(|a| *a = op(*a, q));
-                        }
-                    } else {
-                        // b 를 넓혀 읽음: 출력 끝 축 한 줄씩
-                        let out = x.shape.clone();
-                        let sb = bstrides(&b.shape, &out);
-                        let r = out.len();
-                        let last = out[r - 1];
-                        let lb = sb[r - 1];
-                        let per = (PAR / last.max(1)).max(1);
-                        let body = |c: usize, ch: &mut [f32]| {
-                            for (k, row) in ch.chunks_mut(last).enumerate() {
-                                let mut q = c * per + k;
-                                let mut ib = 0;
-                                for d in (0..r - 1).rev() {
-                                    ib += (q % out[d]) * sb[d];
-                                    q /= out[d];
-                                }
-                                for (j, a) in row.iter_mut().enumerate() {
-                                    *a = op(*a, w[ib + j * lb]);
-                                }
-                            }
-                        };
-                        if v.len() > PAR {
-                            pool::chunks_mut(v, per * last, body);
-                        } else {
-                            body(0, v);
-                        }
+                    let shape = x.shape.clone();
+                    match n.op.as_str() {
+                        "Add" => bin_in_place(v, &shape, w, &b.shape, |p, q| p + q),
+                        "Sub" => bin_in_place(v, &shape, w, &b.shape, |p, q| p - q),
+                        "Mul" => bin_in_place(v, &shape, w, &b.shape, |p, q| p * q),
+                        _ => bin_in_place(v, &shape, w, &b.shape, |p, q| p / q),
                     }
                     Ok(vec![x])
                 }
@@ -326,6 +269,71 @@ pub(crate) fn exec_own(n: &Node, mut x: Tensor, rest: &[Option<&Tensor>]) -> R {
             ins.extend_from_slice(rest);
             exec(n, &ins)
         }
+    }
+}
+
+/// 슬라이스 함수로 제자리(크면 나눠서)
+fn f32_un_s(f: fn(&mut [f32]), x: &mut Tensor) -> Result<(), String> {
+    let Data::F(v) = &mut x.data else { return Err("f32 텐서가 필요".into()) };
+    if v.len() > PAR {
+        pool::chunks_mut(v, PAR, |_, c| f(c));
+    } else {
+        f(v);
+    }
+    Ok(())
+}
+
+fn unary_s(t: &Tensor, f: fn(&mut [f32])) -> R {
+    let mut x = Tensor::f(t.shape.clone(), copy(t.fv()?));
+    f32_un_s(f, &mut x)?;
+    Ok(vec![x])
+}
+
+
+/// v(모양 shape) ⊙= w(넓혀 읽음, 결과 모양은 shape)
+fn bin_in_place(v: &mut [f32], shape: &[usize], w: &[f32], wsh: &[usize], op: impl Fn(f32, f32) -> f32 + Sync) {
+    if w.len() == v.len() {
+        if v.len() > PAR {
+            pool::chunks_mut(v, PAR, |c, ch| ch.iter_mut().zip(&w[c * PAR..]).for_each(|(a, &q)| *a = op(*a, q)));
+        } else {
+            v.iter_mut().zip(w.iter()).for_each(|(a, &q)| *a = op(*a, q));
+        }
+        return;
+    }
+    if w.len() == 1 {
+        let q = w[0];
+        if v.len() > PAR {
+            pool::chunks_mut(v, PAR, |_, ch| ch.iter_mut().for_each(|a| *a = op(*a, q)));
+        } else {
+            v.iter_mut().for_each(|a| *a = op(*a, q));
+        }
+        return;
+    }
+    let sb = bstrides(wsh, shape);
+    let r = shape.len();
+    let last = shape[r - 1];
+    let lb = sb[r - 1];
+    let per = (PAR / last.max(1)).max(1);
+    let body = |c: usize, ch: &mut [f32]| {
+        for (k, row) in ch.chunks_mut(last).enumerate() {
+            let mut q = c * per + k;
+            let mut ib = 0;
+            for d in (0..r - 1).rev() {
+                ib += (q % shape[d]) * sb[d];
+                q /= shape[d];
+            }
+            if lb == 0 {
+                let s = w[ib];
+                row.iter_mut().for_each(|a| *a = op(*a, s));
+            } else {
+                row.iter_mut().zip(&w[ib..]).for_each(|(a, &s)| *a = op(*a, s));
+            }
+        }
+    };
+    if v.len() > PAR {
+        pool::chunks_mut(v, per * last, body);
+    } else {
+        body(0, v);
     }
 }
 
@@ -374,15 +382,6 @@ fn shape_only(n: &Node, ins: &[Option<&Tensor>]) -> Result<Vec<usize>, String> {
     })
 }
 
-fn unary(t: &Tensor, f: impl Fn(f32) -> f32 + Sync) -> R {
-    let mut v = copy(t.fv()?);
-    if v.len() > PAR {
-        pool::chunks_mut(&mut v, PAR, |_, c| c.iter_mut().for_each(|x| *x = f(*x)));
-    } else {
-        v.iter_mut().for_each(|x| *x = f(*x));
-    }
-    Ok(vec![Tensor::f(t.shape.clone(), v)])
-}
 
 fn bshape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
     let r = a.len().max(b.len());
@@ -453,7 +452,7 @@ impl<T> Ptr<T> {
 fn bin_loop<T: Copy + Send + Sync + Default + 'static>(a: &[T], ash: &[usize], b: &[T], bsh: &[usize], f: impl Fn(T, T) -> T + Sync) -> Result<(Vec<usize>, Vec<T>), String> {
     let out = bshape(ash, bsh)?;
     let len: usize = out.iter().product();
-    let mut v = buf::zeros::<T>(len);
+    let mut v = buf::take::<T>(len);
     if a.len() == len && b.len() == len {
         if len > PAR {
             pool::chunks_mut(&mut v, 4096, |c, o| {
@@ -545,7 +544,7 @@ fn map_data(t: &Tensor, shape: Vec<usize>, idx: impl Fn(usize) -> usize + Sync) 
     match &t.data {
         Data::F(v) => {
             let o: Vec<f32> = if len > PAR { {
-                let mut o = buf::zeros::<f32>(len);
+                let mut o = buf::take::<f32>(len);
                 pool::chunks_mut(&mut o, PAR, |c, ch| ch.iter_mut().enumerate().for_each(|(i, x)| *x = v[idx(c * PAR + i)]));
                 o
             } } else { (0..len).map(|i| v[idx(i)]).collect() };
@@ -560,7 +559,7 @@ fn map_data(t: &Tensor, shape: Vec<usize>, idx: impl Fn(usize) -> usize + Sync) 
 /// 보폭 복사: 출력[i…] = 입력[base + Σ i_d · ist_d]. 끝 축 한 줄씩(보폭 1 이면 통째 복사), 여러 줄을 한 일로
 fn strided<T: Copy + Send + Sync + Default + 'static>(src: &[T], out: &[usize], ist: &[usize], base: usize) -> Vec<T> {
     let len: usize = out.iter().product();
-    let mut o = buf::zeros::<T>(len);
+    let mut o = buf::take::<T>(len);
     if len == 0 {
         return o;
     }
@@ -633,7 +632,7 @@ fn concat(ts: &[&Tensor], a: usize) -> R {
         }
     }
     fn go<T: Copy + Send + Sync + Default + 'static>(srcs: &[&[T]], cp: &[(usize, usize, usize, usize)], len: usize) -> Vec<T> {
-        let mut o = buf::zeros::<T>(len);
+        let mut o = buf::take::<T>(len);
         let p = Ptr(o.as_mut_ptr());
         let body = |i: usize| {
             let (d, k, s, l) = cp[i];
@@ -716,7 +715,7 @@ fn gather(t: &Tensor, idx: &Tensor, a: usize) -> R {
     let ni = iv.len();
     // 줄(바깥 o, 번호 k) 마다 inner 개 연속 복사 = 보폭 복사 [바깥, 번호, inner] 를 번호별로
     fn go<T: Copy + Send + Sync + Default + 'static>(v: &[T], iv: &[usize], ni: usize, d: usize, inner: usize, len: usize) -> Vec<T> {
-        let mut o = buf::zeros::<T>(len);
+        let mut o = buf::take::<T>(len);
         let per = (PAR / inner.max(1)).max(1);
         let body = |c: usize, ch: &mut [T]| {
             for (k, row) in ch.chunks_mut(inner.max(1)).enumerate() {
@@ -785,7 +784,7 @@ fn reduce(op: &str, t: &Tensor, ax: &[i64], keep: bool) -> R {
     let mid: usize = t.shape[a0..a1].iter().product();
     let inner: usize = t.shape[a1..].iter().product();
     let v = t.fv()?;
-    let mut o = buf::zeros::<f32>(outer * inner);
+    let mut o = buf::take::<f32>(outer * inner);
     let p = Ptr(o.as_mut_ptr());
     let body = |i: usize| {
         for k in 0..inner {
@@ -819,7 +818,7 @@ fn topk(t: &Tensor, k: usize, a: usize, largest: bool) -> R {
     let d = t.shape[a];
     let inner: usize = t.shape[a + 1..].iter().product();
     let v = t.fv()?;
-    let mut vals = buf::zeros::<f32>(outer * k * inner);
+    let mut vals = buf::take::<f32>(outer * k * inner);
     let mut idx = vec![0i64; outer * k * inner];
     for o in 0..outer {
         for i in 0..inner {
@@ -849,7 +848,7 @@ fn matmul(n: &Node, a: &Tensor, b: &Tensor) -> R {
             return Err(format!("MatMul k {k} ≠ {kb}"));
         }
         let rows = a.len() / k;
-        let mut out = buf::zeros::<f32>(rows * nn);
+        let mut out = buf::take::<f32>(rows * nn);
         let ap = gemm::pack_a(av, rows, k, k);
         let sink = RowMajor { out: out.as_mut_ptr(), ldc: *nn, col_bias: bias.as_deref(), row_bias: None, act: n.act.clone() };
         gemm::gemm(&ap, rows, k, *nn, Panels::Packed(panels), &sink);
@@ -868,7 +867,7 @@ fn matmul(n: &Node, a: &Tensor, b: &Tensor) -> R {
     let nb: usize = batch.iter().product();
     let sa = bstrides(&a.shape[..ar - 2], &batch);
     let sb = bstrides(&b.shape[..br - 2], &batch);
-    let mut out = buf::zeros::<f32>(nb * m * nn);
+    let mut out = buf::take::<f32>(nb * m * nn);
     let op = Ptr(out.as_mut_ptr());
     pool::for_each(nb, &|bi| {
         let (mut ia, mut ib, mut q) = (0, 0, bi);
@@ -905,7 +904,7 @@ fn gemm_op(n: &Node, ins: &[Option<&Tensor>]) -> R {
     let nn = if tb { b.shape[0] } else { b.shape[1] };
     let (av, bv) = (a.fv()?, b.fv()?);
     let c = ins.get(2).copied().flatten();
-    let mut o = buf::zeros::<f32>(m * nn);
+    let mut o = buf::take::<f32>(m * nn);
     for i in 0..m {
         for j in 0..nn {
             let mut s = 0.0;
@@ -972,7 +971,7 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
     let nb = x.shape[0];
     let xv = x.fv()?;
     let (ohw, chw) = (g.oh * g.ow, g.c * g.h * g.w);
-    let mut out = buf::zeros::<f32>(nb * co * ohw);
+    let mut out = buf::take::<f32>(nb * co * ohw);
     if grp == 1 {
         let kk = g.c * kh * kw;
         let owned;
@@ -997,6 +996,15 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 .collect();
             let planes = g.c * st * st;
             let need = (offs.iter().max().unwrap() + np * NB).max(planes * plane);
+            // 1×1 · 보폭 1 · 덧댐 0 이고 끝 판이 입력 안에서 끝나면 입력을 그대로 읽음(복사 없음)
+            if kh == 1 && kw == 1 && st == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w && need <= chw {
+                for b in 0..nb {
+                    let xb = &xv[b * chw..(b + 1) * chw];
+                    let sink = ConvDirectSink { out: out[b * co * ohw..].as_mut_ptr(), wp: wq, ow: g.ow, ohw, nv, bias, act: n.act.clone() };
+                    gemm::gemm(ap, co, kk, np * NB, Panels::Direct { base: xb, offs: &offs }, &sink);
+                }
+                return Ok(vec![Tensor::f(vec![nb, co, g.oh, g.ow], out)]);
+            }
             for b in 0..nb {
                 let xb = &xv[b * chw..(b + 1) * chw];
                 let mut xp = buf::zeros::<f32>(need);
@@ -1017,15 +1025,21 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                             let n = g.w.min(wq - j0);
                             d[j0..j0 + n].copy_from_slice(&row[..n]);
                         } else {
-                            for (j, v) in d.iter_mut().enumerate() {
-                                let x = (st * j + rx) as isize - g.pl as isize;
-                                if x >= 0 && x < g.w as isize {
-                                    *v = row[x as usize];
+                            // x = st · j + rx − pl 가 0 ≤ x < w 인 j 만(분기 없는 보폭 읽기)
+                            let off = rx as isize - g.pl as isize;
+                            let j0 = if off < 0 { ((-off) as usize).div_ceil(st) } else { 0 };
+                            let j1 = (((g.w as isize - 1 - off) / st as isize) + 1).clamp(0, wq as isize) as usize;
+                            if j1 > j0 {
+                                let x0 = (st * j0) as isize + off;
+                                let src = &row[x0 as usize..];
+                                for (j, v) in d[j0..j1].iter_mut().enumerate() {
+                                    *v = src[j * st];
                                 }
                             }
                         }
                     }
                 };
+                let tb = std::time::Instant::now();
                 if planes * plane > PAR {
                     pool::chunks_mut(&mut xp[..planes * plane], plane, body);
                 } else {
@@ -1033,8 +1047,12 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                         body(pi, d);
                     }
                 }
+                let tg = std::time::Instant::now();
                 let sink = ConvDirectSink { out: out[b * co * ohw..].as_mut_ptr(), wp: wq, ow: g.ow, ohw, nv, bias, act: n.act.clone() };
                 gemm::gemm(ap, co, kk, np * NB, Panels::Direct { base: &xp, offs: &offs }, &sink);
+                if std::env::var("NN_PROF").as_deref() == Ok("3") {
+                    eprintln!("    conv s{st} {co}x{kk} n{nv}: 평면 {:.3} ms, 행렬곱 {:.3} ms", (tg - tb).as_secs_f64() * 1e3, tg.elapsed().as_secs_f64() * 1e3);
+                }
                 buf::give(xp);
             }
             return Ok(vec![Tensor::f(vec![nb, co, g.oh, g.ow], out)]);
@@ -1112,7 +1130,7 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
         // 채널별(depthwise)
         let wv = wt.fv()?;
         let op = Ptr(out.as_mut_ptr());
-        pool::for_each(nb * co, &|bc| {
+        pool::for_each(nb * co, &|bc| simd::run(|| {
             let (b, c) = (bc / co, bc % co);
             let plane = &xv[b * chw + c * g.h * g.w..b * chw + (c + 1) * g.h * g.w];
             let k = &wv[c * kh * kw..(c + 1) * kh * kw];
@@ -1149,7 +1167,7 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 }
                 n.act.apply(row);
             }
-        });
+        }));
     } else {
         return Err(format!("group {grp} 합성곱 없음"));
     }
@@ -1169,15 +1187,24 @@ struct ConvDirectSink<'a> {
 unsafe impl Sync for ConvDirectSink<'_> {}
 impl Sink for ConvDirectSink<'_> {
     fn put(&self, r0: usize, c0: usize, w: usize, rows: &mut [[f32; NB]]) {
+        super::simd::run(|| self.put_in(r0, c0, w, rows))
+    }
+}
+
+impl ConvDirectSink<'_> {
+    #[inline(always)]
+    fn put_in(&self, r0: usize, c0: usize, w: usize, rows: &mut [[f32; NB]]) {
         let w = w.min(self.nv.saturating_sub(c0));
+        if let Some(b) = self.bias {
+            for (i, r) in rows.iter_mut().enumerate() {
+                let b = b[r0 + i];
+                r.iter_mut().for_each(|x| *x += b);
+            }
+        }
+        self.act.apply_in(rows.as_flattened_mut());
         for (i, r) in rows.iter_mut().enumerate() {
             let row = r0 + i;
-            let v = &mut r[..w];
-            if let Some(b) = self.bias {
-                let b = b[row];
-                v.iter_mut().for_each(|x| *x += b);
-            }
-            self.act.apply(v);
+            let v = &r[..w];
             // 출력 줄 조각마다 이어 붙여 쓰기
             let mut j = 0;
             while j < w {
@@ -1209,6 +1236,13 @@ struct ConvTSink<'a> {
 unsafe impl Sync for ConvTSink<'_> {}
 impl Sink for ConvTSink<'_> {
     fn put(&self, r0: usize, c0: usize, wv: usize, rows: &mut [[f32; NB]]) {
+        super::simd::run(|| self.put_in(r0, c0, wv, rows))
+    }
+}
+
+impl ConvTSink<'_> {
+    #[inline(always)]
+    fn put_in(&self, r0: usize, c0: usize, wv: usize, rows: &mut [[f32; NB]]) {
         for (i, r) in rows.iter_mut().enumerate() {
             let row = r0 + i;
             let (co, k) = (row / (self.kh * self.kw), row % (self.kh * self.kw));
@@ -1240,7 +1274,7 @@ fn conv_t(n: &Node, ins: &[Option<&Tensor>]) -> R {
     let (nb, h, w) = (x.shape[0], x.shape[2], x.shape[3]);
     let (oh, ow) = (h * kh, w * kw);
     let xv = x.fv()?;
-    let mut out = buf::zeros::<f32>(nb * co * oh * ow);
+    let mut out = buf::take::<f32>(nb * co * oh * ow);
     for b in 0..nb {
         let xb = &xv[b * ci * h * w..(b + 1) * ci * h * w];
         let hw = h * w;
@@ -1262,7 +1296,7 @@ fn pool(n: &Node, x: &Tensor) -> R {
     let incl = n.ai("count_include_pad", 0) != 0;
     let nb = x.shape[0];
     let xv = x.fv()?;
-    let mut out = buf::zeros::<f32>(nb * g.c * g.oh * g.ow);
+    let mut out = buf::take::<f32>(nb * g.c * g.oh * g.ow);
     pool::chunks_mut(&mut out, g.oh * g.ow, |bc, o| {
         let plane = &xv[bc * g.h * g.w..(bc + 1) * g.h * g.w];
         for oy in 0..g.oh {
@@ -1325,7 +1359,7 @@ fn resize(n: &Node, ins: &[Option<&Tensor>]) -> R {
         }
     };
     let xv = x.fv()?;
-    let mut o = buf::zeros::<f32>(x.shape[0] * x.shape[1] * oh * ow);
+    let mut o = buf::take::<f32>(x.shape[0] * x.shape[1] * oh * ow);
     if mode == "nearest" {
         let pick = |v: f32, len: usize| -> usize {
             let i = match nm.as_str() {

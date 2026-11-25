@@ -15,7 +15,7 @@ pub fn zeros<T: Copy + Default + 'static>(n: usize) -> Vec<T> {
         // 맞는 것 중 가장 작은 것
         let mut best: Option<usize> = None;
         for (i, v) in f.iter().enumerate() {
-            if v.capacity() >= n && best.is_none_or(|b| f[b].capacity() > v.capacity()) {
+            if v.len() >= n && best.is_none_or(|b| f[b].len() > v.len()) {
                 best = Some(i);
             }
         }
@@ -28,16 +28,46 @@ pub fn zeros<T: Copy + Default + 'static>(n: usize) -> Vec<T> {
     unsafe { std::mem::transmute::<Vec<f32>, Vec<T>>(v) }
 }
 
+/// 길이 n 버퍼, 값은 아무것(부르는 쪽이 모두 덮어씀): 되쓴 버퍼면 0 채우기 없이
+pub fn take<T: Copy + Default + 'static>(n: usize) -> Vec<T> {
+    if TypeId::of::<T>() != TypeId::of::<f32>() || n < 1024 {
+        return vec![T::default(); n];
+    }
+    let got = {
+        let mut f = FREE.lock().unwrap();
+        let mut best: Option<usize> = None;
+        for (i, v) in f.iter().enumerate() {
+            if v.len() >= n && best.is_none_or(|b| f[b].len() > v.len()) {
+                best = Some(i);
+            }
+        }
+        best.map(|i| f.swap_remove(i))
+    };
+    let v = match got {
+        Some(mut v) => {
+            v.truncate(n);
+            v
+        }
+        None => vec![0f32; n],
+    };
+    // SAFETY: T 는 f32
+    unsafe { std::mem::transmute::<Vec<f32>, Vec<T>>(v) }
+}
+
 /// 다 쓴 버퍼 돌려주기
 pub fn give(v: Vec<f32>) {
     if v.capacity() < 1024 {
         return;
     }
+    // 받을 수 있는 길이 = 지금 길이(채워진 곳만 되씀, 0 채우기 없음)
+    if v.len() < 1024 {
+        return;
+    }
     let mut f = FREE.lock().unwrap();
     if f.len() >= KEEP {
         // 가장 작은 것을 버림
-        let (i, _) = f.iter().enumerate().min_by_key(|(_, v)| v.capacity()).unwrap();
-        if f[i].capacity() >= v.capacity() {
+        let (i, _) = f.iter().enumerate().min_by_key(|(_, v)| v.len()).unwrap();
+        if f[i].len() >= v.len() {
             return;
         }
         f.swap_remove(i);

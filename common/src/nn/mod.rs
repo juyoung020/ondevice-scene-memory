@@ -7,6 +7,8 @@ pub mod gemm;
 mod ops;
 pub mod pool;
 pub mod proto;
+pub mod simd;
+pub mod vmath;
 
 use std::collections::HashMap;
 
@@ -84,10 +86,16 @@ pub enum Act {
 impl Act {
     #[inline]
     pub fn apply(&self, v: &mut [f32]) {
+        simd::run(|| self.apply_in(v))
+    }
+
+    /// [`Act::apply`] 를 이미 넓은 벡터 기능 안에서(행렬곱 출력 쓰기)
+    #[inline(always)]
+    pub(crate) fn apply_in(&self, v: &mut [f32]) {
         match self {
             Act::None => {}
-            Act::Relu => v.iter_mut().for_each(|x| *x = x.max(0.0)),
-            Act::Silu => v.iter_mut().for_each(|x| *x *= sigmoid(*x)),
+            Act::Relu => vmath::relu(v),
+            Act::Silu => vmath::silu(v),
             Act::Prog(p) => {
                 for c in v.chunks_mut(64) {
                     p.run(c);
@@ -127,36 +135,104 @@ pub struct Prog {
 
 impl Prog {
     fn run(&self, v: &mut [f32]) {
-        let n = v.len();
-        let mut regs = vec![[0f32; 64]; self.ins.len() + 1];
-        regs[0][..n].copy_from_slice(v);
-        for (i, &(op, a, b)) in self.ins.iter().enumerate() {
-            let (lo, hi) = regs.split_at_mut(i + 1);
-            let o = &mut hi[0][..n];
-            let get = |s: Src, j: usize| match s {
-                Src::Reg(r) => lo[r][j],
-                Src::K(k) => k,
-            };
-            match op {
-                EOp::Add => (0..n).for_each(|j| o[j] = get(a, j) + get(b, j)),
-                EOp::Sub => (0..n).for_each(|j| o[j] = get(a, j) - get(b, j)),
-                EOp::Mul => (0..n).for_each(|j| o[j] = get(a, j) * get(b, j)),
-                EOp::Div => (0..n).for_each(|j| o[j] = get(a, j) / get(b, j)),
-                EOp::Pow => (0..n).for_each(|j| {
-                    let (x, y) = (get(a, j), get(b, j));
-                    o[j] = if y == 2.0 { x * x } else { x.powf(y) }
-                }),
-                EOp::Relu => (0..n).for_each(|j| o[j] = get(a, j).max(0.0)),
-                EOp::Sigmoid => (0..n).for_each(|j| o[j] = sigmoid(get(a, j))),
-                EOp::Tanh => (0..n).for_each(|j| o[j] = get(a, j).tanh()),
-                EOp::Erf => (0..n).for_each(|j| o[j] = erf(get(a, j))),
-                EOp::Sqrt => (0..n).for_each(|j| o[j] = get(a, j).sqrt()),
-                EOp::Neg => (0..n).for_each(|j| o[j] = -get(a, j)),
-                EOp::Exp => (0..n).for_each(|j| o[j] = exp(get(a, j))),
-            }
-        }
-        v.copy_from_slice(&regs[self.ins.len()][..n]);
+        simd::run(|| self.run_in(v))
     }
+
+    #[inline(always)]
+    fn run_in(&self, v: &mut [f32]) {
+        thread_local! {
+            static REGS: std::cell::RefCell<Vec<[f32; 64]>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        REGS.with(|r| {
+            let mut regs = r.borrow_mut();
+            if regs.len() < self.ins.len() + 1 {
+                regs.resize(self.ins.len() + 1, [0.0; 64]);
+            }
+            let n = v.len();
+            regs[0][..n].copy_from_slice(v);
+            for (i, &(op, a, b)) in self.ins.iter().enumerate() {
+                let (lo, hi) = regs.split_at_mut(i + 1);
+                let o = &mut hi[0][..n];
+                // 두 입력을 (칸, 칸) · (칸, 상수) · (상수, 칸) 로 풀어 반복마다 분기 없게
+                macro_rules! bin {
+                    ($f:expr) => {{
+                        let f = $f;
+                        match (a, b) {
+                            (Src::Reg(x), Src::Reg(y)) => {
+                                let (x, y) = (&lo[x][..n], &lo[y][..n]);
+                                for j in 0..n {
+                                    o[j] = f(x[j], y[j]);
+                                }
+                            }
+                            (Src::Reg(x), Src::K(k)) => {
+                                let x = &lo[x][..n];
+                                for j in 0..n {
+                                    o[j] = f(x[j], k);
+                                }
+                            }
+                            (Src::K(k), Src::Reg(y)) => {
+                                let y = &lo[y][..n];
+                                for j in 0..n {
+                                    o[j] = f(k, y[j]);
+                                }
+                            }
+                            (Src::K(k), Src::K(q)) => o.fill(f(k, q)),
+                        }
+                    }};
+                }
+                macro_rules! un {
+                    ($f:expr) => {{
+                        let f = $f;
+                        match a {
+                            Src::Reg(x) => {
+                                let x = &lo[x][..n];
+                                for j in 0..n {
+                                    o[j] = f(x[j]);
+                                }
+                            }
+                            Src::K(k) => o.fill(f(k)),
+                        }
+                    }};
+                }
+                match op {
+                    EOp::Add => bin!(|p: f32, q: f32| p + q),
+                    EOp::Sub => bin!(|p: f32, q: f32| p - q),
+                    EOp::Mul => bin!(|p: f32, q: f32| p * q),
+                    EOp::Div => bin!(|p: f32, q: f32| p / q),
+                    EOp::Pow => match b {
+                        Src::K(2.0) => un!(|p: f32| p * p),
+                        _ => bin!(|p: f32, q: f32| p.powf(q)),
+                    },
+                    EOp::Relu | EOp::Sigmoid | EOp::Tanh | EOp::Erf | EOp::Sqrt | EOp::Neg | EOp::Exp => {
+                        match a {
+                            Src::Reg(x) => o.copy_from_slice(&lo[x][..n]),
+                            Src::K(k) => o.fill(k),
+                        }
+                        match op {
+                            EOp::Relu => vmath::relu(o),
+                            EOp::Sigmoid => vmath::sigmoid_s(o),
+                            EOp::Tanh => vmath::tanh_s(o),
+                            EOp::Erf => vmath::erf_s(o),
+                            EOp::Sqrt => vmath::sqrt_s(o),
+                            EOp::Neg => vmath::neg_s(o),
+                            _ => vmath::exp_s(o),
+                        }
+                    }
+                }
+            }
+            v.copy_from_slice(&regs[self.ins.len()][..n]);
+        })
+    }
+}
+
+/// tanh(x): |x| < 0.3 은 테일러 급수(x¹¹ 까지), 그 밖은 1 − 2 / (e^(2|x|) + 1). 둘 다 계산해 고름(벡터화)
+#[inline(always)]
+pub fn tanh(x: f32) -> f32 {
+    let a = x.abs();
+    let a2 = a * a;
+    let small = a * (1.0 + a2 * (-1.0 / 3.0 + a2 * (2.0 / 15.0 + a2 * (-17.0 / 315.0 + a2 * (62.0 / 2835.0 - a2 * (1382.0 / 155_925.0))))));
+    let big = 1.0 - 2.0 / (exp(2.0 * a) + 1.0);
+    (if a < 0.3 { small } else { big }).copysign(x)
 }
 
 /// erf(x): erfc 의 Chebyshev 근사(Numerical Recipes erfcc, 상대 오차 < 1.2e-7) 를 f32 로, |x| < 0.5 는 테일러 급수
@@ -544,7 +620,7 @@ impl Model {
                     grew = true;
                 }
             }
-            if set.is_empty() {
+            if set.is_empty() || ins.len() > 31 {
                 continue;
             }
             // 밖에서 쓰이는 값이 마지막 하나뿐이어야 함

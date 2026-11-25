@@ -161,7 +161,7 @@ pub fn chunks_mut<T: Send>(v: &mut [T], chunk: usize, f: impl Fn(usize, &mut [T]
         let e = (s + chunk).min(len);
         // SAFETY: 덩어리끼리 겹치지 않음
         let c = unsafe { std::slice::from_raw_parts_mut(p.get().add(s), e - s) };
-        f(i, c);
+        super::simd::run(|| f(i, c));
     });
 }
 

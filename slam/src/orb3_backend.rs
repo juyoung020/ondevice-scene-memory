@@ -11,7 +11,8 @@
 use crate::backend::SlamBackend;
 use crate::imu::{CsvReplay, Ring};
 use crate::io::FrameSource;
-use crate::orb3::{System, OK};
+use crate::orb3::OK;
+use crate::orb3sys::Orb3System;
 use crate::simd::{m34_vec, M34};
 use crate::stitch::{self, Stitch};
 use crate::stream::{GraphNode, GRAVITY, HELD, LOST, MAP_CORRECTED, NEW_MAP};
@@ -81,7 +82,7 @@ const SWEEP_M: f64 = 0.01;
 const SWEEP_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
 
 pub struct Orb3 {
-    sys: System,
+    sys: Box<dyn Orb3System>,
     ring: Option<Arc<Ring>>,
     replay: Option<CsvReplay>,
     /// IMU → 카메라 회전, t_imu = t_cam + shift
@@ -182,7 +183,7 @@ impl Orb3 {
         std::fs::write(&settings_path, yaml).map_err(|e| format!("{}: {e}", settings_path.display()))?;
         let t0 = Instant::now();
         let voc = vocab();
-        let sys = System::new(&voc, &settings_path.to_string_lossy())?;
+        let sys = crate::orb3sys::open(&voc, &settings_path.to_string_lossy())?;
         common::info!("ORB-SLAM3 RGB-D 준비 {:.1} 초(단어장 {voc})", t0.elapsed().as_secs_f64());
         let stitch = Stitch::start(&common::models::dir().to_string_lossy())?;
         let poses_f = if a.poses.is_empty() {

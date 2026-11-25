@@ -6,9 +6,8 @@ set -e
 R=/mnt/c/ondevice-orb-npu
 H=~/orbnpu_rs
 mkdir -p $H/src/orb3rs
-cd $R
-for f in types stdsort extract; do git show opt/orb3-rust:slam/src/orb3rs/$f.rs > $H/src/orb3rs/$f.rs; done
-git show opt/orb3-rust:slam/src/orb3rs/bit_pattern_31.in > $H/src/orb3rs/bit_pattern_31.in
+# SRC: Windows 에서 `git show opt/orb3-rust:slam/src/orb3rs/<f>` 로 꺼낸 폴더(이 worktree 의 git 은 WSL 에서 못 읽음)
+for f in types.rs stdsort.rs extract.rs bit_pattern_31.in; do cp "$SRC/$f" $H/src/orb3rs/$f; done
 E=$H/src/orb3rs/extract.rs
 # 갈고리: fast → crate::hook::fast(level, ...), 피라미드는 밖에서 넣을 수 있게, levels 공개
 sed -i 's/                    fast(img, iw, /                    crate::hook::fast(level, img, iw, /; s/                        fast(img, iw, /                        crate::hook::fast(level, img, iw, /' $E

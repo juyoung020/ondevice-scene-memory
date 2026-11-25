@@ -5,3 +5,4 @@ pub mod kfdb;
 pub mod crand;
 pub mod eig4;
 pub mod sim3;
+pub mod reloc;

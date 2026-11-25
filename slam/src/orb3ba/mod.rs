@@ -47,3 +47,5 @@ mod tests;
 mod lba_tests;
 #[cfg(test)]
 mod gba_tests;
+#[cfg(test)]
+mod mlba_tests;

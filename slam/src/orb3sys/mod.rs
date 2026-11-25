@@ -6,6 +6,7 @@
 //! 실제 실행에서는 System 통째(`crate::orb3::System`)가 원본 대신 판이고, Rust 판은 하위 단계가 모두 옮겨진 뒤 [`Orb3System`] 로 들어온다.
 //! 스레드 · 멈춤 신호는 [`threads`](원본 교착을 구조로 없앤 판).
 pub mod detectops;
+pub mod essops;
 pub mod gbaops;
 pub mod kfgraph;
 pub mod graft;

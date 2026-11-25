@@ -162,6 +162,10 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - 옮겨 붙이기 계산 probe(graft_probe.cc)도 여기로.
   - 아직: KFDB 그래프 · 공통 영역 찾기 흐름 · 지도 관리(CreateNewMap · ChangeMap · ResetActiveMap · GraftMap) 덤프.
 - `create_new_map_points_into`(rsys): 새 점 넣기를 시험할 수 있게 함수로 뺌, 지도 집합 넣기는 `Map::add_map_point`(원본 set).
+- 받은 브랜치(8 차): LOOP 94d1dab(CorrectLoop 원본 2/2 · mapdata 공시성), BA 7c42ca4 · 89a94bb(합치기 LBA mlba 비교 전 · 전역 BA 강의실 4 · room 1), TRACK f0d329c · 2a37f23(Tracking 빈자리 6 개 Rust · RustSystem HOLES 비움 · 덤프 도구 orb3_refid 로). 병합 뒤 mlba 의 옛 EraseObservation → mapdata.
+- **본질 그래프(루프 판) Rust `orb3sys::essops::RsEss`**: CV `build_eg_loop` · `optimize_essential_graph` 를 LOOP `EssentialGraph` 트레잇에 — 입력 vpKFs · vpMPs = 지도의 나쁘지 않은 것 번호 순, 자식 · 루프 가장자리 번호 순, GetCovisiblesByWeight(100), LoopConnections 무게, 고정 정점 = 지도 첫 키프레임. 결과: 키프레임 자세(Siw → SE3(R, t/s)) 다음 점마다 위치 · UpdateNormalAndDepth. 시험 `ORBLOOP_RUST_ESS=1 ORBLOOP_CORRECT=~/orbloop_reloc/corr_room.bin:~/orbloop_reloc/corr_ds.bin cargo test --release -p slam --test orb3loop_correct`: CorrectLoop 전체 + Rust 본질 그래프 **2/2 비트 동일**(원본 결과를 넣는 판도 2/2).
+- `RsLoop::correct_loop` = LOOP `correct_loop` + RsEss(mbFixScale = 참, mnCorrectedByKF 표는 RsLoop 가 들고 있음), 끝에 루프 양끝 mbNotErase · 지도 변경 번호, 전역 BA 는 지도 id 로. CorrectLoop 안의 Replace 는 `mapdata::mp_replace`(지도 집합에서 빼기까지, 원본 그대로).
+- 새 점 넣기 재확인(TRACK 이 orb3_refid 로 바꾼 뒤): 여전히 구조 16/16 · 비트 1/16 — `localmap` 의 삼각측량 · 회전(Jacobi) · 투영 검사에 mul_add 23 곳이 남아 있음(track.rs 만 뺐음). TRACK 확인 필요.
 - 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀. 다음 단계는 System 흐름(추적 · 지도 · 루프 스레드)을 Rust 모듈로 엮어 `orb3_backend` 를 바꿔 끼우는 것 — 아직 안 옮긴 것: LocalMapping 의 BA 호출부(BA 포터 대기), LoopClosing 흐름 · CorrectLoop · MergeLocal, MLPnPsolver · Relocalization.
 
 ## 정확도 브랜치 따라가기

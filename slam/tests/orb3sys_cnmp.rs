@@ -248,6 +248,18 @@ fn cnmp_insert_matches_original() {
                 th_far_points: th_far,
             };
             let map_id = d.map_id;
+            {
+                let mut nb = 0;
+                for k in d.kfs.values() {
+                    let (r, o) = slam::orb3rs::track::pose_inverse_matrices(&k.tcw);
+                    let r2 = k.twc.rot();
+                    let same = r.iter().flatten().zip(r2.iter().flatten()).all(|(a, b)| a.to_bits() == b.to_bits()) && o.iter().zip(&k.twc.t).all(|(a, b)| a.to_bits() == b.to_bits());
+                    nb += (!same) as usize;
+                }
+                if nb > 0 {
+                    eprintln!("  KF {nb} 개: Rust 역자세(pose_inverse_matrices) ≠ 원본 mTwc");
+                }
+            }
             let mut a = Atlas::default();
             let mut m = Map { id: map_id, ..Default::default() };
             for (id, k) in &d.kfs {

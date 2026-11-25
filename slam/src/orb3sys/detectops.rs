@@ -167,6 +167,8 @@ pub struct RsLoop<O: OptimizeSim3 + Send> {
     pub db: std::sync::Arc<std::sync::Mutex<Option<KeyFrameDatabase>>>,
     pub rand: std::sync::Arc<std::sync::Mutex<GlibcRand>>,
     pub opt: O,
+    /// 점 mnCorrectedByKF · mnCorrectedReference
+    pub corrected_by: std::collections::BTreeMap<MpId, (KfId, KfId)>,
 }
 
 impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
@@ -188,8 +190,26 @@ impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
     fn loop_accept(&mut self, _: &MapState) -> bool {
         true
     }
-    fn correct_loop(&mut self, _: &mut MapState) -> Option<u64> {
-        super::rsys::hole("LoopClosing::CorrectLoop(포터 LOOP 판 대기)")
+    /// CorrectLoop 계산(포터 LOOP `correct_loop`, 원본 2/2 비트 동일) + 본질 그래프(`essops::RsEss`, CV 판 · 원본 2/2 비트 동일).
+    /// 입력 mg2oLoopScw = mg2oLoopSlw · mvpLoopMapPoints = mvpLoopMPs · mvpLoopMatchedMPs(Run 이 넘기는 그대로)
+    fn correct_loop(&mut self, st: &mut MapState) -> Option<u64> {
+        let b = &self.det.lp;
+        let cur = b.last_current_kf.expect("mpCurrentKF");
+        let matched = b.matched_kf.expect("mpLoopMatchedKF");
+        let map = st.atlas.kfs[&cur].map;
+        let init = st.atlas.maps.iter().find(|m| m.id == map).map(|m| m.init_kf_id);
+        let inp = crate::orb3loop::correct::LoopIn { cur, matched, scw: b.slw, loop_mps: &b.mps, loop_matched: &b.matched_mps, fix_scale: true, imu_init: false };
+        let mut ess = super::essops::RsEss { init_kf: init };
+        let out = crate::orb3loop::correct::correct_loop(&inp, &mut st.atlas, &mut self.corrected_by, &mut ess);
+        for k in out.not_erase {
+            if let Some(kf) = st.atlas.kfs.get_mut(&k) {
+                kf.not_erase = true;
+            }
+        }
+        if let Some(m) = st.atlas.maps.iter_mut().find(|m| m.id == map) {
+            m.increase_change_index();
+        }
+        out.run_gba.then_some(map as u64)
     }
     /// mpMergeLastCurrentKF->SetErase() · mpMergeMatchedKF->SetErase() · 일치 수 0 · 짝 목록 비움
     fn clear_merge(&mut self, st: &mut MapState) {

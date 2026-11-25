@@ -13,7 +13,7 @@ use super::lba::{mp_update_normal_and_depth, ObsOrder};
 use super::se3::normalize_rot;
 use super::solver::optimize_stop;
 use super::{Est, Problem, Vertex};
-use crate::orb3rs::localmap::mp_erase_observation;
+use crate::orb3rs::mapdata::mp_erase_observation;
 use crate::orb3rs::track::TrackExt;
 use crate::orb3rs::types::{Atlas, KfId, MpId, Se3};
 
@@ -223,7 +223,7 @@ pub fn merge_local_ba(
         } else {
             None
         };
-        mp_erase_observation(mp, k, atlas, ext);
+        mp_erase_observation(atlas, mp, k);
         if let Some(r) = next_ref {
             atlas.mps.get_mut(&mp).unwrap().ref_kf = r;
         }

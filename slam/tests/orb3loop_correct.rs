@@ -225,6 +225,8 @@ struct Replay {
     before: Option<(KfId, KfId, bool, BTreeMap<KfId, G2oSim3>, BTreeMap<KfId, G2oSim3>, BTreeMap<KfId, BTreeSet<KfId>>, DMap)>,
     after: Option<DMap>,
     why: Vec<String>,
+    /// Some(지도 첫 키프레임) 이면 Rust 본질 그래프
+    rust_ess: bool,
 }
 
 impl EssentialGraph for Replay {
@@ -260,6 +262,15 @@ impl EssentialGraph for Replay {
             self.why.push(format!("Essential 앞 지도 {d:?}"));
         }
         let a = self.after.take().expect("원본 ESSA 없음");
+        if self.rust_ess {
+            // ORBLOOP_RUST_ESS: 원본 결과 대신 Rust 본질 그래프(`orb3sys::essops::RsEss`)를 돌려 원본 ESSA 와 비교
+            slam::orb3sys::essops::RsEss { init_kf: None }.optimize(kfs, mps, _cb, loop_kf, cur, non, cor, lc, fix);
+            let d = strip(diff(kfs, mps, &a));
+            if !d.is_empty() {
+                self.why.push(format!("Rust 본질 그래프 뒤 지도 {d:?}"));
+            }
+            return;
+        }
         for (id, o) in &a.kfs {
             if let Some(k) = kfs.get_mut(id) {
                 k.tcw = o.tcw;
@@ -318,7 +329,7 @@ fn correct_loop_matches_original() {
                 k.first_conn_done = true;
             }
             let mut atlas = Atlas { kfs, mps, ..Default::default() };
-            let mut rep = Replay { before: Some((el, ec, ef, non, cor, lc, mb)), after: Some(ma), why: Vec::new() };
+            let mut rep = Replay { before: Some((el, ec, ef, non, cor, lc, mb)), after: Some(ma), why: Vec::new(), rust_ess: std::env::var("ORBLOOP_RUST_ESS").is_ok() };
             let inp = LoopIn { cur, matched, scw, loop_mps: &loop_mps, loop_matched: &loop_matched, fix_scale: fix, imu_init: false };
             let out = correct_loop(&inp, &mut atlas, &mut corrected_by, &mut rep);
             let (kfs, mps) = (&atlas.kfs, &atlas.mps);

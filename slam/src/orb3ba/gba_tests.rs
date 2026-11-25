@@ -56,6 +56,8 @@ struct Before {
     kfs: Vec<u64>,
     mps: Vec<u64>,
     order: HashMap<u64, Vec<u64>>,
+    /// 그래프가 실제로 읽은 점(나머지는 그 순간 나쁨이었음)
+    used: std::collections::HashSet<u64>,
 }
 struct AfterKf {
     pose: Se3,
@@ -126,7 +128,7 @@ fn read_world(path: &str) -> BTreeMap<i32, (Before, Vec<(u64, AfterKf)>, Vec<(u6
                 mps.push(id);
             }
             atlas.maps.push(Map { id: map_id, kfs: kfs.clone(), mps: mps.clone(), origin_kf: Some(origin), ..Default::default() });
-            befores.insert(idx, Before { loop_kf, init, origin, robust, n_iter, atlas, kfs, mps, order });
+            befores.insert(idx, Before { loop_kf, init, origin, robust, n_iter, atlas, kfs, mps, order, used: Default::default() });
         } else if magic == 0x55424247 {
             // 그래프가 실제로 읽은 점 위치 · 관측으로 앞 기록을 덮음
             let id = r.u64();
@@ -135,6 +137,7 @@ fn read_world(path: &str) -> BTreeMap<i32, (Before, Vec<(u64, AfterKf)>, Vec<(u6
             let ol: Vec<(u64, (i32, i32))> = (0..n).map(|_| (r.u64(), (r.i32(), r.i32()))).collect();
             let b4 = befores.get_mut(&idx).expect("앞 기록");
             b4.order.insert(id, ol.iter().map(|o| o.0).collect());
+            b4.used.insert(id);
             let m = b4.atlas.mps.get_mut(&id).unwrap();
             m.pos = pos;
             m.obs = ol.into_iter().collect();
@@ -148,7 +151,14 @@ fn read_world(path: &str) -> BTreeMap<i32, (Before, Vec<(u64, AfterKf)>, Vec<(u6
                     (id, AfterMp { pos: r.fv::<3>(), gba: r.fv::<3>(), for_kf: r.u64(), normal: r.fv::<3>(), min: r.f32(), max: r.f32() })
                 })
                 .collect();
-            out.insert(idx, (befores.remove(&idx).expect("앞 기록"), kfs, mps));
+            let mut b4 = befores.remove(&idx).expect("앞 기록");
+            // 원본이 그래프를 만들 때 나쁨이던 점(지도 스레드가 앞 기록 뒤에 지움): 읽은 기록이 없음
+            for (id, m) in b4.atlas.mps.iter_mut() {
+                if !b4.used.contains(id) {
+                    m.bad = true;
+                }
+            }
+            out.insert(idx, (b4, kfs, mps));
         } else {
             panic!("모르는 기록 {magic:x}");
         }

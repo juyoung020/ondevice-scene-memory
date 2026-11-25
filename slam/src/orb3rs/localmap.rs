@@ -2,11 +2,12 @@
 //! MapPointCulling · KeyFrameCulling(KeyFrame/MapPoint::SetBadFlag 가 관측 수에 미치는 효과 포함).
 //! 지역 BA 는 opt/orb3-rs-ba 몫이라 부르는 자리만: [`LocalMapperOps::local_ba`].
 use std::collections::BTreeMap;
+use super::mapdata::{kf_set_bad_flag, mp_set_bad_flag};
 use super::track::{obs_weight, TrackExt};
 use super::types::*;
 
 /// LocalMapping::MapPointCulling. `recent` = mlpRecentAddedMapPoints(순서 유지), 돌려줌: SetBadFlag 부른 점들(순서대로).
-/// 점 상태(found · visible · first_kf · bad)는 atlas, nObs 는 ext.
+/// 점 상태(found · visible · first_kf · bad · nObs)는 atlas.
 pub fn map_point_culling(recent: &mut Vec<MpId>, cur_kf: KfId, monocular: bool, atlas: &mut Atlas, ext: &mut TrackExt) -> Vec<MpId> {
     let th: i32 = if monocular { 2 } else { 3 };
     let mut set_bad = Vec::new();
@@ -20,10 +21,10 @@ pub fn map_point_culling(recent: &mut Vec<MpId>, cur_kf: KfId, monocular: bool, 
         let ratio = m.found as f32 / m.visible as f32;
         if ratio < 0.25 {
             set_bad.push(mp);
-            mp_set_bad(mp, atlas, ext);
-        } else if age >= 2 && ext.nobs(mp) <= th {
+            mp_set_bad_flag(atlas, mp);
+        } else if age >= 2 && atlas.mps[&mp].n_obs <= th {
             set_bad.push(mp);
-            mp_set_bad(mp, atlas, ext);
+            mp_set_bad_flag(atlas, mp);
         } else if age >= 3 {
         } else {
             keep.push(mp);
@@ -31,69 +32,6 @@ pub fn map_point_culling(recent: &mut Vec<MpId>, cur_kf: KfId, monocular: bool, 
     }
     *recent = keep;
     set_bad
-}
-
-/// MapPoint::SetBadFlag: 나쁨 표시, 관측한 키프레임 칸 비움(EraseMapPointMatch)
-pub fn mp_set_bad(mp: MpId, atlas: &mut Atlas, _ext: &mut TrackExt) {
-    let obs: Vec<(KfId, (i32, i32))> = {
-        let m = atlas.mps.get_mut(&mp).unwrap();
-        m.bad = true;
-        std::mem::take(&mut m.obs).into_iter().collect()
-    };
-    for (kf, (l, _r)) in obs {
-        if let Some(k) = atlas.kfs.get_mut(&kf) {
-            if l >= 0 && (l as usize) < k.map_points.len() {
-                k.map_points[l as usize] = None;
-            }
-        }
-    }
-}
-
-/// MapPoint::EraseObservation(kf): 관측 무게 빼고, 기준 키프레임이면 다음 관측으로, nObs ≤ 2 면 SetBadFlag
-pub fn mp_erase_observation(mp: MpId, kf: KfId, atlas: &mut Atlas, ext: &mut TrackExt) {
-    let bad = {
-        let m = atlas.mps.get_mut(&mp).unwrap();
-        let Some((l, r)) = m.obs.get(&kf).copied() else { return };
-        let mut w = 0;
-        if l != -1 {
-            w += obs_weight(atlas.kfs[&kf].u_right[l as usize]);
-        }
-        if r != -1 {
-            w += 1;
-        }
-        let m = atlas.mps.get_mut(&mp).unwrap();
-        m.obs.remove(&kf);
-        // if(mpRefKF==pKF) mpRefKF=mObservations.begin()->first (비면 begin() 이 end — 곧 나쁨이 되므로 그대로 둠)
-        if m.ref_kf == kf {
-            if let Some((&first, _)) = m.obs.iter().next() {
-                m.ref_kf = first;
-            }
-        }
-        let n = ext.mp_nobs.entry(mp).or_insert(0);
-        *n -= w;
-        *n <= 2
-    };
-    if bad {
-        mp_set_bad(mp, atlas, ext);
-    }
-}
-
-/// KeyFrame::SetBadFlag 중 컬링 판단에 닿는 효과: 처음 키프레임 · 지우지 말기(mbNotErase)면 그냥 돌아감,
-/// 아니면 나쁨 표시와 자기 지도 점들의 관측 지우기. (신장 트리 다시 잇기 · 공시성 갱신은 판단에 안 닿아 통합 때 옮김)
-pub fn kf_set_bad(kf: KfId, atlas: &mut Atlas, ext: &mut TrackExt) -> bool {
-    let k = &atlas.kfs[&kf];
-    if ext.map_init_kf.get(&k.map) == Some(&kf) {
-        return false;
-    }
-    if ext.kf_not_erase.contains(&kf) {
-        return false;
-    }
-    let mps: Vec<MpId> = k.map_points.iter().flatten().copied().collect();
-    for mp in mps {
-        mp_erase_observation(mp, kf, atlas, ext);
-    }
-    atlas.kfs.get_mut(&kf).unwrap().bad = true;
-    true
 }
 
 /// LocalMapping::KeyFrameCulling(관성 없음). `local` = 지금 키프레임의 공시성 순서 목록(UpdateBestCovisibles 뒤).
@@ -112,7 +50,7 @@ pub fn keyframe_culling(
     for &kf in local {
         count += 1;
         let k = &atlas.kfs[&kf];
-        let is_init = ext.map_init_kf.get(&k.map) == Some(&kf);
+        let is_init = atlas.map_ref(k.map).is_some_and(|m| m.init_kf_id == kf);
         if !(is_init || k.bad) {
             let thd = th_depth(kf);
             let th_obs = 3;
@@ -128,7 +66,7 @@ pub fn keyframe_culling(
                     continue;
                 }
                 n_mps += 1;
-                if ext.nobs(mp) > th_obs {
+                if m.n_obs > th_obs {
                     let lvl = k.keys[i].octave;
                     let mut n = 0;
                     for (&okf, &(l, _r)) in m.obs.iter() {
@@ -150,7 +88,7 @@ pub fn keyframe_culling(
             }
             if (n_red as f32) > redundant_th * n_mps as f32 {
                 called.push(kf);
-                kf_set_bad(kf, atlas, ext);
+                kf_set_bad_flag(atlas, kf);
             }
         }
         if (count > 20 && abort_ba()) || count > 100 {
@@ -546,110 +484,6 @@ fn reproj_ok(cam: &Camera, p: &KfPose, x3d: &[f32; 3], z: f32, kp: &KeyPoint, ur
     }
 }
 
-/// MapPoint::UpdateNormalAndDepth(단일 카메라). 관측 순서 = obs 열쇠(KfId) 순 — 원본은 KeyFrame* 주소 순
-pub fn update_normal_and_depth(mp: MpId, atlas: &mut Atlas) {
-    let m = &atlas.mps[&mp];
-    if m.bad || m.obs.is_empty() {
-        return;
-    }
-    let pos = m.pos;
-    let mut normal = [0f32; 3];
-    let mut n = 0i32;
-    for (k, &(l, _r)) in m.obs.iter() {
-        if l != -1 {
-            let ow = atlas.kfs[k].twc.t;
-            let ni = [pos[0] - ow[0], pos[1] - ow[1], pos[2] - ow[2]];
-            let d = norm3(&ni);
-            for c in 0..3 {
-                normal[c] += ni[c] / d;
-            }
-            n += 1;
-        }
-    }
-    let rk = &atlas.kfs[&m.ref_kf];
-    let ow = rk.twc.t;
-    let pc = [pos[0] - ow[0], pos[1] - ow[1], pos[2] - ow[2]];
-    let dist = norm3(&pc);
-    let li = m.obs.get(&m.ref_kf).map(|o| o.0).unwrap_or(-1);
-    // 원본 observations[pRefKF]: 없으면 (0,0) 이 새로 생김 → 번호 0
-    let level = rk.keys[li.max(0) as usize].octave as usize;
-    let sc = &rk.ctx.pyr.scale;
-    let max_d = dist * sc[level];
-    let min_d = max_d / sc[rk.ctx.pyr.nlevels as usize - 1];
-    let nf = n as f32;
-    let m = atlas.mps.get_mut(&mp).unwrap();
-    m.max_dist = max_d;
-    m.min_dist = min_d;
-    m.normal = [normal[0] / nf, normal[1] / nf, normal[2] / nf];
-}
 
-/// KeyFrame::UpdateBestCovisibles: (무게, 키프레임) 오름차순 → 앞에 끼워 넣기(나쁜 것 뺌)
-pub fn update_best_covisibles(kf: KfId, atlas: &mut Atlas) {
-    let mut pairs: Vec<(i32, KfId)> = atlas.kfs[&kf].conn_weights.iter().map(|(&k, &w)| (w, k)).collect();
-    pairs.sort();
-    let ord: Vec<(KfId, i32)> = pairs.iter().rev().filter(|(_, k)| !atlas.kfs[k].bad).map(|&(w, k)| (k, w)).collect();
-    atlas.kfs.get_mut(&kf).unwrap().ordered_conn = ord;
-}
 
-/// KeyFrame::AddConnection
-pub fn add_connection(kf: KfId, other: KfId, w: i32, atlas: &mut Atlas) {
-    let k = atlas.kfs.get_mut(&kf).unwrap();
-    if k.conn_weights.get(&other) == Some(&w) {
-        return;
-    }
-    k.conn_weights.insert(other, w);
-    update_best_covisibles(kf, atlas);
-}
 
-/// KeyFrame::UpdateConnections(upParent = true). `init_kf` = 지도 mnInitKFid. 첫 연결(부모 없음)이면 부모 정함
-pub fn update_connections(kf: KfId, init_kf: KfId, atlas: &mut Atlas) {
-    let k = &atlas.kfs[&kf];
-    let map = k.map;
-    let mut counter: BTreeMap<KfId, i32> = BTreeMap::new();
-    for mp in k.map_points.iter().flatten() {
-        let m = &atlas.mps[mp];
-        if m.bad {
-            continue;
-        }
-        for o in m.obs.keys() {
-            let ok = &atlas.kfs[o];
-            if *o == kf || ok.bad || ok.map != map {
-                continue;
-            }
-            *counter.entry(*o).or_insert(0) += 1;
-        }
-    }
-    if counter.is_empty() {
-        return;
-    }
-    let (mut nmax, mut kmax) = (0, None);
-    let mut pairs: Vec<(i32, KfId)> = Vec::new();
-    for (&o, &c) in counter.iter() {
-        if c > nmax {
-            nmax = c;
-            kmax = Some(o);
-        }
-        if c >= 15 {
-            pairs.push((c, o));
-            add_connection(o, kf, c, atlas);
-        }
-    }
-    if pairs.is_empty() {
-        let o = kmax.unwrap();
-        pairs.push((nmax, o));
-        add_connection(o, kf, nmax, atlas);
-    }
-    pairs.sort();
-    let ord: Vec<(KfId, i32)> = pairs.iter().rev().map(|&(w, k)| (k, w)).collect();
-    let first = ord[0].0;
-    let k = atlas.kfs.get_mut(&kf).unwrap();
-    k.conn_weights = counter;
-    k.ordered_conn = ord;
-    if k.parent.is_none() && kf != init_kf {
-        k.parent = Some(first);
-        let p = atlas.kfs.get_mut(&first).unwrap();
-        if let Err(i) = p.children.binary_search(&kf) {
-            p.children.insert(i, kf);
-        }
-    }
-}

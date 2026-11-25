@@ -665,9 +665,9 @@ impl Matcher {
                 if let Some(q) = kf.map_points[bi] {
                     if !mps[&q].bad {
                         if mps[&q].n_obs > mps[&pid].n_obs {
-                            replace_map_point(pid, q, kfs, mps);
+                            super::mapdata::mp_replace_parts(kfs, mps, pid, q);
                         } else {
-                            replace_map_point(q, pid, kfs, mps);
+                            super::mapdata::mp_replace_parts(kfs, mps, q, pid);
                         }
                     }
                 } else {
@@ -831,33 +831,3 @@ impl Matcher {
     }
 }
 
-/// MapPoint::Replace(old → new): old 의 관측을 new 로 옮기고 old 는 나쁨 표시(지도에서 지우기는 부른 쪽 Map 몫)
-pub fn replace_map_point(old: MpId, new: MpId, kfs: &mut BTreeMap<KfId, KeyFrame>, mps: &mut BTreeMap<MpId, MapPoint>) {
-    if old == new {
-        return;
-    }
-    let (obs, nvisible, nfound) = {
-        let o = mps.get_mut(&old).unwrap();
-        o.bad = true;
-        o.replaced = Some(new);
-        (std::mem::take(&mut o.obs), o.visible, o.found)
-    };
-    for (k, (l, r)) in obs {
-        let in_kf = mps[&new].obs.contains_key(&k);
-        for idx in [l, r] {
-            if idx == -1 {
-                continue;
-            }
-            if !in_kf {
-                kfs.get_mut(&k).unwrap().map_points[idx as usize] = Some(new);
-                mps.get_mut(&new).unwrap().add_observation(&kfs[&k], idx as usize);
-            } else {
-                kfs.get_mut(&k).unwrap().map_points[idx as usize] = None;
-            }
-        }
-    }
-    let n = mps.get_mut(&new).unwrap();
-    n.found += nfound;
-    n.visible += nvisible;
-    n.compute_distinctive_descriptors(kfs);
-}

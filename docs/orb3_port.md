@@ -27,7 +27,8 @@
 |---|---|---|
 | ORB 추출 · 짝짓기 · 공통 자료 구조 · 통합 | `opt/orb3-rust` | ORBextractor · ORBmatcher · Frame · KeyFrame · MapPoint · Map · Atlas |
 | 포즈 최적화 · PnP | `opt/orb3-rs-opt` | Optimizer::PoseOptimization · MLPnPsolver |
-| 지역 BA · 전역 BA · 그래프 최적화 | `opt/orb3-rs-ba` | Optimizer(LocalBA · GlobalBA · EssentialGraph · Sim3) · g2o |
+| 지역 BA · 전역 BA | `opt/orb3-rs-ba` | Optimizer(LocalBA · GlobalBA) · g2o |
+| Sim3 최적화 · 본질 그래프 | `opt/orb3-rs-cv` | Optimizer(OptimizeSim3 · OptimizeEssentialGraph) |
 | BoW · 키프레임 DB · 재위치 · 루프 · Atlas 합치기 | `opt/orb3-rs-loop` | DBoW2 · KeyFrameDatabase · LoopClosing · Sim3Solver |
 | NPU 준비 | `opt/orb3-rs-npu` | ORB 추출 · 기술자 · 장소 인식 후보 |
 
@@ -41,7 +42,7 @@
 |---|---|---|---|
 | ORBextractor | Frame | Rust 옮김(비트 동일) | 통합(이 브랜치) |
 | ORBmatcher | Tracking · LocalMapping · LoopClosing | 옮김 | 통합 |
-| Frame · KeyFrame · MapPoint · Map · Atlas | 전체 | 자료 구조 정의함, 동작 함수는 옮김 | 통합 |
+| Frame · KeyFrame · MapPoint · Map · Atlas | 전체 | 자료 구조 정의함, 동작 함수는 옮김. KeyFrame.cc · MapPoint.cc · Map.cc 메서드는 `orb3rs::mapdata`(비트 동일) | 통합 · OPT |
 | Tracking(추적 상태 기계 · 지역 지도 추적 · 키프레임 결정 · 우리 패치: 위쪽 · 옮겨 붙이기) | System | 옮김 | TRACK |
 | LocalMapping(점 만들기 · 지우기 · 키프레임 걸러내기) | 지도 스레드 | 옮김 | TRACK(없으면 통합) |
 | Optimizer::PoseOptimization · MLPnPsolver | 추적 · 재위치 | 옮김 | OPT |
@@ -86,7 +87,7 @@ WSL 사본: `~/slam-bench/orb3-nopango`(빌드됨). 비트 비교 기준 빌드(
 - `struct Frame { id, timestamp, keys, desc, u_right, depth, map_points: Vec<Option<MpId>>, outlier, grid(col*48+row), grid_inv_w/h, min/max_x/y, tcw: Option<Se3>, ref_kf, bow: BTreeMap<u32,f64>, feat: BTreeMap<u32,Vec<u32>> }`
 - `struct KeyFrame { id, frame_id, map, timestamp, keys, desc, u_right, depth, map_points, grid, tcw, bad, bow, feat, conn_weights, ordered_conn, parent, children, loop_edges, merge_edges, tcp }`
 - `struct MapPoint { id, map, pos, normal, desc, obs: BTreeMap<KfId,(i32,i32)>, ref_kf, first_kf, visible, found, min_dist, max_dist, bad, replaced, track_* , last_frame_seen }`
-- `struct Map { id, kfs, mps, origin_kf, bad, change_id }`, `struct Atlas { maps, current, kfs, mps, next_kf, next_mp }`
+- `struct Map { id, kfs, mps /* 둘 다 id 순 정렬 유지 */, origin_kf, bad, change_id, init_kf_id, max_kf_id, lower_kf, ref_mps, big_change_idx, change_notified }`, KeyFrame 에 `first_conn_done`(= !mbFirstConnection) · `not_erase` · `to_be_erased`, `struct Atlas { maps, current, kfs, mps, next_kf, next_mp }`
 - 원본의 `std::set<KeyFrame*>` · `std::set<MapPoint*>`(주소 순, 실행마다 다를 수 있음)는 id 순. 하네스에서는 원본 쪽 순회를 id 순으로 정렬해 비교한다.
 
 추출(`orb3rs::extract`): `Extractor::new(Pyramid 설정) ; fn extract(&mut self, gray: &[u8], w, h) -> (Vec<KeyPoint>, Vec<Desc>)`(RGB-D 는 vLappingArea = [0,0] 이라 원본 출력 순서 그대로).
@@ -139,12 +140,21 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - 관측 순서(⑤): Rust 기본은 번호 순(`MapPoint::obs` · `ObsOrder(None)`), 비트 시험만 덤프의 포인터 순서를 넣음. 원본 판은 `map<KeyFrame*>` 할당 주소 순이라 실행마다 간선 순서 · 법선 합 · 기준 키프레임이 흔들리고, 실제 실행 궤적 대조에서 이 차이는 남는다. `opt/pose-parb` 의 번호 순 비교자(-include, 미확정)가 들어오면 원본도 번호 순이 되어 맞춰짐.
 - 받은 브랜치(5 차): LOOP 334c205(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · FindMatchesByProjection `orb3loop::detect`). 시험: `ORBLOOP_LOOPDUMP=~/orbloop_reloc/loop_room.bin:~/orbloop_reloc/loop_ds.bin ORBLOOP_MLPSRV=~/opt/orb3_loop_bg/reloc/mlp_srv cargo test --release -p slam --test orb3loop_detect` 통과. TRACK 은 아직 커밋 없음(작업 트리에 localmap · track · types 수정).
 - **g2o::Sim3 한 벌**: 타입은 `orb3cv::g2osim3::G2oSim3` 하나. BA 판(`orb3ba::sim3`, 쓰는 곳은 시험뿐)은 지움 — CV 판이 BA 하네스 덤프(`/tmp/sim3.bin`, sim3ref 4 만 건 × 7 연산)도 비트 동일로 통과(`ORB3BA_SIM3=/tmp/sim3.bin cargo test --release -p slam --lib orb3ba::tests::sim3_ops`). LOOP 의 `detect::G2oSim3` 도 같은 타입(곱 · 회전 식이 같음)이고, LoopClosing.cc 안에 인라인된 자리의 행렬→사원수 대각 합 순서 (m00+m11)+m22 만 `G2oSim3::from_rows` 로 따로 둠(probe 판 `from_mat` 은 (R22+R11)+R00 — 같은 식도 인라인 자리마다 순서가 다름).
-- **Rust System 뼈대 `orb3sys::rsys::RustSystem`**(`Orb3System` 구현, 컴파일됨): 설정 · 입력 변환(`orb3cv::system`) → ORB 추출 → `Frame::new_rgbd` → `track::track_flow` → 지도 스레드(`mapping::run`, Rust LBA) → 루프 대기열. 빈자리는 원본 FFI 로 대신 부르지 않고 `hole(이름)` 으로 멈춤 — 남은 목록 `rsys::HOLES`: StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame(이상 TRACK 몫) · DoPendingGraft · LocalMapping ProcessNewKeyFrame(UpdateConnections · ComputeBoW) · SearchInNeighbors. 메워지면 `orb3_backend` 가 `RustSystem::open(설정, w, h)` + `set_vocabulary` 로 연다.
+- **Rust System 뼈대 `orb3sys::rsys::RustSystem`**(`Orb3System` 구현, 컴파일됨): 설정 · 입력 변환(`orb3cv::system`) → ORB 추출 → `Frame::new_rgbd` → `track::track_flow` → 지도 스레드(`mapping::run`, Rust LBA) → 루프 대기열. 빈자리는 원본 FFI 로 대신 부르지 않고 `hole(이름)` 으로 멈춤 — 남은 목록 `rsys::HOLES`: StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame(이상 TRACK 몫) . 메워지면 `orb3_backend` 가 `RustSystem::open(설정, w, h)` + `set_vocabulary` 로 연다.
 - 받은 브랜치(6 차): TRACK fcb3ec0(CreateNewMapPoints RGB-D · 삼각측량 비트 동일, Track 흐름 마지막 키프레임 갱신, 덤프 도구 `slam/tools/orb3_track_dump`). 통합 쪽 변경: `TrackOps::need_new_keyframe(&mut self, t: &Tracker)` — 흐름이 `&mut Tracker` 를 쥔 채 부르므로 지금 추적 칸을 인자로 받음(재생 도구 구현도 맞춤).
 - 지도 스레드 단계 `rsys::RsSteps`(KfSteps): MapPointCulling · CreateNewMapPoints(ORBmatcher(0.6, false) SearchForTriangulation, 공시성 10, 새 점 = AddObservation 둘 · KF 점 칸 · ComputeDistinctiveDescriptors · UpdateNormalAndDepth · mlpRecentAddedMapPoints) · KeyFrameCulling(공시성 전체 순서, mbAbortBA = `Mapper::abort_ba`)은 TRACK 비트 동일 함수를 엮음. 새 점을 지도에 넣는 부분은 원본 대조 전(전체 재생 때 확인).
 - 지도 관리(원본 그대로, 실수 계산 없는 상태 조작): Atlas::CreateNewMap(mnLastInitKFidMap = 지금 지도 최대 KF + 1, 새 지도 id = Map::nNextId) · ChangeMap · ResetActiveMap(지도 스레드 한가 대기 → KFDB clearMap → 지금 지도의 KF · 점 지우기(지도 id 유지) → mnLastInitFrameId · mnInitialFrameId · mnLastRelocFrameId = 지금 장면, 상태 NO_IMAGES_YET · 기준/마지막 KF 없음 · 속도 없음, 장면 비움). 흐름 중 바뀌는 추적 칸은 `Edits` 로 모아 흐름 뒤에 넣고 NeedNewKeyFrame 은 넣은 판으로 판단(RGB-D 에서 Reset 뒤 흐름은 바로 끝나 순서 같음).
 - Relocalization–KeyFrameDatabase: ComputeBoW(transform 4 층) → `KeyFrameDatabase::detect_reloc`(Atlas 위 `AtlasGraph`, DB 번호 u32) → `orb3loop::reloc::relocalize`(Rust MLPnP, `GlibcRand` 씨앗 1 하나) → 성공 시 mnLastRelocFrameId. KFDB 에 키프레임 넣기는 루프 스레드(LoopOps) 몫이라 아직 비어 있음.
 - 6 차 병합 뒤 전체 재실행(11-25 저녁, 전부 통과): LOOP 비트 9 · 재위치 흐름 2 · 공통 영역 찾기 1 · BA 5(입력 다시 만듦) · 실제 전역 BA 1 · LBA 37 호출 1 · orb3sys 9 · orb3cv 10. TRACK 재생(`runall.sh`, 원본 덤프를 새로 만들어야 함, 1.5 GB)은 포터 TRACK 이 자기 브랜치에서 돌린 결과(`~/orbtrack_out/result_v5.txt`)를 따름.
+- 받은 브랜치(7 차, 11-25 저녁): OPT 753042f(mapdata) · 64533c4(Sim3 자세 그래프 sim3pg), CV 096e56b(OptimizeSim3 · 본질 그래프 루프 판), LOOP 91816e5(공통 영역 33/33 · CorrectLoop 초안), BA 6d189fc(전역 BA orb3ba::gba), TRACK 648748b(ProcessNewKeyFrame · SearchInNeighbors). OPT 가 옛 orb3ba 사본(sim3.rs 포함)을 함께 올려 add/add 충돌 → 통합판 orb3ba 유지, sim3pg 는 `orb3cv::g2osim3::G2oSim3` 를 씀.
+- **지도 자료 메서드 한 벌 `orb3rs::mapdata`**: 지운 옛 판 — TRACK localmap 의 mp_set_bad · mp_erase_observation · kf_set_bad · update_normal_and_depth · update_best_covisibles · add_connection · update_connections, CV atlas_io 의 mp_erase_observation · mp_set_bad, matcher::replace_map_point(→ `mapdata::mp_replace_parts`, 지도 집합 없는 자리용), LOOP correct.rs 의 G2oSim3 inverse · map · Replace. LBA · GBA 의 UpdateNormalAndDepth 는 관측 순서만 넣는 `mapdata::mp_update_normal_and_depth_obs`. `TrackExt` 의 mp_nobs · kf_not_erase · map_init_kf 칸은 지우고 공통 자료(MapPoint.n_obs · KeyFrame.not_erase · Map.init_kf_id)로. 기준 관측이 없을 때 원본 observations[pRefKF] 의 (0, 0) 를 mapdata 에도 넣음. 남은 겹침: LOOP `orb3loop::graph`(update_connections · add_connection 등, Atlas 없이 kfs · mps 판) — LOOP 가 mapdata 로 옮길 차례(운영자가 LOOP 에 알림).
+- **기준 빌드 어긋남(TRACK)**: TRACK 덤프 도구(`~/opt/orb3_track_bg`, runall.sh)는 `~/slam-bench/src/ORB_SLAM3`(GCC 기본 FMA 합치기 빌드)에 링크돼 있어, 기준 빌드(-ffp-contract=off)와 비트 같은 mapdata 로 모은 뒤 TRACK 재생에서 UpdateNormalAndDepth 법선 · 거리가 끝자리 다름(TRACK 옛 판은 dot3 = fma 사슬로 FMA 빌드를 따랐음). OPT 대조(mapdata, 기준 빌드)는 강의실 686 · TUM room 206 호출 통과. TRACK 은 덤프 도구를 `~/opt/orb3_ref` 에 다시 링크해야 함(TRACK 에 알림).
+- **옮겨 붙이기 `orb3sys::graft`**(패치 TryGraft · DoPendingGraft · GraftMap · RequestGraft): 원본 계산 대조 probe(`~/opt/orb3_sys/graft/probe.cc`, 기준 빌드 플래그) 5 만 건 — YawOnly · 키프레임 자세 × S⁻¹ · S × 점 · 법선 회전 · TryGraft dt · da **비트 동일**(`ORB3GRAFT=/tmp/graft.bin cargo test --release -p slam --lib orb3sys::graft`). 알게 된 것: 패치의 `atan2(R(1,0), R(0,0))` 는 이름공간 없는 C atan2(double), `da * 180.f / M_PI` 는 double 나눗셈, 그 자리 Quaternionf(Matrix3f) 대각 합은 (m22+m11)+m00. 루프 · 전체 BA 중이면 미루는 검사(mMutexBusy · isRunningGBA)는 루프 스레드를 붙일 때(`RustSystem::loop_busy`, 지금 false).
+- **ResetActiveMap 원본대로**: Track() 안 mpSystem->ResetActiveMap() 은 표지만, 실제 Tracking::ResetActiveMap 은 다음 장면 시작(장면 만들기 전). 지도 스레드는 `Mapper::reset_active_map`(지금 키프레임을 마친 뒤 대기열 버림 · 최근 점 목록 비움 = ResetIfRequested) — 이전 판의 "한가할 때까지 기다림"은 지움.
+- **OptimizeSim3 Rust(`orb3loop::detect::RustSim3`, CV sim3opt 를 detect 트레잇에)**: 공통 영역 찾기 시험에 `ORBLOOP_RUST_S3=1` 을 더하면 FFI 대신 Rust — 원본 기록과 13/13 · 호출 33/33 같음.
+- **전역 BA 결과 넣기 `orb3sys::gbaops::RsGba`**(GbaOps): run = 잠금 안에서 뜬 지도로 `gba::global_bundle_adjustment`(10 번, 강건 없음), apply = RunGlobalBundleAdjustment 뒷부분(첫 키프레임부터 신장 트리 BFS · 자식 mTcwGBA 전파 · mTcwBefGBA · 점은 BA 값 또는 기준 키프레임 보정 · 큰 변화 표시). 원본 대조 덤프 없음(전역 BA 하네스는 BA 호출만) — 루프 전체 재생 때 확인.
+- KFDB 넣기(mpKeyFrameDB->add)는 원본 LoopClosing::NewDetectCommonRegions 안(작은 지도 · 검출 · 끝) — LoopOps::detect(통합 담당)를 엮을 때 같이 넣음. LOOP 문서는 KeyFrameDatabase 자체만 맡음(겹침 없음).
+- 7 차 병합 뒤 시험(전부 통과, 아래 둘 빼고): mapdata(덤프 orb3_mapdump.sh run 으로 다시 만듦) · sim3pg 300 그래프 · graft 5 만 · LOOP 비트 9 · 재위치 2 · 공통 영역 33/13(FFI · Rust 둘 다) · BA 5 · 실제 GBA · gba_tests(room_gba2) · LBA 37 · orb3sys 9 · orb3cv 12. 실패 ① `orb3loop_correct`(LOOP CorrectLoop 초안 — LOOP 브랜치 91816e5 그대로도 0/2, 병합 탓 아님) ② TRACK desk2 재생 UpdateNormalAndDepth · UpdateConnections(주소 순) 차이 — 위 기준 빌드 어긋남.
 - 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀. 다음 단계는 System 흐름(추적 · 지도 · 루프 스레드)을 Rust 모듈로 엮어 `orb3_backend` 를 바꿔 끼우는 것 — 아직 안 옮긴 것: LocalMapping 의 BA 호출부(BA 포터 대기), LoopClosing 흐름 · CorrectLoop · MergeLocal, MLPnPsolver · Relocalization.
 
 ## 정확도 브랜치 따라가기
@@ -230,9 +240,18 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - 실패한 재위치는 장면이 들어올 때 상태(앞 추적의 자세 · 짝)를 그대로 남기므로 덤프에 그 상태도 넣음.
   - 실행: `ORBLOOP_RELOC=~/orbloop_reloc/room.bin:~/orbloop_reloc/ds.bin ORBLOOP_MLPSRV=~/opt/orb3_loop_bg/reloc/mlp_srv cargo test --release -p slam --test orb3loop_reloc`(입력 없으면 실패).
 
+### 공통 영역 찾기(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF) — `orb3loop/detect.rs`
+- 옮긴 것: FindMatchesByProjection · DetectCommonRegionsFromLastKF · DetectAndReffineSim3FromLastKF · DetectCommonRegionsFromBoW, g2o::Sim3(double: 사원수 곱 · 점 회전 · 행렬↔사원수 · 곱 · toSophus). OptimizeSim3 는 트레잇(BA 몫이 오면 바꿔 낌).
+- 대조(`slam/tests/orb3loop_detect.rs`): 원본 기준 빌드에 `~/opt/orb3_loop_bg/reloc/loop_dump`(두 함수 · OptimizeSim3 · RandomInt 가로챔)를 링크해 돌림. 호출마다 들어갈 때 상태(현재 키프레임 둘레 2 단계 · 후보 둘레 3 단계 공시 키프레임, 그 지도 점과 관측, 출력 칸의 이전 값), 안에서 쓴 난수, OptimizeSim3 입출력, 나올 때 출력. OptimizeSim3 은 원본 FFI(`mlp_srv` 명령 4: 기준 빌드의 Optimizer::OptimizeSim3 를 가짜 키프레임 · 지도 점으로 부름).
+  - TUM fr1_room(`0-1362,0-700` 되감기) + 강의실 ds_1118(`0-2400`): 호출 33(참 2) **33 / 33 같음**(결과 · 찾은 키프레임 · gScw 비트 · 일치 수 · 점 목록 · 난수 수), OptimizeSim3 13 / 13(입력 짝 · S · 결과 · 남은 짝 · S 비트). 앞선 실행 덤프(room · ds 3 개 루프)로도 52 / 52 · 13 / 13.
+  - OptimizeSim3 까지 간 호출은 모두, 나머지는 25 개 중 하나만 남김(덤프 크기). LastKF 단계는 실제 실행에 드물어 BoW 로 찾은 직후 같은 상태로 원본 DetectAndReffineSim3FromLastKF 를 한 번 더 불러 덤프(지도를 바꾸지 않는 함수).
+  - 덤프하는 동안 지도 스레드를 멈춤(RequestStop · isStopped 대기 · Release). 안 멈추면 원본 루프 스레드가 지도 스레드와 같이 돌아 덤프 뒤 상태가 바뀜 — 처음 실행에서 254 호출 중 32 개가 그래서 난수 범위(Sim3 짝 수)가 달랐음.
+- 맞추며 알게 된 원본 동작: `SE3f.cast<double>()` 은 SO3d 생성자를 거쳐 double 로 다시 정규화(`unit_quaternion().cast<double>()` 은 안 함 — CorrectLoop 의 NonCorrectedSim3 가 이쪽). Quaterniond 곱은 SSE2 Packet2d 판 식(`quatd_mul`). 원본 버릇: BoW 단계 `pMostBoWMatchesKF` 는 늘 후보 자신, `DetectCommonRegionsFromLastKF` 가 `vpMapPoints` 를 덮어씀, FindMatchesByProjection 의 2 단계 이웃은 걸러지지 않고 통째로 붙음, DetectAndReffine 은 OptimizeSim3 결과를 버림(모두 `detect.rs` 머리말).
+- 강의실 실행에서 원본이 두 번 멈춤(`Loop detected` 뒤 `Local Mapping STOP` 다음 진행 없음, 25 분)과 한 번 `std::system_error: Invalid argument` 로 죽음. 덤프 쪽 멈춤 요청 · 풀기(Release 하나가 다른 요청자의 멈춤까지 지움)가 원본의 그 위험을 더 드러냈을 수 있음 — 포팅판은 `orb3sys::threads` 의 StopToken.
+
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
-- `Tracking::Relocalization` 흐름, `LoopClosing`(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
+- `LoopClosing`(CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
 - KeyFrameDatabase 대조는 실제 BoW + 만든 공시성 시나리오. 실제 실행 중 질의를 가로챈 대조는 안 함.
 - 강의실 녹화(ds_1118)는 BoW 단계만; Sim3 · 고유 풀이 대조는 TUM fr1_room 실행 하나.
 
@@ -299,6 +318,29 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 
 확인 안 한 것: 평면 경로는 실제 덤프에 한 번도 나오지 않음(세계 원점을 지나는 평면 위 6 점에서만 생김) — 무작위 평면 장면으로만 확인. 최소 집합 6 이 아닌 설정(`SetRansacParameters` 의 minSet)은 옮기지 않음(원본 Tracking 은 6 만 씀). 고윳값 반복이 30·n 회를 넘는(수렴 실패) 경로 · NaN 입력 경로는 확인 못 함.
 
+#### 지도 자료 메서드(KeyFrame.cc · MapPoint.cc · Map.cc)
+
+모듈 `slam/src/orb3rs/mapdata.rs`(통합 타입 위, 이미 옮겨진 `MapPoint::add_observation` · `compute_distinctive_descriptors` · `predict_scale` 은 그대로 씀):
+
+- KeyFrame: `kf_update_connections`(공시성 세기 · 15 문턱 · 최대 하나 · 처음 연결 부모) · `kf_update_best_covisibles` · `kf_add_connection` · `kf_erase_connection` · `kf_set_bad_flag`(연결 끊기 · 점 관측 지우기 · 신장 트리 다시 잇기 · mTcp · 지도에서 빼기, KeyFrameDatabase 빼기는 true 를 받은 쪽) · `kf_set_erase` · `kf_change_parent` · `kf_erase_map_point_match` · `kf_tracked_map_points`, 자기 칸만 보는 `weight` · `best_covisibility` · `covisibles_by_weight` · `vector_covisible` · `add/erase_child` · `add_loop_edge` · `add_merge_edge` · `add_map_point` 등.
+- MapPoint: `mp_erase_observation`(관측 수 · 새 기준 kf · 2 이하면 나쁨) · `mp_set_bad_flag` · `mp_replace`(+ 지도에서 빼기) · `mp_update_normal_and_depth`, `found_ratio` · `index_in_keyframe` 등.
+- Map: `add_keyframe`(첫 kf · 최대 · 최저 id) · `erase_keyframe` · `add/erase_map_point` · `set_reference_map_points` · `inform_new_big_change` · `increase_change_index` 등. kfs · mps 는 id 순 정렬(std::set 대신).
+- 겹치는 옛 판: `orb3cv::atlas_io::mp_erase_observation/mp_set_bad`(CV) · `orb3rs::localmap::mp_set_bad/mp_erase_observation/kf_set_bad`(TRACK, nObs 를 TrackExt 에 둠) · `matcher::replace_map_point`(지도에서 빼기 없음)는 이 모듈과 같은 일을 함 — 통합 때 이것으로 모으면 됨.
+
+순서: 원본 `std::map/set<KeyFrame*>` 은 **주소 순**이고 실제 실행에서 주소 순 ≠ id 순이 흔함(강의실 · TUM 모두, 기록의 대부분). 결과가 순서에 닿는 자리 — `UpdateBestCovisibles` · `UpdateConnections` 의 무게 동률(pair 비교가 포인터로 갈림) · 최대 개수 동률, `SetBadFlag` 자식 동률, `EraseObservation` 의 새 기준 kf, `ComputeDistinctiveDescriptors` 의 중앙값 동률, **`UpdateNormalAndDepth` 의 법선 합(실수 더하기 순서라 1 ulp 갈림)** — 에서 Rust(id 순)는 주소 순 원본과 다를 수 있다. 원본 자체가 실행마다 다르므로 포팅판은 id 순(결정적)으로 두고, 시험은 기록마다 주소 순위로 id 를 바꿔(같음 비교만 쓰는 id 라 의미가 같음) 원본 순서를 되살려 대조한다.
+
+하네스: `slam/cpp/orb3_mapdump.cc` + `orb3_mapdump.sh`(build · run). 기준 빌드 원본(`~/opt/orb3_ref`)을 RGB-D 로 돌리며 바꾸는 메서드 30 개를 PLT 로 가로채 호출 앞뒤 상태(지도 칸 · 관련 키프레임 그래프 · 점 칸 · 지도 점 · 키프레임별 층 · 오른쪽 좌표 · 기술자 · 주소)를 덤프. 바꾸는 메서드와 SetPose · SetWorldPos · IncreaseVisible/Found 는 전역 재귀 잠금 하나 아래서 돌아 덤프 중 다른 스레드가 상태를 못 바꿈. 같은 오브젝트 안 호출(AddConnection · EraseConnection · ChangeParent 등을 KeyFrame.cc 안에서 부르는 것)은 PLT 를 안 거쳐 바깥 호출 안에 포함돼 확인됨. 시험 `ORBMAP_DUMPS=a.bin:b.bin cargo test --release -p slam --lib orb3rs::mapdata`(입력 없으면 실패).
+
+| 데이터 | 기록(호출) | 비트 같음 | 주소 순위로 바꿔 대조 |
+|---|---|---|---|
+| 강의실 ds_1118_121652 전체 3,807 프레임(루프 · 지도 합치기 포함) | UpdateConnections 738 · KF SetBadFlag 147(실제 지움 147) · SetErase 200 · UpdateBestCovisibles 741 · ChangeParent 10 · EraseChild 6 · Loop/MergeEdge 6 · SetNotErase 1,205 · EraseObservation 3,000 · MP SetBadFlag 3,000 · Replace 2,000 · ComputeDistinctiveDescriptors 3,000 · UpdateNormalAndDepth 3,000 · EraseMapPointMatch 3,000 · AddObservation 3,000 · KF AddMapPoint 3,000 · PredictScale 40,000 · Map Add/EraseKeyFrame 1,346/131 · Add/EraseMapPoint 3,000/2,609 · 큰 변화 7 · 변화 번호 542 · 기준 점 1,940 | 전부 | 대부분(예: UpdateConnections 726, UpdateNormalAndDepth 1,450) |
+| TUM fr1_room 1,362 프레임(루프 2) | 같은 종류 28,000 여(SetBadFlag 는 미룸만) | 전부 | 대부분 |
+| TUM fr1_desk2 640 프레임 | 같은 종류 | 전부 | 대부분 |
+
+비트 맞추기에서 알게 된 것: `UpdateNormalAndDepth` 는 노름 (y²+z²)+x²(= a0+(a1+a2) 와 같은 값) · 칸마다 나눗셈 · `normal/n` 도 나눗셈(역수 곱 아님, 역어셈블 확인). `PredictScale` 은 float `logf`. `UpdateConnections` 는 공시성 표에 15 미만도 다 넣고(정렬 목록에는 문턱 이상만), 자기 정렬 목록은 나쁜 kf 를 거르지 않음(남의 것은 UpdateBestCovisibles 가 거름). 원본 `SetBadFlag` 는 부모 후보에 못 붙은 자식을 원래 부모로 옮긴 뒤에도 자기 자식 목록에서 지우지 않음 — 그대로 옮김.
+
+확인 안 한 것: 오른쪽 카메라 관측(RGB-D 에 없음, 만나면 assert). 덤프 실행은 원본 교착(루프 뒤 지도 스레드 멈춤)이 가끔 걸려 한 번 다시 돌림. `ComputeSceneMedianDepth`(단안 전용)는 옮기지 않음.
+
 ### 포터 CV (11-25)
 
 브랜치 `opt/orb3-rs-cv`(`opt/orb3-rust` 위). 하네스 WSL `~/opt/orb3_cv/`: `ref.cc`(OpenCV 4.6 시스템 판, 입력 · 출력 덤프) · `svd_ref.cc` · `set_ref.cc`(기준 빌드 `cxx.sh` 로 원본 라이브러리 링크), Rust 쪽 `rs/`(`#[path]` 로 `slam/src/orb3cv/*.rs` 를 그대로 끌어와 비교: `cargo run --release -- ../dump` · `--bin svd -- ../svd.bin` · `--bin settings -- ../yaml`). 덤프 · 설정이 없으면 실패.
@@ -326,6 +368,21 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - **Orb3System 연결**: `orb3cv::system::keyframes` · `kf_now`(orb3.cc 의 orb3_keyframes · orb3_kf_now 를 Rust Atlas 로 — 지도 · 키프레임 id 순, 나쁜 키프레임은 mTcp 곱하며 부모로, 부모 고리면 None). 추적 · 지도 · 루프 본체가 다 옮겨지면 Rust 판 `Orb3System` 이 이것과 `SystemInit` 을 씀.
 - 루프 ↔ 지도 멈춤 원인(코드 읽기): 원본 LocalMapping 멈춤은 불 하나를 CorrectLoop · 전체 최적화 지도 갱신 · MergeLocal · GraftMap 이 같이 쓰고 Release 가 남의 요청까지 지움 + 전체 최적화 스레드가 갱신 내내 mMutexGBA 를 쥔 채 지역 지도 멈춤 · 지도 잠금을 기다림. 로그 끝 `*Loop detected → STOP → RELEASE → STOP`(전체 최적화의 STOP 뒤 RELEASE 없음). desk 단독 실행 18 번은 재현 안 됨(부하 겹칠 때 나옴) → gdb 역추적은 못 남김. 스레드 · 잠금 Rust 판은 통합 담당 `orb3sys::threads`(멈춤 토큰 개수) 기준.
 
+#### Sim3 최적화 · 본질 그래프(`orb3cv::sim3opt`, BA 와 나눔: 이 두 함수는 CV 몫)
+
+| 원본 | Rust | 비교(기준 빌드 덤프, `~/orbs3_ref`) | 결과 |
+|---|---|---|---|
+| Optimizer::OptimizeSim3 — 그래프 만들기 · Levenberg 5 번 · χ² > th2 이상치 지우기 · 강건 커널 떼고 5/10 번 · nIn | `build_sim3_problem` · `optimize_sim3` | TUM room ×3 · 360 ×3 · ETH3D large_loop_1 ×2 의 실제 호출 37 개(그래프 만들기 입력까지 덤프한 것 8 개) — 첫 최적화 S12 · 간선 χ² · 반복 수 · nIn · 끝 S12 · 지운 짝 | **비트 동일** |
+| 첫 반복 단계(H 7×7 · b · λ 넣어 푼 x) | `sim3_first_stage` | room 4 호출(`s3stage stage`) | **비트 동일** |
+| g2o LinearSolverDense = Eigen 3.4 LDLT<MatrixXd>(대각 피벗) | `dense_ldlt_solve` | 무작위 7×7 2 만 건(0 열 · 음 · 0 행렬 섞음) | **비트 동일** |
+| OptimizeEssentialGraph(루프 판) — 그래프 만들기(LoopConnections · 신장 트리 · 루프 · 공시성 ≥100 간선) · Levenberg 20 번(λ₀ 1e-16, SimplicialLDLT = `orb3ba::ldlt`) · Tiw(SE3f) · 점 고치기 | `build_eg_loop` · `optimize_essential_graph` · `sim3_to_se3f` · `eg_loop_points` | 실제 루프 9 번(정점 118–293 · 간선 599–2184) 끝 정점 · χ² · 반복 수, 키프레임 자세 1,870, 점 13.3 만 + 첫 반복 단계(오차 · 간선마다 야코비안 · Hpp 블록 2,455 · b · x) | **비트 동일** |
+| OptimizeEssentialGraph(합치기 판) | 최적화 핵심은 같은 `optimize_essential_graph`(그래프 만들기 · 마무리는 남음) | 합치기가 나는 입력을 못 만듦(TUM · ETH3D · slamint 끊김 시퀀스에서 합치기 0 번) | 미검증 |
+
+- 쓰는 법: OptimizeSim3 는 `Sim3Kf`(Tcw 회전 행 우선 · 이동, mvKeysUn, mvInvLevelSigma2, 카메라) 둘 + `Sim3Match`(vpMatches1 있는 자리) → `build_sim3_problem` → `optimize_sim3`(결과 nIn · S12 · 짝마다 지움). 본질 그래프는 `EgLoopInput`(키프레임을 원본 vpKFs 순서로 · 루프 · 자식 · 공시성 목록 순서 그대로) → `build_eg_loop` → `optimize_essential_graph(&mut g.vertices, &g.edges, 20)` → `sim3_to_se3f` · `eg_loop_points`. 원본 순서가 std::set 주소 순인 자리(vpKFs · GetLoopEdges · LoopConnections)는 호출자가 준 순서를 따름 — Rust Atlas 는 id 순으로 준다.
+- 맞추며 알게 된 것: 고정 7×7 에 작은 곱을 더하는 대입은 모든 열에서 0..6 행이 Packet2d 묶음(FMA 사슬) · 6 행 낱개(반 나눔 합). 7 길이 연속 내적은 ((m0+(m2+m4))+(m1+(m3+m5)))+m6. 전치 왼쪽(행 우선) 곱은 전부 낱개. LDLT GEMV 는 앞 4 · 다음 2 행 묶음(AVX-512 반 · 4 분의 1 묶음). VertexSim3Expmap::oplus 가 고정 축척일 때 풀이 벡터 x[6] 을 0 으로 바꿔 computeScale 에도 들어감. OptimizeSim3 의 KF2 밖 점은 `cv::KeyPoint(Point2f, mnTrackScaleLevel)` 둘째 인자가 size 라 octave 0 의 정보 행렬을 씀(원본 그대로). 실패한 선형 풀이 · 미정의 갈래(풀이 실패 시 이전 x)는 덤프에 없음.
+- BA 와의 경계: `orb3ba::ldlt::Ldlt`(analyze · factorize · solve) 만 가져다 씀. BA 쪽 "남음" 표의 OptimizeEssentialGraph · OptimizeSim3 는 여기서 끝남(합치기 판 그래프 만들기만 남음). GlobalBA · 합치기용 BA 는 BA 몫.
+- 하네스(저장소 밖 WSL `~/opt/orb3_cv/s3opt`): `mkpatch.py`+`mkpatch_add.py` 가 원본 Optimizer.cc 에 덤프를 끼워 `libs3dump.so`(build.sh, 기준 빌드에 링크), `run2.sh 이름 폴더 설정`(`ORB3_S3_DUMP`), `egstage`(본질 그래프 다시 풀기 · 첫 반복 단계), `s3stage ldlt|stage`. Rust 비교: `~/opt/orb3_cv/rs` 의 `--bin s3opt 덤프들…` · `--bin egst` · `--bin s3st`. 덤프가 없으면 실패.
+
 ## 포터 BA
 
 ### 상태
@@ -341,6 +398,8 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 | GlobalBundleAdjustemnt(루프 뒤 전역 BA, 커널 없음) 의 g2o 부분 | 같은 `optimize` | **비트 동일**: TUM room 전체(루프 검출 뒤) 실제 GBA 1 호출 — 정점 19,860 · 간선 93,821 · 반복 9, 끝 값 · χ² 전부 같음 |
 | 합치기용 LBA(MergeLocal: 5 번 Huber → 이상치 level 1 · 커널 뺌 → 10 번) 의 g2o 부분 | 같은 `optimize`(두 번째는 level 0 간선만 넣고 delta=None) | 덤프 장치는 있음(마술 수 0x4142474d), 지도 합치기가 일어난 녹화가 아직 없어 미비교 |
 | OptimizeEssentialGraph · OptimizeSim3 | **CV 포터(`opt/orb3-rs-cv`) 몫** | |
+| LocalBundleAdjustment 그래프 만들기 · 이상치 정리 · 되써 넣기 | 남음(공통 자료 구조 `orb3rs::types` 받은 뒤) | |
+| GlobalBundleAdjustemnt · OptimizeEssentialGraph(Sim3, BlockSolver<7,3>) · OptimizeSim3(BlockSolverX + 밀집) · 합치기용 BA | 남음 | |
 
 ### 쓰는 법
 
@@ -371,3 +430,20 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - 낮은 층: `solver::Sys`(오차 · 선형화 · `build_system`), `Sys::schur_pattern` · `Sys::solve(&mut Schur, λ)`(슈어 + LDLT, 6 차 자세 · 3 차 점), `ldlt::Ldlt::{analyze, factorize, solve}`(차수 무관, 위 삼각 CCS 입력) — 7 차(Sim3) 블록 솔버는 이 LDLT 를 그대로 쓰면 된다.
 - `orb3cv::g2osim3::G2oSim3 { r, t, s }`: `exp` · `log` · `mul` · `inverse` · `map`. VertexSim3Expmap::oplus 는 `_fix_scale` 이면 **풀이 벡터 x 의 7 번째 칸을 제자리에서 0 으로 바꾼다**(그 뒤 computeScale 이 바뀐 x 를 씀).
 - 원본 χ² 비교 때 비활성 간선(정점 모두 고정)의 값은 초기화 안 된 메모리라 비교에서 뺀다.
+- 덤프: `ORB3_BA_DUMP=파일 ORB3_BA_MAX=개수 ./ds_run 단어장 설정 녹화폴더 장수 [imu.csv]`. 지금 쓰는 것: `~/orbba_ref/ds_lba.bin`(강의실 700 장, 4.6 MB), `tum_desk2.bin` · `tum_room.bin`(`tum.sh`, 앞 250 장).
+- 시험(`t.sh 이름 [호출]`, 입력 없으면 실패): `full_calls`(ORB3BA_DUMP 의 모든 호출을 끝까지), `stage_first_iteration` · `stage_solve`(ORB3BA_STAGE = `replay 덤프 단계파일 호출` 출력, `st.sh 호출` 이 둘 다), `se3_exp_oplus`(ORB3BA_SE3 = `se3/se3ref` 출력).
+- 원본 replay 자체가 현장 덤프와 χ² 1 개씩 다른 호출이 2 개 있음(정점은 같음) — Rust 는 현장 값과 같다.
+
+#### 전역 BA 전체(`orb3ba::gba`, 11-25)
+
+- `global_bundle_adjustment(atlas, ext, map, n_iter, stop, loop_kf, robust) -> GbaOut` (= GlobalBundleAdjustemnt → BundleAdjustment, RGB-D). 키프레임 · 점은 번호 순(원본 std::set 자리), 관측은 `ObsOrder`(기본 번호 순).
+  - 정점: 나쁘지 않은 키프레임(첫 키프레임만 고정), 점 id = 점 번호 + 최대 키프레임 번호 + 1, 관측이 하나도 안 걸린 점은 뺌. 왼쪽 칸 -1 관측은 간선 없이 nEdges 만 셈. Huber δ = √5.99 · √7.815(float), robust 거짓이면 커널 없음.
+  - 되써 넣기: loop_kf 가 지도 원점 키프레임이면 바로(자세 · 점 · UpdateNormalAndDepth), 아니면 `GbaOut { kf_gba: mTcwGBA, mp_gba: mPosGBA }` 를 돌려줌(mnBAGlobalForKF = loop_kf, 옮기기는 루프 쪽). mTcwGBA = SE3d(q,t).cast<float>(): double 정규화 → float → 다시 정규화. 원본의 dist > 1 갈래는 세기만 해서 뺌.
+- **비트 동일**: TUM room 전체, 루프 뒤 실제 전역 BA 1 호출(키프레임 279 · 점 19,155 · 간선 90,457 · 반복 8) — 그래프(정점 · 간선 순서 · 값) · 반복 수 · 모든 키프레임 mTcwGBA · 모든 점 mPosGBA 같음. 바로 쓰기 갈래(loop_kf = 원점)는 실제 입력이 없어 미비교(지역 BA 와 같은 SetPose · UpdateNormalAndDepth 를 씀).
+- 하네스 `~/opt/orb3_gba`(`gpatch.py` · `gbaw.h` · `build.sh`): 원본 BundleAdjustment 에 지도 상태 앞 · 뒤 덤프. **원본은 전역 BA 그래프를 만드는 동안 지도 스레드가 관측을 계속 바꾼다**(원본 자체 경합) → 하네스는 함수 동안 mMutexMapUpdate 를 쥐어 추적을 막고, 그래프가 실제로 읽은 점 위치 · 관측을 점마다 따로 기록(`used`)해 그것을 입력으로 씀. 실행: `ORB3_BA_ONLY=41424247 ORB3_BA_DUMP=~/orbba_ref/room_gba2.bin ORB3_GBA_WORLD=~/orbba_ref/room_gba2_w.bin ORB3_BA_MAX=4 ./ds_run 단어장 TUM1.yaml room 2000`, 시험 `ORB3GBA=~/orbba_ref/room_gba2 cargo test --release -p slam --lib orb3ba::gba_tests`.
+
+#### CV 포터가 쓸 것(Sim3 · 7 차 블록)
+
+- `orb3ba::sim3::Sim3 { q, t, s }` — `exp(&[f64;7])` · `log()` · `mul` · `inverse` · `map`(기준 빌드와 무작위 4 만 건 비트 동일).
+- `orb3ba::ldlt::Ldlt` — `analyze(n, ap, ai)`(위 삼각 CCS 패턴, 첫 풀이 때 한 번: AMD 순서 · 소거 나무) → `factorize(&values) -> bool`(대각 0 이면 false) → `solve(&b)`. 차수 무관, 7 차 블록도 fillCCS 순서(블록 열 · 블록 안 열 · 블록 행 · 블록 안 행, 대각 블록은 위 삼각만)로 넣으면 됨.
+- Levenberg 틀: `solver::optimize_stop` 의 반복부 — λ 초기값(user 값 또는 1e-5 · 최대 |대각|), 시도마다 push → setLambda → solve → update → restoreDiagonal → 오차 → ρ = (χ²₀ − χ²)/(Σ x(λx + b) + 1e-3), 좋으면 λ *= max(1/3, min(2/3, 1 − (2ρ − 1)³)) · ni = 2, 나쁘면 λ *= ni · ni *= 2 · pop, 시도 10 번, (ini − cur)·1e3 < ini 가 3 번 연속이면 멈춤. 7 차 판은 이 순서를 그대로 쓰고 블록 솔버만 바꿈(지금 코드는 6 · 3 고정 — 일반화가 필요하면 BA 에 요청).

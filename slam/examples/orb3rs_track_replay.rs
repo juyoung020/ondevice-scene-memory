@@ -342,8 +342,7 @@ fn mpcl(r: &mut R, t: &mut Tally, tbad: &mut Tally) {
         let visible = r.i32();
         let first = r.i64();
         let o = r.i32();
-        a.mps.insert(id, MapPoint { id, bad, found, visible, first_kf: first as u64, ..Default::default() });
-        ext.mp_nobs.insert(id, o);
+        a.mps.insert(id, MapPoint { id, bad, found, visible, first_kf: first as u64, n_obs: o, ..Default::default() });
         recent.push(id);
         bad0.push(bad);
     }
@@ -392,11 +391,12 @@ fn kfcl(r: &mut R, t: &mut Tally) {
             k.keys[i].octave = r.i32();
             k.u_right[i] = r.f32();
         }
+        k.not_erase = ne;
         if init {
-            ext.map_init_kf.insert(0, id);
-        }
-        if ne {
-            ext.kf_not_erase.insert(id);
+            match a.maps.iter_mut().find(|m| m.id == 0) {
+                Some(m) => m.init_kf_id = id,
+                None => a.maps.push(Map { id: 0, init_kf_id: id, ..Default::default() }),
+            }
         }
         local.push(id);
     }
@@ -404,9 +404,9 @@ fn kfcl(r: &mut R, t: &mut Tally) {
     for _ in 0..nu {
         let id = r.u64();
         let bad = r.b();
-        ext.mp_nobs.insert(id, r.i32());
+        let n_obs = r.i32();
         let no = r.u32();
-        let mut m = MapPoint { id, bad, ..Default::default() };
+        let mut m = MapPoint { id, bad, n_obs, ..Default::default() };
         for _ in 0..no {
             let k = r.u64();
             let li = r.i32();
@@ -638,7 +638,7 @@ fn undp(r: &mut R, t: &mut Tally, t_addr: &mut Tally) {
     let before = (m.normal, m.min_dist, m.max_dist);
     let _ = before;
     a.mps.insert(1, m);
-    update_normal_and_depth(1, &mut a);
+    slam::orb3rs::mapdata::mp_update_normal_and_depth(&mut a, 1);
     let g = &a.mps[&1];
     let bits = |v: &[f32; 3]| v.map(|x| x.to_bits());
     let ok = bits(&g.normal) == bits(&want_n) && g.min_dist.to_bits() == want_min.to_bits() && g.max_dist.to_bits() == want_max.to_bits();
@@ -727,7 +727,14 @@ fn ucon(r: &mut R, t: &mut Tally, t_addr: &mut Tally) {
     if !up {
         return;
     }
-    update_connections(id, init, &mut a);
+    // 공통 판(mapdata): 지도 mnInitKFid · mbFirstConnection 으로 부모 정함
+    a.kfs.get_mut(&id).unwrap().first_conn_done = !first;
+    let map = a.kfs[&id].map;
+    match a.maps.iter_mut().find(|m| m.id == map) {
+        Some(m) => m.init_kf_id = init,
+        None => a.maps.push(Map { id: map, init_kf_id: init, ..Default::default() }),
+    }
+    slam::orb3rs::mapdata::kf_update_connections(&mut a, id, true);
     let k = &a.kfs[&id];
     let mut ok = k.ordered_conn == ord1 && (k.conn_weights == w1 || w1.is_empty() && k.conn_weights.is_empty());
     let gp = k.parent.map(|p| if p == u64::MAX - 1 { u64::MAX } else { p }).unwrap_or(u64::MAX);

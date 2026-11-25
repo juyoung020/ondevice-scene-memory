@@ -79,6 +79,10 @@ struct MState<K> {
     not_stop: bool,
     finish: bool,
     finished: bool,
+    /// mbResetRequestedActiveMap
+    reset_req: bool,
+    /// 지도 스레드가 처리한 대기열 비우기 수(최근 점 목록 비우기 표지)
+    reset_gen: u64,
 }
 
 /// 지역 지도 스레드의 대기열 · 멈춤(LocalMapping 의 mlNewKeyFrames · mbStopRequested · mbStopped · mbNotStop · mbAbortBA)
@@ -91,7 +95,7 @@ pub struct Mapper<K> {
 impl<K> Mapper<K> {
     pub fn new() -> Arc<Mapper<K>> {
         Arc::new(Mapper {
-            st: Mutex::new(MState { queue: VecDeque::new(), busy: false, accept: true, holders: 0, stopped: false, not_stop: false, finish: false, finished: false }),
+            st: Mutex::new(MState { queue: VecDeque::new(), busy: false, accept: true, holders: 0, stopped: false, not_stop: false, finish: false, finished: false, reset_req: false, reset_gen: 0 }),
             cv: Condvar::new(),
             abort_ba: AtomicBool::new(false),
         })
@@ -168,6 +172,22 @@ impl<K> Mapper<K> {
         }
     }
 
+    /// RequestResetActiveMap: 지도 스레드가 지금 키프레임을 마친 뒤 대기열을 비울 때까지 기다림(끝났으면 바로)
+    pub fn reset_active_map(&self) {
+        assert_no_map_lock("지도 스레드 비우기");
+        let mut s = self.st();
+        s.reset_req = true;
+        self.cv.notify_all();
+        while s.reset_req && !s.finished {
+            s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// 지도 스레드가 처리한 대기열 비우기 수
+    pub fn reset_gen(&self) -> u64 {
+        self.st().reset_gen
+    }
+
     /// RequestFinish: 지도 스레드를 끝냄(멈춤 중이어도 깨움)
     pub fn finish(&self) {
         let mut s = self.st();
@@ -183,6 +203,13 @@ impl<K> Mapper<K> {
         let mut s = self.st();
         s.busy = false;
         loop {
+            if s.reset_req {
+                // ResetIfRequested(지금 지도): 쌓인 키프레임을 버림(최근 점 목록은 reset_gen 을 보고 단계 쪽이 비움)
+                s.queue.clear();
+                s.reset_req = false;
+                s.reset_gen += 1;
+                self.cv.notify_all();
+            }
             if s.finish {
                 s.finished = true;
                 s.stopped = false;

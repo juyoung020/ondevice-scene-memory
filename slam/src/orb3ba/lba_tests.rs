@@ -156,11 +156,9 @@ fn read_world(path: &str) -> BTreeMap<i32, (Before, After)> {
                 let ol = r.obs_list();
                 order.insert(id, ol.iter().map(|o| o.0).collect());
                 let obs = ol.into_iter().collect();
-                ext.mp_nobs.insert(id, nobs);
-                atlas.mps.insert(id, MapPoint { id, map, bad, pos, obs, ref_kf: rk.max(0) as u64, ..Default::default() });
+                atlas.mps.insert(id, MapPoint { id, map, bad, pos, obs, n_obs: nobs, ref_kf: rk.max(0) as u64, ..Default::default() });
             }
-            ext.map_init_kf.insert(map_id, init);
-            atlas.maps.push(Map { id: map_id, ..Default::default() });
+            atlas.maps.push(Map { id: map_id, init_kf_id: init, ..Default::default() });
             befores.insert(idx, Before { kf, atlas, ext, inertial, order });
         } else if magic == 0x4142414d {
             let n = r.u32();
@@ -273,16 +271,16 @@ fn check(base: &str) -> usize {
             let same = m.bad == o.bad
                 && bits3(&m.pos) == bits3(&o.pos)
                 && (o.bad || (bits3(&m.normal) == bits3(&o.normal) && m.min_dist.to_bits() == o.min.to_bits() && m.max_dist.to_bits() == o.max.to_bits()))
-                && ext.nobs(*id) == o.nobs
+                && m.n_obs == o.nobs
                 && (o.ref_kf < 0 || m.ref_kf == o.ref_kf as u64)
                 && m.obs == o.obs;
             if !same {
                 eprintln!(
                     "점 {id}: 나쁨 {}/{} 위치 {:?}/{:?} 법선 {:?}/{:?} 거리 {} {}/{} {} 관측수 {}/{} 기준 {}/{} 관측 {:?}/{:?}",
-                    m.bad, o.bad, m.pos, o.pos, m.normal, o.normal, m.min_dist, m.max_dist, o.min, o.max, ext.nobs(*id), o.nobs, m.ref_kf, o.ref_kf, m.obs, o.obs
+                    m.bad, o.bad, m.pos, o.pos, m.normal, o.normal, m.min_dist, m.max_dist, o.min, o.max, m.n_obs, o.nobs, m.ref_kf, o.ref_kf, m.obs, o.obs
                 );
                 let b = &b4.atlas.mps[id];
-                eprintln!("  앞: 기준 {} 관측수 {} 관측 {:?} 순서 {:?} 지움 {:?}", b.ref_kf, b4.ext.nobs(*id), b.obs, b4.order.get(id), af.erased.iter().filter(|e| e.1 == *id).collect::<Vec<_>>());
+                eprintln!("  앞: 기준 {} 관측수 {} 관측 {:?} 순서 {:?} 지움 {:?}", b.ref_kf, b.n_obs, b.obs, b4.order.get(id), af.erased.iter().filter(|e| e.1 == *id).collect::<Vec<_>>());
                 diffs.push(format!("점 {id}"));
             }
         }

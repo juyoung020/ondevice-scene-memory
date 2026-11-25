@@ -31,3 +31,7 @@
 - Fuse 는 MapPoint::n_obs 만 바꾸므로 단계 끝에 TrackExt::mp_nobs 를 맞춤
 - 남음: Tracking 빈자리(StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame),
   ComputeDistinctiveDescriptors 관측 순서(id 순 vs 원본 주소 순) 덤프 확인
+
+## 통합 담당 알림(11-25 저녁)
+- 지도 자료 메서드를 `orb3rs::mapdata` 하나로 모음: localmap 의 update_normal_and_depth · update_connections · add_connection · update_best_covisibles · mp_set_bad · mp_erase_observation · kf_set_bad 는 지웠고, `TrackExt` 의 mp_nobs · kf_not_erase · map_init_kf 칸도 지움(MapPoint.n_obs · KeyFrame.not_erase · Map.init_kf_id 를 씀). 재생 도구도 맞춤.
+- 덤프 도구가 `~/slam-bench/src/ORB_SLAM3`(FMA 합치기 빌드)에 링크돼 있음 — 기준은 `~/opt/orb3_ref`(-ffp-contract=off). 모은 mapdata 는 기준 빌드와 비트 동일이라 지금 재생에서 UpdateNormalAndDepth 끝자리가 다르게 나옴 → 덤프 도구를 기준 빌드에 다시 링크해 주세요.

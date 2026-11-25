@@ -13,9 +13,9 @@ use super::edges::{depth_positive, Edge, Kind};
 use super::se3::normalize_rot;
 use super::solver::optimize_stop;
 use super::{Est, Problem, Vertex};
-use crate::orb3rs::localmap::mp_erase_observation;
+use crate::orb3rs::mapdata::{self, mp_erase_observation};
 use crate::orb3rs::track::TrackExt;
-use crate::orb3rs::types::{norm, sub, Atlas, KfId, MpId, Se3, V3};
+use crate::orb3rs::types::{Atlas, KfId, MpId, Se3, V3};
 
 /// 원본의 출력 인자(num_fixedKF · num_OptKF · num_MPs · num_edges)와 끝난 모양
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,7 +78,7 @@ pub fn build_graph(kf: KfId, atlas: &Atlas, ext: &TrackExt, inertial: bool) -> L
 pub fn build_graph_ord(kf: KfId, atlas: &Atlas, ext: &TrackExt, inertial: bool, ord: ObsOrder) -> LbaGraph {
     let k0 = &atlas.kfs[&kf];
     let cur_map = k0.map;
-    let init_kf = ext.map_init_kf.get(&cur_map).copied();
+    let init_kf = atlas.map_ref(cur_map).map(|m| m.init_kf_id);
 
     let mut local_mark: BTreeSet<KfId> = BTreeSet::new();
     let mut local_kfs = vec![kf];
@@ -206,36 +206,10 @@ pub fn build_graph_ord(kf: KfId, atlas: &Atlas, ext: &TrackExt, inertial: bool, 
     graph
 }
 
-/// MapPoint::UpdateNormalAndDepth(오른쪽 영상 없음)
+/// MapPoint::UpdateNormalAndDepth — 관측 순서(원본 포인터 순)만 바꿔 넣는 판, 계산은 `mapdata` 하나
 pub fn mp_update_normal_and_depth(mp: MpId, atlas: &mut Atlas, ord: ObsOrder) {
-    let m = &atlas.mps[&mp];
-    if m.bad || m.obs.is_empty() {
-        return;
-    }
-    let pos = m.pos;
-    let mut normal = [0.0f32; 3];
-    let mut n = 0;
-    for (k, (l, _)) in ord.obs(mp, atlas) {
-        if l != -1 {
-            let ni = sub(&pos, &atlas.kfs[&k].camera_center());
-            let d = norm(&ni);
-            normal = [normal[0] + ni[0] / d, normal[1] + ni[1] / d, normal[2] + ni[2] / d];
-            n += 1;
-        }
-    }
-    let rk = &atlas.kfs[&m.ref_kf];
-    let dist = norm(&sub(&pos, &rk.camera_center()));
-    // observations[pRefKF]: 없으면 기본 튜플 (0, 0)
-    let (left, _) = m.obs.get(&m.ref_kf).copied().unwrap_or((0, 0));
-    let level = rk.keys[left as usize].octave as usize;
-    let scale = &rk.ctx.pyr.scale;
-    let max_d = dist * scale[level];
-    let min_d = max_d / scale[rk.ctx.pyr.nlevels as usize - 1];
-    let nf = n as f32;
-    let m = atlas.mps.get_mut(&mp).unwrap();
-    m.max_dist = max_d;
-    m.min_dist = min_d;
-    m.normal = [normal[0] / nf, normal[1] / nf, normal[2] / nf];
+    let obs = ord.obs(mp, atlas);
+    mapdata::mp_update_normal_and_depth_obs(atlas, mp, &obs);
 }
 
 /// LocalBundleAdjustment 전체. `stop` = pbStopFlag(mbAbortBA). `inertial` = pMap->IsInertial()
@@ -296,7 +270,7 @@ pub fn local_bundle_adjustment_ord(kf: KfId, atlas: &mut Atlas, ext: &mut TrackE
         } else {
             None
         };
-        mp_erase_observation(mp, k, atlas, ext);
+        mp_erase_observation(atlas, mp, k);
         if let Some(r) = next_ref {
             atlas.mps.get_mut(&mp).unwrap().ref_kf = r;
         }

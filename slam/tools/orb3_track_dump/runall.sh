@@ -1,5 +1,5 @@
 # runall.sh 태그 [장면이름...]  (DUMP=덤프실행파일)
-cd ~/opt/orb3_track_bg; O=~/slam-bench/src/ORB_SLAM3; P=~/slam-bench/install
+cd ~/opt/orb3_track_bg; O=${ORB:-~/slam-bench/src/ORB_SLAM3}; P=~/slam-bench/install
 export LD_LIBRARY_PATH=$O/lib:$O/Thirdparty/g2o/lib:$O/Thirdparty/DBoW2/lib:$P/lib
 R=~/tgt-orbtrack/release/examples/orb3rs_track_replay; D=./${DUMP:-track_dump}
 tag=$1; shift; want=" $* "
@@ -13,5 +13,5 @@ run() {
   rm -f ~/orbtrack_out/$1.bin
 }
 run ds ds.yaml ~/rec_dl/ds_1118_121652/cam
-for s in desk2 room 360 floor rpy; do run tum_$s $O/Examples/RGB-D/TUM1.yaml ~/data/tum_shake/rgbd_dataset_freiburg1_$s; done
+for s in desk2 room 360 floor rpy; do run tum_$s ${YDIR:-$O}/Examples/RGB-D/TUM1.yaml ~/data/tum_shake/rgbd_dataset_freiburg1_$s; done
 echo done >> $out

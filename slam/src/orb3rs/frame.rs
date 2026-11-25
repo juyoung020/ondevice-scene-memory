@@ -58,7 +58,8 @@ impl Frame {
         f
     }
 
-    fn assign_grid(&mut self) {
+    /// AssignFeaturesToGrid
+    pub fn assign_grid(&mut self) {
         self.grid = vec![Vec::new(); GRID_COLS * GRID_ROWS];
         for i in 0..self.keys.len() {
             if let Some((x, y)) = self.pos_in_grid(&self.keys[i]) {
@@ -224,6 +225,7 @@ impl KeyFrame {
             map,
             timestamp: f.timestamp,
             keys: f.keys.clone(),
+            keys_raw: f.keys.iter().map(|k| [k.x, k.y]).collect(),
             desc: f.desc.clone(),
             u_right: f.u_right.clone(),
             depth: f.depth.clone(),

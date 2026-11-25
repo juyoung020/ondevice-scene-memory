@@ -506,9 +506,9 @@ impl TrackOps for Script {
     fn need_new_keyframe(&mut self, _t: &Tracker) -> bool {
         self.next(8, None) != 0
     }
-    fn create_new_keyframe(&mut self) -> KfId {
+    fn create_new_keyframe(&mut self) -> Option<KfId> {
         self.next(9, None);
-        0
+        Some(0)
     }
     fn try_graft(&mut self) {
         // 붙이기 시도 속 재위치들(TryGraft 는 PLT 를 안 거쳐 사건이 안 묶임): 끝까지 남은 재위치 · 지도 바꾸기를 먹음

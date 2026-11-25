@@ -503,12 +503,12 @@ impl TrackOps for Ops<'_> {
         let f = self.s.cur.as_ref().expect("지금 장면");
         track::need_new_keyframe(&t, f, &*self.s.mapper, &ctx)
     }
-    fn create_new_keyframe(&mut self) -> KfId {
+    fn create_new_keyframe(&mut self) -> Option<KfId> {
         let th = self.s.init.tracking.th_depth;
         let s = &mut *self.s;
         if !s.mapper.set_not_stop(true) {
-            // 원본은 만들지 않고 돌아감: 기준 키프레임 그대로
-            return self.tracker_now().reference_kf.unwrap_or(KfId::MAX);
+            // 원본은 만들지 않고 돌아감(mpReferenceKF · mpLastKeyFrame 그대로)
+            return None;
         }
         let cur = s.cur.as_mut().expect("지금 장면");
         let kf = {
@@ -519,7 +519,7 @@ impl TrackOps for Ops<'_> {
         s.mapper.set_not_stop(false);
         s.changed = true;
         self.ed.reference_kf = Some(Some(kf));
-        kf
+        Some(kf)
     }
     /// 패치 Tracking::TryGraft: 지금 지도를 다른 지도(키프레임 많은 순)에 재위치해 보고, 같은 변환이 두 번이면 합치기 예약
     fn try_graft(&mut self) {
@@ -615,7 +615,8 @@ impl Orb3System for RustSystem {
         let (twc, map_id) = match self.cur.as_ref().and_then(|f| f.tcw) {
             // orb3.cc: put34(tcw.inverse()) — Sophus 역(사원수 켤레)의 행렬
             Some(p) => (crate::orb3cv::system::put34(&p.inverse()), self.current_map_id()),
-            None => ([0.0; 12], self.current_map_id()),
+            // 원본 TrackRGBD 는 자세가 없으면 Sophus::SE3f() (단위)
+            None => ([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], self.current_map_id()),
         };
         Track { state: if self.tracker.state == state::OK { state::OK } else { self.tracker.state }, twc, map_id, ref_kf: self.tracker.reference_kf }
     }

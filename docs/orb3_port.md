@@ -174,6 +174,11 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - 시험 `ORBLOOP_RUST_MERGE=1 ORBLOOP_MERGE=~/orbloop_reloc/mrg_b.bin:~/orbloop_reloc/mrg_d.bin cargo test --release -p slam --test orb3loop_merge`: 단계마다 Rust 결과를 원본 결과와 비교(다음 단계는 원본 값으로 이어감). **본질 그래프 2/2 비트 동일**, 맞춤 BA 1/2 — mrg_d 합치기(KF 197↔15)에서 맞춤 BA 뒤 키프레임 자세 27 · 점 위치 3,231 다름(BA 포터 확인 필요, Huber dsqr 는 이미 float). env 없이(LOOP 원래 시험) 2/2 통과.
 - **전체 재생 도구**: `examples/orb3_sys_run.rs`(rs = RustSystem, cpp = libORB_SLAM3, 같은 `Orb3System` 으로 · 장면마다 wait_idle · TSV: 시각 · 상태 · 지도 · Twc · 추적 ms, `.kf` 키프레임) + `slam/tools/orb3sys_dump/sysrun.sh rs|cpp 출력.tsv [장수]`(라이브러리 경로 · 강의실 기본값) + `trajcmp.py A B`(처음 다른 장면 · 위치 차 · ms). cpp 판은 `ORB_SLAM3_DIR` 라이브러리(지금 orb3-nopango = FMA 기본 빌드, orb3_refid 아님)라 비트 대조가 아니라 궤적 대조. IMU 위쪽은 양쪽 다 안 넣음(RustSystem 이 아직 무시).
   - 강의실 앞 300 장: 둘 다 키프레임 1(카메라 정지 구간), 300 번째 장면 자세가 출력 9 자리까지 같음(마지막 자리 하나만 다름). 추적 ms 평균 rs 8.6 · cpp 12.1.
+- 받은 브랜치(11 차): TRACK 5626607(추적 빈자리 6 개 비트 동일 · localmap FMA 제거). CreateNewKeyFrame 의 SetNotStop 거절은 원본대로 키프레임을 안 만들고 추적 칸(기준 · 마지막 KF)도 그대로(`TrackOps::create_new_keyframe` → `Option<KfId>`).
+- **강의실 녹화 전체(3,807 장) RustSystem vs 원본 기준 빌드(orb3_refid)** — 기준 빌드는 `sysrun_ref.sh`(같은 실행 파일, 실행 때 라이브러리만 orb3_refid 로). `orb3.cc` 를 `-ffp-contract=off` 로 빌드해야 출력 변환이 같음(앞 300 장이 그것 하나로 갈렸음). 결과:
+  - 끝까지 돎(패닉 · 교착 없음). 키프레임 947 / 938, 루프 · 합치기 · 새 지도 지나감.
+  - **장면 0–707 출력 자세 비트 동일**(659–661 놓침 · 662 재위치 포함; 놓침 때 출력은 원본처럼 단위 자세로 고침). 처음 갈림 장면 708(이동 3e-4 m, 끝자리 차이가 아니라 한 번에 갈림 — 원인 미확인: 다음 후보는 PoseOptimization 의 OPT 판 mul_add(g2o_pose 28 · pose_opt 13 곳, FMA 빌드 기준으로 고른 것) · 루프 스레드 비동기(하네스는 지도 스레드만 기다림)). 지도 번호는 1,469 장까지 같음, 위치 차 500 장 0 · 1000 장 1.4 mm · 2000 장 18 mm · 3000 장 7.5 mm · 끝 0.54 m · 최대 2.5 m(1,570 장).
+  - 추적 ms(wait_idle 뺀 Track 만): Rust 평균 79 · 중간 10.5 · 최대 2,641, 원본 평균 18 · 중간 14 · 최대 91. 중간값은 Rust 가 빠르고, 평균을 올리는 것은 수 초짜리 멈춤 — 지도 스레드가 키프레임 처리 전체(지역 BA 포함)를 지도 잠금 안에서 하고 루프 · 전역 BA 결과 넣기도 잠금을 쥐어 추적이 기다림. 다음 일: 원본처럼 잠금 범위를 단계별로 줄이기.
 - 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀(cpp 판 · 비교용). 백엔드를 RustSystem 으로 바꿔 끼우는 것은 전체 재생 판정 뒤.
 
 ## 정확도 브랜치 따라가기

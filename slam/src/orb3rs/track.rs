@@ -423,8 +423,8 @@ pub trait TrackOps {
     fn reset_active_map(&mut self);
     fn change_map(&mut self, map: MapId);
     fn need_new_keyframe(&mut self, t: &Tracker) -> bool;
-    /// 새 키프레임 id 를 돌려줌
-    fn create_new_keyframe(&mut self) -> KfId;
+    /// 새 키프레임 id 를 돌려줌. None = 지도 스레드가 멈춰 있어 SetNotStop 거절(원본은 만들지 않고 돌아감, 추적 칸도 그대로)
+    fn create_new_keyframe(&mut self) -> Option<KfId>;
     fn try_graft(&mut self);
     /// 지도 표: (id, 키프레임 수) — 원본 GetAllMaps 순서
     fn all_maps(&mut self) -> Vec<(MapId, i32)>;
@@ -536,10 +536,11 @@ pub fn track_flow(t: &mut Tracker, frame_id: u64, ts: f64, ops: &mut dyn TrackOp
         let need = ops.need_new_keyframe(t);
         if need && (ok || (t.insert_kfs_lost && t.state == state::RECENTLY_LOST && is_imu(t.sensor))) {
             // CreateNewKeyFrame 끝: mpReferenceKF · mnLastKeyFrameId · mpLastKeyFrame
-            let kf = ops.create_new_keyframe();
-            t.reference_kf = Some(kf);
-            t.last_kf_frame_id = frame_id;
-            t.last_kf = Some(kf);
+            if let Some(kf) = ops.create_new_keyframe() {
+                t.reference_kf = Some(kf);
+                t.last_kf_frame_id = frame_id;
+                t.last_kf = Some(kf);
+            }
         }
     }
     if t.state == state::LOST {

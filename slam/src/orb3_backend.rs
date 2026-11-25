@@ -1092,6 +1092,12 @@ impl SlamBackend for Orb3Backend {
             if let Some(k) = s.dk {
                 let (r, m, n) = crate::refine::manhattan(&mut outp, &dd, &k);
                 common::info!("끝난 지도 방위 바로잡기: 잰 장면 {n} 개, 기준 {r:.1}°, 가장 큰 바로잡음 {m:.1}°");
+                // 지도 통째를 맨해튼 축에 맞춤(벽 · 책상 줄이 지도 x · y 축과 나란히 — 위에서 볼 때 방이 화면 축과 나란)
+                let (sn, cs) = (-r.to_radians()).sin_cos();
+                let rzt: T34 = [cs, -sn, 0.0, 0.0, sn, cs, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+                for f in outp.iter_mut() {
+                    f.1 = mul(&rzt, &f.1);
+                }
             }
         }
         // 끝난 지도 다듬기: 다른 때 같은 곳을 본 장면끼리 깊이 ICP + 방위 · 이동 위치 그래프(refine)

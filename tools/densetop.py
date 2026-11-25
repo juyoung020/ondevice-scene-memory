@@ -10,7 +10,7 @@ vv, uu = np.mgrid[4:480:8, 4:640:8]; pts = []
 for i in range(0, len(P), 3):
     p = dt.get(round(P[i, 0], 4))
     if not p: continue
-    d = np.asarray(Image.open(C + "/" + p))[vv, uu].astype(float) / 1000.0; m = (d > 0.3) & (d < 4.0)
+    d = np.asarray(Image.open(C + "/" + p))[vv, uu].astype(float) / 1000.0; m = (d > 0.3) & (d < float(os.environ.get("ZMAX", 4.0)))
     x = np.stack([(uu[m] - cx) * d[m] / fx, (vv[m] - cy) * d[m] / fy, d[m]], 1)
     pts.append(R.from_quat(P[i, 4:8]).apply(x) + P[i, 1:4])
 a = np.concatenate(pts); fl = np.percentile(a[:, 2], 3); a = a[(a[:, 2] > fl + zlo) & (a[:, 2] < fl + zhi)]

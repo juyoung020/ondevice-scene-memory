@@ -795,3 +795,21 @@ mod tests {
         std::fs::write(out, o).unwrap();
     }
 }
+
+/// 장면들 깊이 수평 법선의 맨해튼 방위(4 배 각 평균 / 4, 라디안, −45°–45°). 법선 적으면 None
+pub fn man_angle(fr: &[crate::mapmerge::Frame], k: &Intr) -> Option<f64> {
+    let (mut c, mut s, mut n) = (0.0, 0.0, 0usize);
+    for f in fr {
+        for (_, nc) in cam_pts(f.d, k).into_iter().flatten() {
+            let w = rot(&f.pose, &nc);
+            if w[2].abs() >= MAN_HZ {
+                continue;
+            }
+            let a = 4.0 * w[1].atan2(w[0]);
+            c += a.cos();
+            s += a.sin();
+            n += 1;
+        }
+    }
+    (n >= 1000).then(|| s.atan2(c) / 4.0)
+}

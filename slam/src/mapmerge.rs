@@ -320,6 +320,33 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
                     starts.push(x);
                 }
             }
+            // 맨해튼 시작 가설(A28): 두 지도 모두 중력 맞춤이라 맞는 방위는 (큰 쪽 맨해튼 − 이 지도 맨해튼) + 90° 배수 넷 중 하나.
+            // 장면 짝 후보 이동 둘레 3 m 를 1 m 격자로, 방위 넷마다 자유 공간 점수(다듬기 없이)를 재 위 3 개를 시작점에 더함. 받는 문턱은 그대로
+            if let (Some(ma), Some(mb)) = (crate::refine::man_angle(fr, k), crate::refine::man_angle(&dst_fr, k)) {
+                let base = mb - ma;
+                let mut grid: Vec<([f64; 4], f64)> = Vec::new();
+                for x in starts.clone() {
+                    for q in 0..4 {
+                        let yaw = base + q as f64 * std::f64::consts::FRAC_PI_2;
+                        // 이 방위로 돌렸을 때 지도 가운데가 후보 자리 가운데에 오게
+                        let (sn, cs) = yaw.sin_cos();
+                        let c0 = apply(&yaw_t(x[0], x[1], x[2], x[3]), &cen);
+                        for i in -3..=3 {
+                            for j in -3..=3 {
+                                let tx = c0[0] + i as f64 - (cs * cen[0] - sn * cen[1]);
+                                let ty = c0[1] + j as f64 - (sn * cen[0] + cs * cen[1]);
+                                let g = [yaw, tx, ty, x[3]];
+                                let sc = score(&pts, &refs, k, &yaw_t(g[0], g[1], g[2], g[3]));
+                                grid.push((g, objective(sc)));
+                            }
+                        }
+                    }
+                }
+                grid.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (g, _) in grid.into_iter().take(3) {
+                    starts.push(g);
+                }
+            }
             let mut res: Vec<([f64; 4], (usize, usize))> = starts
                 .iter()
                 .map(|x| {
@@ -356,7 +383,7 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
                 })
                 .map(|r| ratio(r.1))
                 .fold(0.0, f64::max);
-            // 더 강한 증거(A27): ① 장면 짝 가설 2 개 이상이 받은 자리(0.5 m · 10° 안)에 동의 ② 거꾸로(큰 쪽 장면 점을 m 장면 깊이에) 자유 공간도 ACCEPT 이상.
+            // 더 강한 증거(A27): 거꾸로(큰 쪽 장면 점을 m 장면 깊이에) 자유 공간도 ACCEPT 이상.
             // 반복 책상 줄에서 장면 짝 하나 + 한쪽 점수만으로 붙은 틀린 자리(강의실 지도 1, −46°)를 막음. 못 찾으면 안 붙임
             let bt = yaw_t(best.0[0], best.0[1], best.0[2], best.0[3]);
             let agree = cands
@@ -373,7 +400,7 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
             };
             let id: T34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
             let (rev, _) = free_ratio(&near, &mfr, &id, k);
-            let ok = ratio(best.1) >= ACCEPT && best.1 .0 >= MIN_AGREE && ratio(best.1) - second >= MARGIN && agree >= 2 && rev >= ACCEPT;
+            let ok = ratio(best.1) >= ACCEPT && best.1 .0 >= MIN_AGREE && ratio(best.1) - second >= MARGIN && rev >= ACCEPT;
             let l = format!("지도 {m}: 가장 좋은 {:.3} · 다른 곳 최고 {second:.3} · 동의 짝 {agree}/{} · 거꾸로 {rev:.3} → {}", ratio(best.1), cands.len(), if ok { "옮겨 붙임" } else { "안 붙임" });
             common::info!("끝난 뒤 지도 맞춤: {l}");
             log.push(l);

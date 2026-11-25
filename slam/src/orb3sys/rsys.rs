@@ -690,17 +690,8 @@ impl Orb3System for RustSystem {
         self.tracker = tr;
         self.track_tail();
         let (twc, map_id) = match self.cur.as_ref().and_then(|f| f.tcw) {
-            Some(p) => {
-                let (r, o) = track::pose_inverse_matrices(&p);
-                let mut m = [0.0; 12];
-                for i in 0..3 {
-                    for j in 0..3 {
-                        m[i * 4 + j] = r[i][j] as f64;
-                    }
-                    m[i * 4 + 3] = o[i] as f64;
-                }
-                (m, self.current_map_id())
-            }
+            // orb3.cc: put34(tcw.inverse()) — Sophus 역(사원수 켤레)의 행렬
+            Some(p) => (crate::orb3cv::system::put34(&p.inverse()), self.current_map_id()),
             None => ([0.0; 12], self.current_map_id()),
         };
         Track { state: if self.tracker.state == state::OK { state::OK } else { self.tracker.state }, twc, map_id, ref_kf: self.tracker.reference_kf }

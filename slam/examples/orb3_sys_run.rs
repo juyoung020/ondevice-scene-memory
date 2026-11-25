@@ -58,7 +58,7 @@ fn main() {
         ms_all.push(ms);
         write!(f, "{t:.6}\t{}\t{}", tr.state, tr.map_id).unwrap();
         for v in tr.twc {
-            write!(f, "\t{v:.9}").unwrap();
+            write!(f, "\t{v:?}").unwrap();
         }
         writeln!(f, "\t{ms:.3}").unwrap();
         n += 1;

@@ -21,6 +21,8 @@ fn main() {
         .flag_if_supported("-w")
         // 원본 라이브러리와 같은 -march=native: Eigen 정렬(헤더 속 클래스 배치)이 같아야 함
         .flag("-march=native")
+        // 기준 빌드(orb3_refid)와 같은 -ffp-contract=off: 출력 변환(SE3f 역 → 행렬)이 FMA 로 합쳐지지 않게
+        .flag("-ffp-contract=off")
         .include(&orb)
         .include(format!("{orb}/include"))
         .include(format!("{orb}/include/CameraModels"))

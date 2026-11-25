@@ -232,6 +232,7 @@ fn icp(pi: &T34, ti: &[Option<([f64; 3], [f64; 3])>], pj: &T34, sj: &[[f64; 3]],
 }
 
 /// 위치 그래프 간선: i → j 측정(방위 차, i 방위 축으로 본 이동), 표준편차, 고리인지
+#[derive(Clone)]
 struct Edge {
     i: usize,
     j: usize,
@@ -311,7 +312,7 @@ fn gyro_yaw(gz: &[(f64, f64)], a: f64, b: f64) -> Option<f64> {
 
 /// gz: 세계 z 축 회전 속도(자이로를 장면 자세로 세계에 돌린 z 성분, 시간 순). 비면 자이로 간선 없음
 /// extra: 장소 인식(MegaLoc + XFeat) 짝의 두 장면 시각 — 가장 가까운 마디 쌍도 고리 후보(깊이 ICP 로 같은 검증)
-pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)], log: &mut Vec<String>) -> Vec<T34> {
+pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64, Option<T34>)], log: &mut Vec<String>) -> Vec<T34> {
     let n = nodes.len();
     let ident: T34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     if n < 3 {
@@ -395,6 +396,8 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)],
         }
         cands.extend(picked.into_iter().map(|j| (i, j)));
     }
+    // 장소 인식 짝 고리: (질의 마디 a, 후보 마디 b, b 쪽 세계 고침 d)
+    let mut pr_cands: Vec<(usize, usize, T34)> = Vec::new();
     {
         let mut by_t: Vec<(f64, usize)> = nodes.iter().enumerate().map(|(i, m)| (m.t, i)).collect();
         by_t.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -402,14 +405,20 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)],
             let p = by_t.partition_point(|x| x.0 < t);
             [p.wrapping_sub(1), p].into_iter().filter(|&q| q < by_t.len()).min_by(|&a, &b| (by_t[a].0 - t).abs().total_cmp(&(by_t[b].0 - t).abs())).filter(|&q| (by_t[q].0 - t).abs() < 1.0).map(|q| by_t[q].1)
         };
-        for &(ta, tb) in extra {
+        for &(ta, tb, d) in extra {
             if let (Some(a), Some(b)) = (nearest(ta), nearest(tb))
                 && a != b
                 && (nodes[a].t - nodes[b].t).abs() >= LOOP_DT
             {
-                let (i, j) = if a < b { (a, b) } else { (b, a) };
-                if !cands.contains(&(i, j)) {
-                    cands.push((i, j));
+                match d {
+                    // 짝 변환이 있으면 따로(그 변환에서 시작하는 ICP)
+                    Some(d) => pr_cands.push((a, b, d)),
+                    None => {
+                        let (i, j) = if a < b { (a, b) } else { (b, a) };
+                        if !cands.contains(&(i, j)) {
+                            cands.push((i, j));
+                        }
+                    }
                 }
             }
         }
@@ -439,7 +448,34 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)],
         .collect();
     let n_try = cands.len();
     edges.extend(found.into_iter().flatten());
-    let n_loop = edges.len() - n_seq;
+    // 장소 인식 짝 고리: b 를 짝 변환으로 옮긴 자리에서 깊이 ICP. ICP 가 시작 자리에서 0.15 m · 3° 안에 머물러야(깊이 전체가 짝 변환에 동의) 받음.
+    // 고침 크기는 1.5 m · 30° 까지(끝 자세가 크게 어긋난 곳을 묶으려는 것), 틀린 짝은 코시로 누름
+    let pr: Vec<Option<(Edge, T34)>> = pr_cands
+        .par_iter()
+        .map(|&(a, b, d)| {
+            if src[b].len() < 500 {
+                return None;
+            }
+            let pb0 = mul(&d, &nodes[b].pose);
+            let big = ((pb0[3] - nodes[b].pose[3]).powi(2) + (pb0[7] - nodes[b].pose[7]).powi(2) + (pb0[11] - nodes[b].pose[11]).powi(2)).sqrt();
+            let byaw = wrap(yaw_of(&pb0) - yaw_of(&nodes[b].pose)).abs().to_degrees();
+            if big > 1.5 || byaw > 30.0 {
+                return None;
+            }
+            let (delta, inl, frac) = icp(&nodes[a].pose, &tgt[a], &pb0, &src[b], k)?;
+            let pb = mul(&delta, &pb0);
+            let mv = ((pb[3] - pb0[3]).powi(2) + (pb[7] - pb0[7]).powi(2) + (pb[11] - pb0[11]).powi(2)).sqrt();
+            let dy = wrap(yaw_of(&pb) - yaw_of(&pb0)).abs().to_degrees();
+            if inl < ICP_MIN_INLIERS || frac < ICP_INLIER_FRAC || mv > 0.15 || dy > 3.0 {
+                return None;
+            }
+            let (my, mp) = meas(&nodes[a].pose, &pb);
+            Some((Edge { i: a, j: b, dyaw: my, dp: mp, sig: LOOP_SIG, zmul: 1.0, robust: true }, mul(&pb, &inv(&nodes[b].pose))))
+        })
+        .collect();
+    let n_pr_try = pr_cands.len();
+    let pr_e: Vec<Edge> = pr.into_iter().flatten().map(|x| x.0).collect();
+    let n_loop0 = edges.len() - n_seq;
     // ④ 자이로 방위: 시간 순 이웃 마디(2 초 안, IMU 빈틈 없음) 사이 방위 차 = 자이로 적분(ORB · ICP 의 회전 누적을 누름)
     let gyro_e: Vec<(usize, usize, f64)> = order.windows(2).filter(|w| nodes[w[1]].t - nodes[w[0]].t < 2.0).filter_map(|w| gyro_yaw(gz, nodes[w[0]].t, nodes[w[1]].t).map(|y| (w[0], w[1], y))).collect();
     // ③ 바닥 높이: 마디마다 카메라에서 바닥까지 높이(위 향한 평면 가운데 카메라 아래 1.0–2.2 m 의 가장 큰 무리, 책상 면은 0.8 m 안팎이라 빠짐)
@@ -456,15 +492,16 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)],
         log.push(format!("바닥: 잰 마디 {}/{n}, 바닥 높이 {f:.3} m, 마디 바닥 어긋남 중앙 {:.3} · p90 {:.3} m", fz.len(), v[v.len() / 2], v[v.len() * 9 / 10]));
     }
     // 위치 그래프(가우스-뉴턴, 마디 0 고정): 변수 마디마다 (방위, x, y, z)
-    let mut x: Vec<[f64; 4]> = nodes.iter().map(|m| [yaw_of(&m.pose), m.pose[3], m.pose[7], m.pose[11]]).collect();
-    let x0 = x.clone();
+    let x0: Vec<[f64; 4]> = nodes.iter().map(|m| [yaw_of(&m.pose), m.pose[3], m.pose[7], m.pose[11]]).collect();
+    let solve = |edges: &[Edge]| -> Vec<[f64; 4]> {
+    let mut x = x0.clone();
     let dim = 4 * n;
     let mut last_cost = f64::MAX;
     for _ in 0..15 {
         let mut h = nalgebra::DMatrix::<f64>::zeros(dim, dim);
         let mut g = nalgebra::DVector::<f64>::zeros(dim);
         let mut cost = 0.0;
-        for e in &edges {
+        for e in edges {
             let (xi, xj) = (x[e.i], x[e.j]);
             let (s, c) = xi[0].sin_cos();
             let d = [xj[1] - xi[1], xj[2] - xi[2], xj[3] - xi[3]];
@@ -559,6 +596,44 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)],
         }
         last_cost = cost;
     }
+    x
+    };
+    // Δ = T(p_new) Rz(yaw_new - yaw_old) T(-p_old)
+    let delta = |x: &[[f64; 4]], i: usize| -> T34 {
+        let r = rz(wrap(x[i][0] - x0[i][0]));
+        let po = [x0[i][1], x0[i][2], x0[i][3]];
+        let rp = rot(&r, &po);
+        [r[0], r[1], 0.0, x[i][1] - rp[0], r[4], r[5], 0.0, x[i][2] - rp[1], 0.0, 0.0, 1.0, x[i][3] - rp[2]]
+    };
+    // 장소 인식 짝 고리 거름(지도 통째 자유 공간): 고리 전부 넣어 한 번 풀고, 그 지도에서 고리마다 b 둘레(±5 초) 장면 점을
+    // b 둘레 ±15 초 밖 지도 전체 장면 깊이에 투영. 맞음 비율 ≥ 0.62 · 맞음 300 이상(실행 중 지도 옮겨 붙임과 같은 문턱)인 고리만 남겨 다시 풂.
+    // 틀린 짝(반복 모니터 줄)은 풀린 지도에서 다른 줄 · 벽의 자유 공간을 침범. 끝 자세(휜 지도) 그대로 재면 맞는 고리도 막혀서 풀린 지도에서 잼
+    let n_pr_icp = pr_e.len();
+    let kept: Vec<Edge> = if pr_e.is_empty() {
+        vec![]
+    } else {
+        let mut all = edges.clone();
+        all.extend(pr_e.iter().cloned());
+        let x1 = solve(&all);
+        let p1: Vec<T34> = (0..n).map(|i| mul(&delta(&x1, i), &nodes[i].pose)).collect();
+        let id: T34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let at = |p: &[T34], tb: f64| {
+            let f = |i: usize| crate::mapmerge::Frame { pose: p[i], d: nodes[i].d };
+            let from: Vec<_> = (0..n).filter(|&x| (nodes[x].t - tb).abs() <= 5.0).map(f).collect();
+            let into: Vec<_> = (0..n).filter(|&x| (nodes[x].t - tb).abs() > 15.0).map(f).collect();
+            crate::mapmerge::free_ratio(&from, &into, &id, k)
+        };
+        let sc: Vec<(f64, usize)> = pr_e.par_iter().map(|e| at(&p1, nodes[e.j].t)).collect();
+        for (e, (r, ag)) in pr_e.iter().zip(&sc) {
+            log.push(format!("장소 인식 짝 고리 {:.3} ↔ {:.3}: 자유 공간 {r:.3} · 맞음 {ag}", nodes[e.i].t, nodes[e.j].t));
+        }
+        pr_e.iter().zip(&sc).filter(|(_, s)| s.0 >= 0.62 && s.1 >= 300).map(|(e, _)| e.clone()).collect()
+    };
+    log.push(format!("장소 인식 짝 고리: 후보 {n_pr_try} → 깊이 ICP {n_pr_icp} → 지도 자유 공간 받음 {}", kept.len()));
+    let n_loop = n_loop0 + kept.len();
+    let mut edges = edges;
+    edges.extend(kept);
+    let x = solve(&edges);
     let mut big = (0.0f64, 0.0f64);
     let out: Vec<T34> = (0..n)
         .map(|i| {

@@ -56,6 +56,8 @@ pub struct Hit {
     pub strong: bool,
     /// force 로 검증한 장면의 결과
     pub forced: bool,
+    /// 같은 지도 안 짝(끝난 지도 다듬기의 고리 후보로만 씀)
+    pub same: bool,
 }
 
 struct Stored {
@@ -355,6 +357,11 @@ impl State {
             None => vec![],
             Some(m) => self.db.topk(&self.desc, TOPK, |id| nodes.get(id as usize).and_then(|s| n.maps.get(&s.kf)).is_some_and(|&cm| cm != m)),
         };
+        // 같은 지도 안 예전 장면(20 초 넘게 전) 상위 4 개: 끝난 지도 다듬기의 고리 후보(가운데 책상 줄처럼 한 지도 안에서 어긋난 곳)
+        let same_c: Vec<(i64, f32)> = match my_map {
+            None => vec![],
+            Some(m) => self.db.topk(&self.desc, 4, |id| nodes.get(id as usize).is_some_and(|s| n.t - s.t > 20.0 && n.maps.get(&s.kf) == Some(&m))),
+        };
         // ORB 제안 검증: 상대 키프레임 시각에 가장 가까운 저장 장면 4 개(2 초 안)를 맨 앞에(MegaLoc 점수 문턱 없이)
         if let Some(tf) = n.force {
             let mut near: Vec<(f64, usize)> = nodes.iter().enumerate().map(|(i, s)| ((s.t - tf).abs(), i)).filter(|x| x.0 < 2.0).collect();
@@ -363,6 +370,8 @@ impl State {
             cands.retain(|c| !f.iter().any(|x| x.0 == c.0));
             cands.splice(0..0, f);
         }
+        let mut cands: Vec<(i64, f32, bool)> = cands.into_iter().map(|c| (c.0, c.1, false)).collect();
+        cands.extend(same_c.into_iter().filter(|c| !cands.iter().any(|x| x.0 == c.0)).map(|c| (c.0, c.1, true)).collect::<Vec<_>>());
         if let Some(l) = self.log.as_mut() {
             use std::io::Write as _;
             let _ = writeln!(l, "{:.3} node map {:?} cands {:?}", n.t, my_map, cands.iter().map(|c| (c.0, (c.1 * 100.0).round() / 100.0)).collect::<Vec<_>>());
@@ -370,12 +379,17 @@ impl State {
         let qsmall = small_depth(&n.depth, w, h);
         let mut hits = Vec::new();
         let mut b = XFeatures::default();
-        for &(cid, score) in &cands {
+        let (mut other_done, mut same_done) = (false, false);
+        for &(cid, score, same) in &cands {
+            if (same && same_done) || (!same && other_done) {
+                continue;
+            }
             if score < MIN_SCORE {
-                if n.force.is_some() {
+                if n.force.is_some() && !same {
                     continue;
                 }
-                break;
+                if same { same_done = true } else { other_done = true }
+                continue;
             }
             let c = &self.nodes[cid as usize];
             b.kps.clone_from(&c.kps);
@@ -410,9 +424,9 @@ impl State {
                     let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2} tight {ag_tight:.2} T {}", n.t, c.t, t.iter().map(|v| format!("{v:.5}")).collect::<Vec<_>>().join(" "));
                 }
                 let strong = ov >= DEPTH_OVERLAP && ag >= DEPTH_AGREE;
-                hits.push(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score, strong, forced: n.force.is_some() });
+                hits.push(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score, strong, forced: n.force.is_some() && !same, same });
                 if strong {
-                    break;
+                    if same { same_done = true } else { other_done = true }
                 }
             }
         }

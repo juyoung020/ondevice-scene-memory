@@ -413,6 +413,9 @@ impl Orb3 {
 
     /// 지도 잇기 결과: 두 번 같은 변환이 나오면 작은 지도를 큰 지도로 옮겨 붙이기 부탁
     fn on_hit(&mut self, h: stitch::Hit, t: f64) {
+        if h.same {
+            return;
+        }
         let all = self.all_kfs(t);
         let (Some(&(ma, pa)), Some(&(mb, pb))) = (all.get(&h.q_kf), all.get(&h.c_kf)) else { return };
         if ma == mb {
@@ -1121,7 +1124,16 @@ impl SlamBackend for Orb3Backend {
                     })
                     .collect()
             };
-            let extra: Vec<(f64, f64)> = s.hits_all.iter().map(|h| (h.t, h.c_t)).collect();
+            // 고리 후보: 장소 인식 짝(같은 지도 안 짝 포함, 깊이 맞춤까지 통과한 강한 짝)의 두 장면 시각과 그 짝이 말하는 세계 고침(후보 장면 쪽에 곱함)
+            let at_t: HashMap<u64, T34> = outp.iter().map(|x| (x.0.to_bits(), x.1)).collect();
+            let extra: Vec<(f64, f64, Option<T34>)> = s
+                .hits_all
+                .iter()
+                .map(|h| {
+                    let d = (h.strong).then(|| (at_t.get(&h.t.to_bits()), at_t.get(&h.c_t.to_bits()))).and_then(|(q, c)| Some(mul(&mul(q?, &h.t_qc), &inv(c?))));
+                    (h.t, h.c_t, d)
+                })
+                .collect();
             let dl = crate::refine::refine(&nodes, &k, &gz, &extra, &mut log);
             crate::refine::apply_deltas(&mut outp, &nt, &dl);
             for l in &log {

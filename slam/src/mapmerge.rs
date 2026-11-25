@@ -545,3 +545,19 @@ mod tests {
         assert!(d < 0.1, "{log:?} {got:?}");
     }
 }
+
+/// 지도 통째 자유 공간 비율: from 장면 점을 h 로 옮겨 into 장면 깊이에 투영한 (맞음 / (맞음 + 침범), 맞음 수). 다듬지 않음
+pub fn free_ratio(from: &[Frame], into: &[Frame], h: &T34, k: &Intr) -> (f64, usize) {
+    let mut pts = cloud(from, k);
+    if pts.len() < 200 || into.is_empty() {
+        return (0.0, 0);
+    }
+    if pts.len() > MAX_PTS {
+        let st = pts.len() as f64 / MAX_PTS as f64;
+        pts = (0..MAX_PTS).map(|i| pts[(i as f64 * st) as usize]).collect();
+    }
+    let st = (into.len() as f64 / MAX_REF as f64).max(1.0);
+    let refs: Vec<Ref> = (0..into.len().min(MAX_REF)).map(|i| &into[(i as f64 * st) as usize]).map(|f| Ref { w2c: inv(&f.pose), d: f.d }).collect();
+    let s = score(&pts, &refs, k, h);
+    (ratio(s), s.0)
+}

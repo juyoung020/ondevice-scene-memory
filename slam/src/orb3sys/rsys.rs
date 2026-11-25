@@ -203,6 +203,8 @@ pub struct RustSystem {
     /// LoopClosing 스레드 · 전역 BA
     flow: Arc<LoopFlow<MapState, RsGba>>,
     looping: Option<JoinHandle<LoopStats>>,
+    /// 이 장면에서 만든 키프레임(장면 끝에 지도 스레드로)
+    pending_kf: Option<KfId>,
     /// System::mbResetActiveMap
     reset_pending: bool,
     /// 패치 옮겨 붙이기 칸
@@ -268,6 +270,7 @@ impl RustSystem {
             flow,
             looping,
             reset_pending: false,
+            pending_kf: None,
             graft: GraftState::default(),
             velocity: Se3::default(),
             rel: None,
@@ -517,8 +520,10 @@ impl TrackOps for Ops<'_> {
             let mut g = s.map.lock();
             track::create_new_keyframe(cur, th, &mut g.atlas)
         };
-        s.mapper.insert(kf);
-        s.mapper.set_not_stop(false);
+        // 지도 스레드에 넘기기는 장면 끝(track_tail: mlRelativeFramePoses 의 Tcr 를 잰 뒤)으로 미룸 — 원본은 넘긴 뒤 바로 Tcr 를 재므로
+        // 지도 스레드가 아직 이 키프레임 자세를 안 바꾼 값을 읽는다. Rust 지도 스레드는 키프레임 처리 전체를 지도 잠금 안에서 하므로
+        // 먼저 넘기면 track_tail 이 지역 BA 뒤 자세를 읽을 수도 있어(경합) 결과가 실행마다 달라졌음.
+        s.pending_kf = Some(kf);
         s.changed = true;
         self.ed.reference_kf = Some(Some(kf));
         Some(kf)
@@ -614,6 +619,10 @@ impl Orb3System for RustSystem {
         ed.apply(&mut tr);
         self.tracker = tr;
         self.track_tail();
+        if let Some(k) = self.pending_kf.take() {
+            self.mapper.insert(k);
+            self.mapper.set_not_stop(false);
+        }
         let (twc, map_id) = match self.cur.as_ref().and_then(|f| f.tcw) {
             // orb3.cc: put34(tcw.inverse()) — Sophus 역(사원수 켤레)의 행렬
             Some(p) => (crate::orb3cv::system::put34(&p.inverse()), self.current_map_id()),

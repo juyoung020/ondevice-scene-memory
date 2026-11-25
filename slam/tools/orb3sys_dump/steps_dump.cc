@@ -97,14 +97,18 @@ int main(int argc, char **argv) {
     System S(argv[1], argv[2], System::RGBD, false);
     g_lm = S.mpLocalMapper;
     g = fopen(argv[5], "w");
+    FILE *gt = fopen((std::string(argv[5]) + ".tsv").c_str(), "w");
     size_t j = 0; int n = 0;
     for (size_t i = 0; i < rgb.size() && n < maxf; i++) {
         double t = rgb[i].first;
         while (j + 1 < dep.size() && std::fabs(dep[j + 1].first - t) < std::fabs(dep[j].first - t)) j++;
         if (std::fabs(dep[j].first - t) > 0.02) continue;
         cv::Mat C = cv::imread(dir + "/" + rgb[i].second, cv::IMREAD_UNCHANGED), D = cv::imread(dir + "/" + dep[j].second, cv::IMREAD_UNCHANGED);
-        S.TrackRGBD(C, D, t); S.GetTracker()->WaitMappingIdle(); waitLoop(S); S.GetTracker()->WaitMappingIdle(); n++;
+        Sophus::SE3f tcw = S.TrackRGBD(C, D, t);
+        if (gt) { Eigen::Matrix<float, 3, 4> m = tcw.inverse().matrix3x4(); fprintf(gt, "%.6f\t%d\t%lu", t, S.GetTrackingState(), S.mpAtlas->GetCurrentMap()->GetId());
+          for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) fprintf(gt, "\t%.17g", (double)m(r, c)); fprintf(gt, "\n"); }
+        S.GetTracker()->WaitMappingIdle(); waitLoop(S); S.GetTracker()->WaitMappingIdle(); n++;
         fflush(g);
     }
-    S.Shutdown(); fclose(g); g = nullptr; fprintf(stderr, "frames %d\n", n); return 0;
+    S.Shutdown(); fclose(gt); fclose(g); g = nullptr; fprintf(stderr, "frames %d\n", n); return 0;
 }

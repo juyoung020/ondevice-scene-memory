@@ -16,47 +16,8 @@ use crate::orb3rs::{KeyFrame, KfId, MapPoint, MpId, Se3, Sim3};
 
 // ---------------- g2o::Sim3 (double) ----------------
 
-/// g2o::Sim3: 사원수 r(x, y, z, w) · t · s
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct G2oSim3 {
-    pub r: [f64; 4],
-    pub t: [f64; 3],
-    pub s: f64,
-}
-
-impl Default for G2oSim3 {
-    fn default() -> Self {
-        G2oSim3 { r: [0.0, 0.0, 0.0, 1.0], t: [0.0; 3], s: 1.0 }
-    }
-}
-
-/// Eigen Quaterniond 곱(SSE2 Packet2d 판: t1 = ww·b_xy + yy·b_zw, t2 = zz·b_xy − xx·b_zw, xy = t1 ∓ swap(t2) …)
-pub fn quatd_mul(a: &[f64; 4], b: &[f64; 4]) -> [f64; 4] {
-    let (xx, yy, zz, ww) = (a[0], a[1], a[2], a[3]);
-    let (bx, by, bz, bw) = (b[0], b[1], b[2], b[3]);
-    let t1 = [ww * bx + yy * bz, ww * by + yy * bw];
-    let t2 = [zz * bx - xx * bz, zz * by - xx * bw];
-    let x = t1[0] - t2[1];
-    let y = t1[1] + t2[0];
-    let u1 = [ww * bz - yy * bx, ww * bw - yy * by];
-    let u2 = [zz * bz + xx * bx, zz * bw + xx * by];
-    let z = u1[0] + u2[1];
-    let w = u1[1] - u2[0];
-    [x, y, z, w]
-}
-
-fn crossd(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-
-/// Quaterniond * Vector3d(_transformVector): uv = v×p, uv += uv, (p + w·uv) + v×uv
-pub fn quatd_rotate(q: &[f64; 4], p: &[f64; 3]) -> [f64; 3] {
-    let v = [q[0], q[1], q[2]];
-    let mut uv = crossd(&v, p);
-    uv = [uv[0] + uv[0], uv[1] + uv[1], uv[2] + uv[2]];
-    let c = crossd(&v, &uv);
-    [p[0] + q[3] * uv[0] + c[0], p[1] + q[3] * uv[1] + c[1], p[2] + q[3] * uv[2] + c[2]]
-}
+/// g2o::Sim3 는 통합 한 벌(`orb3cv::g2osim3::G2oSim3`). 곱 · 회전은 같은 식, 아래는 LoopClosing.cc 안에 인라인된 자리의 순서.
+pub use crate::orb3cv::g2osim3::G2oSim3;
 
 /// Eigen Quaterniond(Matrix3d)(Shoemake, 행 우선 m)
 pub fn quatd_from_mat(m: &[[f64; 3]; 3]) -> [f64; 4] {
@@ -100,12 +61,8 @@ pub fn quatd_to_mat(q: &[f64; 4]) -> [[f64; 3]; 3] {
 }
 
 impl G2oSim3 {
-    /// Sim3(Quaterniond, t, s)
-    pub fn new(r: [f64; 4], t: [f64; 3], s: f64) -> G2oSim3 {
-        G2oSim3 { r, t, s }
-    }
-    /// Sim3(Matrix3d, t, s)
-    pub fn from_mat(m: &[[f64; 3]; 3], t: [f64; 3], s: f64) -> G2oSim3 {
+    /// Sim3(Matrix3d(행 우선), t, s) — LoopClosing.cc 안의 대각 합 순서 (m00 + m11) + m22
+    pub fn from_rows(m: &[[f64; 3]; 3], t: [f64; 3], s: f64) -> G2oSim3 {
         G2oSim3 { r: quatd_from_mat(m), t, s }
     }
     /// Sim3(SE3f.cast<double>().unit_quaternion(), translation, 1)
@@ -114,12 +71,7 @@ impl G2oSim3 {
     }
     /// Sim3(R(float 행 우선).cast<double>(), t.cast<double>(), s)
     pub fn from_mat_f(m: &[[f32; 3]; 3], t: &[f32; 3], s: f64) -> G2oSim3 {
-        G2oSim3::from_mat(&m.map(|r| r.map(f64::from)), t.map(f64::from), s)
-    }
-    /// operator*: r = r·o.r, t = s·(r·o.t) + t, s = s·o.s
-    pub fn mul(&self, o: &G2oSim3) -> G2oSim3 {
-        let rt = quatd_rotate(&self.r, &o.t);
-        G2oSim3 { r: quatd_mul(&self.r, &o.r), t: [self.s * rt[0] + self.t[0], self.s * rt[1] + self.t[1], self.s * rt[2] + self.t[2]], s: self.s * o.s }
+        G2oSim3::from_rows(&m.map(|r| r.map(f64::from)), t.map(f64::from), s)
     }
     /// Converter::toSophus: Sim3f(RxSO3d((float)s, r.matrix()).cast<float>(), t.cast<float>())
     pub fn to_sophus(&self) -> Sim3 {

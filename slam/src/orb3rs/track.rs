@@ -459,7 +459,7 @@ pub trait TrackOps {
     fn create_map_in_atlas(&mut self);
     fn reset_active_map(&mut self);
     fn change_map(&mut self, map: MapId);
-    fn need_new_keyframe(&mut self) -> bool;
+    fn need_new_keyframe(&mut self, t: &Tracker) -> bool;
     /// 새 키프레임 id 를 돌려줌
     fn create_new_keyframe(&mut self) -> KfId;
     fn try_graft(&mut self);
@@ -570,7 +570,7 @@ pub fn track_flow(t: &mut Tracker, frame_id: u64, ts: f64, ops: &mut dyn TrackOp
         let both = ops.last_frame_set() && ops.cur_frame_set();
         t.velocity = both;
         ops.post_track_cleanup(both);
-        let need = ops.need_new_keyframe();
+        let need = ops.need_new_keyframe(t);
         if need && (ok || (t.insert_kfs_lost && t.state == state::RECENTLY_LOST && is_imu(t.sensor))) {
             // CreateNewKeyFrame 끝: mpReferenceKF · mnLastKeyFrameId · mpLastKeyFrame
             let kf = ops.create_new_keyframe();

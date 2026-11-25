@@ -11,7 +11,6 @@ pub mod edges;
 pub mod lba;
 pub mod ldlt;
 pub mod se3;
-pub mod sim3;
 pub mod solver;
 
 pub use edges::{Edge, Kind};

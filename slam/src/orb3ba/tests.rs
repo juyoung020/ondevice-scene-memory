@@ -378,12 +378,12 @@ fn se3_exp_oplus() {
 /// g2o::Sim3 exp · log · 곱 · 역 · map 무작위 4 만 건(하네스 sim3ref 덤프)
 #[test]
 fn sim3_ops() {
-    use super::sim3::Sim3;
+    use crate::orb3cv::g2osim3::G2oSim3 as Sim3;
     let b = std::fs::read(need("ORB3BA_SIM3")).expect("sim3 덤프");
     let f: Vec<f64> = b.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
     assert!(!f.is_empty());
-    let sim = |r: &[f64]| Sim3 { q: r[0..4].try_into().unwrap(), t: r[4..7].try_into().unwrap(), s: r[7] };
-    let flat = |s: &Sim3| -> Vec<f64> { s.q.iter().chain(&s.t).copied().chain([s.s]).collect() };
+    let sim = |r: &[f64]| Sim3 { r: r[0..4].try_into().unwrap(), t: r[4..7].try_into().unwrap(), s: r[7] };
+    let flat = |s: &Sim3| -> Vec<f64> { s.r.iter().chain(&s.t).copied().chain([s.s]).collect() };
     let mut bad = [0usize; 7];
     let names = ["exp", "log", "log(exp)", "곱", "역", "map", "C·a·b⁻¹ log"];
     let mut shown = 0;

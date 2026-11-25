@@ -7,6 +7,7 @@
 //! 스레드 · 멈춤 신호는 [`threads`](원본 교착을 구조로 없앤 판).
 pub mod loopflow;
 pub mod mapping;
+pub mod rsys;
 pub mod threads;
 
 /// `crate::orb3::Track` 과 같은 뜻(추적 상태 · 카메라 → 세계 3×4 · 지도 id · 기준 키프레임)

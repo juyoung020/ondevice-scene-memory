@@ -504,7 +504,10 @@ impl Orb3 {
         if let Ok(p) = std::env::var("ORB_TRACE") {
             use std::io::Write as _;
             if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                let _ = writeln!(fh, "{:.6} {} {} {:.6} {:.6} {:.6}", f.t, tr.state, tr.map_id, tr.twc[3], tr.twc[7], tr.twc[11]);
+                // 모든 키프레임 위치 합(지도가 실행마다 같은지)
+                let kv = self.sys.keyframes(true);
+                let ks = kv.iter().fold(0.0f64, |s, (id, m, p)| s + (*id as f64 + 1.0) * (p[3] + 2.0 * p[7] + 3.0 * p[11]) + *m as f64);
+                let _ = writeln!(fh, "{:.6} {} {} {:.6} {:.6} {:.6} kf {} {:.6}", f.t, tr.state, tr.map_id, tr.twc[3], tr.twc[7], tr.twc[11], kv.len(), ks);
             }
         }
         self.s_track.push(c0.elapsed().as_secs_f64() * 1e3);

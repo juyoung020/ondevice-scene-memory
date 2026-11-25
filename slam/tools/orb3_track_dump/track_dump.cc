@@ -78,6 +78,8 @@ struct Buf {
     void flush(const char *tag) {
         std::lock_guard<std::mutex> l(g_mx);
         if (!g_dump) return;
+        static const char *only = getenv("DUMP_TAGS");
+        if (only && strcmp(tag, "FRAM") && strcmp(tag, "TRAK") && strcmp(tag, "CTXF") && !strstr(only, tag)) return;
         uint32_t t; memcpy(&t, tag, 4);
         uint32_t n = (uint32_t)b.size();
         fwrite(&t, 4, 1, g_dump); fwrite(&n, 4, 1, g_dump); fwrite(b.data(), 1, b.size(), g_dump);
@@ -492,23 +494,217 @@ void LocalMapping::KeyFrameCulling() {
 }
 
 
+// ---------------- Tracking 단계 덤프(TRACK 2 단계): 장면 · 지도 점 통째 ----------------
+static int g_slp_every = 8;  // SearchLocalPoints · TrackWithMotionModel · TrackLocalMap 덤프 표본 간격(장면 번호)
+static void put_ctx_once(Frame &F, LocalMapping *L) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    Buf B;
+    B.w(F.fx); B.w(F.fy); B.w(F.cx); B.w(F.cy); B.w(F.invfx); B.w(F.invfy); B.w(F.mbf); B.w(F.mb); B.w(F.mThDepth);
+    B.w<int32_t>(F.mnScaleLevels); B.w(F.mfScaleFactor); B.w(F.mfLogScaleFactor);
+    for (int l = 0; l < F.mnScaleLevels; l++) { B.w(F.mvScaleFactors[l]); B.w(F.mvInvScaleFactors[l]); B.w(F.mvLevelSigma2[l]); B.w(F.mvInvLevelSigma2[l]); }
+    B.w(Frame::mnMinX); B.w(Frame::mnMaxX); B.w(Frame::mnMinY); B.w(Frame::mnMaxY);
+    B.w(Frame::mfGridElementWidthInv); B.w(Frame::mfGridElementHeightInv);
+    B.w<uint8_t>(L->mbFarPoints); B.w(L->mThFarPoints);
+    B.flush("CTXF");
+}
+static uint64_t mid(MapPoint *m) { return m ? (uint64_t)m->mnId : NONE; }
+static void put_pose(Buf &B, const Sophus::SE3f &T) {
+    const Eigen::Quaternionf q = T.unit_quaternion();
+    B.w(q.x()); B.w(q.y()); B.w(q.z()); B.w(q.w());
+    B.w(T.translation()[0]); B.w(T.translation()[1]); B.w(T.translation()[2]);
+}
+static void put_feat(Buf &B, const DBoW2::FeatureVector &fv) {
+    B.w<uint32_t>(fv.size());
+    for (auto &n : fv) { B.w<uint32_t>(n.first); B.w<uint32_t>(n.second.size()); for (auto i : n.second) B.w<uint32_t>(i); }
+}
+static void put_desc(Buf &B, const cv::Mat &d, int i) { const uint8_t *p = d.ptr<uint8_t>(i); for (int k = 0; k < 32; k++) B.w(p[k]); }
+// 장면: 번호 · 자세 · 특징점(왜곡 없음) · 기술자 · 깊이 · 지도 점 · 바깥점 · 기준 키프레임 · FeatureVector
+static void put_frame(Buf &B, Frame &F, bool feat) {
+    B.w<uint64_t>(F.mnId); B.w<double>(F.mTimeStamp);
+    B.w<uint8_t>(F.isSet()); if (F.isSet()) put_pose(B, F.GetPose());
+    B.w<uint32_t>(F.N);
+    for (int i = 0; i < F.N; i++) {
+        const cv::KeyPoint &k = F.mvKeysUn[i];
+        B.w(k.pt.x); B.w(k.pt.y); B.w(k.size); B.w(k.angle); B.w(k.response); B.w<int32_t>(k.octave); B.w<int32_t>(k.class_id);
+        put_desc(B, F.mDescriptors, i);
+        B.w(F.mvuRight[i]); B.w(F.mvDepth[i]);
+        B.w<uint64_t>(mid(F.mvpMapPoints[i])); B.w<uint8_t>(F.mvbOutlier[i]);
+    }
+    B.w<uint64_t>(kid(F.mpReferenceKF));
+    B.w<uint8_t>(feat); if (feat) put_feat(B, F.mFeatVec);
+}
+// 장면 결과: 자세 · 지도 점 · 바깥점
+static void put_frame_out(Buf &B, Frame &F) {
+    B.w<uint8_t>(F.isSet()); if (F.isSet()) put_pose(B, F.GetPose());
+    for (int i = 0; i < F.N; i++) { B.w<uint64_t>(mid(F.mvpMapPoints[i])); B.w<uint8_t>(F.mvbOutlier[i]); }
+}
+// 지도 점(짝짓기 · 자세 최적화 · 시야 판정이 읽는 칸 전부)
+static void put_mp(Buf &B, MapPoint *m) {
+    B.w<uint64_t>(m->mnId); B.w<uint8_t>(m->isBad());
+    Eigen::Vector3f X = m->GetWorldPos(), N = m->GetNormal();
+    for (int k = 0; k < 3; k++) B.w(X[k]);
+    for (int k = 0; k < 3; k++) B.w(N[k]);
+    put_desc(B, m->GetDescriptor(), 0);
+    B.w<int32_t>(m->Observations()); B.w(m->mfMinDistance); B.w(m->mfMaxDistance);
+    B.w<uint64_t>(mid(m->GetReplaced())); B.w<int32_t>(m->mnVisible); B.w<int32_t>(m->mnFound);
+    B.w<uint64_t>(m->mnLastFrameSeen); B.w<uint8_t>(m->mbTrackInView);
+    B.w(m->mTrackProjX); B.w(m->mTrackProjY); B.w(m->mTrackProjXR); B.w<int32_t>(m->mnTrackScaleLevel); B.w(m->mTrackViewCos); B.w(m->mTrackDepth);
+}
+static void put_mps(Buf &B, const std::vector<MapPoint *> &v) {
+    std::set<MapPoint *> s; std::vector<MapPoint *> u;
+    for (MapPoint *m : v) if (m && s.insert(m).second) u.push_back(m);
+    B.w<uint32_t>(u.size());
+    for (MapPoint *m : u) put_mp(B, m);
+}
+// 지도 점 결과 칸(보임 · 찾음 수 · 마지막 본 장면 · 시야 칸)
+static void put_mp_out(Buf &B, const std::vector<MapPoint *> &v) {
+    std::set<MapPoint *> s; std::vector<MapPoint *> u;
+    for (MapPoint *m : v) if (m && s.insert(m).second) u.push_back(m);
+    B.w<uint32_t>(u.size());
+    for (MapPoint *m : u) {
+        B.w<uint64_t>(m->mnId); B.w<int32_t>(m->mnVisible); B.w<int32_t>(m->mnFound); B.w<uint64_t>(m->mnLastFrameSeen); B.w<uint8_t>(m->mbTrackInView);
+        if (m->mbTrackInView) { B.w(m->mTrackProjX); B.w(m->mTrackProjY); B.w(m->mTrackProjXR); B.w<int32_t>(m->mnTrackScaleLevel); B.w(m->mTrackViewCos); B.w(m->mTrackDepth); }
+    }
+}
+
+// CheckReplacedInLastFrame(CRLF): 앞 장면 점 · 대체 점 / 결과 점
+void Tracking::CheckReplacedInLastFrame() {
+    typedef void (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking24CheckReplacedInLastFrameEv");
+    Buf B;
+    B.w<uint32_t>(mLastFrame.N);
+    for (int i = 0; i < mLastFrame.N; i++) { MapPoint *m = mLastFrame.mvpMapPoints[i]; B.w<uint64_t>(mid(m)); B.w<uint64_t>(m ? mid(m->GetReplaced()) : NONE); }
+    o(this);
+    for (int i = 0; i < mLastFrame.N; i++) B.w<uint64_t>(mid(mLastFrame.mvpMapPoints[i]));
+    B.flush("CRLF");
+}
+
+// TrackReferenceKeyFrame(TRKF): 앞 장면 자세, 기준 키프레임(특징점 · 기술자 · Feat · 점), 그 점들 / 결과
+bool Tracking::TrackReferenceKeyFrame() {
+    typedef bool (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking22TrackReferenceKeyFrameEv");
+    put_ctx_once(mCurrentFrame, mpLocalMapper);
+    std::unique_lock<std::mutex> lk(mpAtlas->GetCurrentMap()->mMutexMapUpdate, std::defer_lock);
+    Buf B;
+    mCurrentFrame.ComputeBoW();  // 원본도 맨 앞에서 부름(이미 있으면 그대로)
+    put_frame(B, mCurrentFrame, true);
+    B.w<uint8_t>(mLastFrame.isSet()); put_pose(B, mLastFrame.GetPose());
+    KeyFrame *K = mpReferenceKF;
+    B.w<uint64_t>(K->mnId); B.w<uint32_t>(K->N);
+    std::vector<MapPoint *> kmp = K->GetMapPointMatches();
+    for (int i = 0; i < K->N; i++) {
+        const cv::KeyPoint &k = K->mvKeysUn[i];
+        B.w(k.pt.x); B.w(k.pt.y); B.w(k.angle); B.w<int32_t>(k.octave);
+        put_desc(B, K->mDescriptors, i); B.w(K->mvuRight[i]);
+        B.w<uint64_t>(mid(kmp[i]));
+    }
+    put_feat(B, K->mFeatVec);
+    put_mps(B, kmp);
+    bool r = o(this);
+    B.w<uint8_t>(r);
+    put_frame_out(B, mCurrentFrame);
+    put_mp_out(B, kmp);
+    B.flush("TRKF");
+    ev(1, 0, r);
+    return r;
+}
+
+// TrackWithMotionModel(TWMM): 지금 · 앞 장면, 앞 장면 기준 키프레임 자세, mlRelativeFramePoses.back(), mVelocity, 앞 장면 점들 / 결과
+bool Tracking::TrackWithMotionModel() {
+    typedef bool (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking20TrackWithMotionModelEv");
+    const bool dump = mCurrentFrame.mnId % g_slp_every == 0;
+    if (!dump) { bool r = o(this); ev(2, 0, r); return r; }
+    put_ctx_once(mCurrentFrame, mpLocalMapper);
+    Buf B;
+    B.w<int32_t>(mSensor);
+    put_frame(B, mCurrentFrame, false);
+    put_frame(B, mLastFrame, false);
+    put_pose(B, mLastFrame.mpReferenceKF->GetPose());
+    put_pose(B, mlRelativeFramePoses.back());
+    put_pose(B, mVelocity);
+    put_mps(B, mLastFrame.mvpMapPoints);
+    bool r = o(this);
+    B.w<uint8_t>(r);
+    B.w<uint8_t>(mLastFrame.isSet()); put_pose(B, mLastFrame.GetPose());
+    put_frame_out(B, mCurrentFrame);
+    put_mp_out(B, mLastFrame.mvpMapPoints);
+    B.flush("TWMM");
+    ev(2, 0, r);
+    return r;
+}
+
+// SearchLocalPoints(SLPT): 장면, 지역 점 목록(순서 그대로) · 그 점들 + 장면 점들, 상태 / 결과
+static thread_local bool t_tlm_dump = false;
+static thread_local std::vector<uint8_t> *t_after_slp = nullptr;
+void Tracking::SearchLocalPoints() {
+    typedef void (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking17SearchLocalPointsEv");
+    if (!t_tlm_dump) { o(this); return; }
+    put_ctx_once(mCurrentFrame, mpLocalMapper);
+    Buf B;
+    B.w<int32_t>(mSensor); B.w<int32_t>(mState); B.w<uint64_t>(mnLastRelocFrameId); B.w<uint8_t>(mpAtlas->isImuInitialized());
+    put_frame(B, mCurrentFrame, false);
+    B.w<uint32_t>(mvpLocalMapPoints.size());
+    for (MapPoint *m : mvpLocalMapPoints) B.w<uint64_t>(m->mnId);
+    std::vector<MapPoint *> all = mvpLocalMapPoints;
+    for (MapPoint *m : mCurrentFrame.mvpMapPoints) if (m) all.push_back(m);
+    put_mps(B, all);
+    o(this);
+    put_frame_out(B, mCurrentFrame);
+    put_mp_out(B, all);
+    B.flush("SLPT");
+    if (t_after_slp) { Buf C; put_frame_out(C, mCurrentFrame); *t_after_slp = C.b; }
+}
+
+// TrackLocalMap(TLMP): 자세 최적화 · 점 통계 · 판단(UpdateLocalMap · SearchLocalPoints 는 ULKF · ULMP · SLPT 로 따로) /
+// 넣는 것: SearchLocalPoints 뒤 장면, 그 점들, 상태 / 결과
+bool Tracking::TrackLocalMap() {
+    typedef bool (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking13TrackLocalMapEv");
+    const bool dump = mCurrentFrame.mnId % g_slp_every == 0;
+    if (!dump) { bool r = o(this); ev(4, mCurrentFrame.GetPose().matrix().allFinite() ? 1 : 0, r); return r; }
+    std::vector<uint8_t> after;
+    t_tlm_dump = true; t_after_slp = &after;
+    Buf B;
+    B.w<int32_t>(mSensor); B.w<int32_t>(mState); B.w<uint64_t>(mnLastRelocFrameId); B.w<int32_t>(mMaxFrames); B.w<uint8_t>(mbOnlyTracking);
+    B.w<uint64_t>(mCurrentFrame.mnId);
+    bool r = o(this);
+    t_tlm_dump = false; t_after_slp = nullptr;
+    // SearchLocalPoints 직후 장면(자세 · 점 · 바깥점)
+    B.w<uint32_t>(after.size()); B.b.insert(B.b.end(), after.begin(), after.end());
+    put_mps(B, mCurrentFrame.mvpMapPoints);  // 자세 최적화가 읽는 점(결과 뒤 장면 점 ⊆ SearchLocalPoints 뒤 점)
+    B.w<uint8_t>(r); B.w<int32_t>(mnMatchesInliers);
+    put_frame_out(B, mCurrentFrame);
+    put_mp_out(B, mCurrentFrame.mvpMapPoints);
+    B.flush("TLMP");
+    ev(4, mCurrentFrame.GetPose().matrix().allFinite() ? 1 : 0, r);
+    return r;
+}
+
+// StereoInitialization(SINI): 장면 / 상태, 새 점(번호 · 위치 · 법선 · 거리 · 기술자)
+void Tracking::StereoInitialization() {
+    typedef void (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking20StereoInitializationEv");
+    put_ctx_once(mCurrentFrame, mpLocalMapper);
+    Buf B;
+    put_frame(B, mCurrentFrame, false);
+    o(this);
+    B.w<int32_t>(mState);
+    put_frame_out(B, mCurrentFrame);
+    std::vector<std::pair<int, MapPoint *>> made;
+    for (int i = 0; i < mCurrentFrame.N; i++) if (mCurrentFrame.mvpMapPoints[i]) made.push_back({i, mCurrentFrame.mvpMapPoints[i]});
+    B.w<uint32_t>(made.size());
+    for (auto &p : made) { B.w<int32_t>(p.first); put_mp(B, p.second); }
+    B.w<uint32_t>(mvpLocalMapPoints.size());
+    for (MapPoint *m : mvpLocalMapPoints) B.w<uint64_t>(m->mnId);
+    B.flush("SINI");
+    ev(5, 0, mState);
+}
+
 // ---------------- Track() 흐름: 하위 호출 결과를 사건으로 ----------------
 #define HOOK_BOOL(cls, name, mangled, code) \
 bool cls::name() { typedef bool (*Fn)(cls *); static Fn o = (Fn)orig_sym(mangled); bool r = o(this); ev(code, 0, r); return r; }
-HOOK_BOOL(Tracking, TrackReferenceKeyFrame, "_ZN9ORB_SLAM38Tracking22TrackReferenceKeyFrameEv", 1)
-HOOK_BOOL(Tracking, TrackWithMotionModel, "_ZN9ORB_SLAM38Tracking20TrackWithMotionModelEv", 2)
 bool Tracking::Relocalization(Map *pMap) {
     typedef bool (*Fn)(Tracking *, Map *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking14RelocalizationEPNS_3MapE");
     int64_t id = pMap ? (int64_t)pMap->GetId() : -1;
     bool r = o(this, pMap); ev(3, id, r); return r;
-}
-bool Tracking::TrackLocalMap() {
-    typedef bool (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking13TrackLocalMapEv");
-    bool r = o(this); ev(4, mCurrentFrame.GetPose().matrix().allFinite() ? 1 : 0, r); return r;
-}
-void Tracking::StereoInitialization() {
-    typedef void (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking20StereoInitializationEv");
-    o(this); ev(5, 0, mState);
 }
 void Tracking::CreateMapInAtlas() {
     typedef void (*Fn)(Tracking *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM38Tracking16CreateMapInAtlasEv");
@@ -565,6 +761,7 @@ int main(int argc, char **argv) {
     int maxf = atoi(argv[5]);
     if (argc > 6) g_ulmp_every = atoi(argv[6]);
     if (argc > 7) g_sync = atoi(argv[7]);
+    if (getenv("SLP_EVERY")) g_slp_every = atoi(getenv("SLP_EVERY"));
     std::vector<double> tr, td; std::vector<std::string> pr, pd;
     load(dir + "/rgb.txt", tr, pr); load(dir + "/depth.txt", td, pd);
     System S(argv[1], argv[2], System::RGBD, false);

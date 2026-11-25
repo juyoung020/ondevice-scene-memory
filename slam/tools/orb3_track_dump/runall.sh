@@ -13,5 +13,5 @@ run() {
   rm -f ~/orbtrack_out/$1.bin
 }
 run ds ds.yaml ~/rec_dl/ds_1118_121652/cam
-for s in desk2 room 360 floor rpy; do run tum_$s $O/Examples/RGB-D/TUM1.yaml ~/data/tum_shake/rgbd_dataset_freiburg1_$s; done
+for s in desk2 room 360 floor rpy; do run tum_$s ${YDIR:-$O}/Examples/RGB-D/TUM1.yaml ~/data/tum_shake/rgbd_dataset_freiburg1_$s; done
 echo done >> $out

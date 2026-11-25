@@ -902,6 +902,343 @@ fn tria(r: &mut R, t: &mut Tally) {
     t.add(same, || format!("원본 {ok} {x:?} rust {got:?}"));
 }
 
+// ---------------- Tracking 단계(CTXF · CRLF · TRKF · TWMM · SLPT · TLMP · SINI) ----------------
+
+thread_local! {
+    static CTX: std::cell::RefCell<Option<std::sync::Arc<FrameCtx>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// CTXF: 장면 공통 값(카메라 · 층 표 · 경계 · 격자) + 지역 지도 mbFarPoints · mThFarPoints
+fn ctxf(r: &mut R, far: &mut (bool, f32)) {
+    let (fx, fy, cx, cy, invfx, invfy, bf, b, th_depth) = (r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32());
+    let nl = r.i32();
+    let (sf, lsf) = (r.f32(), r.f32());
+    let mut pyr = Pyramid { nlevels: nl, scale_factor: sf, log_scale_factor: lsf, ..Default::default() };
+    for _ in 0..nl {
+        pyr.scale.push(r.f32());
+        pyr.inv_scale.push(r.f32());
+        pyr.sigma2.push(r.f32());
+        pyr.inv_sigma2.push(r.f32());
+    }
+    let (min_x, max_x, min_y, max_y, gw, gh) = (r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32());
+    *far = (r.b(), r.f32());
+    let cam = Camera { fx, fy, cx, cy, invfx, invfy, bf, b, th_depth, width: max_x as i32, height: max_y as i32 };
+    let c = FrameCtx { cam, pyr, min_x, max_x, min_y, max_y, grid_inv_w: gw, grid_inv_h: gh };
+    CTX.with(|x| *x.borrow_mut() = Some(std::sync::Arc::new(c)));
+}
+fn ctx() -> std::sync::Arc<FrameCtx> {
+    CTX.with(|x| x.borrow().clone().expect("CTXF 먼저"))
+}
+fn opt_id(v: u64) -> Option<u64> {
+    if v == u64::MAX { None } else { Some(v) }
+}
+fn read_pose(r: &mut R) -> Se3 {
+    Se3 { q: [r.f32(), r.f32(), r.f32(), r.f32()], t: [r.f32(), r.f32(), r.f32()] }
+}
+fn read_desc(r: &mut R) -> Desc {
+    r.take::<32>()
+}
+fn read_feat(r: &mut R) -> BTreeMap<u32, Vec<u32>> {
+    let n = r.u32();
+    (0..n)
+        .map(|_| {
+            let id = r.u32();
+            let k = r.u32();
+            (id, (0..k).map(|_| r.u32()).collect())
+        })
+        .collect()
+}
+fn read_frame(r: &mut R) -> Frame {
+    let id = r.u64();
+    let ts = r.f64();
+    let pose = if r.b() { Some(read_pose(r)) } else { None };
+    let n = r.u32() as usize;
+    let mut f = Frame { id, timestamp: ts, ctx: ctx(), ..Default::default() };
+    for _ in 0..n {
+        f.keys.push(KeyPoint { x: r.f32(), y: r.f32(), size: r.f32(), angle: r.f32(), response: r.f32(), octave: r.i32(), class_id: r.i32() });
+        f.desc.push(read_desc(r));
+        f.u_right.push(r.f32());
+        f.depth.push(r.f32());
+        f.map_points.push(opt_id(r.u64()));
+        f.outlier.push(r.b());
+    }
+    f.ref_kf = opt_id(r.u64());
+    if r.b() {
+        f.feat = read_feat(r);
+    }
+    f.assign_grid();
+    if let Some(p) = pose {
+        f.set_pose(p);
+    }
+    f
+}
+/// 장면 결과(자세 있음 · 자세 · 점 · 바깥점)
+type FrameOut = (Option<[u32; 7]>, Vec<(Option<u64>, bool)>);
+fn read_frame_out(r: &mut R, n: usize) -> FrameOut {
+    let p = if r.b() { Some(pose_bits(&read_pose(r))) } else { None };
+    (p, (0..n).map(|_| (opt_id(r.u64()), r.b())).collect())
+}
+fn pose_bits(p: &Se3) -> [u32; 7] {
+    [p.q[0], p.q[1], p.q[2], p.q[3], p.t[0], p.t[1], p.t[2]].map(|v| v.to_bits())
+}
+fn frame_out(f: &Frame) -> FrameOut {
+    (f.tcw.as_ref().map(pose_bits), f.map_points.iter().copied().zip(f.outlier.iter().copied()).collect())
+}
+fn read_mp(r: &mut R) -> MapPoint {
+    let id = r.u64();
+    let bad = r.b();
+    let pos = [r.f32(), r.f32(), r.f32()];
+    let normal = [r.f32(), r.f32(), r.f32()];
+    let desc = read_desc(r);
+    let n_obs = r.i32();
+    let (min_dist, max_dist) = (r.f32(), r.f32());
+    let replaced = opt_id(r.u64());
+    let (visible, found) = (r.i32(), r.i32());
+    let last_frame_seen = r.u64();
+    let track_in_view = r.b();
+    let (track_proj_x, track_proj_y, track_proj_xr, track_scale_level, track_view_cos, track_depth) = (r.f32(), r.f32(), r.f32(), r.i32(), r.f32(), r.f32());
+    MapPoint {
+        id,
+        bad,
+        pos,
+        normal,
+        desc,
+        n_obs,
+        min_dist,
+        max_dist,
+        replaced,
+        visible,
+        found,
+        last_frame_seen,
+        track_in_view,
+        track_proj_x,
+        track_proj_y,
+        track_proj_xr,
+        track_scale_level,
+        track_view_cos,
+        track_depth,
+        ..Default::default()
+    }
+}
+fn read_mps(r: &mut R) -> BTreeMap<MpId, MapPoint> {
+    let n = r.u32();
+    (0..n).map(|_| read_mp(r)).map(|m| (m.id, m)).collect()
+}
+/// 지도 점 결과 칸: (보임, 찾음, 마지막 본 장면, 시야 칸 비트)
+type MpOut = Vec<(u64, i32, i32, u64, Option<[u32; 6]>)>;
+fn read_mp_out(r: &mut R) -> MpOut {
+    let n = r.u32();
+    (0..n)
+        .map(|_| {
+            let id = r.u64();
+            let (v, f) = (r.i32(), r.i32());
+            let ls = r.u64();
+            let tv = if r.b() { Some([r.f32().to_bits(), r.f32().to_bits(), r.f32().to_bits(), r.i32() as u32, r.f32().to_bits(), r.f32().to_bits()]) } else { None };
+            (id, v, f, ls, tv)
+        })
+        .collect()
+}
+fn mp_out(want: &MpOut, mps: &BTreeMap<MpId, MapPoint>) -> MpOut {
+    want.iter()
+        .map(|w| {
+            let m = &mps[&w.0];
+            let tv = m.track_in_view.then(|| {
+                [m.track_proj_x.to_bits(), m.track_proj_y.to_bits(), m.track_proj_xr.to_bits(), m.track_scale_level as u32, m.track_view_cos.to_bits(), m.track_depth.to_bits()]
+            });
+            (m.id, m.visible, m.found, m.last_frame_seen, tv)
+        })
+        .collect()
+}
+fn diff_frame(a: &FrameOut, b: &FrameOut) -> String {
+    if a.0 != b.0 {
+        return format!("자세 원본 {:?} rust {:?}", a.0, b.0);
+    }
+    let k = a.1.iter().zip(&b.1).position(|(x, y)| x != y);
+    format!("점 {k:?}: 원본 {:?} rust {:?}", k.map(|i| a.1[i]), k.map(|i| b.1[i]))
+}
+fn diff_mp(a: &MpOut, b: &MpOut) -> String {
+    let k = a.iter().zip(b).position(|(x, y)| x != y);
+    format!("지도 점 {k:?}: 원본 {:?} rust {:?}", k.map(|i| a[i]), k.map(|i| b[i]))
+}
+
+/// CRLF: CheckReplacedInLastFrame
+fn crlf(r: &mut R, t: &mut Tally) {
+    let n = r.u32() as usize;
+    let mut last = Frame::default();
+    let mut mps = BTreeMap::new();
+    for _ in 0..n {
+        let (m, rep) = (opt_id(r.u64()), opt_id(r.u64()));
+        last.map_points.push(m);
+        if let Some(m) = m {
+            mps.insert(m, MapPoint { id: m, replaced: rep, ..Default::default() });
+        }
+    }
+    let want: Vec<Option<u64>> = (0..n).map(|_| opt_id(r.u64())).collect();
+    check_replaced_in_last_frame(&mut last, &mps);
+    t.add(last.map_points == want, || "점 다름".into());
+}
+
+/// TRKF: TrackReferenceKeyFrame
+fn trkf(r: &mut R, t: &mut Tally, tmp: &mut Tally) {
+    let mut cur = read_frame(r);
+    let _last_set = r.b();
+    let last_pose = read_pose(r);
+    let kid = r.u64();
+    let n = r.u32() as usize;
+    let mut kf = KeyFrame { id: kid, ctx: ctx(), ..Default::default() };
+    for _ in 0..n {
+        kf.keys.push(KeyPoint { x: r.f32(), y: r.f32(), angle: r.f32(), octave: r.i32(), ..Default::default() });
+        kf.desc.push(read_desc(r));
+        kf.u_right.push(r.f32());
+        kf.map_points.push(opt_id(r.u64()));
+    }
+    kf.feat = read_feat(r);
+    let mut mps = read_mps(r);
+    let want_r = r.b();
+    let want = read_frame_out(r, cur.keys.len());
+    let want_mp = read_mp_out(r);
+    let got_r = track_reference_keyframe(&mut cur, last_pose, &kf, &mut mps);
+    let got = frame_out(&cur);
+    t.add(got_r == want_r && (got == want || !want_r && got.1 == want.1 && want.0.is_none() == got.0.is_none()), || {
+        format!("장면 {} 결과 원본 {want_r} rust {got_r}; {}", cur.id, diff_frame(&want, &got))
+    });
+    let gm = mp_out(&want_mp, &mps);
+    tmp.add(gm == want_mp, || diff_mp(&want_mp, &gm));
+}
+
+/// TWMM: UpdateLastFrame + TrackWithMotionModel
+fn twmm(r: &mut R, t: &mut Tally, tmp: &mut Tally) {
+    let sensor = r.i32();
+    let mut cur = read_frame(r);
+    let mut last = read_frame(r);
+    let ref_pose = read_pose(r);
+    let tlr = read_pose(r);
+    let vel = read_pose(r);
+    let mut mps = read_mps(r);
+    let want_r = r.b();
+    let _ = r.b();
+    let want_last = pose_bits(&read_pose(r));
+    let want = read_frame_out(r, cur.keys.len());
+    let want_mp = read_mp_out(r);
+    let got_r = track_with_motion_model(&mut cur, &mut last, ref_pose, tlr, vel, sensor, &mut mps);
+    let got = frame_out(&cur);
+    let got_last = pose_bits(last.tcw.as_ref().unwrap());
+    t.add(got_r == want_r && got == want && got_last == want_last, || {
+        format!("장면 {} 결과 원본 {want_r} rust {got_r}; 앞 자세 같음 {}; {}", cur.id, got_last == want_last, diff_frame(&want, &got))
+    });
+    let gm = mp_out(&want_mp, &mps);
+    tmp.add(gm == want_mp, || diff_mp(&want_mp, &gm));
+}
+
+/// SLPT: SearchLocalPoints
+fn slpt(r: &mut R, far: (bool, f32), t: &mut Tally, tmp: &mut Tally) {
+    let sensor = r.i32();
+    let state = r.i32();
+    let last_reloc = r.u64();
+    let imu = r.b();
+    assert!(!imu);
+    let mut cur = read_frame(r);
+    let n = r.u32();
+    let local: Vec<MpId> = (0..n).map(|_| r.u64()).collect();
+    let mut mps = read_mps(r);
+    let want = read_frame_out(r, cur.keys.len());
+    let want_mp = read_mp_out(r);
+    SLP_FRAME.with(|s| *s.borrow_mut() = Some(cur.clone()));
+    let tk = Tracker { sensor, state, last_reloc_frame_id: last_reloc, local_mps: local, ..Default::default() };
+    search_local_points(&tk, &mut cur, &mut mps, far);
+    let got = frame_out(&cur);
+    t.add(got == want, || format!("장면 {}: {}", cur.id, diff_frame(&want, &got)));
+    let gm = mp_out(&want_mp, &mps);
+    tmp.add(gm == want_mp, || diff_mp(&want_mp, &gm));
+}
+
+/// TLMP: TrackLocalMap 의 SearchLocalPoints 뒤(PoseOptimization · 점 통계 · 판단)
+fn tlmp(r: &mut R, t: &mut Tally, tmp: &mut Tally) {
+    let sensor = r.i32();
+    let state = r.i32();
+    let last_reloc = r.u64();
+    let max_frames = r.i32();
+    let only = r.b();
+    let id = r.u64();
+    let len = r.u32() as usize;
+    let after = r.b[r.o..r.o + len].to_vec();
+    r.o += len;
+    let mut mps = read_mps(r);
+    let want_r = r.b();
+    let want_inl = r.i32();
+    // 원본 SearchLocalPoints 뒤 장면 + 점들의 결과 전 찾음 수
+    let mut ra = R { b: &after, o: 0 };
+    let n = (after.len() - 1 - if after[0] != 0 { 28 } else { 0 }) / 9;
+    let a = read_frame_out(&mut ra, n);
+    let want = read_frame_out(r, n);
+    let want_mp = read_mp_out(r);
+    let mut cur = Frame { id, ctx: ctx(), ..Default::default() };
+    cur.keys = vec![KeyPoint::default(); n];
+    cur.u_right = vec![-1.0; n];
+    cur.map_points = a.1.iter().map(|x| x.0).collect();
+    cur.outlier = a.1.iter().map(|x| x.1).collect();
+    // 자세 최적화에 필요한 특징점 · 오른쪽 좌표가 이 기록에 없음 → SLPT 기록과 같은 장면에서 채움
+    TLM_PEND.with(|p| p.borrow_mut().push((id, cur, mps, a.0, want, want_mp, want_r, want_inl, Tracker { sensor, state, last_reloc_frame_id: last_reloc, max_frames, only_tracking: only, ..Default::default() })));
+    tlmp_run(t, tmp);
+}
+
+type TlmPend = (u64, Frame, BTreeMap<MpId, MapPoint>, Option<[u32; 7]>, FrameOut, MpOut, bool, i32, Tracker);
+thread_local! {
+    static TLM_PEND: std::cell::RefCell<Vec<TlmPend>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SLP_FRAME: std::cell::RefCell<Option<Frame>> = const { std::cell::RefCell::new(None) };
+}
+/// 같은 장면 SLPT 의 특징점으로 TLMP 를 돌림(SLPT 가 TLMP 보다 먼저 기록됨)
+fn tlmp_run(t: &mut Tally, tmp: &mut Tally) {
+    let pend = TLM_PEND.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (id, mut cur, mut mps, pose_after_slp, want, want_mp, want_r, want_inl, mut tk) in pend {
+        let Some(sf) = SLP_FRAME.with(|s| s.borrow_mut().take()).filter(|f| f.id == id) else {
+            t.add(false, || format!("장면 {id}: SLPT 기록 없음"));
+            continue;
+        };
+        cur.keys = sf.keys;
+        cur.u_right = sf.u_right;
+        cur.depth = sf.depth;
+        let p = pose_after_slp.expect("자세");
+        let f = |i: usize| f32::from_bits(p[i]);
+        cur.set_pose(Se3 { q: [f(0), f(1), f(2), f(3)], t: [f(4), f(5), f(6)] });
+        slam::orb3loop::reloc::pose_optimization_frame(&mut cur, &mps);
+        let got_r = track_local_map_finish(&mut tk, &mut cur, &mut mps);
+        let got = frame_out(&cur);
+        t.add(got_r == want_r && tk.matches_inliers == want_inl && got == want, || {
+            format!("장면 {id} 결과 원본 {want_r}/{want_inl} rust {got_r}/{}; {}", tk.matches_inliers, diff_frame(&want, &got))
+        });
+        // 점 칸은 원본 실행 뒤 값을 넣어 돌리므로(찾음 수가 이미 올라감) 비교는 바깥점 · 맞은 수로만
+        let _ = (&want_mp, &mut *tmp);
+    }
+}
+
+/// SINI: StereoInitialization
+fn sini(r: &mut R, t: &mut Tally, tpts: &mut Tally) {
+    let mut cur = read_frame(r);
+    let want_state = r.i32();
+    let want = read_frame_out(r, cur.keys.len());
+    let n = r.u32();
+    let made: Vec<(i32, MapPoint)> = (0..n).map(|_| (r.i32(), read_mp(r))).collect();
+    let nl = r.u32();
+    let _local: Vec<u64> = (0..nl).map(|_| r.u64()).collect();
+    let mut atlas = Atlas { maps: vec![Map::default()], ..Default::default() };
+    let mut tk = Tracker { state: state::NOT_INITIALIZED, ..Default::default() };
+    let kf = stereo_initialization(&mut tk, &mut cur, &mut atlas);
+    let got_state = if kf.is_some() { state::OK } else { state::NOT_INITIALIZED };
+    let same_slots = cur.map_points.iter().map(|m| m.is_some()).eq(want.1.iter().map(|x| x.0.is_some()));
+    t.add(got_state == want_state && same_slots && cur.tcw.as_ref().map(pose_bits) == want.0, || {
+        format!("장면 {} 상태 원본 {want_state} rust {got_state}, 칸 같음 {same_slots}", cur.id)
+    });
+    for (i, w) in &made {
+        let Some(g) = cur.map_points[*i as usize].map(|m| &atlas.mps[&m]) else {
+            tpts.add(false, || format!("칸 {i} 없음"));
+            continue;
+        };
+        let bits = |m: &MapPoint| (m.pos.map(f32::to_bits), m.normal.map(f32::to_bits), m.desc, m.n_obs, m.min_dist.to_bits(), m.max_dist.to_bits());
+        tpts.add(bits(g) == bits(w), || format!("칸 {i}: 원본 {:?} rust {:?}", bits(w), bits(g)));
+    }
+}
+
 fn main() {
     let path = std::env::args().nth(1).expect("dump.bin");
     let d = std::fs::read(&path).unwrap();
@@ -912,6 +1249,7 @@ fn main() {
     let mut states = BTreeMap::new();
     let mut lost_frames = 0u64;
     let mut frames = 0u64;
+    let mut far = (false, 0f32);
     while o + 8 <= d.len() {
         let tag = std::str::from_utf8(&d[o..o + 4]).unwrap().to_string();
         let n = u32::from_le_bytes(d[o + 4..o + 8].try_into().unwrap()) as usize;
@@ -960,6 +1298,32 @@ fn main() {
             "TRIA" => tria(&mut r, tal.entry("Triangulate(JacobiSVD)").or_default()),
             "KFCL" => kfcl(&mut r, tal.entry("KeyFrameCulling").or_default()),
             "TRAK" => trak(&mut r, tal.entry("Track 흐름").or_default(), &mut states),
+            "CTXF" => ctxf(&mut r, &mut far),
+            "CRLF" => crlf(&mut r, tal.entry("CheckReplacedInLastFrame").or_default()),
+            "TRKF" => {
+                let mut b = std::mem::take(tal.entry("TrackReferenceKeyFrame 점 칸").or_default());
+                trkf(&mut r, tal.entry("TrackReferenceKeyFrame").or_default(), &mut b);
+                tal.insert("TrackReferenceKeyFrame 점 칸", b);
+            }
+            "TWMM" => {
+                let mut b = std::mem::take(tal.entry("TrackWithMotionModel 점 칸").or_default());
+                twmm(&mut r, tal.entry("TrackWithMotionModel").or_default(), &mut b);
+                tal.insert("TrackWithMotionModel 점 칸", b);
+            }
+            "SLPT" => {
+                let mut b = std::mem::take(tal.entry("SearchLocalPoints 점 칸").or_default());
+                slpt(&mut r, far, tal.entry("SearchLocalPoints").or_default(), &mut b);
+                tal.insert("SearchLocalPoints 점 칸", b);
+            }
+            "TLMP" => {
+                let mut b = Tally::default();
+                tlmp(&mut r, tal.entry("TrackLocalMap(자세 최적화 · 판단)").or_default(), &mut b);
+            }
+            "SINI" => {
+                let mut b = std::mem::take(tal.entry("StereoInitialization 새 점").or_default());
+                sini(&mut r, tal.entry("StereoInitialization").or_default(), &mut b);
+                tal.insert("StereoInitialization 새 점", b);
+            }
             "FRAM" => {
                 frames += 1;
                 let _ts = r.f64();

@@ -22,7 +22,7 @@ use crate::orb3rs::localmap::{self, NewMp, TriParams};
 use crate::orb3rs::matcher::Matcher;
 use crate::orb3loop::crand::GlibcRand;
 use crate::orb3loop::dbow2::{BowVector, Vocabulary};
-use crate::orb3loop::kfdb::{KeyFrameDatabase, MapId as DbMap};
+use crate::orb3loop::kfdb::{KeyFrameDatabase, KfId as DbKf, MapId as DbMap};
 use crate::orb3loop::reloc::{relocalize, RustPnp};
 use crate::orb3rs::stdsort;
 use crate::orb3rs::types::{quat_from_mat, Atlas, Frame, KeyFrame, KfId, Map, MapId, MapPoint, MpId, Se3};
@@ -50,6 +50,8 @@ pub struct RsSteps {
     pub reset_seen: u64,
     /// 단어장(ComputeBoW). set_vocabulary 가 채움
     pub voc: Arc<std::sync::Mutex<Option<Arc<Vocabulary>>>>,
+    /// KeyFrame::SetBadFlag 의 mpKeyFrameDB->erase(this) 자리
+    pub kfdb: Arc<std::sync::Mutex<Option<KeyFrameDatabase>>>,
 }
 
 impl RsSteps {
@@ -169,6 +171,16 @@ impl KfSteps for RsSteps {
         let th = self.th_depth;
         let abort = &self.mapper;
         localmap::keyframe_culling(&local, false, &|_| th, &|| abort.abort_ba().load(std::sync::atomic::Ordering::SeqCst), &mut st.atlas, &mut st.ext);
+        // SetBadFlag 안의 KeyFrameDatabase::erase(지운 키프레임을 역색인에서 뺌)
+        let gone: Vec<KfId> = local.iter().copied().filter(|k| st.atlas.kfs.get(k).is_some_and(|x| x.bad)).collect();
+        if !gone.is_empty() {
+            if let Some(db) = self.kfdb.lock().unwrap().as_mut() {
+                for k in gone {
+                    let bow: BowVector = st.atlas.kfs[&k].bow.iter().map(|(w, v)| (*w, *v)).collect();
+                    db.erase(k as DbKf, &bow);
+                }
+            }
+        }
     }
 }
 
@@ -296,11 +308,12 @@ impl RustSystem {
             th_far_points: init.settings.th_far_points,
         };
         let voc_steps = Arc::new(std::sync::Mutex::new(None));
-        let mut steps = RsSteps { mapper: Arc::clone(&mapper), recent: Vec::new(), tri, th_depth: init.tracking.th_depth, reset_seen: 0, voc: Arc::clone(&voc_steps) };
+        let kfdb = Arc::new(std::sync::Mutex::new(None));
+        let mut steps = RsSteps {
+            kfdb: Arc::clone(&kfdb), mapper: Arc::clone(&mapper), recent: Vec::new(), tri, th_depth: init.tracking.th_depth, reset_seen: 0, voc: Arc::clone(&voc_steps) };
         let loopq = LoopQueue::<KfId>::new();
         let (m2, map2, q2) = (Arc::clone(&mapper), Arc::clone(&map), Arc::clone(&loopq));
         let mapping = Some(std::thread::spawn(move || mapping::run(&m2, &map2, &q2, &mut steps)));
-        let kfdb = Arc::new(std::sync::Mutex::new(None));
         let rand = Arc::new(std::sync::Mutex::new(GlibcRand::new(1)));
         let flow = Arc::new(LoopFlow::new(Arc::clone(&map), Arc::clone(&mapper), Arc::clone(&loopq), RsGba));
         let ops = RsLoop::new(Arc::clone(&kfdb), Arc::clone(&rand), RustSim3);

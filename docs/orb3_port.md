@@ -167,7 +167,14 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - `RsLoop::correct_loop` = LOOP `correct_loop` + RsEss(mbFixScale = 참, mnCorrectedByKF 표는 RsLoop 가 들고 있음), 끝에 루프 양끝 mbNotErase · 지도 변경 번호, 전역 BA 는 지도 id 로. CorrectLoop 안의 Replace 는 `mapdata::mp_replace`(지도 집합에서 빼기까지, 원본 그대로).
 - 새 점 넣기 재확인(TRACK 이 orb3_refid 로 바꾼 뒤): 여전히 구조 16/16 · 비트 1/16 — `localmap` 의 삼각측량 · 회전(Jacobi) · 투영 검사에 mul_add 23 곳이 남아 있음(track.rs 만 뺐음). TRACK 확인 필요.
 - 받은 브랜치(9 차): CV 619450e(합치기 판 본질 그래프 build_eg_merge, 실제 합치기 2 번 비트 동일). OPT e62179b(essential_merge · sim3pg 합치기 판, 지어낸 입력) 는 운영자 결정으로 받지 않음. 디스크가 모자라 흐름 덤프(orbsys_gba_* · orbsys_cnmp_*)는 시험 뒤 지움 — 다시 만들기: `bash slam/tools/orb3sys_dump/run.sh build` 뒤 `run 출력.bin TUM1.yaml(orb3-nopango) 장면폴더`(새 점은 `ORBSYS_CNMP_EVERY=10` 을 앞에).
-- 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀. 다음 단계는 System 흐름(추적 · 지도 · 루프 스레드)을 Rust 모듈로 엮어 `orb3_backend` 를 바꿔 끼우는 것 — 아직 안 옮긴 것: LocalMapping 의 BA 호출부(BA 포터 대기), LoopClosing 흐름 · CorrectLoop · MergeLocal, MLPnPsolver · Relocalization.
+- 받은 브랜치(10 차): LOOP 53f2265 · 967f7ac(MergeLocal 관성 없음 · RGB-D, 원본 2/2). correct.rs 충돌은 LOOP 판(search_and_fuse 로 뺀 것)으로.
+- **루프 스레드가 RustSystem 안에서 돎**: `RustSystem::open` 이 `LoopFlow<MapState, RsGba>` 를 `orb3-loop` 스레드로 띄우고 `RsLoop::new(KFDB, 난수, RustSim3)` 로 돌림. 난수는 `Arc<Mutex<GlibcRand>>`(씨앗 1) 하나를 재위치(MLPnP)와 루프(Sim3Solver)가 나눠 씀 — 원본 rand() 한 수열. 잠금 순서는 둘 다 지도 갱신 → 난수. `loop_busy` = `LoopFlow::busy`(고치기 · 합치기 중 깃발 = mMutexBusy, 또는 전역 BA 중). 끝내기: 지도 스레드 끝 → 루프 대기열 닫기 → 루프 스레드(돌던 전역 BA 중단 · 기다림) join.
+- `LoopOps::merge_local(map, gba_running)`: 들어올 때 전역 BA 가 돌고 있었는지(bRelaunchBA)를 흐름이 중단 전에 보고 넘김.
+- **MergeLocal Rust `RsLoop::merge_local`** = LOOP `merge_local` + `orb3sys::mergeops`: 맞춤 BA = BA `mlba::merge_local_ba`(bStop 늘 거짓, mnBALocalForMerge 표는 RsLoop 가 듦), 본질 그래프 = CV `build_eg_merge` · 20 번 + 원본 마무리(안 고정 키프레임 mTcw/mTwcBefMerge · SE3d(R, t/s), 안 고친 점: 기준 키프레임이 나쁘면 관측 지워 가며 새 기준 → vpBadPose 면 Twr · Tnc⁻¹ · P · UpdateNormalAndDepth). mTcwBefMerge 는 공통 칸 대신 합치기 들어올 때 지금 지도 자세 표.
+  - 시험 `ORBLOOP_RUST_MERGE=1 ORBLOOP_MERGE=~/orbloop_reloc/mrg_b.bin:~/orbloop_reloc/mrg_d.bin cargo test --release -p slam --test orb3loop_merge`: 단계마다 Rust 결과를 원본 결과와 비교(다음 단계는 원본 값으로 이어감). **본질 그래프 2/2 비트 동일**, 맞춤 BA 1/2 — mrg_d 합치기(KF 197↔15)에서 맞춤 BA 뒤 키프레임 자세 27 · 점 위치 3,231 다름(BA 포터 확인 필요, Huber dsqr 는 이미 float). env 없이(LOOP 원래 시험) 2/2 통과.
+- **전체 재생 도구**: `examples/orb3_sys_run.rs`(rs = RustSystem, cpp = libORB_SLAM3, 같은 `Orb3System` 으로 · 장면마다 wait_idle · TSV: 시각 · 상태 · 지도 · Twc · 추적 ms, `.kf` 키프레임) + `slam/tools/orb3sys_dump/sysrun.sh rs|cpp 출력.tsv [장수]`(라이브러리 경로 · 강의실 기본값) + `trajcmp.py A B`(처음 다른 장면 · 위치 차 · ms). cpp 판은 `ORB_SLAM3_DIR` 라이브러리(지금 orb3-nopango = FMA 기본 빌드, orb3_refid 아님)라 비트 대조가 아니라 궤적 대조. IMU 위쪽은 양쪽 다 안 넣음(RustSystem 이 아직 무시).
+  - 강의실 앞 300 장: 둘 다 키프레임 1(카메라 정지 구간), 300 번째 장면 자세가 출력 9 자리까지 같음(마지막 자리 하나만 다름). 추적 ms 평균 rs 8.6 · cpp 12.1.
+- 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀(cpp 판 · 비교용). 백엔드를 RustSystem 으로 바꿔 끼우는 것은 전체 재생 판정 뒤.
 
 ## 정확도 브랜치 따라가기
 

@@ -109,6 +109,10 @@ impl Detector {
         let map = st.atlas.kfs[&cur].map;
         let add = |st: &MapState, db: &mut KeyFrameDatabase| {
             let k = &st.atlas.kfs[&cur];
+            // 대기열에 있는 동안 KeyFrameCulling 이 지운 키프레임(원본 경합 자리: 지운 뒤 넣으면 역색인에 나쁜 키프레임이 남음)
+            if k.bad {
+                return;
+            }
             db.add(cur as DbKf, &k.bow.iter().map(|(w, v)| (*w, *v)).collect());
         };
         let nkfs = st.atlas.maps.iter().find(|m| m.id == map).map_or(0, |m| m.keyframes_in_map());

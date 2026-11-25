@@ -424,3 +424,61 @@ pub fn n_matrix(p1: &M3, p2: &M3) -> [f32; 16] {
     let n: [f32; 16] = [n11, n12, n13, n14, n12, n22, n23, n24, n13, n23, n33, n34, n14, n24, n34, n44];
     n
 }
+
+/// 생성자 입력: 짝 하나(vpMatched12[i1])의 원본 분기 결과
+#[derive(Clone, Copy, Debug)]
+pub enum PairIn {
+    /// vpMatched12[i1] 이 NULL
+    Unmatched,
+    /// pKF1 의 i1 번 지도 점 없음
+    NoMp1,
+    /// 둘 중 하나 isBad
+    Bad,
+    /// GetIndexInKeyFrame 이 -1(pKF2 에 안 보임: 원본은 vpKeyFrameMatchedMP 를 무시하고 늘 pKF2 로 찾는다)
+    NoIndex,
+    /// 쓰는 짝: 두 지도 점 세계 좌표 · 두 키포인트 층
+    Use { pos1: [f32; 3], pos2: [f32; 3], oct1: i32, oct2: i32 },
+}
+
+/// Rcw*X + tcw (생성자 자리, GIMPLE: 행마다 r1·p1 → fma(r2,p2) → fma(r0,p0) → + t)
+#[inline]
+pub fn rot_add(r: &M3, t: &[f32; 3], p: [f32; 3]) -> [f32; 3] {
+    let mut c = [0f32; 3];
+    for i in 0..3 {
+        let a = r[i + 3] * p[1];
+        let a = fma(p[2], r[i + 6], a);
+        let a = fma(p[0], r[i], a);
+        c[i] = t[i] + a;
+    }
+    c
+}
+
+impl Sim3Solver {
+    /// Sim3Solver(pKF1, pKF2, vpMatched12, bFixScale, vpKeyFrameMatchedMP) 생성자.
+    /// r/t = 키프레임 mRcw · mTcw.translation(), sigma2 = mvLevelSigma2, pairs = vpMatched12 순서.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        r1: &M3,
+        t1: &[f32; 3],
+        r2: &M3,
+        t2: &[f32; 3],
+        sigma2_1: &[f32],
+        sigma2_2: &[f32],
+        pairs: &[PairIn],
+        cam1: Pinhole,
+        cam2: Pinhole,
+        fix_scale: bool,
+    ) -> Self {
+        let (mut x1, mut x2, mut e1, mut e2, mut ix) = (vec![], vec![], vec![], vec![], vec![]);
+        for (i1, p) in pairs.iter().enumerate() {
+            if let PairIn::Use { pos1, pos2, oct1, oct2 } = *p {
+                e1.push((9.210f64 * sigma2_1[oct1 as usize] as f64) as u64);
+                e2.push((9.210f64 * sigma2_2[oct2 as usize] as f64) as u64);
+                ix.push(i1);
+                x1.push(rot_add(r1, t1, pos1));
+                x2.push(rot_add(r2, t2, pos2));
+            }
+        }
+        Self::from_matches(x1, x2, e1, e2, ix, pairs.len(), cam1, cam2, fix_scale)
+    }
+}

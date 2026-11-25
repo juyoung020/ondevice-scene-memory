@@ -356,8 +356,25 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
                 })
                 .map(|r| ratio(r.1))
                 .fold(0.0, f64::max);
-            let ok = ratio(best.1) >= ACCEPT && best.1 .0 >= MIN_AGREE && ratio(best.1) - second >= MARGIN;
-            let l = format!("지도 {m}: 가장 좋은 {:.3} · 다른 곳 최고 {second:.3} → {}", ratio(best.1), if ok { "옮겨 붙임" } else { "안 붙임" });
+            // 더 강한 증거(A27): ① 장면 짝 가설 2 개 이상이 받은 자리(0.5 m · 10° 안)에 동의 ② 거꾸로(큰 쪽 장면 점을 m 장면 깊이에) 자유 공간도 ACCEPT 이상.
+            // 반복 책상 줄에서 장면 짝 하나 + 한쪽 점수만으로 붙은 틀린 자리(강의실 지도 1, −46°)를 막음. 못 찾으면 안 붙임
+            let bt = yaw_t(best.0[0], best.0[1], best.0[2], best.0[3]);
+            let agree = cands
+                .iter()
+                .filter(|h| {
+                    let da = (h[4].atan2(h[0]) - best.0[0] + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
+                    da.abs() < 10f64.to_radians() && (h[3] - best.0[1]).hypot(h[7] - best.0[2]) < 0.5
+                })
+                .count();
+            let mfr: Vec<Frame> = fr.iter().map(|f| Frame { pose: mul(&bt, &f.pose), d: f.d }).collect();
+            let near: Vec<Frame> = {
+                let mc: Vec<[f64; 3]> = mfr.iter().map(|f| [f.pose[3], f.pose[7], f.pose[11]]).collect();
+                all.iter().filter(|(p, _)| mc.iter().any(|c| (c[0] - p[3]).hypot(c[1] - p[7]) < 1.5)).map(|(p, d)| Frame { pose: *p, d }).collect()
+            };
+            let id: T34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+            let (rev, _) = free_ratio(&near, &mfr, &id, k);
+            let ok = ratio(best.1) >= ACCEPT && best.1 .0 >= MIN_AGREE && ratio(best.1) - second >= MARGIN && agree >= 2 && rev >= ACCEPT;
+            let l = format!("지도 {m}: 가장 좋은 {:.3} · 다른 곳 최고 {second:.3} · 동의 짝 {agree}/{} · 거꾸로 {rev:.3} → {}", ratio(best.1), cands.len(), if ok { "옮겨 붙임" } else { "안 붙임" });
             common::info!("끝난 뒤 지도 맞춤: {l}");
             log.push(l);
             if ok {

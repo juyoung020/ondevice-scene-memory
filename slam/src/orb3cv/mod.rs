@@ -24,3 +24,4 @@ impl settings::TrackingParams {
 }
 pub mod atlas_io;
 pub mod system;
+pub mod g2osim3;

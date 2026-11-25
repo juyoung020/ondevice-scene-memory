@@ -11,6 +11,7 @@ pub mod edges;
 pub mod gba;
 pub mod lba;
 pub mod ldlt;
+pub mod mlba;
 pub mod se3;
 pub mod solver;
 

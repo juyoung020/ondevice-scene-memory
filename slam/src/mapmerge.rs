@@ -103,7 +103,7 @@ fn cloud(fr: &[Frame], k: &Intr) -> Vec<[f64; 3]> {
 /// 바닥 높이: 점 높이 5 cm 칸 가운데 가장 많은 칸의 1/4 이상인 가장 낮은 칸
 fn floor(p: &[[f64; 3]]) -> Option<f64> {
     let lo = p.iter().map(|x| x[2]).fold(f64::MAX, f64::min);
-    if !lo.is_finite() {
+    if !lo.is_finite() || p.len() < 300 {
         return None;
     }
     let mut h: HashMap<i64, usize> = HashMap::new();
@@ -260,8 +260,6 @@ fn refine(pts: &[[f64; 3]], refs: &[Ref], k: &Intr, x0: [f64; 4]) -> ([f64; 4], 
 pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr, main: u64, log: &mut Vec<String>) -> HashMap<u64, T34> {
     let mut xf: HashMap<u64, T34> = HashMap::new();
     xf.insert(main, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-    let main_floor = maps.get(&main).and_then(|f| floor(&cloud(f, k)));
-    let Some(main_floor) = main_floor else { return xf };
     let mut order: Vec<u64> = maps.iter().filter(|x| *x.0 != main && x.1.len() >= MIN_FRAMES).map(|x| *x.0).collect();
     order.sort_by_key(|m| std::cmp::Reverse(maps[m].len()));
     loop {
@@ -301,10 +299,17 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
             }
             let st = (all.len() as f64 / MAX_REF as f64).max(1.0);
             let refs: Vec<Ref> = (0..all.len().min(MAX_REF)).map(|i| all[(i as f64 * st) as usize]).map(|(p, d)| Ref { w2c: inv(&p), d }).collect();
-            // 시작점: 후보 방위 · 이동, 높이는 바닥 높이 차. 가까운 시작점(0.3 m · 5°)은 하나만
+            let dst_fr: Vec<Frame> = all.iter().map(|(p, d)| Frame { pose: *p, d }).collect();
+            let dst = cloud(&dst_fr, k);
+            // 시작점: 후보 방위 · 이동, 높이는 바닥 높이 차(큰 쪽 바닥은 옮긴 점 둘레 4 m 안에서만: 큰 지도가 곳에 따라 기울어 있음).
+            // 가까운 시작점(0.3 m · 5°)은 하나만
+            let cen = pts.iter().fold([0.0; 3], |a, p| [a[0] + p[0], a[1] + p[1], a[2] + p[2]]).map(|v| v / pts.len().max(1) as f64);
             let mut starts: Vec<[f64; 4]> = Vec::new();
             for h in &cands {
-                let x = [h[4].atan2(h[0]), h[3], h[7], main_floor - fl];
+                let c = apply(h, &cen);
+                let near: Vec<[f64; 3]> = dst.iter().filter(|q| (q[0] - c[0]).hypot(q[1] - c[1]) < 4.0).copied().collect();
+                let Some(mf) = floor(&near) else { continue };
+                let x = [h[4].atan2(h[0]), h[3], h[7], mf - fl];
                 let dup = starts.iter().any(|s| {
                     let da = (s[0] - x[0] + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
                     da.abs() < 5f64.to_radians() && (s[1] - x[1]).hypot(s[2] - x[2]) < 0.3
@@ -313,8 +318,6 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
                     starts.push(x);
                 }
             }
-            let dst_fr: Vec<Frame> = all.iter().map(|(p, d)| Frame { pose: *p, d }).collect();
-            let dst = cloud(&dst_fr, k);
             let mut res: Vec<([f64; 4], (usize, usize))> = starts
                 .iter()
                 .map(|x| {

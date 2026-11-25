@@ -624,7 +624,7 @@ impl Orb3 {
 }
 
 /// 끝난 지도 기울기 바로잡기: 장면마다 ±0.5 초 가속도 평균(가만히 있을 때: 크기 g ± 0.3, 자이로 평균 < 0.6 rad/s)을 지도 축으로 보낸 '위' 가
-/// 지도 z 와 어긋난 만큼, 같은 ORB 지도에서 앞뒤 1.5 초 안 가만한 장면들의 어긋남 평균(가우스 0.25 초)으로 장면 방향을 돌림(위치는 그대로).
+/// 지도 z 와 어긋난 만큼 장면 방향을 돌림(위치는 그대로). 가만하지 않은 장면은 같은 ORB 지도에서 앞뒤 1.5 초 안 가만한 장면들의 어긋남 평균(가우스 0.25 초), 없으면 5 초 안 가장 가까운 것.
 /// ORB 지도 안 기울기 표류 · 몇 장짜리 회전 튐을 중력 측정으로 누름. fr: (시각, 장면 위치, 원래 ORB 지도). 돌려줌: (돌린 장면 수, 가장 큰 각 °)
 fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f64) {
     if imu.len() < 2 {
@@ -682,7 +682,9 @@ fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f6
                     near = Some((dt, v));
                 }
             }
-            if w > 0.0 {
+            if let Some(v) = meas[i] {
+                Some(v)
+            } else if w > 0.0 {
                 Some(r.map(|v| v / w))
             } else {
                 near.map(|n| n.1)
@@ -828,6 +830,28 @@ impl SlamBackend for Orb3Backend {
         let mut outp: Vec<(f64, T34, u64)> = per.iter().zip(&orig).filter(|x| Some(x.0 .1) == main_map).map(|(x, o)| (x.0, mul(&a_end, &x.2), *o)).collect();
         let (n_lv, max_lv) = level(&mut outp, &s.imu_hist);
         common::info!("끝난 지도 기울기 바로잡기: 장면 {n_lv} 개, 가장 큰 바로잡음 {max_lv:.1}°");
+        // 끝난 지도 다듬기: 다른 때 같은 곳을 본 장면끼리 깊이 ICP + 방위 · 이동 위치 그래프(refine)
+        if let Some(k) = s.dk {
+            let at: HashMap<u64, usize> = outp.iter().enumerate().map(|(i, x)| (x.0.to_bits(), i)).collect();
+            let mut nodes = Vec::new();
+            let mut nt = Vec::new();
+            for (j, (t, _, _, d)) in s.deps.iter().enumerate() {
+                if j % 2 != 0 {
+                    continue;
+                }
+                if let Some(&i) = at.get(&t.to_bits()) {
+                    nodes.push(crate::refine::Node { t: *t, pose: outp[i].1, seg: outp[i].2, d });
+                    nt.push((*t, outp[i].2));
+                }
+            }
+            let t0 = Instant::now();
+            let mut log = Vec::new();
+            let dl = crate::refine::refine(&nodes, &k, &mut log);
+            crate::refine::apply_deltas(&mut outp, &nt, &dl);
+            for l in &log {
+                common::info!("끝난 지도 다듬기: {l}, {:.1} 초", t0.elapsed().as_secs_f64());
+            }
+        }
         let lines: Vec<String> = outp.iter().map(|x| tum_line(x.0, &x.1)).collect();
         if !s.final_path.is_empty() {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&s.final_path).map_err(|e| format!("{}: {e}", s.final_path))?);

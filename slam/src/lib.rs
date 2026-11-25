@@ -19,6 +19,7 @@ pub mod orb3;
 pub mod orb3_backend;
 pub mod stitch;
 pub mod mapmerge;
+pub mod refine;
 pub mod bufpool;
 pub mod simd;
 pub mod imu;

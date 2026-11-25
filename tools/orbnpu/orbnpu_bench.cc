@@ -172,12 +172,54 @@ static Mat fast_score_cpu(const Mat& img) {
     return S;
 }
 
+// 화소 하나의 정확한 FAST 점수(fast_score_cpu 와 같은 값) — 연속 9 칸 최소 · 최대를 미끄럼 창으로
+static inline int fast_score_at(const uchar* p, int stride) {
+    static int ofs[16], st = -1;
+    static const int off[16][2] = {{0,3},{1,3},{2,2},{3,1},{3,0},{3,-1},{2,-2},{1,-3},{0,-3},{-1,-3},{-2,-2},{-3,-1},{-3,0},{-3,1},{-2,2},{-1,3}};
+    if (st != stride) { for (int k = 0; k < 16; ++k) ofs[k] = off[k][1] * stride + off[k][0]; st = stride; }
+    int c = p[0], d[25];
+    for (int k = 0; k < 16; ++k) d[k] = c - p[ofs[k]];
+    for (int k = 16; k < 25; ++k) d[k] = d[k - 16];
+    int best = 0;
+    for (int k = 0; k < 16; ++k) {
+        int mn = d[k], mx = d[k];
+        for (int j = 1; j < 9; ++j) { int v = d[k + j]; mn = std::min(mn, v); mx = std::max(mx, v); }
+        best = std::max(best, std::max(mn, -mx));
+    }
+    return std::min(best, 255);
+}
+
+// 섞음: NPU S(오차 ≤ margin)를 후보 거르개로만 쓰고, 후보(S_npu ≥ minTh+1−margin)만 정확한 점수로 다시 계산.
+// 후보 밖 화소는 정확한 점수 ≤ minTh 라 어느 문턱에서도 구석이 아님 → 원본과 비트 같음(오차 한계가 맞는 한)
+static Mat refine_S(const Mat& Snpu, const Mat& img, int minTh, int margin, long& ncand) {
+    Mat S = Mat::zeros(img.size(), CV_8U);
+    const int lo = minTh + 1 - margin;
+    for (int y = 3; y < img.rows - 3; ++y) {
+        const uchar* sp = Snpu.ptr<uchar>(y);
+        uchar* o = S.ptr<uchar>(y);
+        for (int x = 3; x < img.cols - 3; ++x)
+            if (sp[x] >= lo) { o[x] = (uchar)fast_score_at(img.ptr<uchar>(y) + x, (int)img.step); ++ncand; }
+    }
+    return S;
+}
+
 // 칸 하나 안에서 OpenCV FAST(문턱 th, 비최대 억제)를 S 지도로 그대로 흉내: 칸 가장자리 3 픽셀 제외, 이웃 중 구석 아닌 것은 0
-static void fast_from_S(const Mat& S, int x0, int y0, int x1, int y1, int th, std::vector<KeyPoint>& out) {
+// 게으른 섞음: img 가 있으면 S 는 NPU 지도(오차 ≤ g_margin), 문턱 후보(S ≥ th+1−margin)만 정확 점수를 계산해 cache(u16, 0xFFFF=아직)에 둠
+static int g_margin = 2;
+static long g_exact = 0;
+static void fast_from_S(const Mat& S, int x0, int y0, int x1, int y1, int th, std::vector<KeyPoint>& out,
+                        const Mat* img = nullptr, Mat* cache = nullptr) {
     int w = x1 - x0, h = y1 - y0;
+    const int lo = th + 1 - g_margin;
     auto sc = [&](int yy, int xx) -> int {
         if (yy < 3 || yy >= h - 3 || xx < 3 || xx >= w - 3) return 0;
         int v = S.at<uchar>(y0 + yy, x0 + xx);
+        if (img) {
+            if (v < lo) return 0;
+            ushort& c = cache->at<ushort>(y0 + yy, x0 + xx);
+            if (c == 0xFFFF) { c = (ushort)fast_score_at(img->ptr<uchar>(y0 + yy) + x0 + xx, (int)img->step); ++g_exact; }
+            v = c;
+        }
         return v > th ? v : 0;
     };
     for (int y = 3; y < h - 3; ++y)
@@ -195,10 +237,13 @@ static void fast_from_S(const Mat& S, int x0, int y0, int x1, int y1, int th, st
 // 지도 → 원본 operator() 와 같은 점 · 기술자(가장자리 겹침 구역 없음 = RGB-D)
 static void extract_from_maps(ORBextractor& e, const std::vector<Mat>& S, const std::vector<Mat>& B,
                               const std::vector<Mat>& M10, const std::vector<Mat>& M01,
-                              std::vector<KeyPoint>& outk, Mat& outd) {
+                              std::vector<KeyPoint>& outk, Mat& outd, bool lazy = false) {
     std::vector<std::vector<KeyPoint>> all(e.nlevels);
     const float W = 35;
     for (int level = 0; level < e.nlevels; ++level) {
+        const Mat* im = lazy ? &e.mvImagePyramid[level] : nullptr;
+        Mat cache;
+        if (lazy) cache = Mat(S[level].size(), CV_16U, Scalar(0xFFFF));
         const int minBorderX = EDGE_THRESHOLD - 3, minBorderY = minBorderX;
         const int maxBorderX = S[level].cols - EDGE_THRESHOLD + 3, maxBorderY = S[level].rows - EDGE_THRESHOLD + 3;
         std::vector<KeyPoint> dk;
@@ -216,8 +261,8 @@ static void extract_from_maps(ORBextractor& e, const std::vector<Mat>& S, const 
                 if (iniX >= maxBorderX - 6) continue;
                 if (maxX > maxBorderX) maxX = maxBorderX;
                 std::vector<KeyPoint> cell;
-                fast_from_S(S[level], (int)iniX, (int)iniY, (int)maxX, (int)maxY, e.iniThFAST, cell);
-                if (cell.empty()) fast_from_S(S[level], (int)iniX, (int)iniY, (int)maxX, (int)maxY, e.minThFAST, cell);
+                fast_from_S(S[level], (int)iniX, (int)iniY, (int)maxX, (int)maxY, e.iniThFAST, cell, im, &cache);
+                if (cell.empty()) fast_from_S(S[level], (int)iniX, (int)iniY, (int)maxX, (int)maxY, e.minThFAST, cell, im, &cache);
                 for (auto& k : cell) { k.pt.x += j * wCell; k.pt.y += i * hCell; dk.push_back(k); }
             }
         }
@@ -322,7 +367,16 @@ int main(int argc, char** argv) {
         std::string md = argv[5];
         size_t start = getenv("START") ? atoi(getenv("START")) : 0;
         std::ofstream o(argv[6], std::ios::binary | (start ? std::ios::app : std::ios::trunc));
-        bool cpuS = argc > 7 && std::string(argv[7]) == "cpuS";
+        std::string opt = argc > 7 ? argv[7] : "";
+        bool cpuS = opt == "cpuS";
+        // hyb: S 다듬기 + 블러 CPU(원본 GaussianBlur), hybB: S 다듬기 + 블러 NPU. MARGIN 환경 변수(기본 2)
+        // lazy · lazyB: 칸 문턱별 후보만 정확 점수(게으른 섞음), 블러 CPU · NPU
+        bool lazy = opt == "lazy" || opt == "lazyB";
+        bool hyb = opt == "hyb" || opt == "hybB", cpuBlur = opt == "hyb" || opt == "lazy";
+        int margin = getenv("MARGIN") ? atoi(getenv("MARGIN")) : 2;
+        g_margin = margin;
+        long ncand = 0, npix = 0;
+        double trefine = 0;
         Acc tm;
         for (size_t i = start; i < files.size(); ++i) {
             Mat g = load_gray(files[i]);
@@ -348,13 +402,27 @@ int main(int argc, char** argv) {
                     S.push_back(s8); B.push_back(b8);
                 }
             }
-            std::vector<KeyPoint> k; Mat d;
             auto t0 = Clock::now();
-            extract_from_maps(e, S, B, M10, M01, k, d);
+            if (hyb || lazy) {
+                for (int l = 0; l < e.nlevels; ++l) {
+                    const Mat& lv = e.mvImagePyramid[l];
+                    if (hyb) S[l] = refine_S(S[l], lv, e.minThFAST, margin, ncand);
+                    npix += lv.total();
+                    if (cpuBlur) { Mat w = lv.clone(); GaussianBlur(w, w, Size(7, 7), 2, 2, BORDER_REFLECT_101); B[l] = w; }
+                }
+            }
+            trefine += ms(t0, Clock::now());
+            std::vector<KeyPoint> k; Mat d;
+            t0 = Clock::now();
+            extract_from_maps(e, S, B, M10, M01, k, d, lazy);
             tm.total += ms(t0, Clock::now());
             write_frame(o, k, d);
         }
-        fprintf(stderr, "지도 → 점 · 기술자(CPU 나머지) %.3f ms/장\n", tm.total / std::max<size_t>(1, files.size() - start));
+        double nf = std::max<size_t>(1, files.size() - start);
+        fprintf(stderr, "지도 → 점 · 기술자(CPU 나머지) %.3f ms/장", tm.total / nf);
+        if (lazy) ncand = g_exact;
+        if (hyb || lazy) fprintf(stderr, "  + 다듬기%s %.3f ms/장, 후보 %.2f %% 화소", cpuBlur ? "·블러" : "", trefine / nf, 100.0 * ncand / std::max(1L, npix));
+        fprintf(stderr, "\n");
         return 0;
     }
     std::cerr << "모르는 방식 " << mode << "\n";

@@ -29,6 +29,7 @@ pub mod place;
 pub mod xfeat;
 pub mod lcverify;
 pub mod nnrun;
+pub mod orb3npu;
 
 use nalgebra::{Isometry3, Point3};
 

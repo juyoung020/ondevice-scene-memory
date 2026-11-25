@@ -1,5 +1,5 @@
 # runall.sh 태그 [장면이름...]  (DUMP=덤프실행파일)
-cd ~/opt/orb3_track_bg; O=~/slam-bench/src/ORB_SLAM3; P=~/slam-bench/install
+cd ~/opt/orb3_track_bg; O=${ORB:-~/slam-bench/src/ORB_SLAM3}; P=~/slam-bench/install
 export LD_LIBRARY_PATH=$O/lib:$O/Thirdparty/g2o/lib:$O/Thirdparty/DBoW2/lib:$P/lib
 R=~/tgt-orbtrack/release/examples/orb3rs_track_replay; D=./${DUMP:-track_dump}
 tag=$1; shift; want=" $* "

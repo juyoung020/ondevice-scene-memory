@@ -18,6 +18,12 @@
   같은 무게 키프레임의 순서(예: (2,41) · (3,41)). Rust 는 통합판 약속대로 id 순.
 - 덤프 UNDP · UCON 은 주소도 기록해 두 경우를 나눠 셈.
 
+## 기준 원본 = 결정성 패치판(opt/pose-parb 73c48c5, WSL ~/slam-bench/orb3-parb)
+- 덤프 도구 빌드: `ORB=~/slam-bench/orb3-parb ORB_INC=~/slam-bench/orb3-parb/include/OrderById.h OUT=track_dump_parb bash build.sh`,
+  실행 `ORB=~/slam-bench/orb3-parb DUMP=track_dump_parb bash runall.sh 태그 [장면...]`. 재생 도구의 키프레임 순서도 id 순.
+- p2(6 장면): UpdateNormalAndDepth 9,913,752/9,913,752 · UpdateConnections 4,891/4,891 (주소 순 ≠ id 순 0), 나머지 표 전부 같음.
+  예외 NeedNewKeyFrame 4 건(ds 1 · room 3, 원본 false · rust true, 도중 입력 바뀜 표시 없음) — room 을 다시 돌리면 0 이라 지역 지도 스레드 경합으로 봄, 미해결.
+
 ## 통합판 연결(`slam/src/orb3sys/rsys.rs` RsSteps)
 - MapPointCulling · CreateNewMapPoints · KeyFrameCulling: 통합 담당이 연결(삼각측량 · 컬링은 위 덤프로 비트 동일)
 - ProcessNewKeyFrame(ComputeBoW · 관측 추가 · UpdateNormalAndDepth · ComputeDistinctiveDescriptors · UpdateConnections · AddKeyFrame),

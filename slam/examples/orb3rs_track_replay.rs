@@ -132,7 +132,8 @@ fn nnkf(r: &mut R, t: &mut Tally, t_racy: &mut Tally) {
         // 원본이 부르는 도중 다른 스레드가 입력을 바꿈: 덤프 값으로는 원본 판단을 다시 만들 수 없어 따로 셈
         t_racy.add(got == want, || format!("장면 {id}: 원본 {want} rust {got}"));
     } else {
-        t.add(got == want, || format!("장면 {id}: 원본 {want} rust {got}"));
+        let nr3 = (ctx.ref_tracked)(if n_kfs <= 2 { 2 } else { 3 });
+        t.add(got == want, || format!("장면 {id}: 원본 {want} rust {got} (상태 {} kfs {n_kfs} 기준 {nr3} 짝 {} 받음 {} 시작 {} 대기 {} 멈춤 {} {} 마지막KF {} reloc {})", tr.state, tr.matches_inliers, lm.accept, lm.init, lm.queue, lm.stopped, lm.stop_req, tr.last_kf_frame_id, tr.last_reloc_frame_id));
     }
 }
 
@@ -218,7 +219,9 @@ fn ulkf(r: &mut R, t: &mut Tally, tref: &mut Tally) {
     let want_slots: Vec<bool> = (0..n).map(|_| r.b()).collect();
     let mut tr = Tracker { sensor, last_reloc_frame_id: last_reloc, reference_kf: if ref0 == u64::MAX { None } else { Some(ref0) }, ..Default::default() };
     let mut cref = None;
-    let order = |k: KfId| *addr.get(&k).unwrap_or(&u64::MAX);
+    // 기준 원본은 결정성 패치판(std::set/map<KeyFrame*> 이 번호 순) — 주소 대신 id 순
+    let _ = &addr;
+    let order = |k: KfId| k;
     update_local_keyframes(&mut tr, &mut f, cur, &mut cref, &a, &mut ext, &order);
     let got_slots: Vec<bool> = f.map_points.iter().map(|s| s.is_some()).collect();
     let got_ref = tr.reference_kf.unwrap_or(u64::MAX);

@@ -144,6 +144,8 @@ pub struct Orb3 {
     deps: Vec<(f64, u64, T34, Vec<u16>)>,
     /// IMU 기록(카메라 시각, 카메라 축 가속도, 자이로 크기): 끝난 지도 기울기 바로잡기
     imu_hist: Vec<(f64, [f64; 3], f64)>,
+    /// 자이로 기록(카메라 시각, 카메라 축 rad/s): 끝난 지도 다듬기의 자이로 방위 간선
+    gyro_hist: Vec<(f64, [f64; 3])>,
     dk: Option<crate::mapmerge::Intr>,
     /// 위치가 나온 장면: (시각, 기준 키프레임, 키프레임에서 본 장면 위치)
     tracked: Vec<(f64, u64, T34)>,
@@ -251,6 +253,7 @@ impl Orb3 {
             last_ok_t: f64::MIN,
             deps: Vec::new(),
             imu_hist: Vec::new(),
+            gyro_hist: Vec::new(),
             dk: None,
             tracked: Vec::new(),
             settings_path,
@@ -582,7 +585,12 @@ impl Orb3 {
                 r.feed(ring, f.t + self.shift);
             }
             let imu = &mut self.imu;
-            ring.drain(|s| imu.push([s.t, s.a[0] as f64, s.a[1] as f64, s.a[2] as f64, (s.w[0] * s.w[0] + s.w[1] * s.w[1] + s.w[2] * s.w[2]).sqrt() as f64]));
+            let (gy, r_ci, shift) = (&mut self.gyro_hist, self.r_ci, self.shift);
+            ring.drain(|s| {
+                imu.push([s.t, s.a[0] as f64, s.a[1] as f64, s.a[2] as f64, (s.w[0] * s.w[0] + s.w[1] * s.w[1] + s.w[2] * s.w[2]).sqrt() as f64]);
+                let w = m34_vec(&r_ci, &[s.w[0] as f32, s.w[1] as f32, s.w[2] as f32, 0.0]);
+                gy.push((s.t - shift, [w[0] as f64, w[1] as f64, w[2] as f64]));
+            });
         }
         for s in &self.imu {
             let a = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
@@ -1099,7 +1107,21 @@ impl SlamBackend for Orb3Backend {
             }
             let t0 = Instant::now();
             let mut log = Vec::new();
-            let dl = crate::refine::refine(&nodes, &k, &mut log);
+            // 자이로를 장면 자세(가장 가까운 끝 장면)로 세계에 돌린 z 성분
+            let gz: Vec<(f64, f64)> = {
+                let mut j = 0usize;
+                s.gyro_hist
+                    .iter()
+                    .filter_map(|(t, w)| {
+                        while j + 1 < outp.len() && (outp[j + 1].0 - t).abs() <= (outp[j].0 - t).abs() {
+                            j += 1;
+                        }
+                        let p = &outp.get(j)?.1;
+                        ((outp[j].0 - t).abs() < 0.5).then(|| (*t, p[8] * w[0] + p[9] * w[1] + p[10] * w[2]))
+                    })
+                    .collect()
+            };
+            let dl = crate::refine::refine(&nodes, &k, &gz, &mut log);
             crate::refine::apply_deltas(&mut outp, &nt, &dl);
             for l in &log {
                 common::info!("끝난 지도 다듬기: {l}, {:.1} 초", t0.elapsed().as_secs_f64());

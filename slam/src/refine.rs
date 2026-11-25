@@ -283,7 +283,34 @@ fn floor_height(pose: &T34, t: &[Option<([f64; 3], [f64; 3])>]) -> Option<f64> {
 }
 
 /// 다듬기: 마디마다 세계 쪽에 곱할 변환(새 = Δ · 옛)
-pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
+/// 자이로 방위 간선: 시간 순 이웃 마디 사이 세계 z 축 회전(자이로 적분) 표준편차(°)
+const GYRO_SIG: f64 = 0.5;
+/// 자이로 표본 사이가 이보다 벌어지면(녹화 빈틈) 그 구간은 간선 없음
+const GYRO_GAP: f64 = 0.02;
+
+/// 세계 z 축 회전 속도 표본(시각, rad/s) 을 a..b 로 적분. 빈틈 있으면 None
+fn gyro_yaw(gz: &[(f64, f64)], a: f64, b: f64) -> Option<f64> {
+    let i0 = gz.partition_point(|x| x.0 < a);
+    let i1 = gz.partition_point(|x| x.0 < b);
+    if i0 == 0 || i1 >= gz.len() || i1 <= i0 {
+        return None;
+    }
+    let mut s = 0.0;
+    for i in i0 - 1..i1 {
+        let dt = gz[i + 1].0 - gz[i].0;
+        if dt > GYRO_GAP {
+            return None;
+        }
+        let (lo, hi) = (gz[i].0.max(a), gz[i + 1].0.min(b));
+        if hi > lo {
+            s += gz[i].1 * (hi - lo);
+        }
+    }
+    Some(s)
+}
+
+/// gz: 세계 z 축 회전 속도(자이로를 장면 자세로 세계에 돌린 z 성분, 시간 순). 비면 자이로 간선 없음
+pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], log: &mut Vec<String>) -> Vec<T34> {
     let n = nodes.len();
     let ident: T34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     if n < 3 {
@@ -392,6 +419,8 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
     let n_try = cands.len();
     edges.extend(found.into_iter().flatten());
     let n_loop = edges.len() - n_seq;
+    // ④ 자이로 방위: 시간 순 이웃 마디(2 초 안, IMU 빈틈 없음) 사이 방위 차 = 자이로 적분(ORB · ICP 의 회전 누적을 누름)
+    let gyro_e: Vec<(usize, usize, f64)> = order.windows(2).filter(|w| nodes[w[1]].t - nodes[w[0]].t < 2.0).filter_map(|w| gyro_yaw(gz, nodes[w[0]].t, nodes[w[1]].t).map(|y| (w[0], w[1], y))).collect();
     // ③ 바닥 높이: 마디마다 카메라에서 바닥까지 높이(위 향한 평면 가운데 카메라 아래 1.0–2.2 m 의 가장 큰 무리, 책상 면은 0.8 m 안팎이라 빠짐)
     let floor_h: Vec<Option<f64>> = nodes.iter().zip(&tgt).map(|(m, t)| floor_height(&m.pose, t)).collect();
     let fz: Vec<f64> = nodes.iter().zip(&floor_h).filter_map(|(m, h)| h.map(|h| m.pose[11] - h)).collect();
@@ -463,6 +492,18 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
                 }
             }
         }
+        let ig = 1.0 / GYRO_SIG.to_radians();
+        for &(i, j, dy) in &gyro_e {
+            let r = wrap(x[j][0] - x[i][0] - dy) * ig;
+            let w = 1.0 / (1.0 + r * r / 9.0);
+            cost += 9.0 * (1.0 + r * r / 9.0).ln();
+            g[4 * i] -= w * r * ig;
+            g[4 * j] += w * r * ig;
+            h[(4 * i, 4 * i)] += w * ig * ig;
+            h[(4 * j, 4 * j)] += w * ig * ig;
+            h[(4 * i, 4 * j)] -= w * ig * ig;
+            h[(4 * j, 4 * i)] -= w * ig * ig;
+        }
         // 바닥 높이(마디 하나짜리): z − 카메라 높이 = 바닥, 코시 가중. 모든 마디에 처음 값 쪽 약한 끌림(떨어진 조각이 떠다니지 않게)
         for i in 0..n {
             if let (Some(hh), Some(f)) = (floor_h[i], floor_ref) {
@@ -510,7 +551,7 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
             [r[0], r[1], 0.0, x[i][1] - rp[0], r[4], r[5], 0.0, x[i][2] - rp[1], 0.0, 0.0, 1.0, x[i][3] - rp[2]]
         })
         .collect();
-    log.push(format!("마디 {n}, 이웃 간선 {n_seq}(깊이 ICP {n_seq_icp}), 고리 후보 {n_try} → 받은 고리 {n_loop}, 가장 큰 고침 {:.2} m · {:.1}°", big.0, big.1));
+    log.push(format!("마디 {n}, 이웃 간선 {n_seq}(깊이 ICP {n_seq_icp}), 고리 후보 {n_try} → 받은 고리 {n_loop}, 자이로 방위 간선 {}, 가장 큰 고침 {:.2} m · {:.1}°", gyro_e.len(), big.0, big.1));
     out
 }
 
@@ -646,7 +687,7 @@ mod tests {
             std::fs::write(&out, o).unwrap();
             return;
         }
-        let dl = refine(&nodes, &k, &mut log);
+        let dl = refine(&nodes, &k, &[], &mut log);
         eprintln!("{log:?} {:.1} s", t0.elapsed().as_secs_f64());
         apply_deltas(&mut frames, &nt, &dl);
         let mut o = String::new();

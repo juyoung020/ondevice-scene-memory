@@ -1121,7 +1121,8 @@ impl SlamBackend for Orb3Backend {
                     })
                     .collect()
             };
-            let dl = crate::refine::refine(&nodes, &k, &gz, &mut log);
+            let extra: Vec<(f64, f64)> = s.hits_all.iter().map(|h| (h.t, h.c_t)).collect();
+            let dl = crate::refine::refine(&nodes, &k, &gz, &extra, &mut log);
             crate::refine::apply_deltas(&mut outp, &nt, &dl);
             for l in &log {
                 common::info!("끝난 지도 다듬기: {l}, {:.1} 초", t0.elapsed().as_secs_f64());

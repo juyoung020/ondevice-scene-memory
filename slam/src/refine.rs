@@ -13,9 +13,9 @@ pub const NEAR_M: f64 = 2.5;
 const ZMAX: f64 = NEAR_M;
 /// 고리 후보: 시간 차(초) 이상, 카메라 거리(m) · 보는 방향 각 이하, 마디마다 최대 수
 const LOOP_DT: f64 = 3.0;
-const LOOP_DIST: f64 = 1.5;
-const LOOP_ANG: f64 = 35.0;
-const LOOP_PER_NODE: usize = 4;
+const LOOP_DIST: f64 = 2.5;
+const LOOP_ANG: f64 = 60.0;
+const LOOP_PER_NODE: usize = 10;
 /// ICP 받는 기준: 맞은 점(5 cm 안) 비율 · 수, 고친 크기 한계
 const ICP_INLIER_FRAC: f64 = 0.7;
 const ICP_MIN_INLIERS: usize = 300;
@@ -310,7 +310,8 @@ fn gyro_yaw(gz: &[(f64, f64)], a: f64, b: f64) -> Option<f64> {
 }
 
 /// gz: 세계 z 축 회전 속도(자이로를 장면 자세로 세계에 돌린 z 성분, 시간 순). 비면 자이로 간선 없음
-pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], log: &mut Vec<String>) -> Vec<T34> {
+/// extra: 장소 인식(MegaLoc + XFeat) 짝의 두 장면 시각 — 가장 가까운 마디 쌍도 고리 후보(깊이 ICP 로 같은 검증)
+pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], extra: &[(f64, f64)], log: &mut Vec<String>) -> Vec<T34> {
     let n = nodes.len();
     let ident: T34 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     if n < 3 {
@@ -378,7 +379,8 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], log: &mut Vec<String>
             if ca.acos().to_degrees() > LOOP_ANG {
                 continue;
             }
-            near.push((d + 0.02 * ca.acos().to_degrees(), j));
+            // 시간 멀리 떨어진 쌍 우선(같은 자리를 다른 때 다시 본 것이 고루 쌓인 어긋남을 묶음)
+            near.push((d + 0.02 * ca.acos().to_degrees() - 0.002 * (nodes[j].t - nodes[i].t).abs().min(300.0), j));
         }
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         // 같은 때 몰린 후보는 하나만(서로 2 초 넘게 떨어진 것끼리)
@@ -392,6 +394,25 @@ pub fn refine(nodes: &[Node], k: &Intr, gz: &[(f64, f64)], log: &mut Vec<String>
             }
         }
         cands.extend(picked.into_iter().map(|j| (i, j)));
+    }
+    {
+        let mut by_t: Vec<(f64, usize)> = nodes.iter().enumerate().map(|(i, m)| (m.t, i)).collect();
+        by_t.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let nearest = |t: f64| -> Option<usize> {
+            let p = by_t.partition_point(|x| x.0 < t);
+            [p.wrapping_sub(1), p].into_iter().filter(|&q| q < by_t.len()).min_by(|&a, &b| (by_t[a].0 - t).abs().total_cmp(&(by_t[b].0 - t).abs())).filter(|&q| (by_t[q].0 - t).abs() < 1.0).map(|q| by_t[q].1)
+        };
+        for &(ta, tb) in extra {
+            if let (Some(a), Some(b)) = (nearest(ta), nearest(tb))
+                && a != b
+                && (nodes[a].t - nodes[b].t).abs() >= LOOP_DT
+            {
+                let (i, j) = if a < b { (a, b) } else { (b, a) };
+                if !cands.contains(&(i, j)) {
+                    cands.push((i, j));
+                }
+            }
+        }
     }
     let found: Vec<Option<Edge>> = cands
         .par_iter()
@@ -687,7 +708,7 @@ mod tests {
             std::fs::write(&out, o).unwrap();
             return;
         }
-        let dl = refine(&nodes, &k, &[], &mut log);
+        let dl = refine(&nodes, &k, &[], &[], &mut log);
         eprintln!("{log:?} {:.1} s", t0.elapsed().as_secs_f64());
         apply_deltas(&mut frames, &nt, &dl);
         let mut o = String::new();

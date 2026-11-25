@@ -1651,7 +1651,6 @@ dependencies = [
  "common",
  "image",
  "nalgebra",
- "ort",
  "rayon",
  "rsdriver",
 ]

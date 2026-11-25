@@ -1,5 +1,5 @@
 //! 루프 · 재위치용 신경망(MegaLoc · XFeat) 실행기 하나: 보드는 DXRT(.dxnn, 비동기 올리기 · 받기),
-//! PC 는 ONNX Runtime(.onnx). 출력은 모든 텐서를 이어 붙인 f32 버퍼 하나 + 이름별 (시작, 길이).
+//! PC 는 .onnx 를 Rust 실행기([`common::nn`])로. 출력은 모든 텐서를 이어 붙인 f32 버퍼 하나 + 이름별 (시작, 길이).
 //!
 //! 입력: MegaLoc 은 f32 조각(patches), XFeat 은 ONNX 판 f32 정규화 회색 · NPU 판 u8 회색(모델이 u8 을 받는지 [`Net::wants_u8`]).
 //! DXRT 출력 순서는 모델 파일이 정하므로 이름으로 찾는다([`Net::span`]).
@@ -14,7 +14,7 @@ pub enum Ticket {
 
 enum Kind {
     #[cfg(feature = "onnx")]
-    Onnx { sess: ort::session::Session, input: String, shape: Vec<i64>, u8_in: bool },
+    Onnx { m: common::nn::Model, shape: Vec<usize>, u8_in: bool },
     #[cfg(feature = "dxrt")]
     Dx(common::dxrt::Engine),
     /// 실행기 없는 빌드(시험 · 후처리만)
@@ -30,7 +30,7 @@ pub struct Net {
 }
 
 impl Net {
-    /// `.dxnn` 은 DXRT(NPU 코어 묶기 bound: 0 = 셋 다), 그 밖은 ONNX Runtime(스레드 threads)
+    /// `.dxnn` 은 DXRT(NPU 코어 묶기 bound: 0 = 셋 다), 그 밖은 Rust 실행기(스레드는 실행기 전역 일꾼 수, $NN_THREADS)
     pub fn open(path: &str, threads: usize, bound: u32) -> Result<Net, String> {
         let _ = (threads, bound);
         #[cfg(feature = "dxrt")]
@@ -46,30 +46,20 @@ impl Net {
         }
         #[cfg(feature = "onnx")]
         {
-            use ort::value::ValueType;
-            let sess = ort::session::Session::builder(common::ort::env())
-                .map_err(|e| format!("{path}: {e}"))?
-                .with_intra_threads(threads.max(1))
-                .map_err(|e| format!("{path}: {e}"))?
-                .commit_from_file(path)
-                .map_err(|e| format!("{path}: {e}"))?;
-            let inp = &sess.inputs()[0];
-            let (shape, u8_in) = match inp.dtype() {
-                ValueType::Tensor { ty, shape, .. } => (shape.iter().copied().collect::<Vec<i64>>(), matches!(ty, ort::value::TensorElementType::Uint8)),
-                _ => return Err(format!("{path}: 입력이 텐서가 아님")),
+            let m = common::nn::Model::load(path)?;
+            let (shape, u8_in) = {
+                let (_, s, u) = m.inputs().next().ok_or(format!("{path}: 입력 없음"))?;
+                (s.iter().map(|&d| d.max(1) as usize).collect::<Vec<usize>>(), u)
             };
+            // 출력 크기는 한 번 돌려서 앎(모양이 고정된 모델)
+            let probe = m.run(vec![common::nn::Tensor::f(shape.clone(), vec![0.0; shape.iter().product()])])?;
             let mut outs = Vec::new();
             let mut off = 0usize;
-            for o in sess.outputs() {
-                let n = match o.dtype() {
-                    ValueType::Tensor { shape, .. } => shape.iter().map(|&d| d.max(1) as usize).product::<usize>(),
-                    _ => 0,
-                };
-                outs.push((o.name().to_string(), off, n));
-                off += n;
+            for (name, t) in m.output_names().zip(&probe) {
+                outs.push((name.to_string(), off, t.len()));
+                off += t.len();
             }
-            let input = inp.name().to_string();
-            return Ok(Net { kind: Kind::Onnx { sess, input, shape, u8_in }, outs, total: off });
+            return Ok(Net { kind: Kind::Onnx { m, shape, u8_in }, outs, total: off });
         }
         #[allow(unreachable_code)]
         Err(format!("{path}: 이 빌드에는 실행기가 없다(--features onnx 또는 dxrt)"))
@@ -110,21 +100,16 @@ impl Net {
             #[cfg(feature = "dxrt")]
             Kind::Dx(e) => Ticket::Job(e.submit(input, out)),
             #[cfg(feature = "onnx")]
-            Kind::Onnx { sess, input: name, shape, u8_in } => {
-                let shape: Vec<usize> = shape.iter().map(|&d| d.max(1) as usize).collect();
-                let outs = if *u8_in {
-                    let v = ort::value::TensorRef::from_array_view((shape, input)).expect("입력");
-                    sess.run(ort::inputs![name.as_str() => v]).expect("onnx run")
+            Kind::Onnx { m, shape, u8_in } => {
+                let v: Vec<f32> = if *u8_in {
+                    input.iter().map(|&b| b as f32).collect()
                 } else {
-                    // SAFETY: f32 입력은 부르는 쪽이 f32 슬라이스의 바이트로 넘긴다(정렬 4)
-                    let f = unsafe { std::slice::from_raw_parts(input.as_ptr() as *const f32, input.len() / 4) };
-                    let v = ort::value::TensorRef::from_array_view((shape, f)).expect("입력");
-                    sess.run(ort::inputs![name.as_str() => v]).expect("onnx run")
+                    input.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
                 };
+                let outs = m.run(vec![common::nn::Tensor::f(shape.clone(), v)]).expect("onnx run");
                 out.resize(self.total, 0.0);
-                for (n, s, len) in &self.outs {
-                    let (_, d) = outs[n.as_str()].try_extract_tensor::<f32>().expect("출력");
-                    out[*s..*s + len].copy_from_slice(&d[..*len]);
+                for ((_, s, len), t) in self.outs.iter().zip(outs) {
+                    out[*s..*s + len].copy_from_slice(&t.into_f()[..*len]);
                 }
                 Ticket::Done
             }

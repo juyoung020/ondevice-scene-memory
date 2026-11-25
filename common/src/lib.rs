@@ -9,6 +9,7 @@
 //! - [`prof`]: 장면 길 계측(복사 · 기다림 · 스레드별 CPU · 깨어남)
 //! - [`models`]: 모델 폴더 규칙($ONDEVICE_MODELS · 보드 ~/models · PC models/)
 //! - [`rt`]: 처리 루프 하나 + 작업 풀의 뼈대(깨우개 · epoll · 완료 줄 · 줄 · 돌려받는 버퍼)
+//! - [`nn`]: ONNX 모델을 Rust 로 직접 실행(그래프 읽기 · 상수 접기 · 판 행렬곱)
 //! - `ort`(`onnx` 기능): 프로세스에 하나인 ONNX Runtime 환경
 //! - `dxrt`(`dxrt` 기능): DX-M1 NPU 모델 실행과 DXRT 런타임 설정
 pub mod cli;
@@ -17,6 +18,7 @@ pub mod slot;
 pub mod img;
 pub mod log;
 pub mod models;
+pub mod nn;
 pub mod prof;
 pub mod quat;
 pub mod rt;

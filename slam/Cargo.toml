@@ -14,8 +14,6 @@ nalgebra = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 rsdriver = { path = "../rsdriver", optional = true }
-# 루프 · 재위치 신경망(PC): ONNX Runtime(common 과 같은 판)
-ort = { version = "=2.0.0-rc.15", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -24,6 +22,6 @@ cc = "1"
 default = []
 # D435 입력(rsdriver: V4L2·UVC 직접)
 rsdriver = ["dep:rsdriver"]
-# 루프 · 재위치 신경망 실행기(nnrun): PC = ONNX Runtime, 보드 = DXRT
-onnx = ["dep:ort", "common/onnx"]
+# 루프 · 재위치 신경망 실행기(nnrun): PC = .onnx 를 Rust 실행기(common::nn)로, 보드 = DXRT
+onnx = []
 dxrt = ["common/dxrt"]

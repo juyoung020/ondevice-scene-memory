@@ -1,9 +1,8 @@
 //! 포터 TRACK — ORB-SLAM3 LocalMapping.cc 의 BA 호출을 뺀 판단들(RGB-D, 관성 없음).
 //! MapPointCulling · KeyFrameCulling(KeyFrame/MapPoint::SetBadFlag 가 관측 수에 미치는 효과 포함).
 //! 지역 BA 는 opt/orb3-rs-ba 몫이라 부르는 자리만: [`LocalMapperOps::local_ba`].
-use std::collections::BTreeMap;
 use super::mapdata::{kf_set_bad_flag, mp_set_bad_flag};
-use super::track::{obs_weight, TrackExt};
+use super::track::TrackExt;
 use super::types::*;
 
 /// LocalMapping::MapPointCulling. `recent` = mlpRecentAddedMapPoints(순서 유지), 돌려줌: SetBadFlag 부른 점들(순서대로).

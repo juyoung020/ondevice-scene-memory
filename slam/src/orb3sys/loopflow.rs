@@ -41,9 +41,9 @@ pub trait LoopOps<M>: Send {
     /// CorrectLoop 의 계산 부분(지도 스레드 멈춤 · 지도 잠금 안). Some(지도 id) 면 전역 BA
     fn correct_loop(&mut self, map: &mut M) -> Option<u64>;
     /// 합치기 후보 표지 지우기(SetErase · 일치 수 · 짝 목록 비우기)
-    fn clear_merge(&mut self, map: &M);
+    fn clear_merge(&mut self, map: &mut M);
     /// 루프 후보 표지 지우기
-    fn clear_loop(&mut self, map: &M);
+    fn clear_loop(&mut self, map: &mut M);
     /// 이번 키프레임을 mpLastCurrentKF 로
     fn done(&mut self, kf: u64);
 }
@@ -202,7 +202,7 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
             if f.merge {
                 let v = ops.merge_accept(&self.map.lock());
                 if v == MergeVerdict::Abort {
-                    ops.clear_merge(&self.map.lock());
+                    ops.clear_merge(&mut self.map.lock());
                     continue;
                 }
                 if v == MergeVerdict::Merge {
@@ -211,9 +211,9 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
                     s.merges += 1;
                     s.gba_started += (self.st.handles.lock().unwrap_or_else(|e| e.into_inner()).len() - before) as u64;
                 }
-                ops.clear_merge(&self.map.lock());
+                ops.clear_merge(&mut self.map.lock());
                 if looped {
-                    ops.clear_loop(&self.map.lock());
+                    ops.clear_loop(&mut self.map.lock());
                     looped = false;
                 }
             }
@@ -224,7 +224,7 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
                     s.loops += 1;
                     s.gba_started += (self.st.handles.lock().unwrap_or_else(|e| e.into_inner()).len() - before) as u64;
                 }
-                ops.clear_loop(&self.map.lock());
+                ops.clear_loop(&mut self.map.lock());
             }
             ops.done(kf);
         }
@@ -295,8 +295,8 @@ mod tests {
             m.poses += 1;
             self.gba_map
         }
-        fn clear_merge(&mut self, _m: &FakeMap) {}
-        fn clear_loop(&mut self, _m: &FakeMap) {}
+        fn clear_merge(&mut self, _m: &mut FakeMap) {}
+        fn clear_loop(&mut self, _m: &mut FakeMap) {}
         fn done(&mut self, _kf: u64) {}
     }
 

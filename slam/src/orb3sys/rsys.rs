@@ -7,6 +7,7 @@
 //! 구멍이 다 메워지면 `orb3_backend` 가 `RustSystem` 을 그대로 연다.
 use super::mapping::{self, KfSteps, MapState, MappingStats};
 use super::graft::{self, GraftState};
+use super::kfgraph::AtlasGraph;
 use super::threads::{LoopQueue, MapUpdate, Mapper};
 use super::{Orb3System, Track};
 use crate::orb3cv::system::{self as cvsys, SystemInit};
@@ -17,11 +18,10 @@ use crate::orb3rs::localmap::{self, NewMp, TriParams};
 use crate::orb3rs::matcher::Matcher;
 use crate::orb3loop::crand::GlibcRand;
 use crate::orb3loop::dbow2::{BowVector, Vocabulary};
-use crate::orb3loop::kfdb::{KeyFrameDatabase, KfGraph, KfId as DbKf, MapId as DbMap};
+use crate::orb3loop::kfdb::{KeyFrameDatabase, MapId as DbMap};
 use crate::orb3loop::reloc::{relocalize, RustPnp};
 use crate::orb3rs::stdsort;
 use crate::orb3rs::types::{quat_from_mat, Atlas, Frame, KeyFrame, KfId, Map, MapId, MapPoint, MpId, Se3};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -201,7 +201,6 @@ impl KfSteps for RsSteps {
             }
             touched.push(p);
         }
-        let map = st.atlas.kfs[&kf].map;
         crate::orb3rs::mapdata::kf_update_connections(&mut st.atlas, kf, true);
     }
     fn keyframe_culling(&mut self, st: &mut MapState, kf: KfId) {
@@ -348,43 +347,6 @@ impl Edits {
         if let Some(id) = self.last_reloc_frame_id {
             t.last_reloc_frame_id = id;
         }
-    }
-}
-
-/// KeyFrameDatabase 가 보는 키프레임 그래프(Atlas 위, DB 번호는 u32)
-struct AtlasGraph<'a> {
-    a: &'a Atlas,
-    bow: HashMap<DbKf, BowVector>,
-    covis: HashMap<DbKf, Vec<DbKf>>,
-}
-
-impl<'a> AtlasGraph<'a> {
-    fn new(a: &'a Atlas) -> Self {
-        let bow = a.kfs.iter().map(|(k, f)| (*k as DbKf, f.bow.iter().map(|(w, v)| (*w, *v)).collect())).collect();
-        let covis = a.kfs.iter().map(|(k, f)| (*k as DbKf, f.ordered_conn.iter().map(|c| c.0 as DbKf).collect())).collect();
-        AtlasGraph { a, bow, covis }
-    }
-}
-
-impl KfGraph for AtlasGraph<'_> {
-    fn bow(&self, kf: DbKf) -> &BowVector {
-        &self.bow[&kf]
-    }
-    fn map_of(&self, kf: DbKf) -> DbMap {
-        self.a.kfs[&(kf as KfId)].map as DbMap
-    }
-    fn is_bad(&self, kf: DbKf) -> bool {
-        self.a.kfs[&(kf as KfId)].bad
-    }
-    fn map_is_bad(&self, m: DbMap) -> bool {
-        self.a.maps.iter().find(|x| x.id as DbMap == m).is_none_or(|x| x.bad)
-    }
-    fn is_connected(&self, kf: DbKf, other: DbKf) -> bool {
-        self.a.kfs[&(kf as KfId)].ordered_conn.iter().any(|c| c.0 as DbKf == other)
-    }
-    fn best_covis(&self, kf: DbKf, n: usize) -> &[DbKf] {
-        let v = &self.covis[&kf];
-        &v[..n.min(v.len())]
     }
 }
 

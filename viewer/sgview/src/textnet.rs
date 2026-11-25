@@ -408,6 +408,11 @@ fn kernel() -> RowsFn {
 /// out[rows, n] = x[rows, k] · w[k, n] + b. Threads split the column panels, so each weight is read from memory once per call
 /// (the weights, not the 64 token rows, are what does not fit in cache)
 fn linear(x: &[f32], k: usize, w: &Lin, out: &mut [f32]) {
+    linear_then(x, k, w, out, |_| {})
+}
+
+/// [`linear`], then `post` on each finished block of columns while it is still in cache
+fn linear_then(x: &[f32], k: usize, w: &Lin, out: &mut [f32], post: impl Fn(&mut [[f32; NB]]) + Sync) {
     let n = w.1.len();
     let rows = x.len() / k;
     let (kern, mr) = kernel();
@@ -423,6 +428,7 @@ fn linear(x: &[f32], k: usize, w: &Lin, out: &mut [f32]) {
                 unpack(&w.0[p * k * NB..(p + 1) * k * NB], &mut pb);
                 let mut o = vec![[0f32; NB]; rows];
                 unsafe { kern(x, k, rows, &pb, &w.1[p * NB..(p + 1) * NB], &mut o) };
+                post(&mut o);
                 o
             })
         })
@@ -636,6 +642,7 @@ impl Weights {
             });
             lap(3, &mut t0);
             linear(&c[r.clone()], D, &ly.o, &mut o[r.clone()]);
+            lap(2, &mut t0);
             for i in r.clone() {
                 x[i] += o[i];
             }
@@ -644,10 +651,8 @@ impl Weights {
             }
             lap(1, &mut t0);
             let rf = rows.start * F..rows.end * F;
-            linear(&h[r.clone()], D, &ly.f1, &mut f[rf.clone()]);
+            linear_then(&h[r.clone()], D, &ly.f1, &mut f[rf.clone()], |o| o.iter_mut().flatten().for_each(|y| *y = gelu(*y)));
             lap(2, &mut t0);
-            f[rf.clone()].par_chunks_mut(F).for_each(|y| y.iter_mut().for_each(|y| *y = gelu(*y)));
-            lap(4, &mut t0);
             linear(&f[rf], F, &ly.f2, &mut o[r.clone()]);
             lap(2, &mut t0);
             for i in r {

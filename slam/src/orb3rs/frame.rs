@@ -26,9 +26,10 @@ impl Camera {
     }
 }
 
-/// 깊이 영상(16 비트) → 미터(float): cv::Mat::convertTo(CV_32F, 1/DepthMapFactor)
+/// 깊이 영상(16 비트) → 미터(float): cv::Mat::convertTo(CV_32F, mDepthMapFactor).
+/// Tracking::newParameterLoader: mDepthMapFactor = 1.0f / DepthMapFactor(f32 나눗셈, |값| < 1e-5 면 1)
 pub fn depth_to_float(raw: &[u16], depth_map_factor: f32) -> Vec<f32> {
-    let s = (1.0f64 / depth_map_factor as f64) as f32;
+    let s = if depth_map_factor.abs() < 1e-5 { 1.0f32 } else { 1.0f32 / depth_map_factor };
     raw.iter().map(|&d| d as f32 * s).collect()
 }
 

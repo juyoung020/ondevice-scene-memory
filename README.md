@@ -61,10 +61,10 @@ ondevice(한 프로세스): D435(컬러 + 깊이) → 위치(slam, 위치 추적
 
 **2. 시험 영상 받기** — [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download)에서 영상을 받아 `data/` 아래에 풉니다(D435 로 찍은 사무실 영상 `data/d435/rgbd_dataset_freiburg3_office_sync` 와 같은 TUM 형식). 쓴 데이터 전체 목록은 [data/README.md](data/README.md).
 
-**3. 빌드하고 실행** — 저장소 맨 위가 Cargo 작업 공간 하나입니다(`common` · `slam` · `pipeline` · `viewer/sgview` · `tools` · `rsdriver`, 빌드 결과는 `target/release/` 한 곳). 실행 파일은 `ondevice` 하나로, 위치 추적(slam) → 지도·물체(memmap) → 뷰어 서버(sgview)를 한 프로세스에서 돌립니다. 장면은 메모리 큐로 복사 없이 넘어가고, 뷰어는 이 프로세스가 기억 폴더에 쓴 파일(view.json · pose.json · map.pgm · 물체 사진 · 점 파일 · 사진 벡터 …)을 쓴 바이트 그대로 메모리에서 받습니다. 기억 폴더는 결과물로 그대로 디스크에 쓰입니다. 명령줄은 처음에 한 번 읽어 세 부분의 설정으로 나누고, ONNX Runtime 환경도 하나를 함께 씁니다. 자세한 것은 [slam/README.md](slam/README.md)와 [docs/bridge.md](docs/bridge.md).
+**3. 빌드하고 실행** — 저장소 맨 위가 Cargo 작업 공간 하나입니다(`common` · `slam` · `pipeline` · `viewer/sgview` · `tools` · `rsdriver`, 빌드 결과는 `target/release/` 한 곳). 실행 파일은 `ondevice` 하나로, 위치 추적(slam) → 지도·물체(memmap) → 뷰어 서버(sgview)를 한 프로세스에서 돌립니다. 장면은 메모리 큐로 복사 없이 넘어가고, 뷰어는 이 프로세스가 기억 폴더에 쓴 파일(view.json · pose.json · map.pgm · 물체 사진 · 점 파일 · 사진 벡터 …)을 쓴 바이트 그대로 메모리에서 받습니다. 기억 폴더는 결과물로 그대로 디스크에 쓰입니다. 명령줄은 처음에 한 번 읽어 세 부분의 설정으로 나눕니다. PC 의 신경망(.onnx)은 모두 Rust 실행기(`common::nn`)가 돌립니다. 자세한 것은 [slam/README.md](slam/README.md)와 [docs/bridge.md](docs/bridge.md).
 
 ```bash
-cargo build --release --features directml        # target/release/ondevice
+cargo build --release        # target/release/ondevice
 
 # TUM 영상 → 위치 추적 → 점 지도 + 물체(ObjectSAM + SigLIP2 이름) → 뷰어(http://127.0.0.1:8091), 한 명령
 target/release/ondevice --slam "--tum data/d435/rgbd_dataset_freiburg3_office_sync --config docs/rtabmap_pi.ini" \
@@ -95,7 +95,7 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 
 - **D435 입력:** 리눅스 빌드는 `rsdriver`(V4L2 · UVC 직접, Rust)로 카메라를 엽니다. 제어 기본값은 librealsense 2.59.1 과 같습니다([docs/realsense_input.md](docs/realsense_input.md)). 장면 시각은 컬러 장치 시각에 첫 장면에서 한 번 정한 시스템 시계 차이를 더한 값입니다.
 
-- **아무 말로 찾기(보드):** 물체 기억은 기본으로 `~/models/siglip2-vision_npu.dxnn`(NPU) 사진 벡터를 남기고, 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 보드는 글 인코더를 Rust 로 계산하고(질의 하나 약 75 ms), PC 는 ONNX Runtime 으로 계산합니다. 확인 값은 [docs/npu_models.md](docs/npu_models.md) "글 인코더".
+- **아무 말로 찾기(보드):** 물체 기억은 기본으로 `~/models/siglip2-vision_npu.dxnn`(NPU) 사진 벡터를 남기고, 뷰어에 `--search-model <text_model_fp16.onnx 와 tokenizer.json 이 든 폴더>` 를 더합니다. 글 인코더는 보드 · PC 모두 Rust 로 계산합니다(보드 질의 하나 약 75 ms). 확인 값은 [docs/npu_models.md](docs/npu_models.md) "글 인코더".
 - **움직일 때 번지면:** `--slam "… --exposure 8 --gain 110"` 으로 컬러 노출을 8 ms 로 고정합니다(기본은 자동 노출).
 
 - **보드 화면에서 볼 때:** `chromium --password-store=basic http://127.0.0.1:8091`(키링 암호 창이 브라우저를 막지 않게). 보드 GPU 에서는 점 섞기 · EDL 패스를 끄고 한 번에 그립니다(점 크기 · 화질은 그대로). 주소 뒤 `?metrics=1` 이면 2 초마다 그리기 · 지연 · 프레임 간격 · 긴 작업 · 메모리를 서버 로그에 남깁니다.
@@ -139,4 +139,4 @@ target/release/ondevice --slam "--realsense --config docs/rtabmap_pi.ini --send-
 
 [PolyForm Noncommercial License 1.0.0](LICENSE.md) — 개인 공부·연구·교육·비영리 목적으로는 자유롭게 쓰고 고치고 나눌 수 있고, **상업적 이용은 허용하지 않습니다.** 나눌 때는 `LICENSE.md` 의 저작권 표시(Required Notice)를 함께 전합니다.
 
-저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), rsdriver 에 옮긴 librealsense 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(ONNX Runtime, SigLIP2, DEEPX 런타임)은 각자의 라이선스를 따릅니다.
+저장소에 함께 든 외부 코드(three.js, OrbitControls), `slam/` 에 Rust 로 옮긴 코드(RTAB-Map, OpenCV, GTSAM, FLANN, CCOLAMD — 출처는 [slam/README.md](slam/README.md)), `tools/src/rsref.rs` 에 시험 기준으로 옮긴 librealsense 정렬 코드(Apache-2.0), rsdriver 에 옮긴 librealsense 코드(Apache-2.0), 연결해 쓰는 라이브러리·모델(SigLIP2, DEEPX 런타임)은 각자의 라이선스를 따릅니다.

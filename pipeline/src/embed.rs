@@ -290,7 +290,7 @@ mod worker {
     /// 인코더 실행기: 입력 NCHW f32(−1..1) 256×256 → 768 차원
     enum Net {
         #[cfg(feature = "onnx")]
-        Onnx(ort::session::Session),
+        Onnx(common::nn::Model),
         /// DX-M1: 입력·출력 모두 f32(조각 배치 입력, NPU 작업 하나)
         #[cfg(feature = "dxrt")]
         Dx(crate::seg::dx::Engine),
@@ -309,10 +309,10 @@ mod worker {
             }
             #[cfg(feature = "onnx")]
             {
-                // 지도 쌓기·분할과 코어를 다투지 않게 스레드 둘만
-                let sess = ort::session::Session::builder(common::ort::env()).unwrap().with_intra_threads(2).unwrap()
-                    .commit_from_file(model).unwrap_or_else(|e| panic!("embed model {model}: {e}"));
-                Net::Onnx(sess)
+                // 지도 쌓기·분할과 코어를 다투지 않게 일꾼 둘만
+                let mut m = common::nn::Model::load(model).unwrap_or_else(|e| panic!("embed model {model}: {e}"));
+                m.set_threads(2);
+                Net::Onnx(m)
             }
             #[cfg(not(feature = "onnx"))]
             panic!("--embed {model}: 이 빌드는 NPU 모델(.dxnn)을 받는다");
@@ -363,13 +363,12 @@ mod worker {
         fn run(&mut self, buf: &[f32], v: &mut Vec<f32>) {
             match self {
                 #[cfg(feature = "onnx")]
-                Net::Onnx(sess) => {
-                    let inp = ort::value::TensorRef::from_array_view(([1usize, 3, SIZE, SIZE], buf)).unwrap();
-                    let out = sess.run(ort::inputs![inp]).expect("embed run");
-                    let (_, o) = out["pooler_output"].try_extract_tensor::<f32>().unwrap();
+                Net::Onnx(m) => {
+                    let outs = m.run(vec![common::nn::Tensor::f(vec![1, 3, SIZE, SIZE], buf.to_vec())]).expect("embed run");
+                    let i = m.output_names().position(|n| n == "pooler_output").expect("embed model: pooler_output 없음");
+                    let o = outs.into_iter().nth(i).unwrap().into_f();
                     assert_eq!(o.len(), DIM, "embed model output");
-                    v.clear();
-                    v.extend_from_slice(o);
+                    *v = o;
                 }
                 #[cfg(feature = "dxrt")]
                 Net::Dx(e) => {

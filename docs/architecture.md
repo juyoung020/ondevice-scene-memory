@@ -29,10 +29,10 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 
 - 명령줄은 시작할 때 한 번 읽어 위치(`--slam "…"`) · 물체 기억 · 뷰어(`--serve "…"`) 설정으로 나눈다(`common::cli`). 잘못된 인자는 장치를 열기 전에 멈춘다.
 - 스레드는 처리 루프 하나 + IMU 읽기 하나(IMU 모드) + 작업 풀(`--pool N`, 기본 3)뿐이다. 루프는 epoll 하나에 카메라 장치 fd · 뷰어 소켓 · 깨우개(NPU 끝 · 풀 일 끝 · IMU 표본 · 뷰어 버튼)를 걸고 잠들었다가 준비된 일을 한다. 배치(`--threads`): 루프는 본 스레드 역할(nice · 코어), 풀은 점 역할 코어(nice 0, 긴 줄 일은 그 일 동안만 nice 10). 구조 · 넘김 · 복사 표는 [threads_npu.md](threads_npu.md).
-- PC 빌드의 ONNX Runtime 환경은 프로세스에 하나(`common::ort`): 분할 · 사진 벡터 세션이 함께 쓴다. 보드 빌드는 ONNX Runtime 없이 NPU(DXRT)만 쓰고, 뷰어 검색 글 인코더는 Rust 로 직접 계산한다.
+- PC 빌드의 .onnx 모델(분할 · 사진 벡터 · MegaLoc · XFeat)은 Rust 실행기 `common::nn` 하나가 돌린다(그래프 읽기 · 상수 접기 · 묶기 · 판 행렬곱, 일꾼 묶음 하나를 모델마다 상한을 두고 나눠 씀). 보드 빌드는 NPU(DXRT), 뷰어 검색 글 인코더는 어디서나 Rust(`viewer/sgview/src/textnet.rs`). 대조 기록은 [ort_port.md](ort_port.md).
 - 뷰어 서버는 이 프로세스가 만든 파일을 메모리에서 보낸다(`sgview::memfs`, view 는 `sgview::live`). 디스크에서 읽는 것은 따로 띄운 뷰어(`ondevice view`)뿐이다.
 - 처리가 0.2 s 넘게 밀리면 쌓인 장면을 건너뛰고 최신 장면부터 처리한다. 그래프 블록은 버리지 않는다(`--no-drop` 이면 모두 처리).
-- 분할 모델은 공통 인터페이스(`Segmenter`)로, 모델 파일이 `.onnx` 면 PC(ONNX Runtime), `.dxnn` 이면 보드 NPU(DXRT C API)에서 돈다.
+- 분할 모델은 공통 인터페이스(`Segmenter`)로, 모델 파일이 `.onnx` 면 PC(Rust 실행기), `.dxnn` 이면 보드 NPU(DXRT C API)에서 돈다.
 - 분할은 루프가 장면을 전처리해 NPU 에 바로 올리고(DXRT 비동기 실행, 결과는 받을 버퍼에 바로) 끝 알림(`--npu-wake thread` 기다림 스레드 · `callback` DXRT 콜백)이 루프를 깨우면 올린 순서대로 마스크 해독 · 물체 기억까지 한다. 보드 NPU 에는 장면을 `--npu-jobs` 장까지 함께 올리고 장면 순서는 그대로다. NPU 호출 단계는 [threads_npu.md](threads_npu.md).
 - 병합 기준(HOV-SG·ConceptGraphs 방식): 4 cm 칸 IoU ≥ 0.5, 또는 작은 쪽 기준 겹침 ≥ 0.6 이면서 이름 투표 코사인 ≥ 0.5 이거나 색 히스토그램 코사인 ≥ 0.8.
 - 사진 벡터로 합치기: 두 물체의 사진 벡터 코사인 ≥ 0.88 이고 작은 쪽 굳은 칸의 25 % 이상이 큰 쪽 굳은 칸과 겹치면 이름이 달라도 합친다(같은 물체가 보는 방향에 따라 두 이름으로 남은 경우). 사진 벡터는 물체의 종류까지만 가린다 — 나란히 놓인 모니터 두 대도 코사인이 0.92 다. 그래서 자리가 겹칠 때만 쓰고, 같은 이름의 이웃 물체는 칸 겹침·맞닿음·전형 크기로 가른다. 벡터가 아직 없는 물체는 기하·이름 조건만 본다.
@@ -73,7 +73,7 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 | 폴더 | 내용 |
 |---|---|
 | `pipeline/` | 실행 파일 `ondevice`(Rust): 물체 기억(memmap) 본체 + 위치 · 뷰어 서버를 같은 프로세스에서 부름 |
-| `common/` | 크레이트들이 함께 쓰는 조각: 명령줄 읽기, 스레드 배치, 처리 루프 뼈대(`rt`: 깨우개 · epoll · 완료 줄 · 줄 · 작업 풀), TUM 목록, 사원수, PNG·PLY 바이트, ONNX Runtime 환경 |
+| `common/` | 크레이트들이 함께 쓰는 조각: 명령줄 읽기, 스레드 배치, 처리 루프 뼈대(`rt`: 깨우개 · epoll · 완료 줄 · 줄 · 작업 풀), TUM 목록, 사원수, PNG·PLY 바이트, ONNX 모델 Rust 실행기(`nn`) |
 | `pipeline/src/stream.rs` | 장면 입력(`--slam` 같은 루프의 위치 프로그램 · `--stream` 바이트, 형식은 `slam::stream`) |
 | `pipeline/src/kfstore.rs` | 다시 쌓기용 장면 보관(압축) |
 | `pipeline/src/maps.rs` | 누적 지도·물체 트래커·물체 병합 |
@@ -92,6 +92,6 @@ RealSense D435 (컬러 + 깊이, 640×480@30)
 ## 개발 환경
 
 - 저장소 경로는 공백·한글 없이(`C:\ondevice`). DEEPX 도구가 이런 경로에서 깨진다.
-- 빌드 기능: PC `--features directml`(윈도우 그래픽카드) 또는 기본(CPU), 보드 `--no-default-features --features dxrt`(ONNX Runtime 없이 DXRT 만).
+- 빌드 기능: PC 기본(CPU, Rust 실행기), 보드 `--no-default-features --features dxrt`(DXRT 만).
 - 평가 표: `target/release/bench [--quick]` — TUM 책상·사무실을 정해진 조건으로 돌려 위치 오차·실패·속도·물체 수를 한 표로.
 - 다른 카메라 RGB-D 를 TUM 형식으로: `rgbd2tum <원본> <출력(이름에 freiburg3)> fx fy cx cy <깊이 1 m 값>` — TUM fr3 보정값 640×480 으로 다시 그려 RTAB-Map `rtabmap-rgbd_dataset`·`ondevice --slam "--tum …"` · `ondevice --tum` 이 같이 읽음. 다른 SLAM 위치로 돌리기: `ondevice --tum <폴더> --gt <위치 파일>`, 정렬 후 위치 오차: `ate <추정> <정답>`(기억 폴더에 `poses_est.txt`·`poses_map.txt` 를 남김).

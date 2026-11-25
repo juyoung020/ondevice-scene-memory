@@ -17,6 +17,8 @@ struct Shared {
     total: AtomicUsize,
     finished: AtomicUsize,
     active: AtomicUsize,
+    /// 이번 일에 낄 일꾼 수(부른 스레드 포함)
+    limit: AtomicUsize,
     lock: Mutex<()>,
     cv: Condvar,
     caller: Mutex<()>,
@@ -28,6 +30,8 @@ struct Pool {
 }
 
 thread_local! {
+    /// 이 스레드가 부르는 일에 쓸 일꾼 수 상한([`with_limit`])
+    static LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
     static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -42,12 +46,13 @@ fn pool() -> &'static Pool {
             total: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
+            limit: AtomicUsize::new(usize::MAX),
             lock: Mutex::new(()),
             cv: Condvar::new(),
             caller: Mutex::new(()),
         }));
         for i in 1..n {
-            std::thread::Builder::new().name(format!("nn-{i}")).spawn(move || worker(sh)).expect("nn 일꾼");
+            std::thread::Builder::new().name(format!("nn-{i}")).spawn(move || worker(sh, i)).expect("nn 일꾼");
         }
         Pool { sh, n }
     })
@@ -64,7 +69,7 @@ fn work(sh: &Shared, f: &(dyn Fn(usize) + Sync + '_)) {
     }
 }
 
-fn worker(sh: &'static Shared) {
+fn worker(sh: &'static Shared, idx: usize) {
     INSIDE.with(|c| c.set(true));
     let mut seen = 0usize;
     loop {
@@ -81,6 +86,9 @@ fn worker(sh: &'static Shared) {
             std::hint::spin_loop();
         }
         seen = sh.epoch.load(SeqCst);
+        if idx >= sh.limit.load(SeqCst) {
+            continue;
+        }
         sh.active.fetch_add(1, SeqCst);
         let p = sh.job.load(SeqCst);
         if !p.is_null() {
@@ -98,7 +106,8 @@ pub fn for_each(n: usize, f: &(dyn Fn(usize) + Sync + '_)) {
         return;
     }
     let p = pool();
-    if n == 1 || p.n == 1 || INSIDE.with(|c| c.get()) {
+    let lim = LIMIT.with(|c| c.get()).min(p.n);
+    if n == 1 || lim <= 1 || INSIDE.with(|c| c.get()) {
         (0..n).for_each(f);
         return;
     }
@@ -106,6 +115,7 @@ pub fn for_each(n: usize, f: &(dyn Fn(usize) + Sync + '_)) {
     let _c = sh.caller.lock().unwrap();
     // SAFETY: 이 함수가 돌아가기 전에 job 을 null 로 돌리고 active == 0 을 기다림
     let mut fr: &'static Job = unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync + '_), &'static Job>(f) };
+    sh.limit.store(lim, SeqCst);
     sh.total.store(n, SeqCst);
     sh.finished.store(0, SeqCst);
     sh.next.store(0, SeqCst);
@@ -127,9 +137,17 @@ pub fn for_each(n: usize, f: &(dyn Fn(usize) + Sync + '_)) {
     }
 }
 
-/// 일꾼 수(부른 스레드 포함)
+/// 일꾼 수(부른 스레드 포함, 이 스레드의 상한 적용)
 pub fn threads() -> usize {
-    pool().n
+    pool().n.min(LIMIT.with(|c| c.get())).max(1)
+}
+
+/// f 안에서 부르는 일은 일꾼을 n 까지만(0 = 다)
+pub fn with_limit<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    let old = LIMIT.with(|c| c.replace(if n == 0 { usize::MAX } else { n }));
+    let r = f();
+    LIMIT.with(|c| c.set(old));
+    r
 }
 
 /// v 를 chunk 개씩 나눠 f(덩어리 번호, 덩어리)

@@ -248,9 +248,16 @@ pub struct Model {
     inputs: Vec<(String, usize, Vec<i64>, bool)>,
     outputs: Vec<(String, usize)>,
     free_after: Vec<Vec<usize>>,
+    /// 일꾼 수 상한(0 = 실행기 전역 일꾼 모두)
+    threads: usize,
 }
 
 impl Model {
+    /// 이 모델을 돌릴 때 쓸 일꾼 수 상한(0 = 모두)
+    pub fn set_threads(&mut self, n: usize) {
+        self.threads = n;
+    }
+
     pub fn load(path: &str) -> Result<Model, String> {
         let b = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         Model::from_bytes(&b).map_err(|e| format!("{path}: {e}"))
@@ -312,7 +319,7 @@ impl Model {
             nodes.push(node);
         }
         consts.resize(slot.len(), None);
-        let mut m = Model { nodes, consts, inputs, outputs, free_after: vec![] };
+        let mut m = Model { nodes, consts, inputs, outputs, free_after: vec![], threads: 0 };
         m.fuse();
         m.fuse_ln();
         m.prepack()?;
@@ -664,6 +671,10 @@ impl Model {
 
     /// 입력(그래프 입력 차례) → 출력(그래프 출력 차례)
     pub fn run(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
+        pool::with_limit(self.threads, || self.run_in(inputs))
+    }
+
+    fn run_in(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         let prof = std::env::var_os("NN_PROF").is_some();
         let mut tm: HashMap<String, f64> = HashMap::new();
         let mut vals: Vec<Option<Tensor>> = vec![None; self.consts.len()];
@@ -675,7 +686,16 @@ impl Model {
         }
         for (ni, n) in self.nodes.iter().enumerate() {
             let t0 = std::time::Instant::now();
-            let outs = {
+            // 첫 입력을 이 노드가 마지막으로 쓰면 버퍼째 넘겨 받아 제자리 계산(모양 바꾸기 · 원소별)
+            let s0 = n.ins.first().copied().flatten();
+            let own = match s0 {
+                Some(s) if self.consts[s].is_none() && self.free_after[ni].contains(&s) && n.ins.iter().filter(|&&x| x == Some(s)).count() == 1 && ops::in_place(n) => vals[s].take(),
+                _ => None,
+            };
+            let outs = if let Some(x) = own {
+                let ins: Vec<Option<&Tensor>> = n.ins.iter().skip(1).map(|s| s.and_then(|s| self.consts[s].as_ref().or(vals[s].as_ref()))).collect();
+                ops::exec_own(n, x, &ins).map_err(|e| format!("{}: {e}", n.op))?
+            } else {
                 let ins: Vec<Option<&Tensor>> = n
                     .ins
                     .iter()
@@ -696,7 +716,7 @@ impl Model {
             }
             if prof {
                 if std::env::var("NN_PROF").as_deref() == Ok("2") {
-                    eprintln!("  {} {:?} {:.3} ms", n.op, vals[n.outs[0]].as_ref().map(|t| t.shape.clone()), t0.elapsed().as_secs_f64() * 1e3);
+                    eprintln!("  {} {:?} g{} s{:?} {:.3} ms", n.op, vals[n.outs[0]].as_ref().map(|t| t.shape.clone()), n.ai("group", 1), n.ais("strides"), t0.elapsed().as_secs_f64() * 1e3);
                 }
                 *tm.entry(n.op.clone()).or_default() += t0.elapsed().as_secs_f64();
             }

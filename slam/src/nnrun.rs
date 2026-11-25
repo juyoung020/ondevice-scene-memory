@@ -30,7 +30,7 @@ pub struct Net {
 }
 
 impl Net {
-    /// `.dxnn` 은 DXRT(NPU 코어 묶기 bound: 0 = 셋 다), 그 밖은 Rust 실행기(스레드는 실행기 전역 일꾼 수, $NN_THREADS)
+    /// `.dxnn` 은 DXRT(NPU 코어 묶기 bound: 0 = 셋 다), 그 밖은 Rust 실행기(일꾼 threads 까지)
     pub fn open(path: &str, threads: usize, bound: u32) -> Result<Net, String> {
         let _ = (threads, bound);
         #[cfg(feature = "dxrt")]
@@ -46,7 +46,8 @@ impl Net {
         }
         #[cfg(feature = "onnx")]
         {
-            let m = common::nn::Model::load(path)?;
+            let mut m = common::nn::Model::load(path)?;
+            m.set_threads(threads);
             let (shape, u8_in) = {
                 let (_, s, u) = m.inputs().next().ok_or(format!("{path}: 입력 없음"))?;
                 (s.iter().map(|&d| d.max(1) as usize).collect::<Vec<usize>>(), u)

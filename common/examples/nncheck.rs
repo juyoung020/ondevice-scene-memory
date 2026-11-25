@@ -6,7 +6,10 @@ fn main() {
     let m = common::nn::Model::load(&a[1]).unwrap();
     eprintln!("load {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let (_, shape, u8_in) = m.inputs().next().unwrap();
-    let shape: Vec<usize> = shape.iter().map(|&d| d.max(1) as usize).collect();
+    let shape: Vec<usize> = match std::env::var("NN_SHAPE") {
+        Ok(s) => s.split(',').map(|d| d.parse().unwrap()).collect(),
+        Err(_) => shape.iter().map(|&d| d.max(1) as usize).collect(),
+    };
     let raw = std::fs::read(&a[2]).unwrap();
     let v: Vec<f32> = if u8_in { raw.iter().map(|&b| b as f32).collect() } else { raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
     let reps: usize = a.get(4).map(|s| s.parse().unwrap()).unwrap_or(5);

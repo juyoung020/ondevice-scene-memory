@@ -399,7 +399,7 @@ fn make_seg(path: &str) -> Box<dyn seg::Segmenter + Send> {
     }
     #[cfg(feature = "onnx")]
     {
-        return Box::new(seg::OnnxSeg::new(common::ort::env(), path));
+        return Box::new(seg::OnnxSeg::new(path));
     }
     #[allow(unreachable_code)]
     {

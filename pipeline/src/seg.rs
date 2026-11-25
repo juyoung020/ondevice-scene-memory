@@ -411,19 +411,14 @@ pub trait Segmenter: Send {
     }
 }
 
-// ------------------------------------------------------------------ PC: ONNX Runtime
-/// ONNX Runtime 세션: 프로세스에 하나인 환경(`common::ort`, 뷰어 글 검색과 같은 것)에서 만든다
+// ------------------------------------------------------------------ PC: Rust 실행기(common::nn)
+/// .onnx 를 Rust 실행기로: 일꾼은 쓸 수 있는 코어 수까지만(8 고정이면 taskset 2 코어에서 7 개가 서로 깨우며 코어를 나눠 먹음)
 #[cfg(feature = "onnx")]
-fn session(path: &str) -> ort::session::Session {
-    #[allow(unused_mut)]
-    // 스레드는 쓸 수 있는 코어 수까지만(8 고정이면 taskset 2 코어에서 7 개가 서로 깨우며 문맥 전환 260 만 번·코어를 나눠 먹음)
+fn session(path: &str) -> common::nn::Model {
     let nth = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
-    #[allow(unused_mut)]
-    let mut b = ort::session::Session::builder(common::ort::env()).unwrap().with_intra_threads(nth).unwrap();
-    // directml 기능이면 그래픽카드로(안 되면 ORT 가 CPU 로 물러남). 입력 크기를 고정해 두면 DirectML 이 빠르다.
-    #[cfg(feature = "directml")]
-    let mut b = b.with_execution_providers([ort::ep::DirectML::default().build()]).unwrap().with_dimension_override("batch", 1).unwrap();
-    b.commit_from_file(path).unwrap_or_else(|e| panic!("onnx model {path}: {e}"))
+    let mut m = common::nn::Model::load(path).unwrap_or_else(|e| panic!("onnx model {path}: {e}"));
+    m.set_threads(nth);
+    m
 }
 
 /// ONNX 실행 결과: 검출 [300, 6 + pc] 와 원형 [pc, ph, pw] 를 이어 붙인 버퍼
@@ -452,9 +447,8 @@ pub struct OnnxSeg {
 }
 #[cfg(feature = "onnx")]
 impl OnnxSeg {
-    pub fn new(env: &ort::environment::Environment, path: &str) -> OnnxSeg {
-        let _ = env;
-        let mut sess = session(path);
+    pub fn new(path: &str) -> OnnxSeg {
+        let sess = session(path);
         let (tx, rx_in) = std::sync::mpsc::channel::<(i32, u64, Vec<f32>)>();
         let (tx_out, rx) = std::sync::mpsc::channel::<OnnxOut>();
         let pool: Pools = Default::default();
@@ -465,18 +459,17 @@ impl OnnxSeg {
             crate::out::thread_role(crate::out::Role::Infer);
             common::prof::track_thread();
             for (id, tag, f) in rx_in {
-                let t = ort::value::TensorRef::from_array_view(([1usize, 3, SEG_S, SEG_S], &f[..])).unwrap();
-                let out = sess.run(ort::inputs![t]).expect("onnx run");
-                let (_, det) = out[0].try_extract_tensor::<f32>().unwrap();
-                let (ps, proto) = out[1].try_extract_tensor::<f32>().unwrap();
+                let mut out = sess.run(vec![common::nn::Tensor::f(vec![1, 3, SEG_S, SEG_S], f)]).expect("onnx run");
+                let pt = out.remove(1);
+                let ps = pt.shape.clone();
+                let (det, proto) = (out.remove(0).into_f(), pt.into_f());
                 let mut buf = pool_w.lock().unwrap().1.pop().unwrap_or_default();
                 buf.clear();
-                buf.extend_from_slice(det);
-                buf.extend_from_slice(proto);
+                buf.extend_from_slice(&det);
+                buf.extend_from_slice(&proto);
                 common::prof::copy(common::prof::C::SegOnnxOut, (det.len() + proto.len()) * 4);
-                let o = OnnxOut { id, buf, det: det.len(), p: (ps[1] as usize, ps[2] as usize, ps[3] as usize) };
-                drop(out);
-                pool_w.lock().unwrap().0.push(f);
+                let o = OnnxOut { id, buf, det: det.len(), p: (ps[1], ps[2], ps[3]) };
+                common::nn::buf::give(proto);
                 if tx_out.send(o).is_err() {
                     break;
                 }

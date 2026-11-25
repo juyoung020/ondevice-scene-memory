@@ -126,8 +126,13 @@ pub struct Orb3 {
     /// 확인을 기다리는 잇기: (into, from, into ← from, 시각)
     pend: Vec<(u64, u64, T34, f64)>,
     n_graft: i64,
+    n_gapgraft: i64,
     /// 모든 잇기 짝(약한 짝 포함, 끝난 뒤 지도 통째 맞춤 후보), 끝난 뒤 맞춤용 작은 깊이(장면 5 장마다: 시각, 기준 키프레임, 상대 위치, 160×120 mm)
     hits_all: Vec<stitch::Hit>,
+    /// 빈틈 뒤 새 지도: (새 지도, 앞 지도, 앞 지도 ← 새 지도(카메라가 빈틈 동안 거의 안 움직였다고 봄), 시도 수), 앞 장면의 지도 · 위치
+    gap_hyp: Option<(u64, u64, T34, u32)>,
+    last_pose: Option<(u64, T34)>,
+    last_ok_t: f64,
     deps: Vec<(f64, u64, T34, Vec<u16>)>,
     /// IMU 기록(카메라 시각, 카메라 축 가속도, 자이로 크기): 끝난 지도 기울기 바로잡기
     imu_hist: Vec<(f64, [f64; 3], f64)>,
@@ -223,7 +228,11 @@ impl Orb3 {
             kfmap_t: f64::MIN,
             pend: Vec::new(),
             n_graft: 0,
+            n_gapgraft: 0,
             hits_all: Vec::new(),
+            gap_hyp: None,
+            last_pose: None,
+            last_ok_t: f64::MIN,
             deps: Vec::new(),
             imu_hist: Vec::new(),
             dk: None,
@@ -416,11 +425,19 @@ impl Orb3 {
             self.pend.push((mb, ma, s_ba, t));
             return;
         }
+        if self.try_graft(ma, mb, &s_ba, &all) {
+            self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
+        }
+    }
+
+    /// 지도 a 와 b(b ← a 변환 s_ba)를 지도 통째 자유 공간 검사 뒤 옮겨 붙임(작은 쪽을 큰 쪽으로). 옮겨 붙였으면 참
+    fn try_graft(&mut self, ma: u64, mb: u64, s_ba: &T34, all: &HashMap<u64, (u64, T34)>) -> bool {
+        let s_ba = *s_ba;
         let (na, nb) = (self.map_kfs.get(&ma).copied().unwrap_or(0), self.map_kfs.get(&mb).copied().unwrap_or(0));
         // 지도 통째 자유 공간 검사(장면 한 장 짝은 반복되는 책상 · 모니터 줄에서 두 번 같은 틀린 변환을 낼 수 있음):
         // 작은 지도의 깊이 점을 큰 지도 장면 깊이에 투영해 맞음 비율 ≥ 0.62 · 작은 지도 깊이 6 장 이상일 때만 옮겨 붙이고, 다듬은 변환을 씀
         let (from, into, start) = if na <= nb { (ma, mb, s_ba) } else { (mb, ma, inv(&s_ba)) };
-        let Some(k) = self.dk else { return };
+        let Some(k) = self.dk else { return false };
         let mut ff = Vec::new();
         let mut fi = Vec::new();
         for (_, kf, rel, d) in &self.deps {
@@ -435,17 +452,17 @@ impl Orb3 {
         }
         let t0 = Instant::now();
         let chk = crate::mapmerge::check(&ff, &fi, &start, &k);
-        let Some((s_ok, r, n_ag)) = chk else { return };
+        let Some((s_ok, r, n_ag)) = chk else { return false };
         common::info!("지도 잇기 검사: 지도 {from}(깊이 {} 장) → 지도 {into}(깊이 {} 장) 맞음 비율 {r:.3} · 맞음 {n_ag}, {:.1} 초", ff.len(), fi.len(), t0.elapsed().as_secs_f64());
-        if r < 0.62 || n_ag < 300 || ff.len() < 6 {
-            return;
+        if r < 0.62 || n_ag < 300 || ff.len() < 6 || fi.len() < 6 {
+            return false;
         }
-        self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
         let ok = self.sys.graft(from, into, &s_ok);
         if ok {
             self.n_graft += 1;
             common::info!("위치: 지도 {from} 를 지도 {into} 에 옮겨 붙임(신경망 장소 인식 + 지도 통째 자유 공간 검사)");
         }
+        ok
     }
 
     fn step(&mut self, mut f: Frame, _read_ms: f64) -> bool {
@@ -507,6 +524,35 @@ impl Orb3 {
             self.last_map = Some(tr.map_id);
         }
         let ok = tr.state == OK && tr.twc.iter().all(|x| x.is_finite());
+        // 빈틈 뒤 새 지도는 앞 지도의 마지막 위치에서 이어진다고 보고 바로 옮겨 붙이기를 시도(새 지도 깊이 6 장부터 1 초마다, 최대 8 번)
+        if ok {
+            match self.last_pose {
+                // 빈틈이 짧을 때(1.5 초 이하)만: 5 초 넘는 빈틈은 카메라가 다른 곳으로 가 있어 반복되는 책상 줄의 엉뚱한 자리에 붙음(37 차 950 빈틈)
+                Some((m, p)) if m != tr.map_id && self.gap_hyp.is_none_or(|g| g.0 != tr.map_id) && f.t - self.last_ok_t <= 1.5 => {
+                    self.gap_hyp = Some((tr.map_id, m, mul(&p, &inv(&tr.twc)), 0));
+                }
+                _ => {}
+            }
+            self.last_pose = Some((tr.map_id, tr.twc));
+            self.last_ok_t = f.t;
+        }
+        if let Some((gn, go, gs, tries)) = self.gap_hyp
+            && ok
+            && gn == tr.map_id
+            && self.tracked.len() % 30 == 0
+        {
+            let all = self.all_kfs(f.t);
+            let alive = |m: u64| all.values().any(|x| x.0 == m);
+            if tries >= 8 || !alive(gn) || !alive(go) {
+                self.gap_hyp = None;
+            } else {
+                self.gap_hyp = Some((gn, go, gs, tries + 1));
+                if self.try_graft(gn, go, &gs, &all) {
+                    self.gap_hyp = None;
+                    self.n_gapgraft += 1;
+                }
+            }
+        }
         for s in &self.imu {
             self.gyro_ang += s[4] / 200.0;
         }
@@ -943,7 +989,7 @@ impl SlamBackend for Orb3Backend {
             s.n_sent_ok, s.n_held, s.n_lost, s.n_newmap, s.n_corr, s.n_regrav, s.n_repin, s.n_switch, s.n_spike, s.n_graph, s.n_nodes, s.dropped
         );
         common::info!("ms/장 위치추적 {}", summary(&s.s_track));
-        common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}", s.stitch.sent, s.stitch.hits, s.n_graft);
+        common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}(그 가운데 빈틈 이어 붙이기 {})", s.stitch.sent, s.stitch.hits, s.n_graft, s.n_gapgraft);
         drop(s.poses_f.take());
         let _ = std::fs::remove_file(&s.settings_path);
         Ok(0)

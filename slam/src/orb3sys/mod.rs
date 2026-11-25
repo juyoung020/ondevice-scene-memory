@@ -5,6 +5,7 @@
 //! 함수 하나씩 원본으로 대신 부르려면 그 호출마다 자료를 양쪽으로 옮겨야 한다(TRACK 재생 도구의 `TrackOps` 가 그 방식: 덤프 값을 넘김).
 //! 실제 실행에서는 System 통째(`crate::orb3::System`)가 원본 대신 판이고, Rust 판은 하위 단계가 모두 옮겨진 뒤 [`Orb3System`] 로 들어온다.
 //! 스레드 · 멈춤 신호는 [`threads`](원본 교착을 구조로 없앤 판).
+pub mod gbaops;
 pub mod graft;
 pub mod loopflow;
 pub mod mapping;

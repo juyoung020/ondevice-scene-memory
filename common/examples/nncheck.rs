@@ -15,11 +15,17 @@ fn main() {
     let reps: usize = a.get(4).map(|s| s.parse().unwrap()).unwrap_or(5);
     let mut times = vec![];
     let mut outs = vec![];
+    // 한 번에 생긴 페이지 부재(리눅스 /proc, 마지막 판)
+    let minflt = || std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| s.rsplit(')').next()?.split_whitespace().nth(7)?.parse::<u64>().ok()).unwrap_or(0);
+    let mut faults = 0;
     for _ in 0..reps {
+        let f0 = minflt();
         let t = std::time::Instant::now();
         outs = m.run(vec![common::nn::Tensor::f(shape.clone(), v.clone())]).unwrap();
         times.push(t.elapsed().as_secs_f64() * 1e3);
+        faults = minflt() - f0;
     }
+    eprintln!("page faults/run {faults}");
     times.sort_by(f64::total_cmp);
     println!("rust median {:.2} ms (min {:.2}, {} runs, {} threads)", times[times.len() / 2], times[0], reps, common::nn::pool::threads());
     for (name, o) in m.output_names().zip(outs) {

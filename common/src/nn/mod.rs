@@ -288,6 +288,9 @@ pub(crate) struct Node {
     pub attrs: HashMap<String, Attr>,
     pub act: Act,
     pub pre: Pre,
+    /// Conv 입력 채널 조각들(ins 번호, 채널 시작, 채널 수 · 0 = 끝까지): 비어 있으면 ins[0] 한 덩어리.
+    /// 채널 이어 붙이기(Concat) · 나누기(Split) 출력을 복사 없이 그대로 읽음
+    pub cat: Vec<(usize, usize, usize)>,
 }
 
 impl Node {
@@ -369,7 +372,7 @@ impl Model {
         for rn in g.nodes {
             let ins: Vec<Option<usize>> = rn.ins.iter().map(|n| if n.is_empty() { None } else { Some(id(n, &mut slot)) }).collect();
             let outs: Vec<usize> = rn.outs.iter().map(|n| id(n, &mut slot)).collect();
-            let node = Node { op: rn.op, ins, outs, attrs: rn.attrs.into_iter().collect(), act: Act::None, pre: Pre::None };
+            let node = Node { op: rn.op, ins, outs, attrs: rn.attrs.into_iter().collect(), act: Act::None, pre: Pre::None, cat: vec![] };
             consts.resize(slot.len(), None);
             if node.op == "Constant" {
                 let t = match node.attrs.iter().next().map(|a| a.1.clone()) {
@@ -397,6 +400,7 @@ impl Model {
         consts.resize(slot.len(), None);
         let mut m = Model { nodes, consts, inputs, outputs, free_after: vec![], threads: 0 };
         m.fuse();
+        m.fuse_cat();
         m.fuse_ln();
         m.prepack()?;
         m.fuse_progs();
@@ -461,6 +465,89 @@ impl Model {
         });
     }
 
+    /// 채널 축(1) Concat 을 하나뿐인 소비자 Conv(group 1) 의 입력 조각으로, Conv 가 읽는 Split(축 1) 출력은
+    /// Split 입력의 채널 범위로 바꿈. 아무도 안 쓰게 된 Split 출력은 만들지 않음(keep), Concat 은 지움
+    fn fuse_cat(&mut self) {
+        let u = self.uses();
+        let prod: HashMap<usize, usize> = self.nodes.iter().enumerate().flat_map(|(i, n)| n.outs.iter().map(move |&s| (s, i))).collect();
+        // Split 출력 칸 → (Split 입력 칸, 채널 시작, 채널 수): 크기가 상수로 정해진 것만
+        let mut view: HashMap<usize, (usize, usize, usize)> = HashMap::new();
+        for n in &self.nodes {
+            if n.op != "Split" || n.ai("axis", 0) != 1 {
+                continue;
+            }
+            let Some(x) = n.ins[0] else { continue };
+            let sizes = match n.ins.get(1).copied().flatten() {
+                Some(s) => match self.consts[s].as_ref() {
+                    Some(t) => t.ints(),
+                    None => continue,
+                },
+                None => match n.ais("split") {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            let mut off = 0;
+            for (&o, &sz) in n.outs.iter().zip(&sizes) {
+                if !self.is_out(o) {
+                    view.insert(o, (x, off, sz as usize));
+                }
+                off += sz as usize;
+            }
+        }
+        let mut dead = vec![false; self.nodes.len()];
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].op != "Conv" || self.nodes[i].ai("group", 1) != 1 {
+                continue;
+            }
+            let Some(x) = self.nodes[i].ins[0] else {
+                continue;
+            };
+            // 조각 칸들(칸, 시작, 수)
+            let mut parts: Vec<(usize, usize, usize)> = vec![(x, 0, 0)];
+            if let Some(&c) = prod.get(&x) {
+                let cn = &self.nodes[c];
+                if cn.op == "Concat" && cn.ai("axis", 0) == 1 && !self.is_out(x) && u.get(&x).map(|v| v.len()) == Some(1) && cn.ins.iter().all(|s| s.is_some()) {
+                    parts = cn.ins.iter().map(|s| (s.unwrap(), 0, 0)).collect();
+                    dead[c] = true;
+                }
+            }
+            let parts: Vec<(usize, usize, usize)> = parts.into_iter().map(|p| view.get(&p.0).copied().unwrap_or(p)).collect();
+            if parts.len() == 1 && parts[0].1 == 0 && parts[0].2 == 0 {
+                continue;
+            }
+            let n = &mut self.nodes[i];
+            n.ins[0] = None;
+            if n.ins.len() < 3 {
+                n.ins.resize(3, None);
+            }
+            for (s, off, cnt) in parts {
+                n.cat.push((n.ins.len(), off, cnt));
+                n.ins.push(Some(s));
+            }
+        }
+        self.drop_dead(&dead);
+        // Split 출력 중 아무도 안 쓰는 것은 만들지 않음
+        let u = self.uses();
+        let mut gone = vec![];
+        for (i, n) in self.nodes.iter_mut().enumerate() {
+            if n.op != "Split" {
+                continue;
+            }
+            let keep: Vec<i64> = n.outs.iter().map(|&o| (u.contains_key(&o) || self.outputs.iter().any(|q| q.1 == o)) as i64).collect();
+            if keep.iter().all(|&k| k == 0) {
+                gone.push(i);
+            } else if keep.contains(&0) {
+                n.attrs.insert("keep".into(), Attr::Is(keep));
+            }
+        }
+        let mut dead = vec![false; self.nodes.len()];
+        for i in gone {
+            dead[i] = true;
+        }
+        self.drop_dead(&dead);
+    }
+
     fn kscalar(&self, s: Option<usize>) -> Option<f32> {
         let t = self.consts[s?].as_ref()?;
         if t.len() == 1 { Some(t.clone().into_f()[0]) } else { None }
@@ -489,7 +576,9 @@ impl Model {
                 continue;
             }
             let x = n.ins[0];
-            let Some(sub) = one(n.outs[0], &dead) else { continue };
+            let Some(sub) = one(n.outs[0], &dead) else {
+                continue;
+            };
             let sn = &self.nodes[sub];
             if sn.op != "Sub" || sn.ins[0] != x {
                 continue;
@@ -503,16 +592,24 @@ impl Model {
             if self.nodes[pw].op != "Pow" || self.kscalar(self.nodes[pw].ins[1]) != Some(2.0) || self.nodes[dv].op != "Div" || self.nodes[dv].ins[0] != Some(d) {
                 continue;
             }
-            let Some(rm) = one(self.nodes[pw].outs[0], &dead) else { continue };
+            let Some(rm) = one(self.nodes[pw].outs[0], &dead) else {
+                continue;
+            };
             if self.nodes[rm].op != "ReduceMean" || self.nodes[rm].ais("axes") != Some(vec![-1]) {
                 continue;
             }
-            let Some(ad) = one(self.nodes[rm].outs[0], &dead) else { continue };
+            let Some(ad) = one(self.nodes[rm].outs[0], &dead) else {
+                continue;
+            };
             if self.nodes[ad].op != "Add" {
                 continue;
             }
-            let Some(eps) = self.kscalar(self.nodes[ad].ins[1]).or(self.kscalar(self.nodes[ad].ins[0])) else { continue };
-            let Some(sq) = one(self.nodes[ad].outs[0], &dead) else { continue };
+            let Some(eps) = self.kscalar(self.nodes[ad].ins[1]).or(self.kscalar(self.nodes[ad].ins[0])) else {
+                continue;
+            };
+            let Some(sq) = one(self.nodes[ad].outs[0], &dead) else {
+                continue;
+            };
             if self.nodes[sq].op != "Sqrt" || one(self.nodes[sq].outs[0], &dead) != Some(dv) {
                 continue;
             }

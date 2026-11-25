@@ -319,7 +319,16 @@ fn full_calls() {
                 vb += 1;
             }
         }
-        let cb = o.chi2.iter().zip(&c.chi2).filter(|(a, b)| a.to_bits() != b.0.to_bits()).count();
+        // 비활성 간선(정점이 모두 고정)의 원본 χ² 는 초기화 안 된 오차라 비교하지 않음
+        let act = Sys::new(&c.problem).active;
+        let differs = |k: usize, a: &f64, b: &(f64, u8)| act[k] && a.to_bits() != b.0.to_bits();
+        let cb = o.chi2.iter().zip(&c.chi2).enumerate().filter(|(k, (a, b))| differs(*k, a, b)).count();
+        for (k, (a, b)) in o.chi2.iter().zip(&c.chi2).enumerate() {
+            if differs(k, a, b) {
+                let e = &c.problem.edges[k];
+                eprintln!("  χ² 간선 {k} {:?} 우리 {a:e} 원본 {:e} 고정 {} {}", e.kind, b.0, c.problem.vertices[e.v0].fixed, c.problem.vertices[e.v1].fixed);
+            }
+        }
         eprintln!(
             "호출 {}: 정점 {} 간선 {} 반복 {}/{} 다른 정점 {} 다른 χ² {}",
             c.idx,
@@ -364,4 +373,48 @@ fn se3_exp_oplus() {
     }
     eprintln!("{} 건: exp 다름 {be}, oplus 다름 {bo}", f.len() / 27);
     assert_eq!(be + bo, 0);
+}
+
+/// g2o::Sim3 exp · log · 곱 · 역 · map 무작위 4 만 건(하네스 sim3ref 덤프)
+#[test]
+fn sim3_ops() {
+    use super::sim3::Sim3;
+    let b = std::fs::read(need("ORB3BA_SIM3")).expect("sim3 덤프");
+    let f: Vec<f64> = b.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(!f.is_empty());
+    let sim = |r: &[f64]| Sim3 { q: r[0..4].try_into().unwrap(), t: r[4..7].try_into().unwrap(), s: r[7] };
+    let flat = |s: &Sim3| -> Vec<f64> { s.q.iter().chain(&s.t).copied().chain([s.s]).collect() };
+    let mut bad = [0usize; 7];
+    let names = ["exp", "log", "log(exp)", "곱", "역", "map", "C·a·b⁻¹ log"];
+    let mut shown = 0;
+    for r in f.chunks_exact(74) {
+        let d: [f64; 7] = r[0..7].try_into().unwrap();
+        let a = sim(&r[7..15]);
+        let bb = sim(&r[15..23]);
+        let p: [f64; 3] = r[23..26].try_into().unwrap();
+        let e = Sim3::exp(&d);
+        let got: [Vec<f64>; 7] = [
+            flat(&e),
+            a.log().to_vec(),
+            e.log().to_vec(),
+            flat(&a.mul(&bb)),
+            flat(&a.inverse()),
+            a.map(&p).to_vec(),
+            a.mul(&e).mul(&bb.inverse()).log().to_vec(),
+        ];
+        let want: [&[f64]; 7] = [&r[26..34], &r[34..41], &r[41..48], &r[48..56], &r[56..64], &r[64..67], &r[67..74]];
+        for k in 0..7 {
+            if got[k].iter().zip(want[k]).any(|(x, y)| x.to_bits() != y.to_bits()) {
+                if shown < 6 {
+                    eprintln!("{} d={:?}\n  우리 {:?}\n  원본 {:?}", names[k], d, got[k], want[k]);
+                    shown += 1;
+                }
+                bad[k] += 1;
+            }
+        }
+    }
+    for k in 0..7 {
+        eprintln!("{}: 다름 {}", names[k], bad[k]);
+    }
+    assert_eq!(bad.iter().sum::<usize>(), 0);
 }

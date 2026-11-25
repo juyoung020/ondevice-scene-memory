@@ -306,3 +306,10 @@
   부정 낱말(1 등이면 이름 안 붙임)도 남은 틀림(n ≥ 12 의 10 개)이 대부분 '다른 진짜 물체 이름'(monitor · computer tower · keyboard · box)이라 걸러낼 낱말이 없다.
 - 정정: 앞서 올린 parc_names_default.png 는 포트 8096 에 옛 뷰어(parc_out18, 거르기 전)가 남아 새 뷰어가 못 떠서 옛 화면을 찍은 것이었다(view.json 은 맞았음: 25 · 68 · 120 = object).
   옛 뷰어를 끄고 parc_out21 뷰어가 뜬 것(로그 `memory dir /home/rea/parc_out21`)을 확인한 뒤 다시 찍음 — 화면에 object#25 · object#68 · object#120, safety helmet#105 그대로.
+
+### 병렬 C 이어서 5 — 1 등 · 2 등 코사인 차 문턱 0.003 → 0.01(채택, 70 → 80 %)
+
+- 대표 사진 근사(tools/naming/margin_eval.py, 본 횟수 ≥ 12): 문턱 0.003 65 % · 0.005 69 % · 0.008 71 % · **0.01 77 %** · 0.015 79 % · 0.02 80 %(붙는 수 34 → 15). 0.01 을 전체 실행으로 확인.
+- 전체 실행 눈 판정: 앞(parc_out25) 15/20(75 %), 뒤 절반(parc_out26) 9/10(90 %), **합 24/30 = 80 %**(전 33/47 = 70 %).
+- 대가: 이름 붙는 물체 47 → 30. 맞던 이름 중 bulletin board · first aid kit · jacket · door(앞) · box · bulletin board(뒤) 등이 object 로 바뀜.
+- 남은 틀림 6: 게시판 → window, 의자 → table · monitor(2) · computer tower, 문틀 → ruler.

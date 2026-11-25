@@ -100,7 +100,7 @@ pub const NAME_MIN: f32 = 0.3;
 pub const NAME_MIN_UNNAMED: f32 = 0.15;
 /// 1 등 이름과 2 등 이름의 코사인 차가 이보다 작으면 이름을 붙이지 않는다. fr1_desk 물체 23 개(사람이 이름을 단 것)에서
 /// 몫 0.15 만 쓸 때 맞은 이름 비율 0.52, 차 0.003 을 더하면 0.67(이름 붙은 물체 15 개)
-pub const NAME_MARGIN: f32 = 0.003;
+pub const NAME_MARGIN: f32 = 0.01;
 
 /// 구조물 낱말(가장 닮은 구조물 표 낱말이 이 넷 중 하나면 벽 · 바닥 · 천장 면)
 pub const STRUCTURAL: [&str; 4] = ["floor", "wall", "ceiling", "baseboard"];

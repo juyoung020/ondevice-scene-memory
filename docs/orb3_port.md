@@ -140,6 +140,7 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 | glibc rand | `rand` · `RandomInt` | 원본 실행이 Sim3 에서 쓴 값 | 753 / 753 호출의 수열 |
 | Hessenberg · Francis QR · 두 행 떼기 · 고유벡터 역대입 | Eigen 내부 함수 | TUM fr1_room 실제 실행(LD_PRELOAD 로 가로챔) | 8,539 · 30,053 · 13,891 · 8,539 모두 같음 |
 | ComputeSim3 | `Sim3Solver::ComputeSim3` | 같은 실행 | 8,539 / 8,539 (R · t · s · T12 · T21) |
+| Sim3Solver 생성자 | `Sim3Solver(pKF1, pKF2, vpMatched12, …)` | 같은 실행(ctor_hook.so) | 505 / 505 (카메라 좌표 · 투영 · 오차 문턱 · 색인 · RANSAC 설정), 호출 중 다른 스레드가 포즈를 바꾼 2 번은 뺌 |
 | Sim3 RANSAC | `Sim3Solver::iterate`(5 인자) | 같은 실행(루프 검출 포함) | 753 / 753 (인라이어 · 수렴 · 반복 수 · 행렬 · 투영) |
 
 ### 맞추며 알게 된 원본 동작
@@ -153,12 +154,12 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 ### 하네스(저장소 밖, WSL `~/opt/orb3_loop_bg`)
 - `bow_dump`: 원본 어휘 · ORBextractor · transform · score 덤프(`voc.bin` · `bow.bin`).
 - `kfdb_scn`: 원본 `KeyFrameDatabase.cc` 를 가짜 KeyFrame/Map/Frame 헤더로 그대로 컴파일해 시나리오 실행(`kfdb.bin`).
-- `run_tum` + `sim3_hook.so` · `eig_hook.so`(LD_PRELOAD): 뷰어 없는 rgbd_tum 으로 fr1_room 을 돌리며 `Sim3Solver::iterate` · `ComputeSim3` · Eigen 내부 단계 입출력과 rand 값을 가로채 덤프.
+- `run_tum` + `sim3_hook.so` · `eig_hook.so` · `ctor_hook.so`(LD_PRELOAD, 덤프 경로 `CTOR_DUMP`; 연관 목록 `/tmp/assoc_room.txt`): 뷰어 없는 rgbd_tum 으로 fr1_room 을 돌리며 `Sim3Solver::iterate` · `ComputeSim3` · Eigen 내부 단계 입출력과 rand 값을 가로채 덤프.
 - 시험: `ORBLOOP_DUMPS=~/orbloop_out1:~/orbloop_out2 ORBLOOP_VOC=.../ORBvoc.txt cargo test --release -p slam --test orb3loop_bit`.
 
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
-- Sim3Solver 생성자(지도 점 → 카메라 좌표 · 오차 문턱), `Tracking::Relocalization` 흐름, `LoopClosing`(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
+- `Tracking::Relocalization` 흐름, `LoopClosing`(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
 - KeyFrameDatabase 대조는 실제 BoW + 만든 공시성 시나리오. 실제 실행 중 질의를 가로챈 대조는 안 함.
 - 강의실 녹화(ds_1118)는 BoW 단계만; Sim3 · 고유 풀이 대조는 TUM fr1_room 실행 하나.
 

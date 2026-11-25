@@ -129,6 +129,10 @@ pub struct Orb3 {
     n_gapgraft: i64,
     /// ORB 다른 지도 재위치가 낸 옮겨 붙이기 제안(우리 깊이 검증을 기다림): (제안, 검증 장면을 보냈나), 받음 · 거절 수
     orb_prop: Option<(crate::orb3::GraftProposal, bool)>,
+    /// 실행 중 지도 통째 맞춤(끝난 뒤 맞춤과 같은 mapmerge, 같은 문턱)을 마지막으로 한 때, 그때 지도별 깊이 장 수, 붙인 수
+    last_mm_t: f64,
+    last_mm_sig: Vec<(u64, usize)>,
+    n_mmgraft: i64,
     n_prop_ok: i64,
     n_prop_no: i64,
     /// 모든 잇기 짝(약한 짝 포함, 끝난 뒤 지도 통째 맞춤 후보), 끝난 뒤 맞춤용 작은 깊이(장면 5 장마다: 시각, 기준 키프레임, 상대 위치, 160×120 mm)
@@ -236,6 +240,9 @@ impl Orb3 {
             n_graft: 0,
             n_gapgraft: 0,
             orb_prop: None,
+            last_mm_t: f64::MIN,
+            last_mm_sig: Vec::new(),
+            n_mmgraft: 0,
             n_prop_ok: 0,
             n_prop_no: 0,
             hits_all: Vec::new(),
@@ -502,6 +509,65 @@ impl Orb3 {
         ok
     }
 
+    /// 실행 중 지도 통째 맞춤: 못 붙은 지도를 가장 큰 지도에 여러 시작 가설(잇기 짝 전부) + 자유 공간 점수로(끝난 뒤 맞춤과 같은 문턱 0.75 · 다른 자리와 차 0.1).
+    /// 장면 한 장 짝은 반복되는 모니터 줄에서 틀린 변환에도 동의하므로(A20), 받는 것은 지도 통째 깊이로만 정함. 한 번에 한 지도
+    fn run_mapmerge(&mut self, t: f64) {
+        let Some(k) = self.dk else { return };
+        let all = self.all_kfs(t);
+        let mut maps: HashMap<u64, Vec<crate::mapmerge::Frame>> = HashMap::new();
+        for (_, kf, rel, d) in &self.deps {
+            if let Some(&(m, p)) = all.get(kf) {
+                maps.entry(m).or_default().push(crate::mapmerge::Frame { pose: mul(&p, rel), d });
+            }
+        }
+        if maps.len() < 2 {
+            return;
+        }
+        let mut sig: Vec<(u64, usize)> = maps.iter().map(|x| (*x.0, x.1.len())).collect();
+        sig.sort();
+        if sig == self.last_mm_sig {
+            return;
+        }
+        self.last_mm_sig = sig;
+        let Some(main) = self.map_kfs.iter().max_by_key(|x| (*x.1, std::cmp::Reverse(*x.0))).map(|x| *x.0) else { return };
+        let mut hyps: Vec<(usize, u64, u64, T34)> = Vec::new();
+        for h in &self.hits_all {
+            if let (Some(&(ma, pa)), Some(&(mb, pb))) = (all.get(&h.q_kf), all.get(&h.c_kf))
+                && ma != mb
+            {
+                let q_a = mul(&pa, &h.q_rel);
+                let c_b = mul(&pb, &h.c_rel);
+                hyps.push((h.inliers, ma, mb, mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a))));
+            }
+        }
+        if hyps.is_empty() {
+            return;
+        }
+        hyps.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let hyps: Vec<(u64, u64, T34)> = hyps.into_iter().map(|x| (x.1, x.2, x.3)).collect();
+        let t0 = Instant::now();
+        let mut log = Vec::new();
+        let xf = crate::mapmerge::merge(&maps, &hyps, &k, main, &mut log);
+        for l in &log {
+            common::info!("실행 중 지도 맞춤: {l}");
+        }
+        common::info!("실행 중 지도 맞춤: 지도 {} 개 · 후보 {} 개 · 붙일 지도 {} 개, {:.1} 초", maps.len(), hyps.len(), xf.len() - 1, t0.elapsed().as_secs_f64());
+        // 붙일 지도 하나(깊이 장 수 가장 많은 것)를 main 에 옮겨 붙이기 부탁, 나머지는 다음 차례
+        if let Some((&m, x)) = xf.iter().filter(|x| *x.0 != main).max_by_key(|x| (maps[x.0].len(), std::cmp::Reverse(*x.0)))
+            && self.sys.graft(m, main, x)
+        {
+            self.n_graft += 1;
+            self.n_mmgraft += 1;
+            let ts: Vec<f64> = self.deps.iter().filter(|d| all.get(&d.1).is_some_and(|a| a.0 == m)).map(|d| d.0).collect();
+            common::info!(
+                "위치: 지도 {m} 를 지도 {main} 에 옮겨 붙임(실행 중 지도 통째 맞춤) GRAFT 지도맞춤 장면 {:.3}–{:.3} → 지도 {main}",
+                ts.first().copied().unwrap_or(0.0),
+                ts.last().copied().unwrap_or(0.0)
+            );
+            self.last_mm_sig.clear();
+        }
+    }
+
     fn step(&mut self, mut f: Frame, _read_ms: f64) -> bool {
         if common::control::take_reset() || (!self.reset_file.is_empty() && std::fs::remove_file(&self.reset_file).is_ok()) {
             // 뷰어 지도 초기화: 물체 기억 · 점 지도만 비우고, 노드는 다음 훑기에 모두 다시 보냄
@@ -606,6 +672,11 @@ impl Orb3 {
                     self.n_gapgraft += 1;
                 }
             }
+        }
+        // 실행 중 지도 통째 맞춤(10 초마다, 지도별 깊이 장 수가 바뀌었을 때)
+        if ok && f.t - self.last_mm_t >= 10.0 {
+            self.last_mm_t = f.t;
+            self.run_mapmerge(f.t);
         }
         for s in &self.imu {
             self.gyro_ang += s[4] / 200.0;
@@ -1064,7 +1135,7 @@ impl SlamBackend for Orb3Backend {
             s.n_sent_ok, s.n_held, s.n_lost, s.n_newmap, s.n_corr, s.n_regrav, s.n_repin, s.n_switch, s.n_spike, s.n_graph, s.n_nodes, s.dropped
         );
         common::info!("ms/장 위치추적 {}", summary(&s.s_track));
-        common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}(그 가운데 빈틈 이어 붙이기 {}) · ORB 제안 받음 {} · 거절 {}", s.stitch.sent, s.stitch.hits, s.n_graft, s.n_gapgraft, s.n_prop_ok, s.n_prop_no);
+        common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}(그 가운데 빈틈 이어 붙이기 {}) · 실행 중 지도 맞춤 {} · ORB 제안 받음 {} · 거절 {}", s.stitch.sent, s.stitch.hits, s.n_graft, s.n_gapgraft, s.n_mmgraft, s.n_prop_ok, s.n_prop_no);
         drop(s.poses_f.take());
         let _ = std::fs::remove_file(&s.settings_path);
         Ok(0)

@@ -7,12 +7,13 @@ pub mod extract;
 pub mod matcher;
 pub mod frame;
 pub mod stdsort;
-// 포터 OPT: 포즈 최적화 · PnP
+// 포터 OPT: 포즈 최적화 · PnP · 지도 자료 메서드
 pub mod g2o_pose;
 pub mod mlpnp;
 mod mlpnp_jacs;
 pub mod pinhole;
 pub mod pose_opt;
+pub mod mapdata;
 // 포터 TRACK: Tracking.cc 판단 · LocalMapping 컬링
 pub mod track;
 pub mod localmap;

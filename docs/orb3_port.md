@@ -41,7 +41,7 @@
 |---|---|---|---|
 | ORBextractor | Frame | Rust 옮김(비트 동일) | 통합(이 브랜치) |
 | ORBmatcher | Tracking · LocalMapping · LoopClosing | 옮김 | 통합 |
-| Frame · KeyFrame · MapPoint · Map · Atlas | 전체 | 자료 구조 정의함, 동작 함수는 옮김 | 통합 |
+| Frame · KeyFrame · MapPoint · Map · Atlas | 전체 | 자료 구조 정의함, 동작 함수는 옮김. KeyFrame.cc · MapPoint.cc · Map.cc 메서드는 `orb3rs::mapdata`(비트 동일) | 통합 · OPT |
 | Tracking(추적 상태 기계 · 지역 지도 추적 · 키프레임 결정 · 우리 패치: 위쪽 · 옮겨 붙이기) | System | 옮김 | TRACK |
 | LocalMapping(점 만들기 · 지우기 · 키프레임 걸러내기) | 지도 스레드 | 옮김 | TRACK(없으면 통합) |
 | Optimizer::PoseOptimization · MLPnPsolver | 추적 · 재위치 | 옮김 | OPT |
@@ -86,7 +86,7 @@ WSL 사본: `~/slam-bench/orb3-nopango`(빌드됨). 비트 비교 기준 빌드(
 - `struct Frame { id, timestamp, keys, desc, u_right, depth, map_points: Vec<Option<MpId>>, outlier, grid(col*48+row), grid_inv_w/h, min/max_x/y, tcw: Option<Se3>, ref_kf, bow: BTreeMap<u32,f64>, feat: BTreeMap<u32,Vec<u32>> }`
 - `struct KeyFrame { id, frame_id, map, timestamp, keys, desc, u_right, depth, map_points, grid, tcw, bad, bow, feat, conn_weights, ordered_conn, parent, children, loop_edges, merge_edges, tcp }`
 - `struct MapPoint { id, map, pos, normal, desc, obs: BTreeMap<KfId,(i32,i32)>, ref_kf, first_kf, visible, found, min_dist, max_dist, bad, replaced, track_* , last_frame_seen }`
-- `struct Map { id, kfs, mps, origin_kf, bad, change_id }`, `struct Atlas { maps, current, kfs, mps, next_kf, next_mp }`
+- `struct Map { id, kfs, mps /* 둘 다 id 순 정렬 유지 */, origin_kf, bad, change_id, init_kf_id, max_kf_id, lower_kf, ref_mps, big_change_idx, change_notified }`, KeyFrame 에 `first_conn_done`(= !mbFirstConnection) · `not_erase` · `to_be_erased`, `struct Atlas { maps, current, kfs, mps, next_kf, next_mp }`
 - 원본의 `std::set<KeyFrame*>` · `std::set<MapPoint*>`(주소 순, 실행마다 다를 수 있음)는 id 순. 하네스에서는 원본 쪽 순회를 id 순으로 정렬해 비교한다.
 
 추출(`orb3rs::extract`): `Extractor::new(Pyramid 설정) ; fn extract(&mut self, gray: &[u8], w, h) -> (Vec<KeyPoint>, Vec<Desc>)`(RGB-D 는 vLappingArea = [0,0] 이라 원본 출력 순서 그대로).
@@ -298,6 +298,29 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 원본 iterate 시간은 `run_mlpnp` 안에서 원본 함수 호출을 잰 것(실행 중 다른 스레드와 같이 돎), Rust 는 같은 입력 재실행. 원본 대비 빠른 까닭: 결과를 버리는 Refine 의 내점 전부 computePose 를 건너뜀 · 고정 크기 행렬(동적 할당 없음)· 희소 행렬 P 없음. 원본 실행은 스레드 때문에 매번 재위치 시도 수가 다름(같은 설정에서 370 · 25,396 호출) — 비교는 덤프 단위라 영향 없음.
 
 확인 안 한 것: 평면 경로는 실제 덤프에 한 번도 나오지 않음(세계 원점을 지나는 평면 위 6 점에서만 생김) — 무작위 평면 장면으로만 확인. 최소 집합 6 이 아닌 설정(`SetRansacParameters` 의 minSet)은 옮기지 않음(원본 Tracking 은 6 만 씀). 고윳값 반복이 30·n 회를 넘는(수렴 실패) 경로 · NaN 입력 경로는 확인 못 함.
+
+#### 지도 자료 메서드(KeyFrame.cc · MapPoint.cc · Map.cc)
+
+모듈 `slam/src/orb3rs/mapdata.rs`(통합 타입 위, 이미 옮겨진 `MapPoint::add_observation` · `compute_distinctive_descriptors` · `predict_scale` 은 그대로 씀):
+
+- KeyFrame: `kf_update_connections`(공시성 세기 · 15 문턱 · 최대 하나 · 처음 연결 부모) · `kf_update_best_covisibles` · `kf_add_connection` · `kf_erase_connection` · `kf_set_bad_flag`(연결 끊기 · 점 관측 지우기 · 신장 트리 다시 잇기 · mTcp · 지도에서 빼기, KeyFrameDatabase 빼기는 true 를 받은 쪽) · `kf_set_erase` · `kf_change_parent` · `kf_erase_map_point_match` · `kf_tracked_map_points`, 자기 칸만 보는 `weight` · `best_covisibility` · `covisibles_by_weight` · `vector_covisible` · `add/erase_child` · `add_loop_edge` · `add_merge_edge` · `add_map_point` 등.
+- MapPoint: `mp_erase_observation`(관측 수 · 새 기준 kf · 2 이하면 나쁨) · `mp_set_bad_flag` · `mp_replace`(+ 지도에서 빼기) · `mp_update_normal_and_depth`, `found_ratio` · `index_in_keyframe` 등.
+- Map: `add_keyframe`(첫 kf · 최대 · 최저 id) · `erase_keyframe` · `add/erase_map_point` · `set_reference_map_points` · `inform_new_big_change` · `increase_change_index` 등. kfs · mps 는 id 순 정렬(std::set 대신).
+- 겹치는 옛 판: `orb3cv::atlas_io::mp_erase_observation/mp_set_bad`(CV) · `orb3rs::localmap::mp_set_bad/mp_erase_observation/kf_set_bad`(TRACK, nObs 를 TrackExt 에 둠) · `matcher::replace_map_point`(지도에서 빼기 없음)는 이 모듈과 같은 일을 함 — 통합 때 이것으로 모으면 됨.
+
+순서: 원본 `std::map/set<KeyFrame*>` 은 **주소 순**이고 실제 실행에서 주소 순 ≠ id 순이 흔함(강의실 · TUM 모두, 기록의 대부분). 결과가 순서에 닿는 자리 — `UpdateBestCovisibles` · `UpdateConnections` 의 무게 동률(pair 비교가 포인터로 갈림) · 최대 개수 동률, `SetBadFlag` 자식 동률, `EraseObservation` 의 새 기준 kf, `ComputeDistinctiveDescriptors` 의 중앙값 동률, **`UpdateNormalAndDepth` 의 법선 합(실수 더하기 순서라 1 ulp 갈림)** — 에서 Rust(id 순)는 주소 순 원본과 다를 수 있다. 원본 자체가 실행마다 다르므로 포팅판은 id 순(결정적)으로 두고, 시험은 기록마다 주소 순위로 id 를 바꿔(같음 비교만 쓰는 id 라 의미가 같음) 원본 순서를 되살려 대조한다.
+
+하네스: `slam/cpp/orb3_mapdump.cc` + `orb3_mapdump.sh`(build · run). 기준 빌드 원본(`~/opt/orb3_ref`)을 RGB-D 로 돌리며 바꾸는 메서드 30 개를 PLT 로 가로채 호출 앞뒤 상태(지도 칸 · 관련 키프레임 그래프 · 점 칸 · 지도 점 · 키프레임별 층 · 오른쪽 좌표 · 기술자 · 주소)를 덤프. 바꾸는 메서드와 SetPose · SetWorldPos · IncreaseVisible/Found 는 전역 재귀 잠금 하나 아래서 돌아 덤프 중 다른 스레드가 상태를 못 바꿈. 같은 오브젝트 안 호출(AddConnection · EraseConnection · ChangeParent 등을 KeyFrame.cc 안에서 부르는 것)은 PLT 를 안 거쳐 바깥 호출 안에 포함돼 확인됨. 시험 `ORBMAP_DUMPS=a.bin:b.bin cargo test --release -p slam --lib orb3rs::mapdata`(입력 없으면 실패).
+
+| 데이터 | 기록(호출) | 비트 같음 | 주소 순위로 바꿔 대조 |
+|---|---|---|---|
+| 강의실 ds_1118_121652 전체 3,807 프레임(루프 · 지도 합치기 포함) | UpdateConnections 738 · KF SetBadFlag 147(실제 지움 147) · SetErase 200 · UpdateBestCovisibles 741 · ChangeParent 10 · EraseChild 6 · Loop/MergeEdge 6 · SetNotErase 1,205 · EraseObservation 3,000 · MP SetBadFlag 3,000 · Replace 2,000 · ComputeDistinctiveDescriptors 3,000 · UpdateNormalAndDepth 3,000 · EraseMapPointMatch 3,000 · AddObservation 3,000 · KF AddMapPoint 3,000 · PredictScale 40,000 · Map Add/EraseKeyFrame 1,346/131 · Add/EraseMapPoint 3,000/2,609 · 큰 변화 7 · 변화 번호 542 · 기준 점 1,940 | 전부 | 대부분(예: UpdateConnections 726, UpdateNormalAndDepth 1,450) |
+| TUM fr1_room 1,362 프레임(루프 2) | 같은 종류 28,000 여(SetBadFlag 는 미룸만) | 전부 | 대부분 |
+| TUM fr1_desk2 640 프레임 | 같은 종류 | 전부 | 대부분 |
+
+비트 맞추기에서 알게 된 것: `UpdateNormalAndDepth` 는 노름 (y²+z²)+x²(= a0+(a1+a2) 와 같은 값) · 칸마다 나눗셈 · `normal/n` 도 나눗셈(역수 곱 아님, 역어셈블 확인). `PredictScale` 은 float `logf`. `UpdateConnections` 는 공시성 표에 15 미만도 다 넣고(정렬 목록에는 문턱 이상만), 자기 정렬 목록은 나쁜 kf 를 거르지 않음(남의 것은 UpdateBestCovisibles 가 거름). 원본 `SetBadFlag` 는 부모 후보에 못 붙은 자식을 원래 부모로 옮긴 뒤에도 자기 자식 목록에서 지우지 않음 — 그대로 옮김.
+
+확인 안 한 것: 오른쪽 카메라 관측(RGB-D 에 없음, 만나면 assert). 덤프 실행은 원본 교착(루프 뒤 지도 스레드 멈춤)이 가끔 걸려 한 번 다시 돌림. `ComputeSceneMedianDepth`(단안 전용)는 옮기지 않음.
 
 ### 포터 CV (11-25)
 

@@ -8,6 +8,7 @@
 //!
 //! 쓰는 법: `Problem` 에 정점(id 순서와 무관) · 간선(원본이 addEdge 한 순서)을 넣고 `optimize(10)`.
 pub mod edges;
+pub mod gba;
 pub mod lba;
 pub mod ldlt;
 pub mod se3;
@@ -42,3 +43,5 @@ pub struct Problem {
 mod tests;
 #[cfg(test)]
 mod lba_tests;
+#[cfg(test)]
+mod gba_tests;

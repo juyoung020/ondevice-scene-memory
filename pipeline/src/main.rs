@@ -2484,10 +2484,18 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     for d in dets.iter().flatten().filter(|_| map_ok) {
         let c_obj = Instant::now();
         let name = "object";
-        let [x1, y1, x2, y2] = d.box_.map(|v| v as usize);
-        let (bw, bh) = (x2 - x1, y2 - y1);
-        erode_into(&d.mask, bw, bh, 3, &mut eb);
-        let m = &eb.b;
+        let [bx1, by1, bx2, by2] = d.box_.map(|v| v as usize);
+        erode_into(&d.mask, bx2 - bx1, by2 - by1, 3, &mut eb);
+        // 한 마스크에 깊이로 떨어진 물체 여럿(의자 등받이 · 모니터 뒷면 · 책상 상판)이 잡히면 깊이 연결 성분으로 나눠 따로 넣는다
+        let parts = depth_parts(&eb.b, bx1, by1, bx2 - bx1, by2 - by1, w, depth);
+        let whole = [(bx1, by1, bx2 - bx1, by2 - by1, std::borrow::Cow::Borrowed(&eb.b[..]))];
+        let parts: Vec<_> = match parts {
+            Some(p) => p.into_iter().map(|(a, b, c, e, mm)| (a, b, c, e, std::borrow::Cow::Owned(mm))).collect(),
+            None => whole.into_iter().collect(),
+        };
+        for (x1, y1, bw, bh, m) in &parts {
+        let (x1, y1, bw, bh, m) = (*x1, *y1, *bw, *bh, &m[..]);
+        let (x2, y2) = (x1 + bw, y1 + bh);
         // 마스크 안 깊이 있는 화소: 먼저 세어 간격을 정하고, 그 간격으로 최대 약 2,500 개만 모은다
         // 한 번 훑어 깊이 있는 화소 자리를 모아 두고(마스크·깊이를 두 번 읽지 않게) 그 간격으로 고름
         valid.clear();
@@ -2590,6 +2598,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             common::prof::time(common::prof::T::ObjUpdate, c_up);
         }
         seen.insert(id);
+        }
     }
     EB.with(|c| c.set(eb));
     OS.with(|c| c.set((valid, pix, zs, pts)));
@@ -2834,6 +2843,81 @@ impl ViewWorker {
 /// 물체 사진 점수(클수록 이름 붙이기에 좋은 사진): 넓이 × 밝기 × 선명함 × 잘림. 마스크 안 화소를 4 칸마다 본다.
 /// 어두운 사진(밝기 평균 60 아래), 흐린 사진(이웃 밝기 차 평균이 작음), 영상 가장자리에 닿아 잘린 사진은 깎는다
 #[allow(clippy::too_many_arguments)]
+/// 마스크 안 깊이 연결 성분(이웃 깊이 차 < 3 mm + 0.4 %·z²). 가장 큰 성분이 깊이 있는 화소의 70 % 미만이면
+/// 10 % 이상인 성분마다 (x1, y1, w, h, 마스크) 를 돌려준다(둘 미만이면 None = 마스크 그대로)
+fn depth_parts(m: &[bool], x1: usize, y1: usize, bw: usize, bh: usize, w: usize, depth: &Depth) -> Option<Vec<(usize, usize, usize, usize, Vec<bool>)>> {
+    let n = bw * bh;
+    let mut z = vec![0f32; n];
+    let mut tot = 0usize;
+    for yy in 0..bh {
+        for xx in 0..bw {
+            let i = yy * bw + xx;
+            if m[i] {
+                let v = depth.at((y1 + yy) * w + x1 + xx);
+                if v > 0.2 && v < MAX_DEPTH_M as f32 {
+                    z[i] = v;
+                    tot += 1;
+                }
+            }
+        }
+    }
+    if tot < 400 {
+        return None;
+    }
+    let mut lab = vec![u32::MAX; n];
+    let mut sizes: Vec<usize> = vec![];
+    let mut st = vec![];
+    for s0 in 0..n {
+        if z[s0] == 0.0 || lab[s0] != u32::MAX {
+            continue;
+        }
+        let l = sizes.len() as u32;
+        lab[s0] = l;
+        st.push(s0);
+        let mut c = 0;
+        while let Some(i) = st.pop() {
+            c += 1;
+            let (xx, yy, zi) = (i % bw, i / bw, z[i]);
+            let th = 0.003 + 0.004 * zi * zi;
+            let mut go = |j: usize| {
+                if z[j] != 0.0 && lab[j] == u32::MAX && (z[j] - zi).abs() < th {
+                    lab[j] = l;
+                    st.push(j);
+                }
+            };
+            if xx > 0 { go(i - 1); }
+            if xx + 1 < bw { go(i + 1); }
+            if yy > 0 { go(i - bw); }
+            if yy + 1 < bh { go(i + bw); }
+        }
+        sizes.push(c);
+    }
+    let big = *sizes.iter().max()?;
+    if big as f64 >= 0.7 * tot as f64 {
+        return None;
+    }
+    let keep: Vec<u32> = (0..sizes.len() as u32).filter(|&l| sizes[l as usize] as f64 >= 0.1 * tot as f64 && sizes[l as usize] >= 80).collect();
+    if keep.len() < 2 {
+        return None;
+    }
+    Some(keep.iter().map(|&l| {
+        let (mut ax, mut ay, mut bx, mut by) = (usize::MAX, usize::MAX, 0, 0);
+        for (i, &li) in lab.iter().enumerate() {
+            if li == l {
+                let (xx, yy) = (i % bw, i / bw);
+                ax = ax.min(xx); ay = ay.min(yy); bx = bx.max(xx); by = by.max(yy);
+            }
+        }
+        let (pw, ph) = (bx + 1 - ax, by + 1 - ay);
+        let mut pm = vec![false; pw * ph];
+        for yy in 0..ph {
+            for xx in 0..pw {
+                pm[yy * pw + xx] = lab[(ay + yy) * bw + ax + xx] == l;
+            }
+        }
+        (x1 + ax, y1 + ay, pw, ph, pm)
+    }).collect())
+}
 fn crop_score(rgb: &[u8], w: usize, h: usize, x1: usize, y1: usize, bw: usize, bh: usize, m: &[bool]) -> u32 {
     let luma = |o: usize| (rgb[o * 3] as u32 * 77 + rgb[o * 3 + 1] as u32 * 150 + rgb[o * 3 + 2] as u32 * 29) >> 8;
     let (mut n, mut sum, mut grad) = (0u32, 0u32, 0u32);

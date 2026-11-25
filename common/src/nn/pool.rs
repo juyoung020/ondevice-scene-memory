@@ -20,6 +20,8 @@ struct Shared {
     /// 이번 일에 낄 일꾼 수(부른 스레드 포함)
     limit: AtomicUsize,
     lock: Mutex<()>,
+    /// 잠든(잠들려는) 일꾼 수: 0 이면 깨우기(시스템 호출)를 건너뜀
+    sleepers: AtomicUsize,
     cv: Condvar,
     caller: Mutex<()>,
 }
@@ -48,6 +50,7 @@ fn pool() -> &'static Pool {
             active: AtomicUsize::new(0),
             limit: AtomicUsize::new(usize::MAX),
             lock: Mutex::new(()),
+            sleepers: AtomicUsize::new(0),
             cv: Condvar::new(),
             caller: Mutex::new(()),
         }));
@@ -80,7 +83,9 @@ fn worker(sh: &'static Shared, idx: usize) {
             spins += 1;
             if spins % 64 == 0 && t0.elapsed() > SPIN {
                 let g = sh.lock.lock().unwrap();
+                sh.sleepers.fetch_add(1, SeqCst);
                 let _g = sh.cv.wait_while(g, |_| sh.epoch.load(SeqCst) == seen).unwrap();
+                sh.sleepers.fetch_sub(1, SeqCst);
                 break;
             }
             std::hint::spin_loop();
@@ -120,11 +125,11 @@ pub fn for_each(n: usize, f: &(dyn Fn(usize) + Sync + '_)) {
     sh.finished.store(0, SeqCst);
     sh.next.store(0, SeqCst);
     sh.job.store(&mut fr as *mut _, SeqCst);
-    {
+    sh.epoch.fetch_add(1, SeqCst);
+    if sh.sleepers.load(SeqCst) > 0 {
         let _g = sh.lock.lock().unwrap();
-        sh.epoch.fetch_add(1, SeqCst);
+        sh.cv.notify_all();
     }
-    sh.cv.notify_all();
     INSIDE.with(|c| c.set(true));
     work(sh, f);
     INSIDE.with(|c| c.set(false));

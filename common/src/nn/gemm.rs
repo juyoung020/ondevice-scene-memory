@@ -283,6 +283,15 @@ pub trait Sink: Sync {
 
 /// C = A · B, A 는 [`pack_a`], 결과는 sink 로. 일은 (판, 줄 덩어리) 로 나눔
 pub fn gemm(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink) {
+    // 일꾼 수는 일 크기에 맞춤: 곱셈-덧셈 2 M 개(1 스레드 약 15 µs)당 하나 — 작은 행렬곱은 나누는 비용이 더 큼
+    let want = (m * k * n >> 21).max(1);
+    if want < super::pool::threads() {
+        return super::pool::with_limit(want, || gemm_in(ap, m, k, n, b, sink));
+    }
+    gemm_in(ap, m, k, n, b, sink)
+}
+
+fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink) {
     let (kern, kdir, _) = kernel();
     let mr = mr_for(m);
     let np = n.div_ceil(NB);

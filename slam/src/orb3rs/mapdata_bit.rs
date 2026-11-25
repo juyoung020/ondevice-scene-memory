@@ -7,9 +7,16 @@ use std::sync::Arc;
 struct R<'a> {
     b: &'a [u8],
     p: usize,
+    /// 덤프 끝이 잘림(원본 실행이 교착으로 시간 초과 종료될 때 마지막 기록)
+    eof: bool,
 }
 impl R<'_> {
     fn take<const N: usize>(&mut self) -> [u8; N] {
+        if self.p + N > self.b.len() {
+            self.eof = true;
+            self.p = self.b.len();
+            return [0; N];
+        }
         let v: [u8; N] = self.b[self.p..self.p + N].try_into().unwrap();
         self.p += N;
         v
@@ -36,7 +43,10 @@ impl R<'_> {
         Se3 { q: [self.f32(), self.f32(), self.f32(), self.f32()], t: [self.f32(), self.f32(), self.f32()] }
     }
     fn ids(&mut self) -> Vec<u64> {
-        let n = self.u32() as usize;
+        let n = if self.eof { 0 } else { self.u32() as usize };
+        if self.eof {
+            return Vec::new();
+        }
         (0..n).map(|_| self.u64()).collect()
     }
 }
@@ -63,6 +73,8 @@ struct DKf {
     tcw: Se3,
     twc: Se3,
     tcp: Se3,
+    tcw_bm: Se3,
+    twc_bm: Se3,
     conn: BTreeMap<u64, i32>,
     ordered: Vec<(u64, i32)>,
     parent: i64,
@@ -109,14 +121,14 @@ fn rd_state(r: &mut R) -> State {
     }
     for _ in 0..r.u32() {
         let (id, bad, map, first, not_erase, to_be) = (r.u64(), r.u8() != 0, r.i64(), r.u8() != 0, r.u8() != 0, r.u8() != 0);
-        let (tcw, twc, tcp) = (r.se3(), r.se3(), r.se3());
+        let (tcw, twc, tcp, tcw_bm, twc_bm) = (r.se3(), r.se3(), r.se3(), r.se3(), r.se3());
         let n = r.u32();
         let conn = (0..n).map(|_| (r.u64(), r.i32())).collect();
         let n = r.u32();
         let ordered = (0..n).map(|_| (r.u64(), r.i32())).collect();
         let parent = r.i64();
         let (children, loops, merges) = (r.ids(), r.ids(), r.ids());
-        s.g.push(DKf { id, bad, map, first, not_erase, to_be, tcw, twc, tcp, conn, ordered, parent, children, loops, merges });
+        s.g.push(DKf { id, bad, map, first, not_erase, to_be, tcw, twc, tcp, tcw_bm, twc_bm, conn, ordered, parent, children, loops, merges });
     }
     for _ in 0..r.u32() {
         let id = r.u64();
@@ -242,6 +254,8 @@ fn build(s: &State, st: &StOf, ctx: &Arc<FrameCtx>) -> Atlas {
         k.tcw = d.tcw;
         k.twc = d.twc;
         k.tcp = d.tcp;
+        k.tcw_bef_merge = d.tcw_bm;
+        k.twc_bef_merge = d.twc_bm;
         k.conn_weights = d.conn.clone();
         k.ordered_conn = d.ordered.clone();
         k.parent = opt(d.parent);
@@ -332,6 +346,8 @@ fn compare(a: &Atlas, before: &State, after: &State, addr_ok: bool, base_mps: us
         c(tag("children"), k.children == sorted(&d.children));
         c("loops".into(), k.loop_edges == sorted(&d.loops) && k.merge_edges == sorted(&d.merges));
         c("tcp".into(), se3b(&k.tcp) == se3b(&d.tcp));
+        c("pose".into(), se3b(&k.tcw) == se3b(&d.tcw) && se3b(&k.twc) == se3b(&d.twc));
+        c("bef_merge".into(), se3b(&k.tcw_bef_merge) == se3b(&d.tcw_bm) && se3b(&k.twc_bef_merge) == se3b(&d.twc_bm));
     }
     for (id, l) in &after.l {
         let k = &a.kfs[id];
@@ -372,12 +388,12 @@ fn addr_monotone(addrs: &BTreeMap<u64, u64>) -> bool {
     addrs.values().zip(addrs.values().skip(1)).all(|(a, b)| a < b)
 }
 
-const NAMES: [&str; 32] = [
+const NAMES: [&str; 33] = [
     "", "UpdateConnections", "KF SetBadFlag", "KF SetErase", "AddConnection", "EraseConnection", "AddChild", "EraseChild", "ChangeParent",
     "AddLoopEdge", "AddMergeEdge", "SetNotErase", "KF AddMapPoint", "EraseMapPointMatch(idx)", "EraseMapPointMatch(mp)", "ReplaceMapPointMatch",
     "AddObservation", "EraseObservation", "MP SetBadFlag", "Replace", "ComputeDistinctiveDescriptors", "UpdateNormalAndDepth",
     "PredictScale", "", "Map AddKeyFrame", "Map EraseKeyFrame", "Map AddMapPoint", "Map EraseMapPoint",
-    "InformNewBigChange", "IncreaseChangeIndex", "SetReferenceMapPoints", "UpdateBestCovisibles",
+    "InformNewBigChange", "IncreaseChangeIndex", "SetReferenceMapPoints", "UpdateBestCovisibles", "OptimizeEssentialGraph(합치기)",
 ];
 
 #[test]
@@ -387,14 +403,15 @@ fn original_dumps() {
     for path in dumps.split(':').filter(|s| !s.is_empty()) {
         let b = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         assert!(!b.is_empty(), "{path}: 빈 덤프");
-        let mut r = R { b: &b, p: 0 };
+        let mut r = R { b: &b, p: 0, eof: false };
         let mut st: BTreeMap<u64, Static> = BTreeMap::new();
         let mut addrs: BTreeMap<u64, u64> = BTreeMap::new();
         let mut ctx = Arc::new(FrameCtx::default());
-        let (mut n, mut nbad, mut nadd) = ([0usize; 32], [0usize; 32], [0usize; 32]);
+        let (mut n, mut nbad, mut nadd) = ([0usize; 33], [0usize; 33], [0usize; 33]);
         let mut first: Vec<String> = Vec::new();
-        let mut shown = [0usize; 32];
+        let mut shown = [0usize; 33];
         let mut nkill = 0usize;
+        let mut nmeg_addr = 0usize;
         while r.p < b.len() {
             match r.u32() {
                 0x4448444d => {
@@ -433,8 +450,13 @@ fn original_dumps() {
                 0x4352444d => {
                     let op = r.u8() as usize;
                     let (x, y, z) = (r.i64(), r.i64(), r.i64());
+                    let lists: Vec<Vec<u64>> = if op == 32 { (0..4).map(|_| r.ids()).collect() } else { Vec::new() };
                     let before = rd_state(&mut r);
                     let after = rd_state(&mut r);
+                    if r.eof {
+                        eprintln!("  (끝 기록 잘림: {} — 원본 실행이 중간에 끝남)", NAMES[op]);
+                        break;
+                    }
                     let mut before = before;
                     let mut after = after;
                     let mut ids = BTreeSet::new();
@@ -459,7 +481,9 @@ fn original_dumps() {
                         v
                     };
                     // Map 넣기 · 빼기는 순서에 안 닿고 최대 · 최저 id 를 크기로 비교하므로 바꾸지 않음
-                    let addr_ok = matches!(op, 24 | 25) || by_addr.iter().copied().eq(ids.iter().copied().filter(|i| addrs.contains_key(i)));
+                    let addr_mono = by_addr.iter().copied().eq(ids.iter().copied().filter(|i| addrs.contains_key(i)));
+                    // 합치기 본질 그래프는 id 크기 비교(l < i)를 쓰므로 바꾸지 않고 대조(주소 순이 달라도 결과에 닿는 집합은 루프 간선 · 관측뿐)
+                    let addr_ok = matches!(op, 24 | 25 | 32) || addr_mono;
                     let fwd: BTreeMap<u64, u64> = by_addr.iter().enumerate().map(|(r, &i)| (i, r as u64)).collect();
                     let inv: BTreeMap<u64, u64> = fwd.iter().map(|(&a, &b)| (b, a)).collect();
                     if !addr_ok {
@@ -521,10 +545,11 @@ fn original_dumps() {
                         28 => a.map_mut(id).unwrap().inform_new_big_change(),
                         29 => a.map_mut(id).unwrap().increase_change_index(),
                         31 => kf_update_best_covisibles(&mut a, id),
+                        32 => super::super::essential_merge::optimize_essential_graph_merge(&mut a, id, &lists[0], &lists[1], &lists[2], &lists[3]),
                         30 => a.map_mut(id).unwrap().set_reference_map_points(vec![0; y as usize]),
                         _ => panic!("모르는 op {op}"),
                     }
-                    if !addr_ok {
+                    if !addr_ok || (op == 32 && !addr_mono) {
                         nadd[op] += 1;
                     }
                     let mut diffs = compare(&a, &before, &after, addr_ok, base_mps);
@@ -543,6 +568,22 @@ fn original_dumps() {
                             }
                         }
                     }
+                    if op == 32 {
+                        // 법선 합은 관측 순서(원본 주소 순)에 닿음: 그 점 관측 kf 의 주소 순 = id 순일 때만 비교
+                        // 관측 순서(원본 주소 순)에 닿는 것: 법선 합, 나쁜 기준 kf 를 지운 뒤 새 기준(→ 위치 · 거리).
+                        // 그 점 관측 kf 의 주소 순 = id 순인 점만 비교(주소 순 자체는 UpdateNormalAndDepth · EraseObservation 시험에서 확인)
+                        diffs.retain(|d| {
+                            let Some(rest) = d.strip_prefix("mp") else { return true };
+                            let id: u64 = rest.split(' ').next().unwrap().parse().unwrap();
+                            let p = before.m.iter().find(|m| m.id == id).unwrap();
+                            let ad: Vec<u64> = p.obs.keys().map(|k| addrs[k]).collect();
+                            let mono = ad.windows(2).all(|w| w[0] < w[1]);
+                            if !mono {
+                                nmeg_addr += 1;
+                            }
+                            mono
+                        });
+                    }
                     n[op] += 1;
                     if matches!(op, 2 | 3) && after.g.iter().any(|k| k.id == x as u64 && k.bad) {
                         nkill += 1;
@@ -559,12 +600,12 @@ fn original_dumps() {
             }
         }
         eprintln!("== {path}: 키프레임 {} 개, 주소 순 = id 순: {}", addrs.len(), addr_monotone(&addrs));
-        for op in 1..32 {
+        for op in 1..33 {
             if n[op] > 0 {
                 eprintln!("  {:32} {:6} 호출, 다름 {:4} (주소 순위로 바꿔 대조 {})", NAMES[op], n[op], nbad[op], nadd[op]);
             }
         }
-        eprintln!("  (SetBadFlag 이 실제로 키프레임을 지운 호출 {nkill})");
+        eprintln!("  (SetBadFlag 이 실제로 키프레임을 지운 호출 {nkill}, 합치기 본질 그래프에서 관측 주소 순≠id 순이라 법선 비교를 뺀 점 {nmeg_addr})");
         for f in &first {
             eprintln!("  ! {f}");
         }

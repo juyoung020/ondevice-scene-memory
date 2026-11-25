@@ -15,6 +15,7 @@ pub mod pinhole;
 pub mod pose_opt;
 pub mod mapdata;
 pub mod sim3pg;
+pub mod essential_merge;
 // 포터 TRACK: Tracking.cc 판단 · LocalMapping 컬링
 pub mod track;
 pub mod localmap;

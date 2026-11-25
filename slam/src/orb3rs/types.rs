@@ -168,6 +168,9 @@ pub struct KeyFrame {
     pub first_conn_done: bool,
     pub not_erase: bool,
     pub to_be_erased: bool,
+    /// mTcwBefMerge · mTwcBefMerge(지도 합치기 전 위치, 본질 그래프 · 점 보정이 씀)
+    pub tcw_bef_merge: Se3,
+    pub twc_bef_merge: Se3,
 }
 
 /// MapPoint

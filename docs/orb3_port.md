@@ -281,6 +281,28 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 
 확인 안 한 것: 오른쪽 카메라 관측(RGB-D 에 없음, 만나면 assert). 덤프 실행은 원본 교착(루프 뒤 지도 스레드 멈춤)이 가끔 걸려 한 번 다시 돌림. `ComputeSceneMedianDepth`(단안 전용)는 옮기지 않음.
 
+#### 합치기 본질 그래프(OptimizeEssentialGraph 합치기 판) · g2o Sim3 자세 그래프
+
+몫: 운영자 지시(11-25)로 OPT 가 맡음 — Optimizer 중 아무도 안 맡은 것(RGB-D · 관성 없음에서 쓰는 것)은 `LoopClosing::MergeLocal` 이 부르는 5 인자 `OptimizeEssentialGraph(pCurKF, vpFixedKFs, vpFixedCorrectedKFs, vpNonFixedKFs, vpNonCorrectedMPs)` 하나뿐(루프 판 본질 그래프 · OptimizeSim3 은 CV, LBA · GBA · 합치기 LBA 는 BA, 관성 판은 지움, Tracking 의 GBA 는 단안 초기화 전용). PoseOptimization 은 앞서 a4fbc75 로 비트 동일 확인됨.
+
+모듈:
+
+- `orb3rs::sim3pg` — g2o `VertexSim3Expmap` · `EdgeSim3`(수치 야코비안 ±1e-9) · `BlockSolver_7_3`(점이 없어도 슈어 경로) · `LinearSolverEigen` · Levenberg. g2o::Sim3 · SimplicialLDLT(AMD) 는 BA 포터의 `orb3ba::{sim3, ldlt}` 를 그대로 씀(브랜치에서 `orb3ba` 파일을 그대로 가져옴 — 통합 때 같은 내용이라 충돌 없음). CV 의 루프 판 본질 그래프도 이 풀이기를 쓰면 됨(척도 고정 · 고정 정점 경로 포함).
+- `orb3rs::essential_merge::optimize_essential_graph_merge` — 정점 · 간선 만들기(부모 · 루프 · 공시성 100 이상) · 풀이 · 결과 반영(비고정 kf 의 합치기 전 위치 저장 · SetPose) · 점 보정(기준 kf 가 나쁘면 관측 지우며 찾기, Twr·Twr_before⁻¹ 로 옮기고 UpdateNormalAndDepth). KeyFrame 에 `tcw_bef_merge` · `twc_bef_merge` 칸 추가.
+
+비트 맞추기에서 알게 된 것(libg2o 역어셈블, 기준 빌드라 FMA 는 Eigen 묶음 pmadd 자리만):
+
+- Ω = I 라 −Ωe · AᵀΩ 는 정확히 −e · Aᵀ. 7 길이 내적(b · χ² · AᵀΩ) = p6 + (((p4+p2)+p0) + ((p5+p3)+p1)).
+- H += (Aᵀ)·A · (Aᵀ)·B · (Bᵀ)·B 는 지연 곱: 0..5 행은 k=0 곱에서 시작한 FMA 사슬, 6 행은 ((m6+m5)+(m4+m3)) + ((m2+m1)+m0). 헤세 번호가 v0 > v1 인 간선의 블록(행 우선으로 씀, Bᵀ·AtOᵀ)은 칸마다 낱개 곱 나무 합 ((p3+p4)+(p5+p6)) + ((p1+p2)+p0).
+- 척도 고정 정점은 갱신 배열의 그 칸을 0 으로 고쳐 씀(Levenberg 의 scale 계산에 닿음). Terminate 로 끝나도 반복 수 · postIteration 은 셈.
+- SE3f → Sim3 은 cast<double> 때 SO3d 가 사원수를 다시 정규화, 결과 SE3d(R, t/s) → cast<float> 도 각각 정규화.
+
+시험:
+
+- `cpp/orb3_sim3pg_probe.cc`(+ `orb3_mapdump.sh probe · pg`): 무작위 Sim3 자세 그래프(정점 3–42, 고정 · 척도 고정 섞음, 잡음 3 단계)를 원본 g2o 로 풀어 첫 선형화(오차 · χ² · H · b · λ · x)와 반복마다 정점 값 · 반복 수를 덤프. `ORBPG_DUMP=pg.bin cargo test --release -p slam --lib orb3rs::sim3pg`: **300 그래프 전부 비트 동일**.
+- 실제 지도: `orb3_mapdump` 가 5 인자 본질 그래프를 가로채 앞뒤 상태를 덤프(실제 MergeLocal 호출) + 실행 끝에 현재 지도에서 나눔만 지어낸 호출 20 번(`ORBMAP_SYNTH`). mapdata 시험이 같이 대조: kf 자세 · 합치기 전 위치 · 점 위치 · 거리 · 관측 등 전부. 법선은 관측 순서(원본 주소 순)에 닿아, 그 점 관측 kf 주소 순 = id 순인 것만 비교(주소 순 법선 자체는 UpdateNormalAndDepth 시험에서 주소 순위로 바꿔 확인됨). 관측 순서에 닿는 새 기준 kf(→ 위치)도 같은 조건.
+- 결과: 강의실 ds_1118_121652 전체(나쁜 kf 131 개 있는 지도)에서 20 호출, TUM desk2 20 호출 — kf 자세 · 합치기 전 위치 · 점 위치 · 거리 · 관측 · 비교한 법선 전부 비트 동일. 실제 MergeLocal 호출은 이번 두 실행에 지도 합치기가 안 일어나 0 번(합치기는 실행마다 다름) — 덤프 장치는 있음.
+
 ### 포터 CV (11-25)
 
 브랜치 `opt/orb3-rs-cv`(`opt/orb3-rust` 위). 하네스 WSL `~/opt/orb3_cv/`: `ref.cc`(OpenCV 4.6 시스템 판, 입력 · 출력 덤프) · `svd_ref.cc` · `set_ref.cc`(기준 빌드 `cxx.sh` 로 원본 라이브러리 링크), Rust 쪽 `rs/`(`#[path]` 로 `slam/src/orb3cv/*.rs` 를 그대로 끌어와 비교: `cargo run --release -- ../dump` · `--bin svd -- ../svd.bin` · `--bin settings -- ../yaml`). 덤프 · 설정이 없으면 실패.

@@ -18,6 +18,8 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <random>
+#include <algorithm>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <Eigen/Core>
@@ -39,6 +41,8 @@
 #include <MapPoint.h>
 #include <Map.h>
 #include <Frame.h>
+#include <Optimizer.h>
+#include <Atlas.h>
 #undef private
 #undef protected
 
@@ -49,7 +53,7 @@ static thread_local int g_depth = 0;
 static std::unordered_set<unsigned long> g_static;
 static bool g_hdr = false;
 enum Op : uint8_t { UC = 1, KSB, KSE, AC, EC, ACH, ECH, CHP, ALE, AME, SNE, KAM, KEMI, KEMP, KRM,
-                    MAO, MEO, MSB, MRP, MCD, MUN, MPSK, MPSF, PAK, PEK, PAM, PEM, PBC, PIC, PSR, UBC };
+                    MAO, MEO, MSB, MRP, MCD, MUN, MPSK, MPSF, PAK, PEK, PAM, PEM, PBC, PIC, PSR, UBC, MEG };
 static long g_cnt[64], g_rec[64], g_cap[64];
 
 static void *sym(const char *n) {
@@ -111,7 +115,7 @@ static void wkf(KeyFrame *k) {
     for (auto *s : {&k->mspChildrens, &k->mspLoopEdges, &k->mspMergeEdges}) for (auto *x : *s) wstatic(x);
     W<uint64_t>(k->mnId); W<uint8_t>(k->mbBad); W<int64_t>(k->mpMap ? (int64_t)k->mpMap->mnId : -1);
     W<uint8_t>(k->mbFirstConnection); W<uint8_t>(k->mbNotErase); W<uint8_t>(k->mbToBeErased);
-    Wse3(k->mTcw); Wse3(k->mTwc); Wse3(k->mTcp);
+    Wse3(k->mTcw); Wse3(k->mTwc); Wse3(k->mTcp); Wse3(k->mTcwBefMerge); Wse3(k->mTwcBefMerge);
     W<uint32_t>(k->mConnectedKeyFrameWeights.size());
     for (auto &e : k->mConnectedKeyFrameWeights) { W<uint64_t>(e.first->mnId); W<int32_t>(e.second); }
     W<uint32_t>(k->mvpOrderedConnectedKeyFrames.size());
@@ -206,7 +210,7 @@ void KeyFrame::UpdateConnections(bool up) {
 }
 static void kf_sb_sets(KeyFrame *k, Sets &s) {
     s.g.insert(k); s.l.insert(k); s.maps.insert(k->mpMap);
-    for (auto *p : k->mvpMapPoints) if (p) { s.m.insert(p); for (auto &o : p->mObservations) s.l.insert(o.first); }
+    for (auto *p : k->mvpMapPoints) if (p) { s.m.insert(p); for (auto &o : p->mObservations) { s.l.insert(o.first); s.g.insert(o.first); } }
     bfs_all(s, k->mpMap);
 }
 void KeyFrame::SetBadFlag() {
@@ -406,6 +410,72 @@ MAPOP(InformNewBigChange(), (this), "_ZN9ORB_SLAM33Map18InformNewBigChangeEv", P
 MAPOP(IncreaseChangeIndex(), (this), "_ZN9ORB_SLAM33Map19IncreaseChangeIndexEv", PIC, F0, begin(PIC, mnId, 0, 0, s))
 MAPOP(SetReferenceMapPoints(const std::vector<MapPoint *> &v), (this, v), "_ZN9ORB_SLAM33Map21SetReferenceMapPointsERKSt6vectorIPNS_8MapPointESaIS3_EE", PSR, FV, begin(PSR, mnId, v.size(), 0, s))
 
+// ---------- Optimizer::OptimizeEssentialGraph(합치기 판) ----------
+// 원본은 지도 갱신 잠금을 잡으므로 전역 잠금 G 는 덤프할 때만 잡는다(쥔 채 부르면 추적 스레드와 교착).
+typedef void (*MegFn)(KeyFrame *, std::vector<KeyFrame *> &, std::vector<KeyFrame *> &, std::vector<KeyFrame *> &, std::vector<MapPoint *> &);
+static void meg_sets(Sets &s, std::vector<KeyFrame *> *ls[3], std::vector<MapPoint *> &mps) {
+    for (int i = 0; i < 3; i++) for (auto *k : *ls[i]) {
+        s.g.insert(k); s.l.insert(k); addconn(s, k);
+        if (k->mpParent) s.g.insert(k->mpParent);
+        for (auto *c : k->mspChildrens) s.g.insert(c);
+        for (auto *c : k->mspLoopEdges) s.g.insert(c);
+    }
+    for (auto *p : mps) { s.m.insert(p); if (p->mpRefKF) { s.g.insert(p->mpRefKF); s.l.insert(p->mpRefKF); } for (auto &o : p->mObservations) { s.l.insert(o.first); s.g.insert(o.first); } }
+}
+void Optimizer::OptimizeEssentialGraph(KeyFrame *cur, std::vector<KeyFrame *> &vf, std::vector<KeyFrame *> &vfc, std::vector<KeyFrame *> &vnf, std::vector<MapPoint *> &mps) {
+    static MegFn o_ = nullptr;
+    if (!o_) o_ = (MegFn)sym("_ZN9ORB_SLAM39Optimizer22OptimizeEssentialGraphEPNS_8KeyFrameERSt6vectorIS2_SaIS2_EES6_S6_RS3_IPNS_8MapPointESaIS8_EE");
+    Sets s;
+    bool d;
+    std::vector<uint8_t> pre;
+    {
+        std::lock_guard<std::recursive_mutex> l(G);
+        d = g_depth == 0 && want(MEG);
+        if (d) {
+            std::vector<KeyFrame *> *ls[3] = {&vf, &vfc, &vnf};
+            meg_sets(s, ls, mps);
+            W<uint32_t>(0x4352444d); W<uint8_t>(MEG); W<int64_t>(cur->mnId); W<int64_t>(0); W<int64_t>(0);
+            for (int i = 0; i < 3; i++) { W<uint32_t>(ls[i]->size()); for (auto *k : *ls[i]) W<uint64_t>(k->mnId); }
+            W<uint32_t>(mps.size()); for (auto *p : mps) W<uint64_t>(p->mnId);
+            wstate(s);
+            pre.swap(B);  // 앞 상태는 들고 있다가 뒤 상태와 한 번에 씀(그 사이 다른 스레드 기록이 끼지 않게)
+        }
+    }
+    o_(cur, vf, vfc, vnf, mps);
+    if (d) { std::lock_guard<std::recursive_mutex> l(G); std::vector<uint8_t> mid; mid.swap(B); B.swap(pre); wstate(s); flush(); B.swap(mid); }
+}
+
+// 실행 끝(스레드 멈춘 뒤) 현재 지도에서 합치기 본질 그래프를 여러 번 부른다: 실제 지도 · 그래프에 나눔만 지어냄
+static void synth_meg(System &S, int n, unsigned seed) {
+    Map *m = S.mpAtlas->GetCurrentMap();
+    std::vector<KeyFrame *> kfs = m->GetAllKeyFrames();
+    std::sort(kfs.begin(), kfs.end(), KeyFrame::lId);
+    if (kfs.size() < 10) return;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> U(-1, 1);
+    for (int it = 0; it < n; it++) {
+        size_t N = kfs.size();
+        size_t a = 1 + rng() % (N / 2), b = a + 1 + rng() % std::max<size_t>(1, std::min<size_t>(N - a - 1, 12));
+        std::vector<KeyFrame *> vf, vfc, vnf;
+        for (size_t i = 0; i < N; i++) {
+            KeyFrame *k = kfs[i];
+            if (i < a) { if (rng() % 3) vf.push_back(k); }
+            else if (i < b) {
+                vfc.push_back(k);
+                Eigen::Vector3f dt(0.02f * U(rng), 0.02f * U(rng), 0.02f * U(rng));
+                Sophus::SE3f P(Sophus::SO3f::exp(Eigen::Vector3f(0.01f * U(rng), 0.01f * U(rng), 0.01f * U(rng))), dt);
+                k->mTcwBefMerge = P * k->GetPose();
+                k->mTwcBefMerge = k->mTcwBefMerge.inverse();
+            } else vnf.push_back(k);
+        }
+        if (rng() % 2) vnf.push_back(kfs[a]);  // 고정 보정과 겹침(원본이 건너뛰는 경로)
+        std::vector<MapPoint *> mps;
+        std::set<KeyFrame *> nf(vnf.begin(), vnf.end());
+        for (auto *p : m->GetAllMapPoints()) if (p->mpRefKF && (nf.count(p->mpRefKF) || rng() % 20 == 0)) mps.push_back(p);
+        Optimizer::OptimizeEssentialGraph(kfs.back(), vf, vfc, vnf, mps);
+    }
+}
+
 static void load(const std::string &f, std::vector<double> &ts, std::vector<std::string> &p) {
     std::ifstream in(f); std::string l;
     while (std::getline(in, l)) {
@@ -433,8 +503,9 @@ int main(int argc, char **argv) {
         n++;
     }
     S.Shutdown();
+    synth_meg(S, atoi(getenv("ORBMAP_SYNTH") ? getenv("ORBMAP_SYNTH") : "20"), 7);
     { std::lock_guard<std::recursive_mutex> l(G); fclose(g_out); g_out = nullptr; }
     fprintf(stderr, "frames %d\n", n);
-    for (int k = 1; k < 32; k++) fprintf(stderr, "op%d calls %ld rec %ld\n", k, g_cnt[k], g_rec[k]);
+    for (int k = 1; k < 33; k++) fprintf(stderr, "op%d calls %ld rec %ld\n", k, g_cnt[k], g_rec[k]);
     return 0;
 }

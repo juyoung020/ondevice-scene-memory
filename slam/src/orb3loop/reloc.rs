@@ -2,10 +2,15 @@
 //! 패치판 지도별)와 BoW 계산은 부르는 쪽 몫: 여기는 후보 목록을 받아 원본 순서 그대로
 //! SearchByBoW(0.75) → PnP RANSAC 5 번씩 돌아가며 → PoseOptimization → 투영 보강(0.9, 10/100 · 3/64) 을 한다.
 //!
-//! PnP 는 원본 MLPnPsolver 자리. 포터 OPT 가 Rust 로 옮기는 중이라 트레잇으로 받는다(지금은 원본 FFI 를 끼움).
-//! 트레잇은 Sophus::SE3f(eigTcw) 생성까지 끝낸 자세를 돌려준다(행렬→사원수 비트를 원본 쪽에서 정함).
+//! PnP 는 원본 MLPnPsolver 자리: 트레잇으로 받고, 기본은 포터 OPT 의 Rust 판([`RustPnp`], `orb3rs::mlpnp`).
+//! 대조 시험은 같은 자리에 원본 FFI 도 끼운다. 트레잇은 Sophus::SE3f(eigTcw) 생성까지 끝낸 자세를 돌려준다.
+//! 난수: 원본은 glibc rand 하나를 Sim3Solver 등과 같이 쓰므로 [`RustPnp`] 는 부르는 쪽의 `GlibcRand` 를 빌려 쓴다.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+
+use super::crand::GlibcRand;
+use crate::orb3rs::mlpnp::MlpnpSolver;
 
 use crate::orb3rs::matcher::Matcher;
 use crate::orb3rs::pinhole::Pinhole;
@@ -28,6 +33,63 @@ pub trait PnpSolver {
 pub trait PnpFactory {
     type S: PnpSolver;
     fn make(&mut self, f: &Frame, matches: &[Option<MpId>], mps: &BTreeMap<MpId, MapPoint>) -> Self::S;
+}
+
+/// Rust 판 MLPnP(`orb3rs::mlpnp`). 난수 생성기는 시스템이 하나를 나눠 씀
+pub struct RustPnp<'r, R: RandomInt = GlibcRand> {
+    pub rand: &'r RefCell<R>,
+}
+
+/// `DUtils::Random::RandomInt` 자리(시험은 원본 실행 값을 넣음)
+pub trait RandomInt {
+    fn random_int(&mut self, min: i32, max: i32) -> i32;
+}
+
+impl RandomInt for GlibcRand {
+    fn random_int(&mut self, min: i32, max: i32) -> i32 {
+        GlibcRand::random_int(self, min, max)
+    }
+}
+
+pub struct RustPnpSolver<'r, R: RandomInt> {
+    s: MlpnpSolver,
+    rand: &'r RefCell<R>,
+}
+
+impl<'r, R: RandomInt> PnpFactory for RustPnp<'r, R> {
+    type S = RustPnpSolver<'r, R>;
+    /// MLPnPsolver 생성자: 짝이 있고 나쁘지 않은 점만, 원본 순서대로
+    fn make(&mut self, f: &Frame, matches: &[Option<MpId>], mps: &BTreeMap<MpId, MapPoint>) -> Self::S {
+        let c = f.ctx.cam;
+        let (mut kps, mut sig, mut w, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, m) in matches.iter().enumerate() {
+            let Some(p) = m.map(|id| &mps[&id]) else { continue };
+            if p.bad || i >= f.keys.len() {
+                continue;
+            }
+            let k = &f.keys[i];
+            kps.push([k.x, k.y]);
+            sig.push(f.ctx.pyr.sigma2[k.octave as usize]);
+            w.push(p.pos);
+            idx.push(i);
+        }
+        let s = MlpnpSolver::new(Pinhole::new(c.fx, c.fy, c.cx, c.cy), &kps, &sig, &w, &idx, matches.len(), 0.99, 10, 300, 6, 0.5, 5.991);
+        RustPnpSolver { s, rand: self.rand }
+    }
+}
+
+impl<R: RandomInt> PnpSolver for RustPnpSolver<'_, R> {
+    fn iterate(&mut self, n: i32) -> PnpStep {
+        let mut r = self.rand.borrow_mut();
+        let o = self.s.iterate(n, &mut |a, b| r.random_int(a, b));
+        let pose = o.ok.then(|| {
+            // Sophus::SE3f(Matrix4f): 회전 부분 → Eigen 사원수, 평행 이동 그대로(열 우선)
+            let t = &o.tcw;
+            let m = [[t[0], t[4], t[8]], [t[1], t[5], t[9]], [t[2], t[6], t[10]]];
+            Se3 { q: crate::orb3rs::quat_from_mat(&m), t: [t[12], t[13], t[14]] }
+        });
+        PnpStep { pose, no_more: o.no_more, inliers: o.inliers }
+    }
 }
 
 /// `Optimizer::PoseOptimization(&mCurrentFrame)` 를 Frame 위에서: 맵 점 칸만 관측으로, 이상치 표시를 되돌려 쓰고 자세 갱신.

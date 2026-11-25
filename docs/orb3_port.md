@@ -202,7 +202,11 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - 지도 스레드는 큐가 빌 때만 `Stop()` 을 봄. 멈춤 요청 쪽이 여럿(CorrectLoop · MergeLocal · GBA 끝 · 우리 GraftMap)인데 `Release()` 하나가 `mbStopRequested` 를 통째로 지움 → 다른 요청자가 `isStopped()` 를 영영 못 볼 수 있음(GBA 끝 · GraftMap 은 `isFinished` 로만 빠져나옴, CorrectLoop 의 기다림은 빠질 길 없음).
 - 포팅판 방침: 지도 스레드 멈춤을 요청자별 토큰(세는 방식)으로, 큐 비우기는 지도 스레드 자신만, 루프 · 합치기 쪽 기다림에 종료 확인을 넣음. 원본 멈춤 스택을 얻으면 위 둘 중 어느 쪽인지 기록.
 - 구현: 통합 담당의 `orb3sys/threads.rs`(`Mapper::request_stop` → `StopToken`, 세는 표 · Condvar · 큐 먼저 비우고 멈춤 · `MapUpdate` 잠금 쥔 채 기다리면 패닉) 하나로 씀. LOOP 판 `stopctl.rs` 는 같은 일이라 지움.
-- `Tracking::Relocalization` 흐름: `orb3loop/reloc.rs` `relocalize`(후보 → SearchByBoW 0.75 → PnP 5 번씩 → PoseOptimization → 투영 보강 10/100 · 3/64, 원본 순서 그대로), PnP 는 `PnpFactory` 트레잇(원본 MLPnP FFI 또는 포터 OPT 의 Rust 판을 끼움). 부품(짝짓기 · PoseOptimization)은 비트 대조 끝난 것. **흐름 전체의 원본 대조 하네스와 MLPnP FFI 는 아직 없음**(TUM 에서 재위치가 거의 안 일어나 추적을 일부러 잃게 하는 입력이 필요).
+- `Tracking::Relocalization` 흐름: `orb3loop/reloc.rs` `relocalize`(후보 → SearchByBoW 0.75 → PnP 5 번씩 → PoseOptimization → 투영 보강 10/100 · 3/64, 원본 순서 그대로), PnP 는 `PnpFactory` 트레잇(원본 MLPnP FFI 또는 포터 OPT 의 Rust 판을 끼움). 부품(짝짓기 · PoseOptimization)은 비트 대조 끝난 것. 기본 PnP 는 포터 OPT 의 Rust MLPnP(`RustPnp`, 난수는 부르는 쪽 `GlibcRand` 를 빌림 — Sim3Solver 와 한 수열).
+- 재위치 흐름 대조(`slam/tests/orb3loop_reloc.rs`): 원본 기준 빌드를 되감기 · 건너뛰기 순서로 돌린 덤프(`~/opt/orb3_loop_bg/reloc/reloc_dump`, 후보 질의 직후의 장면 · 후보 키프레임 · 지도 점 · 들어올 때 장면 상태, iterate 마다 짝 · 난수 · 출력, 끝 결과)를 Rust 자료로 옮겨 `relocalize` 를 돌림. PnP 를 ① 원본 MLPnPsolver FFI(`mlp_srv`, 기준 빌드에 링크한 자식 프로세스, 원본 실행 난수를 그대로 받음) ② Rust MLPnP 두 가지로 끼워 둘 다 대조.
+  - TUM fr1_room(`0-500,120-500:3,600-1300:6`) 86 번 + 강의실 ds_1118(`0-900,200-900:4,1500-3800:10`) 150 번 = 재위치 236 번(성공 7) **236 / 236 같음**(성공 · 자세 비트 · 지도 점 · 이상치), iterate 26 / 26(짝 목록 · 결과 · 난수 수), FFI · Rust 둘 다.
+  - 실패한 재위치는 장면이 들어올 때 상태(앞 추적의 자세 · 짝)를 그대로 남기므로 덤프에 그 상태도 넣음.
+  - 실행: `ORBLOOP_RELOC=~/orbloop_reloc/room.bin:~/orbloop_reloc/ds.bin ORBLOOP_MLPSRV=~/opt/orb3_loop_bg/reloc/mlp_srv cargo test --release -p slam --test orb3loop_reloc`(입력 없으면 실패).
 
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
@@ -238,6 +242,40 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 원본 시간은 `libreplay`(한 스레드, 덤프 입력으로 라이브러리 원본 호출), Rust 는 같은 입력 `dump_check`. 둘 다 이 PC(다른 에이전트와 CPU 공유)라 절대값은 흔들림. 원본 대비 빠른 까닭: g2o 그래프 · 블록 행렬 · 동적 할당 · 가상 호출이 없고 6x6 를 고정 크기로 풂 — 연산 순서는 그대로라 비트 같음.
 
 확인 안 한 것: 관측 3 개 미만 · 활성 간선 0 · Hessian 이 양이 아닌 경우(LDLT 실패 뒤 이전 x 재사용) 경로는 덤프에 나온 만큼만 확인(활성 간선 0 은 강의실 덤프에 있음). 보드(aarch64)에서는 `mul_add` 가 fmadd 라 같은 비트가 나와야 하나 보드에서 돌려 보지는 않음(보드 금지).
+
+#### MLPnPsolver(재위치 PnP + RANSAC)
+
+모듈:
+
+- `mlpnp.rs` — `MlpnpSolver`(생성자 + `SetRansacParameters` · `iterate` · `CheckInliers`), `compute_pose6`(MLPnP 6 점: 비평면 12 열 · 평면 9 열 두 경로), 가우스-뉴턴(최대 5 회), Eigen `JacobiSVD`(정사각 · 1x3 Householder 사전 QR), `FullPivHouseholderQR<Matrix3d>` 랭크, `SelfAdjointEigenSolver<Matrix3d>`(3x3 닫힌 꼴 삼중 대각화 + QR 단계), 행렬식 · 로드리게스.
+- `mlpnp_jacs.rs` — `mlpnpJacs`(2x6 야코비안, 식 1,000 줄) 생성 코드. `mlpnp_inv4.inc` — Eigen `compute_inverse_size4`(SSE 판) 생성 코드. 원본 오브젝트 GIMPLE(`-fdump-tree-optimized`, 원본 빌드 플래그 그대로)을 하네스 `gen/gimple_to_rust.py` · `gimple_vec2_to_rust.py` 로 그대로 옮김(FMA 자리 · 연산 순서 · `sincos` 합치기까지).
+- 난수는 `iterate(n, &mut |a, b| RandomInt(a, b))` 로 받는다 — 원본은 glibc `rand()` 하나를 Sim3Solver 등과 나눠 쓰므로 통합 쪽이 `opt/orb3-rs-loop` 의 `crand.rs`(glibc rand, 씨앗 1) 생성기 하나를 넘겨야 같은 수열.
+- 원본 `Refine()` 의 `computePose`(내점 전부)는 결과를 버리는 코드(mRi 를 갱신하지 않음)라 부르지 않고, `Refine` 의 `CheckInliers` 는 같은 mRi 로 다시 세는 것이라 직전 결과를 씀 — 출력 · 상태 비트는 같고 시간만 줄어듦.
+
+비트 맞추기에서 알아낸 것(Eigen 커널마다 GCC 의 FMA 합치기가 다름 — GIMPLE 을 읽어 정하고 하네스로 확인):
+
+- `JacobiSVD` 회전: 행(왼쪽) `x' = fma(c, x, s·y)`, `y' = fma(−s, x, c·y)`, 열(오른쪽)은 전치 회전으로 같은 꼴. U 는 `applyOnTheRight(j_leftᵀ)` 가 다시 전치해 j_left 그대로. `real_2x2_jacobi_svd` 의 2x2 왼쪽 회전은 2 칸 벡터 FMA.
+- 1x3 영공간(Householder): `tailSqNorm = fma(x2, x2, x1²)`, `beta = sqrt(fma(c0, c0, tail))`, Q 대각 `fma(−τe, e, 1)`.
+- AᵀA(GEMM gebp, 깊이 12): 4 열 묶음은 k < 8 을 짝 · 홀 두 누산기로 나눠 FMA 뒤 합치고 남은 k 를 FMA, 묶음 밖 열은 한 사슬. 9x9(평면)의 마지막 행은 "한 행씩" 경로 — k 0..8 을 ((0+2)+(4+6)) · ((1+3)+(5+7)) 로 따로 더한 뒤 FMA, 끝에 짝 + 홀.
+- 3x3 `U·Vᵀ`: 비평면 경로는 칸마다 곱 반올림 후 차례로 더함(합침 없음), 평면 경로는 지연 곱(목적지 16 바이트 정렬: 열마다 두 행 Packet FMA 사슬, 한 행 스칼라) — 같은 식인데 인라인 자리마다 다름.
+- 고정 3x3 곱 · 행렬×벡터: 0 · 1 행은 k 오름차순 FMA 사슬, 2 행은 `fma(x0, y0, fma(x2, y2, x1·y1))`(Eigen 펼친 합 p0 + (p1 + p2)). 노름은 `sqrt(fma(z, z, x² + y²))`, 내적은 `fma(a2, b2, a0b0 + a1b1)`.
+- `CheckInliers`: double 로 `fma(z, R02, fma(x, R00, y·R01)) + t` 를 float 로 내린 뒤 float 투영, `e² = fma(dx, dx, dy²)`.
+- 가우스-뉴턴의 JᵀJ 는 GEMM(6 행 = 반 · 4 분의 1 Packet, 열 0..4 묶음 · 4 · 5 단독), g = Jᵀr · dl = J dx 는 GEMV(0 에서 시작하는 FMA 사슬), LDLT 는 포즈 최적화의 `ldlt_factor6` · `ldlt_back6` 그대로 맞음.
+
+하네스(WSL `~/opt/orb3_opt_bg`): `run_mlpnp`(원본 RGB-D 실행 중 `MLPnPsolver::iterate` 를 가로채 입력 상태 · RandomInt(스레드별) · 출력 · 상태를 덤프, 원본 iterate 시간 측정. `HOP=n` 이면 지도 구간 안에서 n 번 순간 이동해 재위치를 일으킴), `libmlpref.so`(`mlpref.cc`: 라이브러리 원본 `computePose` · `mlpnp_gn` · `mlpnpJacs` · 로드리게스 · Eigen 약한 기호(JacobiSVD 생성자 · 4x4 역행렬 · 행렬식 · FullPivQR)를 dlsym 으로 부름 + computePose 비평면 · 평면 본문을 그대로 베낀 추적판), `rs/src/mlpnp_check.rs`(`unit` 함수별 무작위 대조, `trace`/`planar` 중간값 대조, `dump` 덤프 재실행 + 표본마다 원본 computePose 대조), `gen/`(GIMPLE → Rust 생성기).
+
+| 대상 | 데이터 | 호출 수 | 비트 같음 | 원본 µs | Rust µs |
+|---|---|---|---|---|---|
+| iterate(출력 · 상태 전부) | 강의실 ds_1118_121652 1,000 프레임 + 순간 이동 600 번 | 25,396(표본 32,385) | 25,396 / 25,396 | 108.5 / 호출 | 30.7 / 호출 |
+| iterate | TUM fr1_desk2 + 순간 이동 800 번 | 779(표본 2,909) | 779 / 779 | — | 96.5 / 호출 |
+| iterate | TUM desk2 → room 되감기(실패 시도 포함) | 21(표본 150) | 21 / 21 | — | — |
+| computePose(6 점) | 위 덤프 표본 | 4,682 | 4,682 / 4,682 | 56–75 | 22–25 |
+| computePose 비평면 · 평면(랭크 2) | 무작위 장면 각 5,000 | 10,000 | 10,000 / 10,000 | — | — |
+| 단위(무작위 각 3,000) | 영공간 · 야코비안 · 로드리게스 양방향 · 4x4 역행렬 · 행렬식 · 랭크(일반 · 평면) · SVD 3x3(U · V) · 12x12(V) · 가우스-뉴턴 | — | 전부 같음 | — | — |
+
+원본 iterate 시간은 `run_mlpnp` 안에서 원본 함수 호출을 잰 것(실행 중 다른 스레드와 같이 돎), Rust 는 같은 입력 재실행. 원본 대비 빠른 까닭: 결과를 버리는 Refine 의 내점 전부 computePose 를 건너뜀 · 고정 크기 행렬(동적 할당 없음)· 희소 행렬 P 없음. 원본 실행은 스레드 때문에 매번 재위치 시도 수가 다름(같은 설정에서 370 · 25,396 호출) — 비교는 덤프 단위라 영향 없음.
+
+확인 안 한 것: 평면 경로는 실제 덤프에 한 번도 나오지 않음(세계 원점을 지나는 평면 위 6 점에서만 생김) — 무작위 평면 장면으로만 확인. 최소 집합 6 이 아닌 설정(`SetRansacParameters` 의 minSet)은 옮기지 않음(원본 Tracking 은 6 만 씀). 고윳값 반복이 30·n 회를 넘는(수렴 실패) 경로 · NaN 입력 경로는 확인 못 함.
 
 ### 포터 CV (11-25)
 

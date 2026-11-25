@@ -5,24 +5,17 @@
 //! std::map<KeyFrame*> 순회는 번호 순(graph.rs 머리말).
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::detect::{quatd_rotate, G2oSim3};
+use super::detect::G2oSim3;
 use super::graph::{add_loop_edge, connected_set, update_connections, update_normal_and_depth};
-use crate::orb3rs::matcher::{replace_map_point, Matcher};
+use crate::orb3rs::matcher::Matcher;
+
+/// MapPoint::Replace(공통 `mapdata` 몸통, 지도에서 빼기는 원본도 여기선 지도 집합이 없음)
+fn replace_map_point(old: MpId, new: MpId, kfs: &mut BTreeMap<KfId, KeyFrame>, mps: &mut BTreeMap<MpId, MapPoint>) {
+    crate::orb3rs::mapdata::mp_replace_parts(kfs, mps, old, new);
+}
 use crate::orb3rs::{quat_normalize, KeyFrame, KfId, MapPoint, MpId, Se3};
 
 impl G2oSim3 {
-    /// inverse: (r̄, r̄·((−1/s)·t), 1/s)
-    pub fn inverse(&self) -> G2oSim3 {
-        let rc = [-self.r[0], -self.r[1], -self.r[2], self.r[3]];
-        let c = -1.0 / self.s;
-        let t = quatd_rotate(&rc, &[c * self.t[0], c * self.t[1], c * self.t[2]]);
-        G2oSim3 { r: rc, t, s: 1.0 / self.s }
-    }
-    /// map(p) = s·(r·p) + t
-    pub fn map(&self, p: &[f64; 3]) -> [f64; 3] {
-        let q = quatd_rotate(&self.r, p);
-        [self.s * q[0] + self.t[0], self.s * q[1] + self.t[1], self.s * q[2] + self.t[2]]
-    }
     /// Sophus::SE3d(r, t / s).cast<float>(): double 사원수 정규화 → float 로 내려 다시 정규화
     pub fn to_se3f(&self) -> Se3 {
         let q = &self.r;

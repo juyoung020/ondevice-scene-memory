@@ -354,6 +354,65 @@ void LocalMapping::CreateNewMapPoints() {
     B.flush("CNMP");
 }
 
+
+// ---------------- MapPoint::UpdateNormalAndDepth (UNDP) ----------------
+// 입력: 위치, 기준 키프레임, 관측(주소 순: id · 주소 · 왼쪽 번호 · 카메라 중심 · 그 번호 octave), 크기 표 / 결과: 법선 · 최소 · 최대 거리
+void MapPoint::UpdateNormalAndDepth() {
+    typedef void (*Fn)(MapPoint *);
+    static Fn orig = (Fn)orig_sym("_ZN9ORB_SLAM38MapPoint20UpdateNormalAndDepthEv");
+    Buf B;
+    bool bad; std::map<KeyFrame *, std::tuple<int, int>> obs; KeyFrame *ref; Eigen::Vector3f pos;
+    { std::unique_lock<std::mutex> l1(mMutexFeatures); std::unique_lock<std::mutex> l2(mMutexPos); bad = mbBad; obs = mObservations; ref = mpRefKF; pos = mWorldPos; }
+    B.w<uint8_t>(bad); B.w(pos[0]); B.w(pos[1]); B.w(pos[2]);
+    B.w<uint64_t>(kid(ref)); B.w<uint64_t>((uint64_t)(uintptr_t)ref);
+    B.w<uint32_t>(obs.size());
+    for (auto &o : obs) {
+        KeyFrame *k = o.first; int li = std::get<0>(o.second);
+        B.w<uint64_t>(k->mnId); B.w<uint64_t>((uint64_t)(uintptr_t)k); B.w<int32_t>(li);
+        Eigen::Vector3f c = k->GetCameraCenter(); B.w(c[0]); B.w(c[1]); B.w(c[2]);
+        B.w<int32_t>(li >= 0 ? k->mvKeysUn[li].octave : -1);
+    }
+    if (ref) {
+        Eigen::Vector3f c = ref->GetCameraCenter(); B.w(c[0]); B.w(c[1]); B.w(c[2]);
+        B.w<uint32_t>(ref->mvScaleFactors.size()); for (float f : ref->mvScaleFactors) B.w(f);
+    }
+    orig(this);
+    { std::unique_lock<std::mutex> l2(mMutexPos); B.w(mNormalVector[0]); B.w(mNormalVector[1]); B.w(mNormalVector[2]); B.w(mfMinDistance); B.w(mfMaxDistance); }
+    B.flush("UNDP");
+}
+
+// ---------------- KeyFrame::UpdateConnections (UCON) ----------------
+static void put_conn(Buf &B, KeyFrame *k) {
+    B.w<uint32_t>(k->mConnectedKeyFrameWeights.size());
+    for (auto &c : k->mConnectedKeyFrameWeights) { B.w<uint64_t>(c.first->mnId); B.w<uint64_t>((uint64_t)(uintptr_t)c.first); B.w<int32_t>(c.second); B.w<uint8_t>(c.first->isBad()); }
+    B.w<uint32_t>(k->mvpOrderedConnectedKeyFrames.size());
+    for (size_t i = 0; i < k->mvpOrderedConnectedKeyFrames.size(); i++) { B.w<uint64_t>(k->mvpOrderedConnectedKeyFrames[i]->mnId); B.w<int32_t>(k->mvOrderedWeights[i]); }
+}
+void KeyFrame::UpdateConnections(bool up) {
+    typedef void (*Fn)(KeyFrame *, bool);
+    static Fn orig = (Fn)orig_sym("_ZN9ORB_SLAM38KeyFrame17UpdateConnectionsEb");
+    Buf B;
+    B.w<uint64_t>(mnId); B.w<uint8_t>(up); B.w<uint8_t>(mbFirstConnection); B.w<uint64_t>(mpMap->GetInitKFid());
+    B.w<uint64_t>(kid(mpParent));
+    std::set<KeyFrame *> others;
+    std::vector<MapPoint *> v = GetMapPointMatches();
+    uint32_t n = 0; for (auto *m : v) if (m) n++;
+    B.w<uint32_t>(n);
+    for (auto *m : v) if (m) {
+        B.w<uint8_t>(m->isBad());
+        auto ob = m->GetObservations();
+        B.w<uint32_t>(ob.size());
+        for (auto &o : ob) { B.w<uint64_t>(o.first->mnId); B.w<uint64_t>((uint64_t)(uintptr_t)o.first); B.w<uint8_t>(o.first->isBad()); B.w<uint8_t>(o.first->GetMap() == mpMap); others.insert(o.first); }
+    }
+    others.erase(this);
+    B.w<uint32_t>(others.size());
+    for (KeyFrame *k : others) { B.w<uint64_t>(k->mnId); B.w<uint8_t>(k->isBad()); put_conn(B, k); }
+    orig(this, up);
+    put_conn(B, this); B.w<uint64_t>(kid(mpParent));
+    for (KeyFrame *k : others) put_conn(B, k);
+    B.flush("UCON");
+}
+
 // ---------------- LocalMapping::MapPointCulling ----------------
 void LocalMapping::MapPointCulling() {
     typedef void (*Fn)(LocalMapping *);

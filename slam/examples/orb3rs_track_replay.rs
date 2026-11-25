@@ -582,6 +582,172 @@ fn trak(r: &mut R, t: &mut Tally, states: &mut BTreeMap<i32, u64>) {
 }
 
 
+
+fn ctx_with_scale(scale: Vec<f32>) -> std::sync::Arc<FrameCtx> {
+    let nl = scale.len() as i32;
+    std::sync::Arc::new(FrameCtx { pyr: Pyramid { scale, nlevels: nl, ..Default::default() }, ..Default::default() })
+}
+
+/// UNDP: MapPoint::UpdateNormalAndDepth. 원본 관측 순서(주소 순)가 id 순과 다르면 따로 셈
+fn undp(r: &mut R, t: &mut Tally, t_addr: &mut Tally) {
+    let bad = r.b();
+    let pos = [r.f32(), r.f32(), r.f32()];
+    let rid = r.u64();
+    let _raddr = r.u64();
+    let n = r.u32();
+    let mut a = Atlas::default();
+    let mut m = MapPoint { id: 1, pos, bad, ref_kf: rid, ..Default::default() };
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        let id = r.u64();
+        let _ad = r.u64();
+        let li = r.i32();
+        let c = [r.f32(), r.f32(), r.f32()];
+        let oct = r.i32();
+        ids.push(id);
+        m.obs.insert(id, (li, -1));
+        let k = kf_entry(&mut a, id);
+        k.twc.t = c;
+        if li >= 0 {
+            if k.keys.len() <= li as usize {
+                k.keys.resize(li as usize + 1, KeyPoint::default());
+            }
+            k.keys[li as usize].octave = oct;
+        }
+    }
+    if rid != u64::MAX {
+        let c = [r.f32(), r.f32(), r.f32()];
+        let ns = r.u32();
+        let sc: Vec<f32> = (0..ns).map(|_| r.f32()).collect();
+        let k = kf_entry(&mut a, rid);
+        k.twc.t = c;
+        if k.keys.is_empty() {
+            k.keys.push(KeyPoint::default());
+        }
+        k.ctx = ctx_with_scale(sc);
+    }
+    let want_n = [r.f32(), r.f32(), r.f32()];
+    let want_min = r.f32();
+    let want_max = r.f32();
+    if rid == u64::MAX || bad || n == 0 {
+        return;
+    }
+    let before = (m.normal, m.min_dist, m.max_dist);
+    let _ = before;
+    a.mps.insert(1, m);
+    slam::orb3rs::mapdata::mp_update_normal_and_depth(&mut a, 1);
+    let g = &a.mps[&1];
+    let bits = |v: &[f32; 3]| v.map(|x| x.to_bits());
+    let ok = bits(&g.normal) == bits(&want_n) && g.min_dist.to_bits() == want_min.to_bits() && g.max_dist.to_bits() == want_max.to_bits();
+    let sorted = ids.windows(2).all(|w| w[0] < w[1]);
+    let tt = if sorted { t } else { t_addr };
+    tt.add(ok, || format!("점 기준 {rid}: 법선 원본 {want_n:?} rust {:?} 거리 {want_min} {want_max} vs {} {}", g.normal, g.min_dist, g.max_dist));
+}
+
+fn read_conn(r: &mut R) -> (BTreeMap<KfId, i32>, Vec<(KfId, i32)>, bool, Vec<(KfId, bool)>) {
+    let n = r.u32();
+    let mut w = BTreeMap::new();
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        let id = r.u64();
+        let _ad = r.u64();
+        let wt = r.i32();
+        let bad = r.b();
+        w.insert(id, wt);
+        ids.push((id, bad));
+    }
+    let sorted = ids.windows(2).all(|p| p[0].0 < p[1].0);
+    let m = r.u32();
+    let ord = (0..m).map(|_| (r.u64(), r.i32())).collect();
+    (w, ord, sorted, ids)
+}
+
+/// UCON: KeyFrame::UpdateConnections
+fn ucon(r: &mut R, t: &mut Tally, t_addr: &mut Tally) {
+    let id = r.u64();
+    let up = r.b();
+    let first = r.b();
+    let init = r.u64();
+    let par0 = r.u64();
+    let n = r.u32();
+    let mut a = Atlas::default();
+    kf_entry(&mut a, id);
+    let mut addr_sorted = true;
+    let mut slots = Vec::new();
+    for i in 0..n {
+        let bad = r.b();
+        let no = r.u32();
+        let mut m = MapPoint { id: i as u64 + 1, bad, ..Default::default() };
+        let mut ids = Vec::new();
+        for _ in 0..no {
+            let k = r.u64();
+            let _ad = r.u64();
+            let kb = r.b();
+            let same = r.b();
+            ids.push(k);
+            m.obs.insert(k, (0, -1));
+            let e = kf_entry(&mut a, k);
+            e.bad = kb;
+            if !same {
+                e.map = 999;
+            }
+        }
+        addr_sorted &= ids.windows(2).all(|w| w[0] < w[1]);
+        slots.push(Some(m.id));
+        a.mps.insert(m.id, m);
+    }
+    let no = r.u32();
+    let mut others = Vec::new();
+    for _ in 0..no {
+        let k = r.u64();
+        let kb = r.b();
+        let (w, ord, srt, ids) = read_conn(r);
+        addr_sorted &= srt;
+        for (c, cb) in ids {
+            kf_entry(&mut a, c).bad = cb;
+        }
+        let e = kf_entry(&mut a, k);
+        e.bad = kb;
+        e.conn_weights = w;
+        e.ordered_conn = ord;
+        others.push(k);
+    }
+    {
+        let e = a.kfs.get_mut(&id).unwrap();
+        e.map_points = slots;
+        e.parent = if first { None } else { Some(if par0 == u64::MAX { u64::MAX - 1 } else { par0 }) };
+    }
+    let (w1, ord1, srt1, _) = read_conn(r);
+    addr_sorted &= srt1;
+    let par1 = r.u64();
+    let after: Vec<(BTreeMap<KfId, i32>, Vec<(KfId, i32)>)> = others.iter().map(|_| { let (w, o, s, _) = read_conn(r); addr_sorted &= s; (w, o) }).collect();
+    if !up {
+        return;
+    }
+    // 공통 판(mapdata): 지도 mnInitKFid · mbFirstConnection 으로 부모 정함
+    a.kfs.get_mut(&id).unwrap().first_conn_done = !first;
+    let map = a.kfs[&id].map;
+    match a.maps.iter_mut().find(|m| m.id == map) {
+        Some(m) => m.init_kf_id = init,
+        None => a.maps.push(Map { id: map, init_kf_id: init, ..Default::default() }),
+    }
+    slam::orb3rs::mapdata::kf_update_connections(&mut a, id, true);
+    let k = &a.kfs[&id];
+    let mut ok = k.ordered_conn == ord1 && (k.conn_weights == w1 || w1.is_empty() && k.conn_weights.is_empty());
+    let gp = k.parent.map(|p| if p == u64::MAX - 1 { u64::MAX } else { p }).unwrap_or(u64::MAX);
+    ok &= gp == par1;
+    let mut why = String::new();
+    for (i, o) in others.iter().enumerate() {
+        let ko = &a.kfs[o];
+        if ko.ordered_conn != after[i].1 || ko.conn_weights != after[i].0 {
+            ok = false;
+            why = format!("이웃 {o}: 원본 {:?} rust {:?}", after[i].1, ko.ordered_conn);
+        }
+    }
+    let tt = if addr_sorted { t } else { t_addr };
+    tt.add(ok, || format!("키프레임 {id}: 원본 {ord1:?} 부모 {par1} rust {:?} 부모 {gp} {why}", k.ordered_conn));
+}
+
 static POSE_DIFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn read_kfdata(r: &mut R, keys_same: &mut u64) -> KeyFrame {
@@ -778,6 +944,16 @@ fn main() {
                 tal.insert("MapPointCulling 나쁨", b);
             }
             "CNMP" => cnmp(&mut r, tal.entry("CreateNewMapPoints").or_default(), &mut cnmp_stats),
+            "UNDP" => {
+                let mut b = std::mem::take(tal.entry("UpdateNormalAndDepth(주소 순 ≠ id 순)").or_default());
+                undp(&mut r, tal.entry("UpdateNormalAndDepth").or_default(), &mut b);
+                *tal.entry("UpdateNormalAndDepth(주소 순 ≠ id 순)").or_default() = b;
+            }
+            "UCON" => {
+                let mut b = std::mem::take(tal.entry("UpdateConnections(주소 순 ≠ id 순)").or_default());
+                ucon(&mut r, tal.entry("UpdateConnections").or_default(), &mut b);
+                *tal.entry("UpdateConnections(주소 순 ≠ id 순)").or_default() = b;
+            }
             "TRIA" => tria(&mut r, tal.entry("Triangulate(JacobiSVD)").or_default()),
             "KFCL" => kfcl(&mut r, tal.entry("KeyFrameCulling").or_default()),
             "TRAK" => trak(&mut r, tal.entry("Track 흐름").or_default(), &mut states),

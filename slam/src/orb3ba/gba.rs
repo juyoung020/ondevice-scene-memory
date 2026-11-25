@@ -123,7 +123,7 @@ pub fn global_bundle_adjustment(atlas: &mut Atlas, ext: &TrackExt, map: MapId, n
     kfs.sort_unstable();
     let mut mps = m.mps.clone();
     mps.sort_unstable();
-    let init = ext.map_init_kf.get(&map).copied();
+    let init = Some(m.init_kf_id);
     let origin = m.origin_kf;
     bundle_adjustment_ord(atlas, init, origin, &kfs, &mps, n_iter, stop, loop_kf, robust, ObsOrder::default())
 }

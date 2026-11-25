@@ -836,7 +836,7 @@ impl RustSystem {
         {
             let mut g = self.map.lock();
             crate::orb3sys::mapping::step_text(&format!("G {from} {into} {}\n",crate::orb3sys::mapping::se3_hex(&s)));
-            let fm = g.atlas.maps.iter().find(|m| m.id == from).map(|m| (m.kfs.iter().copied().min(), m.mps.iter().copied().min()));
+            let fm = g.atlas.maps.iter().find(|m| m.id == from).map(|m| (m.kfs.iter().copied().min(), m.mps.iter().copied().filter(|p| g.atlas.mps.get(p).is_some_and(|x| !x.bad)).min()));
             let pk = |g: &MapState, w: &str| {
                 if let Some((Some(k), Some(p))) = fm {
                     let (kf, mp) = (&g.atlas.kfs[&k], &g.atlas.mps[&p]);
@@ -847,12 +847,14 @@ impl RustSystem {
             pk(&g, "GB");
             graft::graft_map(&mut g.atlas, from, into, &s);
             pk(&g, "GA");
-            if let Some((&km, kf)) = g.atlas.kfs.iter().next_back() {
-                crate::orb3sys::mapping::step_text(&format!("T {km} GK {} {}\n",crate::orb3sys::mapping::se3_hex(&kf.tcw), kf.map));
-            }
             let k0 = g.atlas.maps.iter().find(|m| m.id == into).and_then(|m| m.kfs.iter().copied().filter(|k| !g.atlas.kfs[k].bad).min());
             if let Some(k0) = k0 {
                 crate::orb3sys::mapping::step_digest(&g, k0, "graft");
+            }
+            // 원본 쪽과 같은 자리 · 같은 키프레임(합친 지도의 가장 큰 번호)
+            if let Some(km) = g.atlas.maps.iter().find(|m| m.id == into).and_then(|m| m.kfs.iter().copied().max()) {
+                let kf = &g.atlas.kfs[&km];
+                crate::orb3sys::mapping::step_text(&format!("T {km} GK {} {}\n", crate::orb3sys::mapping::se3_hex(&kf.tcw), kf.map));
             }
             if let Some(p) = self.last.as_ref().and_then(|l| l.tcw) {
                 crate::orb3sys::mapping::step_text(&format!("GL {}\n",crate::orb3sys::mapping::se3_hex(&p)));

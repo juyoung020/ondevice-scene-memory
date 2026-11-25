@@ -18,18 +18,10 @@
   같은 무게 키프레임의 순서(예: (2,41) · (3,41)). Rust 는 통합판 약속대로 id 순.
 - 덤프 UNDP · UCON 은 주소도 기록해 두 경우를 나눠 셈.
 
-## 통합판 연결(`slam/src/orb3sys/steps.rs` TrackSteps: KfSteps)
-- 채움: MapPointCulling · KeyFrameCulling
-- 남음(hole): ProcessNewKeyFrame(ComputeBoW · UpdateNormalAndDepth · UpdateConnections 필요), CreateNewMapPoints 의 새 점 지도 넣기
-  (삼각측량 계산은 끝, MapPoint 생성 · UpdateNormalAndDepth 잇기 남음), SearchInNeighbors(Fuse)
-- Tracking 빈자리(StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame)는 다음 차례
-
-## 고친 것
-- KeyFrame::UnprojectStereo 는 mvKeys(보정 전) 좌표를 씀 → `KeyFrame.keys_raw` 칸 추가
-- KeyFrame::mRwc = mTwc.rotationMatrix() 는 켤레 사원수를 다시 정규화해 만들어 Rcw 전치와 끝자리가 다름
-  → `KfPose.rwc_stored`(UnprojectStereo 용), 광선은 원본처럼 전치(`rwc`)
-- Track 흐름: CreateNewKeyFrame 뒤 mpLastKeyFrame · mpReferenceKF · mnLastKeyFrameId 갱신(floor 1143 불일치 원인)
-- 덤프: CreateNewMapPoints 기호 이름 오타(17→18), CNMP 기록 중 지도 갱신 잠금, NeedNewKeyFrame 은 읽기~원본 호출 사이 입력이 바뀌면 표시(따로 셈)
-
-## 원본 쪽 문제
-- ds 장면에서 원본 LoopClosing::RunGlobalBundleAdjustment 가 KeyFrame::GetChilds 를 끝없이 도는 경우 한 번 봄(신장 트리 순환). runall 에 timeout 2400 s
+## 통합판 연결(`slam/src/orb3sys/rsys.rs` RsSteps)
+- MapPointCulling · CreateNewMapPoints · KeyFrameCulling: 통합 담당이 연결(삼각측량 · 컬링은 위 덤프로 비트 동일)
+- ProcessNewKeyFrame(ComputeBoW · 관측 추가 · UpdateNormalAndDepth · ComputeDistinctiveDescriptors · UpdateConnections · AddKeyFrame),
+  SearchInNeighbors(1 · 2 차 이웃, Fuse 양방향, 점 갱신, UpdateConnections): 포터 TRACK 이 채움. 부품은 비트 확인, 두 단계를 통째로 원본과 비교하는 덤프는 아직
+- Fuse 는 MapPoint::n_obs 만 바꾸므로 단계 끝에 TrackExt::mp_nobs 를 맞춤
+- 남음: Tracking 빈자리(StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame),
+  ComputeDistinctiveDescriptors 관측 순서(id 순 vs 원본 주소 순) 덤프 확인

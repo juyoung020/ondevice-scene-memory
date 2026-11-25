@@ -33,8 +33,6 @@ pub const HOLES: &[&str] = &[
     "Tracking::TrackLocalMap(SearchLocalPoints · PoseOptimization 엮기)",
     "Tracking::CreateNewKeyFrame",
     "패치 DoPendingGraft",
-    "LocalMapping::ProcessNewKeyFrame(UpdateConnections · ComputeBoW)",
-    "LocalMapping::SearchInNeighbors",
 ];
 
 /// 옮겨지지 않은 단계를 지나면 그 이름으로 멈춤
@@ -44,18 +42,64 @@ pub fn hole(name: &str) -> ! {
 }
 
 /// 지도 스레드 키프레임 단계: 포터 TRACK 판(MapPointCulling · CreateNewMapPoints · KeyFrameCulling, 원본 덤프와 비트 동일)을 엮음.
-/// ProcessNewKeyFrame(UpdateConnections · ComputeBoW 포함) · SearchInNeighbors 는 아직 빈자리.
+/// ProcessNewKeyFrame · SearchInNeighbors 도 포터 TRACK 판(UpdateNormalAndDepth · UpdateConnections 는 덤프와 비트 동일, 순회는 id 순).
 pub struct RsSteps {
     pub mapper: Arc<Mapper<KfId>>,
     /// mlpRecentAddedMapPoints
     pub recent: Vec<MpId>,
     pub tri: TriParams,
     pub th_depth: f32,
+    /// 단어장(ComputeBoW). set_vocabulary 가 채움
+    pub voc: Arc<std::sync::Mutex<Option<Arc<Vocabulary>>>>,
+}
+
+/// mp_nobs(TrackExt) 를 MapPoint::nObs 에 맞춤(Fuse 등 MapPoint 쪽만 바꾸는 단계 뒤)
+fn sync_nobs(st: &mut MapState, mps: impl IntoIterator<Item = MpId>) {
+    for m in mps {
+        if let Some(p) = st.atlas.mps.get(&m) {
+            st.ext.mp_nobs.insert(m, p.n_obs);
+        }
+    }
 }
 
 impl KfSteps for RsSteps {
-    fn process_new_keyframe(&mut self, _: &mut MapState, _: KfId) {
-        hole("LocalMapping::ProcessNewKeyFrame")
+    fn process_new_keyframe(&mut self, st: &mut MapState, kf: KfId) {
+        // KeyFrame::ComputeBoW
+        if st.atlas.kfs[&kf].bow.is_empty() {
+            let voc = self.voc.lock().unwrap().clone().unwrap_or_else(|| hole("단어장(set_vocabulary) 없이 ComputeBoW"));
+            let (bv, fv) = voc.transform(&st.atlas.kfs[&kf].desc, 4);
+            let k = st.atlas.kfs.get_mut(&kf).unwrap();
+            k.bow = bv.into_iter().collect();
+            k.feat = fv.into_iter().collect();
+        }
+        let slots = st.atlas.kfs[&kf].map_points.clone();
+        for (i, slot) in slots.iter().enumerate() {
+            let Some(mp) = *slot else { continue };
+            if st.atlas.mps[&mp].bad {
+                continue;
+            }
+            if !st.atlas.mps[&mp].obs.contains_key(&kf) {
+                let a = &mut st.atlas;
+                let k = &a.kfs[&kf];
+                a.mps.get_mut(&mp).unwrap().add_observation(k, i);
+                localmap::update_normal_and_depth(mp, a);
+                let kfs = &a.kfs;
+                a.mps.get_mut(&mp).unwrap().compute_distinctive_descriptors(kfs);
+                sync_nobs(st, [mp]);
+            } else {
+                // 추적이 넣은 새 깊이 점
+                self.recent.push(mp);
+            }
+        }
+        let map = st.atlas.kfs[&kf].map;
+        let init = st.ext.map_init_kf.get(&map).copied().unwrap_or(KfId::MAX);
+        localmap::update_connections(kf, init, &mut st.atlas);
+        // Atlas::AddKeyFrame(지금 지도 집합)
+        if let Some(mi) = st.atlas.maps.iter_mut().find(|x| x.id == map) {
+            if let Err(p) = mi.kfs.binary_search(&kf) {
+                mi.kfs.insert(p, kf);
+            }
+        }
     }
     fn map_point_culling(&mut self, st: &mut MapState, kf: KfId) {
         localmap::map_point_culling(&mut self.recent, kf, false, &mut st.atlas, &mut st.ext);
@@ -103,8 +147,66 @@ impl KfSteps for RsSteps {
             },
         );
     }
-    fn search_in_neighbors(&mut self, _: &mut MapState, _: KfId) {
-        hole("LocalMapping::SearchInNeighbors")
+    /// LocalMapping::SearchInNeighbors(단안 · 관성 아님). mnFuseTargetForKF · mnFuseCandidateForKF 표시는 이 호출 안의 집합
+    fn search_in_neighbors(&mut self, st: &mut MapState, kf: KfId) {
+        let abort = || self.mapper.abort_ba().load(std::sync::atomic::Ordering::SeqCst);
+        let mut marked = std::collections::BTreeSet::new();
+        let mut targets: Vec<KfId> = Vec::new();
+        for k in best_covisibles(&st.atlas.kfs[&kf], 10) {
+            if st.atlas.kfs[&k].bad || marked.contains(&k) {
+                continue;
+            }
+            targets.push(k);
+            marked.insert(k);
+        }
+        let n1 = targets.len();
+        for i in 0..n1 {
+            for k2 in best_covisibles(&st.atlas.kfs[&targets[i]], 20) {
+                if st.atlas.kfs[&k2].bad || marked.contains(&k2) || k2 == kf {
+                    continue;
+                }
+                targets.push(k2);
+                marked.insert(k2);
+            }
+            if abort() {
+                break;
+            }
+        }
+        let m = Matcher::new(0.6, true);
+        let cur_pts = st.atlas.kfs[&kf].map_points.clone();
+        let mut touched: Vec<MpId> = cur_pts.iter().flatten().copied().collect();
+        for &t in &targets {
+            m.fuse(t, &mut st.atlas.kfs, &cur_pts, &mut st.atlas.mps, 3.0);
+        }
+        if abort() {
+            sync_nobs(st, touched);
+            return;
+        }
+        let mut cand_set = std::collections::HashSet::new();
+        let mut cands: Vec<Option<MpId>> = Vec::new();
+        for &t in &targets {
+            for p in st.atlas.kfs[&t].map_points.iter().flatten() {
+                if st.atlas.mps[p].bad || !cand_set.insert(*p) {
+                    continue;
+                }
+                cands.push(Some(*p));
+            }
+        }
+        m.fuse(kf, &mut st.atlas.kfs, &cands, &mut st.atlas.mps, 3.0);
+        touched.extend(cands.iter().flatten());
+        for p in st.atlas.kfs[&kf].map_points.clone().into_iter().flatten() {
+            if !st.atlas.mps[&p].bad {
+                let a = &mut st.atlas;
+                let kfs = &a.kfs;
+                a.mps.get_mut(&p).unwrap().compute_distinctive_descriptors(kfs);
+                localmap::update_normal_and_depth(p, a);
+            }
+            touched.push(p);
+        }
+        sync_nobs(st, touched);
+        let map = st.atlas.kfs[&kf].map;
+        let init = st.ext.map_init_kf.get(&map).copied().unwrap_or(KfId::MAX);
+        localmap::update_connections(kf, init, &mut st.atlas);
     }
     fn keyframe_culling(&mut self, st: &mut MapState, kf: KfId) {
         let local: Vec<KfId> = st.atlas.kfs[&kf].ordered_conn.iter().map(|c| c.0).collect();
@@ -156,6 +258,7 @@ pub struct RustSystem {
     initial_frame_id: u64,
     /// 단어장(재위치 · BoW). 없으면 재위치 단계에서 멈춤
     voc: Option<Arc<Vocabulary>>,
+    voc_steps: Arc<std::sync::Mutex<Option<Arc<Vocabulary>>>>,
     /// KeyFrameDatabase(키프레임 넣기는 루프 스레드 몫)
     kfdb: Arc<std::sync::Mutex<Option<KeyFrameDatabase>>>,
     /// 원본 glibc rand(씨앗 1): Sim3Solver · MLPnP 가 한 수열을 나눠 씀
@@ -182,7 +285,8 @@ impl RustSystem {
             far_points: init.settings.th_far_points != 0.0,
             th_far_points: init.settings.th_far_points,
         };
-        let mut steps = RsSteps { mapper: Arc::clone(&mapper), recent: Vec::new(), tri, th_depth: init.tracking.th_depth };
+        let voc_steps = Arc::new(std::sync::Mutex::new(None));
+        let mut steps = RsSteps { mapper: Arc::clone(&mapper), recent: Vec::new(), tri, th_depth: init.tracking.th_depth, voc: Arc::clone(&voc_steps) };
         let loopq = LoopQueue::<KfId>::new();
         let (m2, map2, q2) = (Arc::clone(&mapper), Arc::clone(&map), Arc::clone(&loopq));
         let mapping = Some(std::thread::spawn(move || mapping::run(&m2, &map2, &q2, &mut steps)));
@@ -204,6 +308,7 @@ impl RustSystem {
             last_init_frame_id: 0,
             initial_frame_id: 0,
             voc: None,
+            voc_steps,
             kfdb: Arc::new(std::sync::Mutex::new(None)),
             rand: std::cell::RefCell::new(GlibcRand::new(1)),
         })
@@ -212,6 +317,7 @@ impl RustSystem {
     /// 단어장을 붙임(재위치 · BoW 에 필요)
     pub fn set_vocabulary(&mut self, voc: Arc<Vocabulary>) {
         *self.kfdb.lock().unwrap() = Some(KeyFrameDatabase::new(&voc));
+        *self.voc_steps.lock().unwrap() = Some(Arc::clone(&voc));
         self.voc = Some(voc);
     }
 

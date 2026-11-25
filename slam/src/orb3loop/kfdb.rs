@@ -106,6 +106,8 @@ impl KeyFrameDatabase {
                     s.words = 0;
                     if !g.is_connected(kf, ki) {
                         s.query = qid;
+                        // 결정성 고침(원본 버그): 이번 질의에서 점수를 안 매긴 이웃의 지난 점수를 더하지 않게 0 으로
+                        s.score = 0.0;
                         sharing.push(ki);
                     }
                 }
@@ -185,6 +187,7 @@ impl KeyFrameDatabase {
                     }
                     s.words = 0;
                     s.query = q;
+                    s.score = 0.0; // 결정성 고침(원본 버그, detect_n_best 와 같음)
                     sharing.push(ki);
                 }
                 s.words += 1;

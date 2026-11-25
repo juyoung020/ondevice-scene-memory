@@ -17,6 +17,8 @@ pub mod backend;
 // ORB-SLAM3 RGB-D 위치(같은 프로세스 처리 루프의 백엔드)
 pub mod orb3;
 pub mod orb3_backend;
+// ORB-SLAM3 지역 · 전역 번들 조정 · 그래프 최적화(g2o 경로)를 비트 동일로 옮긴 것
+pub mod orb3ba;
 pub mod stitch;
 pub mod mapmerge;
 pub mod refine;

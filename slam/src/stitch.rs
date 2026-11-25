@@ -50,6 +50,8 @@ pub struct Hit {
     pub t_qc: T34,
     pub inliers: usize,
     pub score: f32,
+    /// 깊이 맞춤까지 통과(바로 옮겨 붙여도 됨). 아니면 검증만 통과한 약한 짝: 끝난 뒤 지도 통째 맞춤의 후보로만 씀
+    pub strong: bool,
 }
 
 struct Stored {
@@ -176,7 +178,7 @@ fn small_depth(d: &[u16], w: usize, h: usize) -> Vec<u16> {
 
 pub struct Stitch {
     tx: Option<Sender<Node>>,
-    rx: Receiver<Option<Hit>>,
+    rx: Receiver<Vec<Hit>>,
     th: Option<std::thread::JoinHandle<()>>,
     pub pending: usize,
     pub sent: u64,
@@ -198,7 +200,7 @@ impl Stitch {
     pub fn start(models: &str) -> Result<Stitch, String> {
         let cfg = LcConfig::from_dir(models);
         let (tx, rx) = channel::<Node>();
-        let (otx, orx) = channel::<Option<Hit>>();
+        let (otx, orx) = channel::<Vec<Hit>>();
         let (rtx, rrx) = channel::<Result<(), String>>();
         let th = std::thread::Builder::new()
             .name("stitch".into())
@@ -234,15 +236,15 @@ impl Stitch {
         }
     }
 
-    /// 끝난 결과(맞은 짝이 있으면 Some). block = 하나 끝날 때까지 기다림
-    pub fn recv(&mut self, block: bool) -> Option<Option<Hit>> {
+    /// 끝난 결과(맞은 짝들, 강한 짝은 맨 끝에 하나까지). block = 하나 끝날 때까지 기다림
+    pub fn recv(&mut self, block: bool) -> Option<Vec<Hit>> {
         if self.pending == 0 {
             return None;
         }
         let r = if block { self.rx.recv().ok() } else { self.rx.try_recv().ok() };
         if let Some(h) = &r {
             self.pending -= 1;
-            self.hits += h.is_some() as u64;
+            self.hits += h.iter().any(|x| x.strong) as u64;
         }
         r
     }
@@ -306,10 +308,10 @@ impl State {
         })
     }
 
-    fn step(&mut self, n: Node) -> Option<Hit> {
+    fn step(&mut self, n: Node) -> Vec<Hit> {
         let (w, h) = (n.w, n.h);
         if w != xfeat::W || h != xfeat::H || n.color.len() != w * h * 3 || n.depth.len() != w * h {
-            return None;
+            return Vec::new();
         }
         let rgb: &[u8] = if n.bgr {
             self.rgb.clear();
@@ -354,7 +356,7 @@ impl State {
             let _ = writeln!(l, "{:.3} node map {:?} cands {:?}", n.t, my_map, cands.iter().map(|c| (c.0, (c.1 * 100.0).round() / 100.0)).collect::<Vec<_>>());
         }
         let qsmall = small_depth(&n.depth, w, h);
-        let mut hit = None;
+        let mut hits = Vec::new();
         let mut b = XFeatures::default();
         for &(cid, score) in &cands {
             if score < MIN_SCORE {
@@ -390,18 +392,18 @@ impl State {
                 let ag_tight = depth_agree_tol(&qsmall, &c.small_d, w, h, &n.k, &c.k, &t, 0.02, 0.01).1;
                 if let Some(l) = self.log.as_mut() {
                     use std::io::Write as _;
-                    let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2} tight {ag_tight:.2}", n.t, c.t);
+                    let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2} tight {ag_tight:.2} T {}", n.t, c.t, t.iter().map(|v| format!("{v:.5}")).collect::<Vec<_>>().join(" "));
                 }
-                if ov < DEPTH_OVERLAP || ag < DEPTH_AGREE {
-                    continue;
+                let strong = ov >= DEPTH_OVERLAP && ag >= DEPTH_AGREE;
+                hits.push(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score, strong });
+                if strong {
+                    break;
                 }
-                hit = Some(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score });
-                break;
             }
         }
         self.db.add(self.nodes.len() as i64, &self.desc);
         let desc: Vec<i8> = q.desc.iter().map(|&v| (v * Q8).round().clamp(-127.0, 127.0) as i8).collect();
         self.nodes.push(Stored { t: n.t, kf: n.kf, rel: n.rel, up: n.up, kps: q.kps, desc, x3, small_d: qsmall, k: n.k });
-        hit
+        hits
     }
 }

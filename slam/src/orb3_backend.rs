@@ -126,6 +126,12 @@ pub struct Orb3 {
     /// 확인을 기다리는 잇기: (into, from, into ← from, 시각)
     pend: Vec<(u64, u64, T34, f64)>,
     n_graft: i64,
+    /// 모든 잇기 짝(약한 짝 포함, 끝난 뒤 지도 통째 맞춤 후보), 끝난 뒤 맞춤용 작은 깊이(장면 5 장마다: 시각, 기준 키프레임, 상대 위치, 160×120 mm)
+    hits_all: Vec<stitch::Hit>,
+    deps: Vec<(f64, u64, T34, Vec<u16>)>,
+    /// IMU 기록(카메라 시각, 카메라 축 가속도, 자이로 크기): 끝난 지도 기울기 바로잡기
+    imu_hist: Vec<(f64, [f64; 3], f64)>,
+    dk: Option<crate::mapmerge::Intr>,
     /// 위치가 나온 장면: (시각, 기준 키프레임, 키프레임에서 본 장면 위치)
     tracked: Vec<(f64, u64, T34)>,
     settings_path: std::path::PathBuf,
@@ -217,6 +223,10 @@ impl Orb3 {
             kfmap_t: f64::MIN,
             pend: Vec::new(),
             n_graft: 0,
+            hits_all: Vec::new(),
+            deps: Vec::new(),
+            imu_hist: Vec::new(),
+            dk: None,
             tracked: Vec::new(),
             settings_path,
             t_run: Instant::now(),
@@ -434,14 +444,18 @@ impl Orb3 {
         for s in &self.imu {
             let a = m34_vec(&self.r_ci, &[s[1] as f32, s[2] as f32, s[3] as f32, 0.0]);
             self.acc.push_back((s[0] - self.shift, [a[0] as f64, a[1] as f64, a[2] as f64]));
+            self.imu_hist.push((s[0] - self.shift, [a[0] as f64, a[1] as f64, a[2] as f64], s[4]));
         }
         while self.acc.front().is_some_and(|x| f.t - x.0 > 1.0) {
             self.acc.pop_front();
         }
         // 최대 속도 재생(받는 쪽을 기다림)은 잇기 결과도 기다려 실시간처럼 제때 반영
         while let Some(r) = self.stitch.recv(self.block) {
-            if let Some(h) = r {
-                self.on_hit(h, f.t);
+            for h in r {
+                self.hits_all.push(h.clone());
+                if h.strong {
+                    self.on_hit(h, f.t);
+                }
             }
         }
         let c0 = Instant::now();
@@ -516,7 +530,15 @@ impl Orb3 {
             let k = tr.ref_kf.filter(|k| self.sent.contains_key(k) && self.kfs.contains_key(k)).or_else(|| self.kfs.keys().filter(|k| self.sent.contains_key(k)).max().copied());
             if let Some(k) = k {
                 anchor = (k + 1) as u32;
-                self.tracked.push((f.t, k, mul(&inv(&self.kfs[&k]), &tr.twc)));
+                let rel = mul(&inv(&self.kfs[&k]), &tr.twc);
+                self.tracked.push((f.t, k, rel));
+                // 끝난 뒤 지도 맞춤용 작은 깊이(5 장마다)
+                if self.tracked.len() % 5 == 1 && f.depth_mm.len() == (w * h) as usize && w as usize == crate::mapmerge::SW * 4 && h as usize == crate::mapmerge::SH * 4 {
+                    use crate::mapmerge::{SH, SW};
+                    let d: Vec<u16> = (0..SH * SW).map(|i| f.depth_mm[(i / SW) * 4 * w as usize + (i % SW) * 4]).collect();
+                    self.deps.push((f.t, k, rel, d));
+                    self.dk.get_or_insert(crate::mapmerge::Intr { fx: f.cam.fx, fy: f.cam.fy, cx: f.cam.cx, cy: f.cam.cy });
+                }
             }
         }
         // 지도 잇기에 장면 보내기(0.25 초마다, 1 초 평균 가속도로 본 IMU 위쪽이 믿을 만할 때)
@@ -601,6 +623,106 @@ impl Orb3 {
     }
 }
 
+/// 끝난 지도 기울기 바로잡기: 장면마다 ±0.5 초 가속도 평균(가만히 있을 때: 크기 g ± 0.3, 자이로 평균 < 0.6 rad/s)을 지도 축으로 보낸 '위' 가
+/// 지도 z 와 어긋난 만큼, 같은 ORB 지도에서 앞뒤 1.5 초 안 가만한 장면들의 어긋남 평균(가우스 0.25 초)으로 장면 방향을 돌림(위치는 그대로).
+/// ORB 지도 안 기울기 표류 · 몇 장짜리 회전 튐을 중력 측정으로 누름. fr: (시각, 장면 위치, 원래 ORB 지도). 돌려줌: (돌린 장면 수, 가장 큰 각 °)
+fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f64) {
+    if imu.len() < 2 {
+        return (0, 0.0);
+    }
+    // 누적 합으로 창 평균
+    let mut cs = vec![[0.0f64; 4]; imu.len() + 1];
+    for (i, x) in imu.iter().enumerate() {
+        cs[i + 1] = [cs[i][0] + x.1[0], cs[i][1] + x.1[1], cs[i][2] + x.1[2], cs[i][3] + x.2];
+    }
+    let rate = (imu.len() - 1) as f64 / (imu[imu.len() - 1].0 - imu[0].0).max(1e-6);
+    let idx = |t: f64| imu.partition_point(|x| x.0 < t);
+    // 가만한 장면의 바로잡을 회전(가로축 회전 벡터)
+    let mut meas: Vec<Option<[f64; 3]>> = vec![None; fr.len()];
+    for (i, (t, p, _)) in fr.iter().enumerate() {
+        let (a, b) = (idx(t - 0.5), idx(t + 0.5));
+        if ((b - a) as f64) < 0.75 * rate {
+            continue;
+        }
+        let n = (b - a) as f64;
+        let m = [(cs[b][0] - cs[a][0]) / n, (cs[b][1] - cs[a][1]) / n, (cs[b][2] - cs[a][2]) / n];
+        let g = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+        if (g - 9.81).abs() > 0.3 || (cs[b][3] - cs[a][3]) / n > 0.6 {
+            continue;
+        }
+        let u = [(p[0] * m[0] + p[1] * m[1] + p[2] * m[2]) / g, (p[4] * m[0] + p[5] * m[1] + p[6] * m[2]) / g, (p[8] * m[0] + p[9] * m[1] + p[10] * m[2]) / g];
+        // u → z 회전: 축 u × z = (u.y, −u.x, 0), 각 acos(u.z)
+        let ang = u[2].clamp(-1.0, 1.0).acos();
+        let l = (u[0] * u[0] + u[1] * u[1]).sqrt();
+        if l > 1e-9 {
+            meas[i] = Some([u[1] / l * ang, -u[0] / l * ang, 0.0]);
+        }
+    }
+    let mut n_done = 0;
+    let mut max_a: f64 = 0.0;
+    let corr: Vec<Option<[f64; 3]>> = (0..fr.len())
+        .map(|i| {
+            let (t, m) = (fr[i].0, fr[i].2);
+            let (mut w, mut r) = (0.0, [0.0; 3]);
+            let mut near: Option<(f64, [f64; 3])> = None;
+            for (j, x) in fr.iter().enumerate() {
+                let Some(v) = meas[j] else { continue };
+                if x.2 != m {
+                    continue;
+                }
+                let dt = (x.0 - t).abs();
+                if dt <= 1.5 {
+                    let k = (-0.5 * (dt / 0.25).powi(2)).exp();
+                    w += k;
+                    for c in 0..3 {
+                        r[c] += k * v[c];
+                    }
+                }
+                if dt <= 5.0 && near.is_none_or(|n| dt < n.0) {
+                    near = Some((dt, v));
+                }
+            }
+            if w > 0.0 {
+                Some(r.map(|v| v / w))
+            } else {
+                near.map(|n| n.1)
+            }
+        })
+        .collect();
+    for (f, c) in fr.iter_mut().zip(corr) {
+        let Some(r) = c else { continue };
+        let a = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+        if a < 1e-9 {
+            continue;
+        }
+        let k = r.map(|v| v / a);
+        let (s_, c_) = a.sin_cos();
+        let v = 1.0 - c_;
+        let rot = [
+            c_ + k[0] * k[0] * v,
+            k[0] * k[1] * v - k[2] * s_,
+            k[0] * k[2] * v + k[1] * s_,
+            k[1] * k[0] * v + k[2] * s_,
+            c_ + k[1] * k[1] * v,
+            k[1] * k[2] * v - k[0] * s_,
+            k[2] * k[0] * v - k[1] * s_,
+            k[2] * k[1] * v + k[0] * s_,
+            c_ + k[2] * k[2] * v,
+        ];
+        let p = f.1;
+        let mut q = p;
+        for i in 0..3 {
+            for j in 0..3 {
+                q[i * 4 + j] = rot[i * 3] * p[j] + rot[i * 3 + 1] * p[4 + j] + rot[i * 3 + 2] * p[8 + j];
+            }
+        }
+        f.1 = q;
+        n_done += 1;
+        max_a = max_a.max(a.to_degrees());
+    }
+    (n_done, max_a)
+}
+
 /// 같은 프로세스 처리 루프용: 입력을 열고, 첫 장면을 읽어 ORB-SLAM3 를 만든다(첫 장면은 첫 step 에 넣음)
 pub struct Orb3Backend {
     inner: Option<Orb3>,
@@ -659,6 +781,42 @@ impl SlamBackend for Orb3Backend {
             *cnt.entry(x.1).or_default() += 1;
         }
         let main_map = cnt.iter().max_by_key(|x| *x.1).map(|x| *x.0);
+        // 끝난 뒤 지도 통째 맞춤: 못 이은 지도를 가장 큰 지도에(깊이 자유 공간 검사, mapmerge)
+        let mut xf: HashMap<u64, T34> = HashMap::new();
+        if let (Some(mm), Some(k)) = (main_map, s.dk) {
+            let mut dfr: Vec<(u64, T34, &[u16])> = Vec::new();
+            for (_, kf, rel, d) in &s.deps {
+                if let Some((m, p)) = s.sys.kf_now(*kf) {
+                    dfr.push((m, mul(&p, rel), d));
+                }
+            }
+            let mut maps: HashMap<u64, Vec<crate::mapmerge::Frame>> = HashMap::new();
+            for (m, p, d) in &dfr {
+                maps.entry(*m).or_default().push(crate::mapmerge::Frame { pose: *p, d });
+            }
+            let mut hyps = Vec::new();
+            for h in &s.hits_all {
+                if let (Some((ma, pa)), Some((mb, pb))) = (s.sys.kf_now(h.q_kf), s.sys.kf_now(h.c_kf)) {
+                    if ma != mb {
+                        let q_a = mul(&pa, &h.q_rel);
+                        let c_b = mul(&pb, &h.c_rel);
+                        hyps.push((ma, mb, mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a))));
+                    }
+                }
+            }
+            let t0 = Instant::now();
+            let mut log = Vec::new();
+            xf = crate::mapmerge::merge(&maps, &hyps, &k, mm, &mut log);
+            for l in &log {
+                common::info!("끝난 뒤 지도 맞춤: {l}");
+            }
+            common::info!("끝난 뒤 지도 맞춤: 후보 {} 개, 붙인 지도 {} 개, {:.1} 초", hyps.len(), xf.len() - 1, t0.elapsed().as_secs_f64());
+        }
+        let orig: Vec<u64> = per.iter().map(|x| x.1).collect();
+        let per: Vec<(f64, u64, T34)> = per.into_iter().map(|(t, m, p)| match xf.get(&m) {
+            Some(x) => (t, main_map.unwrap(), mul(x, &p)),
+            None => (t, m, p),
+        }).collect();
         let ref_map = s.ref_kf.and_then(|(id, _)| s.sys.kf_now(id));
         // 보낸 세계 ← 끝 ORB 지도(기준 키프레임이 큰 지도에 있으면 그 못 박음, 아니면 지금 값)
         let a_end = match ref_map {
@@ -667,12 +825,24 @@ impl SlamBackend for Orb3Backend {
         };
         let in_main = per.iter().filter(|x| Some(x.1) == main_map).count();
         let other = per.len() - in_main;
-        let lines: Vec<String> = per.iter().filter(|x| Some(x.1) == main_map).map(|x| tum_line(x.0, &mul(&a_end, &x.2))).collect();
+        let mut outp: Vec<(f64, T34, u64)> = per.iter().zip(&orig).filter(|x| Some(x.0 .1) == main_map).map(|(x, o)| (x.0, mul(&a_end, &x.2), *o)).collect();
+        let (n_lv, max_lv) = level(&mut outp, &s.imu_hist);
+        common::info!("끝난 지도 기울기 바로잡기: 장면 {n_lv} 개, 가장 큰 바로잡음 {max_lv:.1}°");
+        let lines: Vec<String> = outp.iter().map(|x| tum_line(x.0, &x.1)).collect();
         if !s.final_path.is_empty() {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&s.final_path).map_err(|e| format!("{}: {e}", s.final_path))?);
             let _ = writeln!(f, "# timestamp x y z qx qy qz qw (컬러 카메라 광학 → 지도, 끝난 기준 지도)");
             for l in &lines {
                 let _ = writeln!(f, "{l}");
+            }
+        }
+        // 시험용: 모든 지도의 장면 위치(STITCH_LOG 옆 .maps): t 지도 TUM
+        if let Ok(p) = std::env::var("STITCH_LOG") {
+            if let Ok(f) = std::fs::File::create(format!("{p}.maps")) {
+                let mut f = std::io::BufWriter::new(f);
+                for x in &per {
+                    let _ = writeln!(f, "{} {}", x.1, tum_line(x.0, &x.2));
+                }
             }
         }
         let mut maps: HashMap<u64, usize> = HashMap::new();

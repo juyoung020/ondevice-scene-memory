@@ -52,19 +52,23 @@ struct Ops<'a, S: KfSteps> {
 
 impl<S: KfSteps> LocalMapperOps for Ops<'_, S> {
     fn process_new_keyframe(&mut self) {
-        self.steps.process_new_keyframe(self.st, self.kf)
+        self.steps.process_new_keyframe(self.st, self.kf);
+        step_digest(self.st, self.kf, "pnk");
     }
     fn map_point_culling(&mut self) {
-        self.steps.map_point_culling(self.st, self.kf)
+        self.steps.map_point_culling(self.st, self.kf);
+        step_digest(self.st, self.kf, "mpc");
     }
     fn create_new_map_points(&mut self) {
-        self.steps.create_new_map_points(self.st, self.kf)
+        self.steps.create_new_map_points(self.st, self.kf);
+        step_digest(self.st, self.kf, "cnmp");
     }
     fn check_new_keyframes(&mut self) -> bool {
         self.mapper.check_new_keyframes()
     }
     fn search_in_neighbors(&mut self) {
-        self.steps.search_in_neighbors(self.st, self.kf)
+        self.steps.search_in_neighbors(self.st, self.kf);
+        step_digest(self.st, self.kf, "sin");
     }
     fn stop_requested(&mut self) -> bool {
         self.mapper.stop_requested()
@@ -78,13 +82,85 @@ impl<S: KfSteps> LocalMapperOps for Ops<'_, S> {
         let s = lba::local_bundle_adjustment(self.kf, &mut self.st.atlas, &mut self.st.ext, self.st.inertial, &|| abort.load(Ordering::SeqCst));
         self.stats.local_ba += 1;
         self.stats.local_ba_iters += s.iterations as u64;
+        step_digest(self.st, self.kf, "lba");
     }
     fn keyframe_culling(&mut self) {
-        self.steps.keyframe_culling(self.st, self.kf)
+        self.steps.keyframe_culling(self.st, self.kf);
+        step_digest(self.st, self.kf, "kfc");
     }
     fn insert_in_loop_closer(&mut self) {
         self.to_loop = true;
     }
+}
+
+/// 재생 대조용(ORBSYS_STEPS=파일): 단계 뒤 지금 지도 요약 한 줄 — 원본 쪽 `slam/tools/orb3sys_dump/steps_dump.cc` 와 같은 식
+/// (나쁘지 않은 키프레임 · 점, id 순, FNV-1a: 자세 · 연결 · KF 점 칸 · 점 위치/법선/거리 · 관측/nObs/기준 KF)
+pub fn step_digest(st: &MapState, kf: KfId, step: &str) {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(f) = OUT.get_or_init(|| std::env::var("ORBSYS_STEPS").ok().map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("ORBSYS_STEPS")))) else { return };
+    struct H(u64);
+    impl H {
+        fn b(&mut self, x: &[u8]) {
+            for c in x {
+                self.0 ^= *c as u64;
+                self.0 = self.0.wrapping_mul(1099511628211);
+            }
+        }
+        fn u(&mut self, v: u64) { self.b(&v.to_le_bytes()) }
+        fn i(&mut self, v: i32) { self.b(&v.to_le_bytes()) }
+        fn f(&mut self, v: f32) { self.b(&v.to_le_bytes()) }
+    }
+    let a = &st.atlas;
+    let mid = a.kfs[&kf].map;
+    let Some(m) = a.maps.iter().find(|m| m.id == mid) else { return };
+    let ks: Vec<KfId> = m.kfs.iter().copied().filter(|k| a.kfs.get(k).is_some_and(|x| !x.bad)).collect();
+    let ps: Vec<u64> = m.mps.iter().copied().filter(|p| a.mps.get(p).is_some_and(|x| !x.bad)).collect();
+    let mut ks = ks;
+    ks.sort_unstable();
+    let mut ps = ps;
+    ps.sort_unstable();
+    let o = 1469598103934665603u64;
+    let (mut hk, mut hc, mut hm, mut hp, mut ho) = (H(o), H(o), H(o), H(o), H(o));
+    for k in &ks {
+        let x = &a.kfs[k];
+        hk.u(*k);
+        for v in x.tcw.q { hk.f(v) }
+        for v in x.tcw.t { hk.f(v) }
+        hc.u(*k);
+        for (c, w) in &x.conn_weights { hc.u(*c); hc.i(*w) }
+        hc.u(x.parent.unwrap_or(u64::MAX));
+        for (c, w) in &x.ordered_conn { hc.u(*c); hc.i(*w) }
+        hm.u(*k);
+        for p in &x.map_points { hm.u(p.unwrap_or(u64::MAX)) }
+    }
+    for p in &ps {
+        let x = &a.mps[p];
+        hp.u(*p);
+        for v in x.pos { hp.f(v) }
+        for v in x.normal { hp.f(v) }
+        hp.f(x.min_dist);
+        hp.f(x.max_dist);
+        ho.u(*p);
+        ho.i(x.n_obs);
+        ho.u(x.ref_kf);
+        for (k, (l, r)) in &x.obs { ho.u(*k); ho.i(*l); ho.i(*r) }
+    }
+    if std::env::var_os("ORBSYS_STEPS_FULL").is_some() {
+        let mut t = String::new();
+        for k in &ks {
+            let x = &a.kfs[k];
+            t += &format!("  K{k} p{} w", x.parent.map_or(-1, |p| p as i64));
+            for (c, w) in &x.conn_weights { t += &format!(" {c}:{w}") }
+            t += " o";
+            for (c, w) in &x.ordered_conn { t += &format!(" {c}:{w}") }
+            t += "\n";
+        }
+        let _ = f.lock().unwrap().write_all(t.as_bytes());
+    }
+    let line = format!("{kf} {step} {} {} {:016x} {:016x} {:016x} {:016x} {:016x}
+", ks.len(), ps.len(), hk.0, hc.0, hm.0, hp.0, ho.0);
+    let _ = f.lock().unwrap().write_all(line.as_bytes());
 }
 
 /// LocalMapping::Run: 끝날 때까지 키프레임을 처리해 루프 대기열로 넘김
@@ -98,7 +174,8 @@ pub fn run(mapper: &Arc<Mapper<KfId>>, map: &MapUpdate<MapState>, loopq: &LoopQu
             ops.to_loop
         };
         stats.keyframes += 1;
-        if to_loop {
+        // LoopClosing::InsertKeyFrame: 원본은 0 번 키프레임을 대기열에 넣지 않음(그래서 KeyFrameDatabase 에도 없음)
+        if to_loop && kf != 0 {
             loopq.insert(kf);
         }
     }

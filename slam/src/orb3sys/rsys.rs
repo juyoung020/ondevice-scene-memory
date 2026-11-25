@@ -90,6 +90,8 @@ impl KfSteps for RsSteps {
         localmap::search_in_neighbors(&mut st.atlas, kf, &abort);
     }
     fn keyframe_culling(&mut self, st: &mut MapState, kf: KfId) {
+        // 원본 KeyFrameCulling 첫 줄: mpCurrentKeyFrame->UpdateBestCovisibles()(15 미만 연결까지 순서 목록에 들어감)
+        crate::orb3rs::mapdata::kf_update_best_covisibles(&mut st.atlas, kf);
         let local: Vec<KfId> = st.atlas.kfs[&kf].ordered_conn.iter().map(|c| c.0).collect();
         let th = self.th_depth;
         let abort = &self.mapper;

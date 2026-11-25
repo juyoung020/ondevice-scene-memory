@@ -12,7 +12,10 @@ case $1 in
   LIB="-L$S/lib -lORB_SLAM3 -L$S/Thirdparty/DBoW2/lib -lDBoW2 -L$S/Thirdparty/g2o/lib -lg2o $(pkg-config --libs opencv4) -Wl,--disable-new-dtags,-rpath,$S/lib:$S/Thirdparty/DBoW2/lib:$S/Thirdparty/g2o/lib:$P/lib -L$P/lib"
   g++ -include $S/include/OrderById.h -O2 -std=c++17 -march=native -ffp-contract=off -DCOMPILEDWITHC11 -DHAVE_GLEW -DHAVE_EIGEN -D_LINUX_ $INC "$D/flow_dump.cc" -o $OUT/flow_dump $LIB \
     -lpango_display -lpango_core -lpango_windowing -lpango_opengl -lGLEW -lGL -lboost_serialization
+  g++ -include $S/include/OrderById.h -O2 -std=c++17 -march=native -ffp-contract=off -DCOMPILEDWITHC11 -DHAVE_GLEW -DHAVE_EIGEN -D_LINUX_ $INC "$D/steps_dump.cc" -o $OUT/steps_dump $LIB     -lpango_display -lpango_core -lpango_windowing -lpango_opengl -lGLEW -lGL -lboost_serialization
   g++ -O3 -std=c++17 -DNDEBUG -march=native -ffp-contract=off -I$S/Thirdparty/Sophus -isystem /usr/include/eigen3 "$D/graft_probe.cc" -o $OUT/graft_probe ;;
  run) ulimit -c 0; LD_LIBRARY_PATH=$P/lib timeout ${ORBSYS_TIMEOUT:-2400} $OUT/flow_dump $HOME/slam-bench/orb3-nopango/Vocabulary/ORBvoc.txt "$3" "$4" "$2" 0-100000 2>&1 | tail -1 ;;
  graft) $OUT/graft_probe "$2" "$3" ;;
+ # 지도 스레드 단계별 요약: bash run.sh steps 출력.txt 장수 [yaml] [녹화폴더] (Rust 쪽은 ORBSYS_STEPS=출력.txt 로 orb3_sys_run rs)
+ steps) ulimit -c 0; LD_LIBRARY_PATH=$P/lib timeout ${ORBSYS_TIMEOUT:-2400} $OUT/steps_dump $HOME/slam-bench/orb3-nopango/Vocabulary/ORBvoc.txt "${4:-$HOME/opt/orb3_ba_bg/ds.yaml}" "${5:-$HOME/rec_dl/ds_1118_121652/cam}" "$3" "$2" 2>&1 | tail -1 ;;
 esac

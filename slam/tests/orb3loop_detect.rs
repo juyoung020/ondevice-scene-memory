@@ -175,6 +175,7 @@ struct Tally {
     ok: u64,
     osim_n: u64,
     osim_same: u64,
+    last_n: u64,
     bad: Vec<String>,
 }
 
@@ -383,6 +384,7 @@ fn run(path: &str, srv: &mut Srv, t: &mut Tally) {
             let _ = cur;
         } else {
             assert_eq!(kind, 0x4c524344, "DCRL 자리 아님");
+            t.last_n += 1;
             let cur = r.u64();
             let member = r.u64();
             let matched = r.u64();
@@ -435,7 +437,7 @@ fn detect_common_regions_match_original() {
     for p in dumps.split(':') {
         run(p, &mut srv, &mut t);
     }
-    eprintln!("호출 {}(참 {}) 중 같음 {}, OptimizeSim3 {} 중 같음 {}", t.n, t.ok, t.same, t.osim_n, t.osim_same);
+    eprintln!("호출 {}(참 {}, 그중 LastKF {}) 중 같음 {}, OptimizeSim3 {} 중 같음 {}", t.n, t.ok, t.last_n, t.same, t.osim_n, t.osim_same);
     for s in &t.bad {
         eprintln!("  {s}");
     }

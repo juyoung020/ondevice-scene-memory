@@ -65,8 +65,14 @@ impl G2oSim3 {
     pub fn from_rows(m: &[[f64; 3]; 3], t: [f64; 3], s: f64) -> G2oSim3 {
         G2oSim3 { r: quatd_from_mat(m), t, s }
     }
-    /// Sim3(SE3f.cast<double>().unit_quaternion(), translation, 1)
+    /// Sim3(SE3f.cast<double>().unit_quaternion(), translation, 1): Sophus 의 cast 는 SO3d 생성자를 거쳐 double 로 다시 정규화
     pub fn from_se3(p: &Se3) -> G2oSim3 {
+        let q = p.q.map(f64::from);
+        let n = ((q[0] * q[0] + q[2] * q[2]) + (q[1] * q[1] + q[3] * q[3])).sqrt();
+        G2oSim3 { r: [q[0] / n, q[1] / n, q[2] / n, q[3] / n], t: p.t.map(f64::from), s: 1.0 }
+    }
+    /// Sim3(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>(), 1): 사원수만 내려받음(정규화 없음)
+    pub fn from_se3_raw(p: &Se3) -> G2oSim3 {
         G2oSim3 { r: p.q.map(f64::from), t: p.t.map(f64::from), s: 1.0 }
     }
     /// Sim3(R(float 행 우선).cast<double>(), t.cast<double>(), s)

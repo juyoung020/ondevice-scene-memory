@@ -1239,6 +1239,183 @@ fn sini(r: &mut R, t: &mut Tally, tpts: &mut Tally) {
     }
 }
 
+// ---------------- LocalMapping 단계 통째(PNKF · SINB) ----------------
+
+fn map_id(v: i64) -> MapId {
+    v as u64
+}
+fn read_kf_full(r: &mut R) -> KeyFrame {
+    let id = r.u64();
+    let frame_id = r.u64();
+    let map = map_id(r.i64());
+    let timestamp = r.f64();
+    let bad = r.b();
+    let not_erase = r.b();
+    let first_conn_done = !r.b();
+    let tcw = read_pose(r);
+    let twc = read_pose(r);
+    let n = r.u32() as usize;
+    let mut k = KeyFrame { id, frame_id, map, timestamp, bad, not_erase, first_conn_done, tcw, twc, ctx: ctx(), ..Default::default() };
+    for _ in 0..n {
+        k.keys.push(KeyPoint { x: r.f32(), y: r.f32(), size: r.f32(), angle: r.f32(), response: r.f32(), octave: r.i32(), class_id: -1 });
+        k.keys_raw.push([r.f32(), r.f32()]);
+        k.desc.push(read_desc(r));
+        k.u_right.push(r.f32());
+        k.depth.push(r.f32());
+        k.map_points.push(opt_id(r.u64()));
+    }
+    let nb = r.u32();
+    k.bow = (0..nb).map(|_| (r.u32(), r.f64())).collect();
+    k.feat = read_feat(r);
+    let nc = r.u32();
+    k.conn_weights = (0..nc).map(|_| (r.u64(), r.i32())).collect();
+    let no = r.u32();
+    k.ordered_conn = (0..no).map(|_| (r.u64(), r.i32())).collect();
+    k.parent = opt_id(r.u64());
+    let nch = r.u32();
+    k.children = (0..nch).map(|_| r.u64()).collect();
+    let mut f = Frame { keys: k.keys.clone(), ctx: ctx(), ..Default::default() };
+    f.assign_grid();
+    k.grid = f.grid;
+    k
+}
+fn read_mp_full(r: &mut R) -> MapPoint {
+    let id = r.u64();
+    let map = map_id(r.i64());
+    let bad = r.b();
+    let pos = [r.f32(), r.f32(), r.f32()];
+    let normal = [r.f32(), r.f32(), r.f32()];
+    let desc = read_desc(r);
+    let n_obs = r.i32();
+    let (min_dist, max_dist) = (r.f32(), r.f32());
+    let ref_kf = r.u64();
+    let first_kf = r.u64();
+    let first_frame = r.u64();
+    let replaced = opt_id(r.u64());
+    let (visible, found) = (r.i32(), r.i32());
+    let no = r.u32();
+    let obs = (0..no).map(|_| (r.u64(), (r.i32(), r.i32()))).collect();
+    MapPoint { id, map, bad, pos, normal, desc, n_obs, min_dist, max_dist, ref_kf, first_kf, first_frame, replaced, visible, found, obs, ..Default::default() }
+}
+/// 지도 조각 → Atlas. 돌려줌: (통째 키프레임 번호들, 점 번호들)
+fn read_region(r: &mut R, a: &mut Atlas) -> (Vec<KfId>, Vec<MpId>) {
+    let nk = r.u32();
+    let mut ks = Vec::new();
+    for _ in 0..nk {
+        let k = read_kf_full(r);
+        ks.push(k.id);
+        a.kfs.insert(k.id, k);
+    }
+    let nm = r.u32();
+    let mut ms = Vec::new();
+    for _ in 0..nm {
+        let m = read_mp_full(r);
+        ms.push(m.id);
+        a.mps.insert(m.id, m);
+    }
+    let ns = r.u32();
+    for _ in 0..ns {
+        let id = r.u64();
+        let bad = r.b();
+        let map = map_id(r.i64());
+        a.kfs.insert(id, KeyFrame { id, bad, map, ctx: ctx(), ..Default::default() });
+    }
+    (ks, ms)
+}
+type KfCmp = (Vec<Option<u64>>, Vec<(u64, i32)>, Vec<(u64, i32)>, Option<u64>, Vec<u64>, bool);
+fn kf_cmp(k: &KeyFrame) -> KfCmp {
+    let mut ch = k.children.clone();
+    ch.sort_unstable();
+    (k.map_points.clone(), k.conn_weights.iter().map(|(a, b)| (*a, *b)).collect(), k.ordered_conn.clone(), k.parent, ch, k.bad)
+}
+type MpCmp = (bool, [u32; 3], [u32; 3], Desc, i32, u32, u32, u64, Option<u64>, i32, i32, Vec<(u64, (i32, i32))>);
+fn mp_cmp(m: &MapPoint) -> MpCmp {
+    (
+        m.bad,
+        m.pos.map(f32::to_bits),
+        m.normal.map(f32::to_bits),
+        m.desc,
+        m.n_obs,
+        m.min_dist.to_bits(),
+        m.max_dist.to_bits(),
+        m.ref_kf,
+        m.replaced,
+        m.visible,
+        m.found,
+        m.obs.iter().map(|(a, b)| (*a, *b)).collect(),
+    )
+}
+/// 단계 뒤 조각을 원본과 비교: (키프레임 같음, 점 같음, 첫 차이)
+fn cmp_region(r: &mut R, a: &Atlas, ks: &[KfId], ms: &[MpId]) -> (bool, bool, String) {
+    let mut why = String::new();
+    let mut kok = true;
+    for &k in ks {
+        let w = read_kf_full(r);
+        let (x, y) = (kf_cmp(&w), kf_cmp(&a.kfs[&k]));
+        if x != y && kok {
+            kok = false;
+            let f = |i: usize| match i {
+                0 => format!("점 {:?}", x.0.iter().zip(&y.0).enumerate().find(|(_, (p, q))| p != q)),
+                1 => format!("무게 {:?} / {:?}", x.1, y.1),
+                2 => format!("순서 {:?} / {:?}", x.2, y.2),
+                _ => format!("부모 {:?}/{:?} 자식 {:?}/{:?} 나쁨 {}/{}", x.3, y.3, x.4, y.4, x.5, y.5),
+            };
+            let i = if x.0 != y.0 { 0 } else if x.1 != y.1 { 1 } else if x.2 != y.2 { 2 } else { 3 };
+            why += &format!("키프레임 {k}: {} ", f(i));
+        }
+    }
+    let mut mok = true;
+    for &m in ms {
+        let w = read_mp_full(r);
+        let (x, y) = (mp_cmp(&w), mp_cmp(&a.mps[&m]));
+        if x != y && mok {
+            mok = false;
+            why += &format!("점 {m}: 원본 {x:?} rust {y:?}");
+        }
+    }
+    (kok, mok, why)
+}
+fn read_map(r: &mut R) -> (MapId, KfId, bool) {
+    (map_id(r.i64()), r.u64(), r.b())
+}
+
+/// PNKF: ProcessNewKeyFrame 통째
+fn pnkf(r: &mut R, tk: &mut Tally, tm: &mut Tally, tr: &mut Tally) {
+    let kf = r.u64();
+    let (mid_, init, had) = read_map(r);
+    let mut a = Atlas::default();
+    let (ks, ms) = read_region(r, &mut a);
+    a.maps.push(Map { id: mid_, init_kf_id: init, kfs: if had { vec![kf] } else { vec![] }, ..Default::default() });
+    let mut recent = Vec::new();
+    process_new_keyframe(&mut a, kf, &mut recent);
+    let (_, _, has) = read_map(r);
+    let (kok, mok, why) = cmp_region(r, &a, &ks, &ms);
+    let n = r.u32();
+    let want: Vec<u64> = (0..n).map(|_| r.u64()).collect();
+    tk.add(kok && has == a.maps[0].kfs.contains(&kf), || format!("키프레임 {kf}: {why}"));
+    tm.add(mok, || format!("키프레임 {kf}: {why}"));
+    tr.add(want == recent, || format!("키프레임 {kf}: 최근 점 원본 {} rust {}", want.len(), recent.len()));
+}
+
+/// SINB: SearchInNeighbors 통째. 원본 도중 mbAbortBA 가 서면 따로 셈
+fn sinb(r: &mut R, tk: &mut Tally, tm: &mut Tally, racy: &mut Tally) {
+    let kf = r.u64();
+    let ab0 = r.b();
+    let mut a = Atlas::default();
+    let (ks, ms) = read_region(r, &mut a);
+    let map = a.kfs[&kf].map;
+    a.maps.push(Map { id: map, ..Default::default() });
+    let ab1 = r.b();
+    search_in_neighbors(&mut a, kf, &|| ab1);
+    let (kok, mok, why) = cmp_region(r, &a, &ks, &ms);
+    if ab0 || ab1 {
+        racy.add(kok && mok, || format!("키프레임 {kf}: {why}"));
+    } else {
+        tk.add(kok, || format!("키프레임 {kf}: {why}"));
+        tm.add(mok, || format!("키프레임 {kf}: {why}"));
+    }
+}
+
 fn main() {
     let path = std::env::args().nth(1).expect("dump.bin");
     let d = std::fs::read(&path).unwrap();
@@ -1323,6 +1500,24 @@ fn main() {
                 let mut b = std::mem::take(tal.entry("StereoInitialization 새 점").or_default());
                 sini(&mut r, tal.entry("StereoInitialization").or_default(), &mut b);
                 tal.insert("StereoInitialization 새 점", b);
+            }
+            "PNKF" => {
+                let mut a = std::mem::take(tal.entry("ProcessNewKeyFrame 키프레임").or_default());
+                let mut b = std::mem::take(tal.entry("ProcessNewKeyFrame 점").or_default());
+                let mut c = std::mem::take(tal.entry("ProcessNewKeyFrame 최근 점").or_default());
+                pnkf(&mut r, &mut a, &mut b, &mut c);
+                tal.insert("ProcessNewKeyFrame 키프레임", a);
+                tal.insert("ProcessNewKeyFrame 점", b);
+                tal.insert("ProcessNewKeyFrame 최근 점", c);
+            }
+            "SINB" => {
+                let mut a = std::mem::take(tal.entry("SearchInNeighbors 키프레임").or_default());
+                let mut b = std::mem::take(tal.entry("SearchInNeighbors 점").or_default());
+                let mut c = std::mem::take(tal.entry("SearchInNeighbors(도중 중단 깃발 · 참고)").or_default());
+                sinb(&mut r, &mut a, &mut b, &mut c);
+                tal.insert("SearchInNeighbors 키프레임", a);
+                tal.insert("SearchInNeighbors 점", b);
+                tal.insert("SearchInNeighbors(도중 중단 깃발 · 참고)", c);
             }
             "FRAM" => {
                 frames += 1;

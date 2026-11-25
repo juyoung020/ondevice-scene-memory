@@ -68,32 +68,7 @@ impl KfSteps for RsSteps {
             k.bow = bv.into_iter().collect();
             k.feat = fv.into_iter().collect();
         }
-        let slots = st.atlas.kfs[&kf].map_points.clone();
-        for (i, slot) in slots.iter().enumerate() {
-            let Some(mp) = *slot else { continue };
-            if st.atlas.mps[&mp].bad {
-                continue;
-            }
-            if !st.atlas.mps[&mp].obs.contains_key(&kf) {
-                let a = &mut st.atlas;
-                let k = &a.kfs[&kf];
-                a.mps.get_mut(&mp).unwrap().add_observation(k, i);
-                crate::orb3rs::mapdata::mp_update_normal_and_depth(a, mp);
-                let kfs = &a.kfs;
-                a.mps.get_mut(&mp).unwrap().compute_distinctive_descriptors(kfs);
-            } else {
-                // 추적이 넣은 새 깊이 점
-                self.recent.push(mp);
-            }
-        }
-        let map = st.atlas.kfs[&kf].map;
-        crate::orb3rs::mapdata::kf_update_connections(&mut st.atlas, kf, true);
-        // Atlas::AddKeyFrame(지금 지도 집합)
-        if let Some(mi) = st.atlas.maps.iter_mut().find(|x| x.id == map) {
-            if let Err(p) = mi.kfs.binary_search(&kf) {
-                mi.kfs.insert(p, kf);
-            }
-        }
+        localmap::process_new_keyframe(&mut st.atlas, kf, &mut self.recent);
     }
     fn map_point_culling(&mut self, st: &mut MapState, kf: KfId) {
         self.reset_if_requested();
@@ -106,59 +81,7 @@ impl KfSteps for RsSteps {
     /// LocalMapping::SearchInNeighbors(단안 · 관성 아님). mnFuseTargetForKF · mnFuseCandidateForKF 표시는 이 호출 안의 집합
     fn search_in_neighbors(&mut self, st: &mut MapState, kf: KfId) {
         let abort = || self.mapper.abort_ba().load(std::sync::atomic::Ordering::SeqCst);
-        let mut marked = std::collections::BTreeSet::new();
-        let mut targets: Vec<KfId> = Vec::new();
-        for k in best_covisibles(&st.atlas.kfs[&kf], 10) {
-            if st.atlas.kfs[&k].bad || marked.contains(&k) {
-                continue;
-            }
-            targets.push(k);
-            marked.insert(k);
-        }
-        let n1 = targets.len();
-        for i in 0..n1 {
-            for k2 in best_covisibles(&st.atlas.kfs[&targets[i]], 20) {
-                if st.atlas.kfs[&k2].bad || marked.contains(&k2) || k2 == kf {
-                    continue;
-                }
-                targets.push(k2);
-                marked.insert(k2);
-            }
-            if abort() {
-                break;
-            }
-        }
-        let m = Matcher::new(0.6, true);
-        let cur_pts = st.atlas.kfs[&kf].map_points.clone();
-        let mut touched: Vec<MpId> = cur_pts.iter().flatten().copied().collect();
-        for &t in &targets {
-            m.fuse(t, &mut st.atlas.kfs, &cur_pts, &mut st.atlas.mps, 3.0);
-        }
-        if abort() {
-            return;
-        }
-        let mut cand_set = std::collections::HashSet::new();
-        let mut cands: Vec<Option<MpId>> = Vec::new();
-        for &t in &targets {
-            for p in st.atlas.kfs[&t].map_points.iter().flatten() {
-                if st.atlas.mps[p].bad || !cand_set.insert(*p) {
-                    continue;
-                }
-                cands.push(Some(*p));
-            }
-        }
-        m.fuse(kf, &mut st.atlas.kfs, &cands, &mut st.atlas.mps, 3.0);
-        touched.extend(cands.iter().flatten());
-        for p in st.atlas.kfs[&kf].map_points.clone().into_iter().flatten() {
-            if !st.atlas.mps[&p].bad {
-                let a = &mut st.atlas;
-                let kfs = &a.kfs;
-                a.mps.get_mut(&p).unwrap().compute_distinctive_descriptors(kfs);
-                crate::orb3rs::mapdata::mp_update_normal_and_depth(a, p);
-            }
-            touched.push(p);
-        }
-        crate::orb3rs::mapdata::kf_update_connections(&mut st.atlas, kf, true);
+        localmap::search_in_neighbors(&mut st.atlas, kf, &abort);
     }
     fn keyframe_culling(&mut self, st: &mut MapState, kf: KfId) {
         let local: Vec<KfId> = st.atlas.kfs[&kf].ordered_conn.iter().map(|c| c.0).collect();

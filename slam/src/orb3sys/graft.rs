@@ -85,8 +85,8 @@ pub fn so3_log_norm(q: &[f32; 4]) -> f32 {
 /// YawOnly: z 축 방위 + 이동만(Eigen AngleAxisf(yaw, UnitZ).toRotationMatrix() → SE3f(R, t))
 pub fn yaw_only(s: &Se3) -> Se3 {
     let r = s.rot();
-    // 원본 atan2(float, float) 는 이름공간 없는 C atan2(double) 로 풀림
-    let yaw = (r[1][0] as f64).atan2(r[0][0] as f64) as f32;
+    // 원본 라이브러리(libORB_SLAM3, 기준 빌드)는 atan2f 를 부름(디스어셈블로 확인 — 따로 빌드한 probe 는 double atan2 로 풀려 달랐음)
+    let yaw = r[1][0].atan2(r[0][0]);
     let (sn, c) = (yaw.sin(), yaw.cos());
     // AngleAxis::toRotationMatrix, 축 (0, 0, 1): 대각 tmp·axis + c, (2, 2) = (1 − c) + c
     let one_c = 1.0f32 - c;

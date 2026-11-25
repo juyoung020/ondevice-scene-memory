@@ -95,10 +95,31 @@ impl<S: KfSteps> LocalMapperOps for Ops<'_, S> {
 
 /// 재생 대조용(ORBSYS_STEPS=파일): 단계 뒤 지금 지도 요약 한 줄 — 원본 쪽 `slam/tools/orb3sys_dump/steps_dump.cc` 와 같은 식
 /// (나쁘지 않은 키프레임 · 점, id 순, FNV-1a: 자세 · 연결 · KF 점 칸 · 점 위치/법선/거리 · 관측/nObs/기준 KF)
-pub fn step_digest(st: &MapState, kf: KfId, step: &str) {
-    use std::io::Write;
+fn steps_out() -> Option<&'static std::sync::Mutex<std::fs::File>> {
     static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
-    let Some(f) = OUT.get_or_init(|| std::env::var("ORBSYS_STEPS").ok().map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("ORBSYS_STEPS")))) else { return };
+    OUT.get_or_init(|| std::env::var("ORBSYS_STEPS").ok().map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("ORBSYS_STEPS")))).as_ref()
+}
+
+/// 재생 대조용: 단계 파일에 줄 하나(ORBSYS_STEPS 없으면 아무것도 안 함)
+pub fn step_text(s: &str) {
+    use std::io::Write;
+    if let Some(f) = steps_out() {
+        let _ = f.lock().unwrap().write_all(s.as_bytes());
+    }
+}
+
+/// 자세 7 칸(사원수 x y z w, 이동) 비트 16 진
+pub fn se3_hex(p: &crate::orb3rs::types::Se3) -> String {
+    p.q.iter().chain(p.t.iter()).map(|v| format!("{:08x}", v.to_bits())).collect::<Vec<_>>().join(" ")
+}
+
+pub fn step_digest(st: &MapState, kf: KfId, step: &str) {
+    step_digest_atlas(&st.atlas, kf, step)
+}
+
+pub fn step_digest_atlas(a: &crate::orb3rs::types::Atlas, kf: KfId, step: &str) {
+    use std::io::Write;
+    let Some(f) = steps_out() else { return };
     struct H(u64);
     impl H {
         fn b(&mut self, x: &[u8]) {
@@ -111,7 +132,6 @@ pub fn step_digest(st: &MapState, kf: KfId, step: &str) {
         fn i(&mut self, v: i32) { self.b(&v.to_le_bytes()) }
         fn f(&mut self, v: f32) { self.b(&v.to_le_bytes()) }
     }
-    let a = &st.atlas;
     let mid = a.kfs[&kf].map;
     let Some(m) = a.maps.iter().find(|m| m.id == mid) else { return };
     let ks: Vec<KfId> = m.kfs.iter().copied().filter(|k| a.kfs.get(k).is_some_and(|x| !x.bad)).collect();

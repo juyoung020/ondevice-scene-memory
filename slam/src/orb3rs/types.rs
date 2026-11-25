@@ -234,6 +234,8 @@ pub struct Atlas {
     pub mps: BTreeMap<MpId, MapPoint>,
     pub next_kf: KfId,
     pub next_mp: MpId,
+    /// Map::nNextId: 지운 지도(옮겨 붙이기 · 합치기)의 번호도 다시 쓰지 않음
+    pub next_map: MapId,
 }
 
 // ---------- Sophus SE3f · Eigen float 연산(원본 빌드와 비트 동일, ~/opt/orb3_geom 으로 확인) ----------

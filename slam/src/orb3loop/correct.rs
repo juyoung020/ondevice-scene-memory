@@ -124,6 +124,7 @@ pub fn correct_loop<E: EssentialGraph>(inp: &LoopIn, a: &mut Atlas, corrected_by
     // SearchAndFuse(CorrectedSim3, mvpLoopMapPoints)
     let lmps: Vec<MpId> = inp.loop_mps.iter().map(|m| m.expect("mvpLoopMapPoints 에 NULL")).collect();
     search_and_fuse(&corrected, &lmps, a);
+    crate::orb3sys::mapping::step_digest_atlas(a, inp.cur, "fuse");
     let mut loop_conn: BTreeMap<KfId, BTreeSet<KfId>> = BTreeMap::new();
     for &k in &conn_kfs {
         let prev: Vec<KfId> = a.kfs[&k].ordered_conn.iter().map(|c| c.0).collect();

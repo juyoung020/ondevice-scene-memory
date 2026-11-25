@@ -23,6 +23,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 thread_local! {
     /// 이 스레드가 쥔 지도 갱신 잠금 수
     static MAP_HELD: Cell<u32> = const { Cell::new(0) };
+    /// 이 스레드가 지도 갱신 잠금을 기다린 시간(ns, 계측용 — `take_map_wait_ns` 로 읽고 비움)
+    static MAP_WAIT_NS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// 이 스레드가 지금까지 지도 갱신 잠금을 기다린 시간(ns)을 읽고 0 으로
+pub fn take_map_wait_ns() -> u64 {
+    MAP_WAIT_NS.with(|c| c.replace(0))
 }
 
 fn assert_no_map_lock(what: &str) {
@@ -40,7 +47,16 @@ impl<T> MapUpdate<T> {
         MapUpdate(Mutex::new(v))
     }
     pub fn lock(&self) -> MapGuard<'_, T> {
-        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let g = match self.0.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let t0 = std::time::Instant::now();
+                let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                MAP_WAIT_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
+                g
+            }
+        };
         MAP_HELD.with(|c| c.set(c.get() + 1));
         MapGuard(g)
     }

@@ -342,7 +342,8 @@ fn atlas_create_new_map(a: &mut Atlas, last_init_kf: &mut KfId) {
             *last_init_kf = mx + 1;
         }
     }
-    let id = a.maps.iter().map(|m| m.id + 1).max().unwrap_or(0);
+    let id = a.maps.iter().map(|m| m.id + 1).max().unwrap_or(0).max(a.next_map);
+    a.next_map = id + 1;
     a.maps.push(Map { id, ..Default::default() });
     a.current = a.maps.len() - 1;
 }
@@ -368,6 +369,7 @@ impl Ops<'_> {
     }
     /// Frame::ComputeBoW
     fn compute_bow(&mut self) {
+        let _t = Tm::new("compute_bow");
         let voc = self.s.voc.clone().unwrap_or_else(|| hole("단어장(set_vocabulary) 없이 ComputeBoW"));
         let f = self.s.cur.as_mut().expect("지금 장면");
         if f.bow.is_empty() {
@@ -378,8 +380,60 @@ impl Ops<'_> {
     }
 }
 
+/// 추적 단계 자세 대조(ORBSYS_TRK=시작-끝 장면 번호, 원본 쪽 steps_dump.cc 의 T 줄과 같은 꼴)
+fn trk_on(id: u64) -> bool {
+    static R: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (a, b) = *R.get_or_init(|| std::env::var("ORBSYS_TRK").ok().and_then(|e| e.split_once('-').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).unwrap_or((1, 0)));
+    id >= a && id <= b
+}
+fn trk_pose(w: &str, id: u64, p: &Se3, n: i64) {
+    if trk_on(id) {
+        crate::orb3sys::mapping::step_text(&format!("T {id} {w} {} {n}\n", crate::orb3sys::mapping::se3_hex(p)));
+    }
+}
+fn nmp(f: &Frame) -> i64 {
+    (0..f.keys.len()).filter(|&i| f.map_points[i].is_some() && !f.outlier[i]).count() as i64
+}
+
+/// 추적 단계 계측(ORBSYS_TIME=파일): 장면마다 단계별 ms · 지도 갱신 잠금 기다린 ms
+struct Tm(&'static str, std::time::Instant);
+thread_local! {
+    static TIMES: std::cell::RefCell<Vec<(&'static str, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+impl Tm {
+    fn new(n: &'static str) -> Tm {
+        Tm(n, std::time::Instant::now())
+    }
+}
+impl Drop for Tm {
+    fn drop(&mut self) {
+        let ns = self.1.elapsed().as_nanos() as u64;
+        TIMES.with(|t| {
+            let mut t = t.borrow_mut();
+            match t.iter_mut().find(|e| e.0 == self.0) {
+                Some(e) => e.1 += ns,
+                None => t.push((self.0, ns)),
+            }
+        });
+    }
+}
+fn time_line(frame: u64, total_ns: u64) {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let wait = crate::orb3sys::threads::take_map_wait_ns();
+    let v = TIMES.with(|t| std::mem::take(&mut *t.borrow_mut()));
+    let Some(f) = OUT.get_or_init(|| std::env::var("ORBSYS_TIME").ok().map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("ORBSYS_TIME")))) else { return };
+    let mut l = format!("{frame}\t{:.3}\twait={:.3}", total_ns as f64 * 1e-6, wait as f64 * 1e-6);
+    for (n, ns) in v {
+        l += &format!("\t{n}={:.3}", ns as f64 * 1e-6);
+    }
+    l.push('\n');
+    let _ = f.lock().unwrap().write_all(l.as_bytes());
+}
+
 impl TrackOps for Ops<'_> {
     fn stereo_initialization(&mut self) -> i32 {
+        let _t = Tm::new("stereo_initialization");
         let mut t = self.tracker_now();
         t.state = state::NOT_INITIALIZED;
         let s = &mut *self.s;
@@ -397,6 +451,7 @@ impl TrackOps for Ops<'_> {
         t.state
     }
     fn check_replaced_in_last_frame(&mut self) {
+        let _t = Tm::new("check_replaced_in_last_frame");
         let s = &mut *self.s;
         if let Some(l) = s.last.as_mut() {
             let g = s.map.lock();
@@ -404,6 +459,7 @@ impl TrackOps for Ops<'_> {
         }
     }
     fn track_reference_keyframe(&mut self) -> bool {
+        let _t = Tm::new("track_reference_keyframe");
         self.compute_bow();
         let t = self.tracker_now();
         let s = &mut *self.s;
@@ -414,16 +470,26 @@ impl TrackOps for Ops<'_> {
         track::track_reference_keyframe(cur, last_pose, &rkf, &mut g.atlas.mps)
     }
     fn track_with_motion_model(&mut self) -> bool {
+        let _t = Tm::new("track_with_motion_model");
         let t = self.tracker_now();
         let s = &mut *self.s;
         let (Some(last), Some(tlr)) = (s.last.as_mut(), s.rel) else { return false };
         let cur = s.cur.as_mut().expect("지금 장면");
         let mut g = s.map.lock();
         let Some(ref_pose) = last.ref_kf.and_then(|k| g.atlas.kfs.get(&k)).map(|k| k.tcw) else { return false };
-        track::track_with_motion_model(cur, last, ref_pose, tlr, s.velocity, t.sensor, &mut g.atlas.mps)
+        if let Some(k) = last.ref_kf {
+            trk_pose("tlr", cur.id, &tlr, k as i64);
+            trk_pose("ref", cur.id, &ref_pose, g.atlas.kfs[&k].map as i64);
+        }
+        let r = track::track_with_motion_model(cur, last, ref_pose, tlr, s.velocity, t.sensor, &mut g.atlas.mps);
+        if let Some(p) = last.tcw {
+            trk_pose("ulf", cur.id, &p, nmp(last));
+        }
+        r
     }
     /// Tracking::Relocalization(pMap): ComputeBoW → DetectRelocalizationCandidates(F, pMap) → 재위치 흐름(`orb3loop::reloc`)
     fn relocalization(&mut self, map: Option<MapId>) -> bool {
+        let _t = Tm::new("relocalization");
         let voc = self.s.voc.clone().unwrap_or_else(|| hole("단어장(set_vocabulary) 없이 Relocalization"));
         let s = &mut *self.s;
         let f = s.cur.as_mut().expect("지금 장면");
@@ -439,19 +505,25 @@ impl TrackOps for Ops<'_> {
         let cands = {
             let mut db = s.kfdb.lock().unwrap();
             let db = db.as_mut().expect("KeyFrameDatabase");
+            let _t = Tm::new("reloc_db");
             db.detect_reloc(&AtlasGraph::new(&g.atlas), &bow, pmap as DbMap).into_iter().map(|k| k as KfId).collect::<Vec<_>>()
         };
         // 루프 스레드와 같은 수열: 잠금 안에서 잠깐 빌려 씀
         let mut rg = s.rand.lock().unwrap();
         let cell = std::cell::RefCell::new(std::mem::replace(&mut *rg, GlibcRand::new(1)));
-        let ok = relocalize(f, &cands, &g.atlas.kfs, &g.atlas.mps, &mut RustPnp { rand: &cell });
+        let ok = {
+            let _t = Tm::new("reloc_pnp");
+            relocalize(f, &cands, &g.atlas.kfs, &g.atlas.mps, &mut RustPnp { rand: &cell })
+        };
         *rg = cell.into_inner();
+        trk_pose(if ok { "rel1" } else { "rel0" }, f.id, &f.tcw.unwrap_or_default(), pmap as i64);
         if ok {
             self.ed.last_reloc_frame_id = Some(f.id);
         }
         ok
     }
     fn track_local_map(&mut self) -> bool {
+        let _t = Tm::new("track_local_map");
         let mut t = self.tracker_now();
         let far = (self.s.init.settings.th_far_points != 0.0, self.s.init.settings.th_far_points);
         let ok = {
@@ -459,7 +531,10 @@ impl TrackOps for Ops<'_> {
             let cur = s.cur.as_mut().expect("지금 장면");
             let mut g = s.map.lock();
             let st = &mut *g;
-            track::track_local_map(&mut t, cur, &mut st.atlas, &mut st.ext, &|k| k, far)
+            trk_pose("tlm0", cur.id, &cur.tcw.unwrap_or_default(), nmp(cur));
+            let r = track::track_local_map(&mut t, cur, &mut st.atlas, &mut st.ext, &|k| k, far);
+            trk_pose("tlm1", cur.id, &cur.tcw.unwrap_or_default(), if r { t.matches_inliers as i64 } else { -1 });
+            r
         };
         self.keep_local(&t);
         ok
@@ -469,6 +544,7 @@ impl TrackOps for Ops<'_> {
     }
     /// Tracking::CreateMapInAtlas 의 지도 · 장면 부분(추적 상태 칸은 `track::create_map_in_atlas`)
     fn create_map_in_atlas(&mut self) {
+        let _t = Tm::new("create_map_in_atlas");
         let s = &mut *self.s;
         s.last_init_frame_id = s.next_frame;
         {
@@ -492,6 +568,7 @@ impl TrackOps for Ops<'_> {
         self.s.changed = true;
     }
     fn need_new_keyframe(&mut self, t: &Tracker) -> bool {
+        let _t = Tm::new("need_new_keyframe");
         let mut t = t.clone();
         self.ed.apply(&mut t);
         let g = self.s.map.lock();
@@ -509,6 +586,7 @@ impl TrackOps for Ops<'_> {
         track::need_new_keyframe(&t, f, &*self.s.mapper, &ctx)
     }
     fn create_new_keyframe(&mut self) -> Option<KfId> {
+        let _t = Tm::new("create_new_keyframe");
         let th = self.s.init.tracking.th_depth;
         let s = &mut *self.s;
         if !s.mapper.set_not_stop(true) {
@@ -530,6 +608,7 @@ impl TrackOps for Ops<'_> {
     }
     /// 패치 Tracking::TryGraft: 지금 지도를 다른 지도(키프레임 많은 순)에 재위치해 보고, 같은 변환이 두 번이면 합치기 예약
     fn try_graft(&mut self) {
+        let _t = Tm::new("try_graft");
         let frame_id = self.s.cur.as_ref().expect("지금 장면").id;
         let (cur, mut maps) = {
             let g = self.s.map.lock();
@@ -595,10 +674,13 @@ impl TrackOps for Ops<'_> {
 
 impl Orb3System for RustSystem {
     fn track(&mut self, rgb: &[u8], depth: &[u16], w: u32, h: u32, t: f64, _up: Option<[f64; 3]>) -> Track {
+        let t_all = std::time::Instant::now();
         if std::mem::take(&mut self.reset_pending) {
+            let _t = Tm::new("reset");
             self.reset_active_map_now();
         }
         let (wu, hu) = (w as usize, h as usize);
+        let t_ex = Tm::new("extract");
         let mut gray = std::mem::take(&mut self.gray);
         let mut dep = std::mem::take(&mut self.depth);
         self.init.gray(rgb, wu, hu, 3, &mut gray);
@@ -610,25 +692,35 @@ impl Orb3System for RustSystem {
         self.gray = gray;
         self.depth = dep;
         self.last = self.cur.replace(f);
-        self.do_pending_graft();
+        drop(t_ex);
+        {
+            let _t = Tm::new("graft_apply");
+            self.do_pending_graft();
+        }
         let mut tr = std::mem::take(&mut self.tracker);
         let tk = tr.clone();
         let mut ops = Ops { s: self, ed: Edits::default(), tk };
-        track::track_flow(&mut tr, id, t, &mut ops);
+        {
+            let _t = Tm::new("flow");
+            track::track_flow(&mut tr, id, t, &mut ops);
+        }
         let ed = ops.ed;
         ed.apply(&mut tr);
         self.tracker = tr;
         self.track_tail();
+        // 지도 번호는 키프레임을 넘기기 전에 읽음(넘긴 뒤면 지도 스레드가 잡은 지도 잠금을 기다리게 됨)
+        let map_id = self.current_map_id();
+        let twc = match self.cur.as_ref().and_then(|f| f.tcw) {
+            // orb3.cc: put34(tcw.inverse()) — Sophus 역(사원수 켤레)의 행렬
+            Some(p) => crate::orb3cv::system::put34(&p.inverse()),
+            // 원본 TrackRGBD 는 자세가 없으면 Sophus::SE3f() (단위)
+            None => [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        };
         if let Some(k) = self.pending_kf.take() {
             self.mapper.insert(k);
             self.mapper.set_not_stop(false);
         }
-        let (twc, map_id) = match self.cur.as_ref().and_then(|f| f.tcw) {
-            // orb3.cc: put34(tcw.inverse()) — Sophus 역(사원수 켤레)의 행렬
-            Some(p) => (crate::orb3cv::system::put34(&p.inverse()), self.current_map_id()),
-            // 원본 TrackRGBD 는 자세가 없으면 Sophus::SE3f() (단위)
-            None => ([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], self.current_map_id()),
-        };
+        time_line(id, t_all.elapsed().as_nanos() as u64);
         Track { state: if self.tracker.state == state::OK { state::OK } else { self.tracker.state }, twc, map_id, ref_kf: self.tracker.reference_kf }
     }
     fn map_changed(&mut self) -> bool {
@@ -743,7 +835,28 @@ impl RustSystem {
         tok.wait();
         {
             let mut g = self.map.lock();
+            crate::orb3sys::mapping::step_text(&format!("G {from} {into} {}\n",crate::orb3sys::mapping::se3_hex(&s)));
+            let fm = g.atlas.maps.iter().find(|m| m.id == from).map(|m| (m.kfs.iter().copied().min(), m.mps.iter().copied().min()));
+            let pk = |g: &MapState, w: &str| {
+                if let Some((Some(k), Some(p))) = fm {
+                    let (kf, mp) = (&g.atlas.kfs[&k], &g.atlas.mps[&p]);
+                    let h = |v: &[f32]| v.iter().map(|x| format!("{:08x}", x.to_bits())).collect::<Vec<_>>().join(" ");
+                    crate::orb3sys::mapping::step_text(&format!("{w} K{k} {} P{p} {} N {}\n", crate::orb3sys::mapping::se3_hex(&kf.tcw), h(&mp.pos), h(&mp.normal)));
+                }
+            };
+            pk(&g, "GB");
             graft::graft_map(&mut g.atlas, from, into, &s);
+            pk(&g, "GA");
+            if let Some((&km, kf)) = g.atlas.kfs.iter().next_back() {
+                crate::orb3sys::mapping::step_text(&format!("T {km} GK {} {}\n",crate::orb3sys::mapping::se3_hex(&kf.tcw), kf.map));
+            }
+            let k0 = g.atlas.maps.iter().find(|m| m.id == into).and_then(|m| m.kfs.iter().copied().filter(|k| !g.atlas.kfs[k].bad).min());
+            if let Some(k0) = k0 {
+                crate::orb3sys::mapping::step_digest(&g, k0, "graft");
+            }
+            if let Some(p) = self.last.as_ref().and_then(|l| l.tcw) {
+                crate::orb3sys::mapping::step_text(&format!("GL {}\n",crate::orb3sys::mapping::se3_hex(&p)));
+            }
         }
         drop(tok);
         if move_cam {

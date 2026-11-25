@@ -7,7 +7,7 @@
 static Sophus::SE3f YawOnly(const Sophus::SE3f &S)
 {
     const Eigen::Matrix3f R = S.rotationMatrix();
-    const float yaw = atan2(R(1, 0), R(0, 0));
+    const float yaw = atan2f(R(1, 0), R(0, 0));  // 라이브러리 안 GraftMap 과 같게(atan2f)
     return Sophus::SE3f(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix(), S.translation());
 }
 static float rnd() { return (float)rand() / RAND_MAX * 2.f - 1.f; }

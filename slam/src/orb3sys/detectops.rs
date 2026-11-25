@@ -60,7 +60,7 @@ fn from_last<O: OptimizeSim3>(st: &mut MapState, b: &mut Branch, cur: KfId, is_l
     let scw = scl.mul(&b.slw);
     let out = {
         let w = World { kfs: &a.kfs, mps: &a.mps };
-        detect_and_refine_sim3_from_last_kf(&w, cur, cur, matched, &scw, false, opt)
+        detect_and_refine_sim3_from_last_kf(&w, cur, cur, matched, &scw, FIX_SCALE, opt)
     };
     if out.ok {
         b.n_coincidences += 1;
@@ -142,7 +142,7 @@ impl Detector {
             let mut o = b.bow_out();
             let found = {
                 let w = World { kfs: &st.atlas.kfs, mps: &st.atlas.mps };
-                detect_common_regions_from_bow(&w, cur, false, cands, opt, &mut rnd, &mut o)
+                detect_common_regions_from_bow(&w, cur, FIX_SCALE, cands, opt, &mut rnd, &mut o)
             };
             if let Some(k) = o.set_not_erase {
                 st.atlas.kfs.get_mut(&k).unwrap().not_erase = true;
@@ -183,13 +183,19 @@ impl<O: OptimizeSim3 + Send> RsLoop<O> {
     }
 }
 
+/// LoopClosing::mbFixScale = (mSensor != MONOCULAR) — RGB-D 는 참(공통 영역 찾기의 Sim3Solver · OptimizeSim3 · 본질 그래프 모두)
+const FIX_SCALE: bool = true;
+
 impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
     fn detect(&mut self, map: &super::threads::MapUpdate<MapState>, kf: u64) -> Found {
         let mut g = map.lock();
         let mut db = self.db.lock().unwrap();
         let db = db.as_mut().expect("KeyFrameDatabase(set_vocabulary)");
         let mut r = self.rand.lock().unwrap();
-        self.det.detect(&mut g, db, &mut r, kf as KfId, &mut self.opt)
+        let f = self.det.detect(&mut g, db, &mut r, kf as KfId, &mut self.opt);
+        let id = |k: Option<KfId>| k.map_or(-1, |k| k as i64);
+        super::mapping::step_text(&format!("L {kf} {} {} {} {}\n", f.looped as u8, f.merge as u8, id(self.det.lp.matched_kf), id(self.det.mg.matched_kf)));
+        f
     }
     /// 관성 없음: 늘 합침
     fn merge_accept(&mut self, _: &MapState) -> super::loopflow::MergeVerdict {
@@ -208,6 +214,7 @@ impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
         let mut lba = super::mergeops::RsMergeLba { ext, marks: &mut self.marks };
         let mut ess = super::mergeops::RsMergeEss { bef };
         let out = crate::orb3loop::merge::merge_local(&inp, atlas, &mut lba, &mut ess, &mut |_, _, _| {});
+        super::mapping::step_digest(st, cur, "merge");
         out.relaunch_gba.then_some(out.map as u64)
     }
     /// 관성 없음: 기울기 검사 없이 받아들임
@@ -222,7 +229,17 @@ impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
         let matched = b.matched_kf.expect("mpLoopMatchedKF");
         let map = st.atlas.kfs[&cur].map;
         let init = st.atlas.maps.iter().find(|m| m.id == map).map(|m| m.init_kf_id);
-        let inp = crate::orb3loop::correct::LoopIn { cur, matched, scw: b.slw, loop_mps: &b.mps, loop_matched: &b.matched_mps, fix_scale: true, imu_init: false };
+        super::mapping::step_digest(st, cur, "corr0");
+        {
+            let h = |v: &[Option<KfId>]| v.iter().fold(1469598103934665603u64, |h, m| (h ^ m.unwrap_or(u64::MAX)).wrapping_mul(1099511628211));
+            super::mapping::step_text(&format!("C {cur} {matched} {} {} {:016x} {:016x}\n", b.mps.len(), b.matched_mps.len(), h(&b.mps), h(&b.matched_mps)));
+            let d = |v: f64| format!("{:016x}", v.to_bits());
+            let sc = &b.slw;
+            super::mapping::step_text(&format!("CS {} {} {} {} {} {} {} {}\n", d(sc.r[0]), d(sc.r[1]), d(sc.r[2]), d(sc.r[3]), d(sc.t[0]), d(sc.t[1]), d(sc.t[2]), d(sc.s)));
+            let l: Vec<String> = b.matched_mps.iter().map(|m| m.map_or(-1, |m| m as i64).to_string()).collect();
+            super::mapping::step_text(&format!("CM {}\n", l.join(" ")));
+        }
+        let inp = crate::orb3loop::correct::LoopIn { cur, matched, scw: b.slw, loop_mps: &b.mps, loop_matched: &b.matched_mps, fix_scale: FIX_SCALE, imu_init: false };
         let mut ess = super::essops::RsEss { init_kf: init };
         let out = crate::orb3loop::correct::correct_loop(&inp, &mut st.atlas, &mut self.corrected_by, &mut ess);
         for k in out.not_erase {
@@ -233,6 +250,7 @@ impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
         if let Some(m) = st.atlas.maps.iter_mut().find(|m| m.id == map) {
             m.increase_change_index();
         }
+        super::mapping::step_digest(st, cur, "corr");
         out.run_gba.then_some(map as u64)
     }
     /// mpMergeLastCurrentKF->SetErase() · mpMergeMatchedKF->SetErase() · 일치 수 0 · 짝 목록 비움

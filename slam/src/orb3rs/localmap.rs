@@ -543,8 +543,15 @@ pub fn search_in_neighbors(atlas: &mut Atlas, kf: KfId, abort: &dyn Fn() -> bool
         let m = Matcher::new(0.6, true);
         let cur_pts = atlas.kfs[&kf].map_points.clone();
         let mut touched: Vec<MpId> = cur_pts.iter().flatten().copied().collect();
+        let mut erased = Vec::new();
         for &t in &targets {
-            m.fuse(t, &mut atlas.kfs, &cur_pts, &mut atlas.mps, 3.0);
+            m.fuse(t, &mut atlas.kfs, &cur_pts, &mut atlas.mps, 3.0, &mut erased);
+        }
+        // Replace 의 EraseMapPoint(원본은 그 자리에서; 지도 집합은 정렬 집합이라 늦게 빼도 같음)
+        for (map, old) in erased.drain(..) {
+            if let Some(mm) = atlas.map_mut(map) {
+                mm.erase_map_point(old);
+            }
         }
         if abort() {
             return;
@@ -559,7 +566,12 @@ pub fn search_in_neighbors(atlas: &mut Atlas, kf: KfId, abort: &dyn Fn() -> bool
                 cands.push(Some(*p));
             }
         }
-        m.fuse(kf, &mut atlas.kfs, &cands, &mut atlas.mps, 3.0);
+        m.fuse(kf, &mut atlas.kfs, &cands, &mut atlas.mps, 3.0, &mut erased);
+        for (map, old) in erased {
+            if let Some(mm) = atlas.map_mut(map) {
+                mm.erase_map_point(old);
+            }
+        }
         touched.extend(cands.iter().flatten());
         for p in atlas.kfs[&kf].map_points.clone().into_iter().flatten() {
             if !atlas.mps[&p].bad {

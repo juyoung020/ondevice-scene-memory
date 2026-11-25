@@ -592,8 +592,9 @@ impl Matcher {
         nmatches
     }
 
-    /// Fuse(KF, 지도 점들, th, bRight = false): 키프레임에 투영해 이미 점이 있으면 합치고(Replace) 없으면 관측을 더함
-    pub fn fuse(&self, kf_id: KfId, kfs: &mut BTreeMap<KfId, KeyFrame>, points: &[Option<MpId>], mps: &mut BTreeMap<MpId, MapPoint>, th: f32) -> i32 {
+    /// Fuse(KF, 지도 점들, th, bRight = false): 키프레임에 투영해 이미 점이 있으면 합치고(Replace) 없으면 관측을 더함.
+    /// Replace 로 나빠진 점은 (지도, 점)을 `erased` 에 넣음 — 원본 Replace 의 mpMap->EraseMapPoint 는 부른 쪽이 지도 집합에서
+    pub fn fuse(&self, kf_id: KfId, kfs: &mut BTreeMap<KfId, KeyFrame>, points: &[Option<MpId>], mps: &mut BTreeMap<MpId, MapPoint>, th: f32, erased: &mut Vec<(MapId, MpId)>) -> i32 {
         let (tcw, ow, ctx) = {
             let kf = &kfs[&kf_id];
             (kf.tcw, kf.camera_center(), kf.ctx.clone())
@@ -664,10 +665,9 @@ impl Matcher {
                 let bi = best_idx as usize;
                 if let Some(q) = kf.map_points[bi] {
                     if !mps[&q].bad {
-                        if mps[&q].n_obs > mps[&pid].n_obs {
-                            super::mapdata::mp_replace_parts(kfs, mps, pid, q);
-                        } else {
-                            super::mapdata::mp_replace_parts(kfs, mps, q, pid);
+                        let (old, new) = if mps[&q].n_obs > mps[&pid].n_obs { (pid, q) } else { (q, pid) };
+                        if let Some(map) = super::mapdata::mp_replace_parts(kfs, mps, old, new) {
+                            erased.push((map, old));
                         }
                     }
                 } else {

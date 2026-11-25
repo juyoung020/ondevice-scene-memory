@@ -33,6 +33,7 @@
 #include <LocalMapping.h>
 #include <Tracking.h>
 #include <Optimizer.h>
+#include <ORBmatcher.h>
 #include <LoopClosing.h>
 #undef private
 #undef protected
@@ -125,6 +126,42 @@ bool Tracking::Relocalization(Map *pMap) {
     bool r = o(this, pMap);
     if (trk(mCurrentFrame.mnId)) pose(r ? "rel1" : "rel0", mCurrentFrame.mnId, mCurrentFrame.GetPose(), pMap ? (long)pMap->GetId() : -1);
     return r;
+}
+// 자세 최적화 입력 · 출력(ORBSYS_PO=파일, ORBSYS_PO_RANGE=시작-끝 장면): Rust pose_opt 를 같은 입력으로 돌려 비트 비교
+static FILE *gpo() { static FILE *f = nullptr; static bool t = false; if (!t) { t = true; const char *e = getenv("ORBSYS_PO"); if (e) f = fopen(e, "w"); } return f; }
+static bool porange(unsigned long id) { static long a = -2, b = -1; if (a == -2) { const char *e = getenv("ORBSYS_PO_RANGE"); if (!e || sscanf(e, "%ld-%ld", &a, &b) != 2) { a = 0; b = 1L << 40; } } return (long)id >= a && (long)id <= b; }
+int Optimizer::PoseOptimization(Frame *F) {
+    typedef int (*Fn)(Frame *); static Fn o = (Fn)dlsym(L(), "_ZN9ORB_SLAM39Optimizer16PoseOptimizationEPNS_5FrameE");
+    FILE *f = gpo();
+    if (!f || !porange(F->mnId)) return o(F);
+    Sophus::SE3f p = F->GetPose(); auto q = p.unit_quaternion(); auto t = p.translation();
+    const std::vector<float> &cp = F->mpCamera->mvParameters;
+    int n = 0; for (int i = 0; i < F->N; i++) if (F->mvpMapPoints[i]) n++;
+    fprintf(f, "PO %lu %d %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", F->mnId, n, hx(cp[0]), hx(cp[1]), hx(cp[2]), hx(cp[3]),
+            hx(F->fx), hx(F->fy), hx(F->cx), hx(F->cy), hx(F->mbf), hx(q.x()), hx(q.y()), hx(q.z()), hx(q.w()), hx(t.x()), hx(t.y()), hx(t.z()));
+    for (int i = 0; i < F->N; i++) { MapPoint *m = F->mvpMapPoints[i]; if (!m) continue; const cv::KeyPoint &k = F->mvKeysUn[i]; Eigen::Vector3f x = m->GetWorldPos();
+        fprintf(f, "O %08x %08x %08x %08x %08x %08x %08x %lu %d\n", hx(k.pt.x), hx(k.pt.y), hx(F->mvuRight[i]), hx(F->mvInvLevelSigma2[k.octave]), hx(x[0]), hx(x[1]), hx(x[2]), m->mnId, i); }
+    int r = o(F);
+    p = F->GetPose(); q = p.unit_quaternion(); t = p.translation();
+    fprintf(f, "R %d %08x %08x %08x %08x %08x %08x %08x ", r, hx(q.x()), hx(q.y()), hx(q.z()), hx(q.w()), hx(t.x()), hx(t.y()), hx(t.z()));
+    for (int i = 0; i < F->N; i++) if (F->mvpMapPoints[i]) fputc(F->mvbOutlier[i] ? '1' : '0', f);
+    fputc('\n', f);
+    return r;
+}
+// 움직임 모형 짝짓기에서 점 하나 따라가기(ORBSYS_SBP=장면:점번호): 투영 · 반경 · 후보 거리, 끝난 뒤 그 점이 붙은 칸
+int ORBmatcher::SearchByProjection(Frame &C, const Frame &Lf, const float th, const bool bMono) {
+    typedef int (*Fn)(ORBmatcher *, Frame &, const Frame &, float, bool); static Fn o = (Fn)dlsym(L(), "_ZN9ORB_SLAM310ORBmatcher18SearchByProjectionERNS_5FrameERKS1_fb");
+    unsigned long fa = 0, mpw = 0; const char *e = getenv("ORBSYS_SBP");
+    bool on = e && sscanf(e, "%lu:%lu", &fa, &mpw) == 2 && C.mnId == fa;
+    if (on) for (int i = 0; i < Lf.N; i++) { MapPoint *m = Lf.mvpMapPoints[i]; if (!m || m->mnId != mpw) continue;
+        Eigen::Vector3f xc = C.GetPose() * m->GetWorldPos(); float invzc = 1.0 / xc(2); Eigen::Vector2f uv = C.mpCamera->project(xc);
+        int oc = Lf.mvKeys[i].octave; float r = th * C.mvScaleFactors[oc];
+        { Eigen::Vector3f w = m->GetWorldPos(); fprintf(stderr, "SBP i%d out%d bad%d nobs%d w %08x %08x %08x xc %08x %08x %08x\n", i, (int)Lf.mvbOutlier[i], (int)m->isBad(), m->Observations(), hx(w[0]), hx(w[1]), hx(w[2]), hx(xc[0]), hx(xc[1]), hx(xc[2])); }
+        for (size_t i2 : C.GetFeaturesInArea(uv(0), uv(1), r, oc - 1, oc + 1)) { float ur = uv(0) - C.mbf * invzc;
+            fprintf(stderr, "  c %zu d %d ur %08x er %08x cur %ld\n", i2, DescriptorDistance(m->GetDescriptor(), C.mDescriptors.row(i2)), hx(C.mvuRight[i2]), hx(fabs(ur - C.mvuRight[i2])), C.mvpMapPoints[i2] ? (long)C.mvpMapPoints[i2]->mnId : -1L); } }
+    int n = o(this, C, Lf, th, bMono);
+    if (on) { fprintf(stderr, "SBP n %d th %g:", n, th); for (int i = 0; i < C.N; i++) if (C.mvpMapPoints[i] && C.mvpMapPoints[i]->mnId == mpw) fprintf(stderr, " at %d", i); fprintf(stderr, "\n"); }
+    return n;
 }
 // 루프 스레드: 공통 영역 찾기 결과(L 키프레임 루프 합치기 루프짝 합치기짝) · 고치기 · 합치기 뒤 요약
 bool LoopClosing::NewDetectCommonRegions() {

@@ -109,6 +109,7 @@ pub fn pose_optimization_frame(f: &mut Frame, mps: &BTreeMap<MpId, MapPoint>) ->
     let t = f.tcw.unwrap_or_default();
     let mut out = vec![false; obs.len()];
     let (n, p) = pose_optimization(&Se3f { q: t.q, t: t.t }, &pc, &obs, &mut out);
+    po_dump(f.id, &pc, &t, &obs, &idx, &f.map_points, n, &p, &out);
     if obs.len() < 3 {
         return 0;
     }
@@ -117,6 +118,43 @@ pub fn pose_optimization_frame(f: &mut Frame, mps: &BTreeMap<MpId, MapPoint>) ->
     }
     f.set_pose(Se3 { q: p.q, t: p.t });
     n
+}
+
+/// 시험용 덤프(ORBSYS_PO=파일, ORBSYS_PO_RANGE=시작-끝): steps_dump.cc 의 원본 덤프와 같은 꼴
+fn po_dump(id: u64, pc: &PoseCam, t: &Se3, obs: &[PoseObs], idx: &[usize], mpv: &[Option<MpId>], n: i32, p: &Se3f, out: &[bool]) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static F: OnceLock<Option<(Mutex<std::fs::File>, u64, u64)>> = OnceLock::new();
+    let Some((file, a, b)) = F.get_or_init(|| {
+        let path = std::env::var("ORBSYS_PO").ok()?;
+        let (a, b) = std::env::var("ORBSYS_PO_RANGE").ok().and_then(|r| {
+            let (x, y) = r.split_once('-')?;
+            Some((x.parse().ok()?, y.parse().ok()?))
+        }).unwrap_or((0, u64::MAX));
+        Some((Mutex::new(std::fs::File::create(path).ok()?), a, b))
+    }) else { return };
+    if id < *a || id > *b {
+        return;
+    }
+    let h = |v: f32| format!("{:08x}", v.to_bits());
+    let mut s = format!("PO {id} {}", obs.len());
+    for v in [pc.cam.p[0], pc.cam.p[1], pc.cam.p[2], pc.cam.p[3], pc.fx, pc.fy, pc.cx, pc.cy, pc.bf, t.q[0], t.q[1], t.q[2], t.q[3], t.t[0], t.t[1], t.t[2]] {
+        s += &format!(" {}", h(v));
+    }
+    s.push('\n');
+    for (o, &i) in obs.iter().zip(idx) {
+        s += &format!("O {} {} {} {} {} {} {} {} {i}\n", h(o.u), h(o.v), h(o.ur), h(o.inv_sigma2), h(o.xw[0]), h(o.xw[1]), h(o.xw[2]), mpv[i].unwrap());
+    }
+    s += &format!("R {n}");
+    for v in p.q.iter().chain(p.t.iter()) {
+        s += &format!(" {}", h(*v));
+    }
+    s.push(' ');
+    for &o in out {
+        s.push(if o { '1' } else { '0' });
+    }
+    s.push('\n');
+    file.lock().unwrap().write_all(s.as_bytes()).unwrap();
 }
 
 fn drop_outliers(f: &mut Frame) {

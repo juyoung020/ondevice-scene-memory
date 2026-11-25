@@ -43,7 +43,7 @@ impl Pyramid {
         }
         let inv_scale = scale.iter().map(|s| 1.0f32 / s).collect();
         let inv_sigma2 = sigma2.iter().map(|s| 1.0f32 / s).collect();
-        Pyramid { nfeatures, scale_factor, nlevels, ini_th_fast, min_th_fast, scale, inv_scale, sigma2, inv_sigma2, log_scale_factor: (scale_factor as f64).ln() as f32 }
+        Pyramid { nfeatures, scale_factor, nlevels, ini_th_fast, min_th_fast, scale, inv_scale, sigma2, inv_sigma2, log_scale_factor: scale_factor.ln() }
     }
 }
 

@@ -5,6 +5,7 @@
 pub mod types;
 pub mod extract;
 pub mod matcher;
+pub mod frame;
 pub mod stdsort;
 
 pub use types::*;

@@ -277,3 +277,17 @@
 - ORT 포터에: embed.rs 의 ONNX 실행에서 last_hidden_state 를 pooler 뒤에 이어 붙이게 한 줄만 고침(Rust 이식판도 이 출력이 필요).
 - Rust 머리 확인(`cargo test --release maskpool`, 모델 있을 때만): 모든 무게 1 → ONNX pooler_output 과 최대 차 1.3e-5. 마스크 무게 판(왼쪽 위 4×4 조각)은 파이썬(tools/naming/maphead_check.py, 같은 입력)과 앞 4 값 · 합(25.1694 / 25.1694)이 소수 5 자리까지 같음.
 - 뷰어 캡처(parc_out18, `ondevice view` 포트 8096, 헤드리스 Chrome): docs/img/parc_names_maskpool.png — 화면 이름표가 대표 사진 판정표와 같다(chair · monitor · desk · first aid kit · safety helmet · bulletin board, 틀린 hammer · light switch · can · paper · computer tower 도 그대로 보임).
+
+### 병렬 C 이어서 3 — 다른 구간으로 확인, 본 횟수 12 번 미만은 이름 안 보임(채택)
+
+- 다른 구간: 강의실 녹화 뒤 절반(장면 1750–3515, ~/rec_dl/cv33_b, 같은 사진 폴더에 목록만 자름). 같은 구간에서 옛 C(581de99, 따로 빌드)와 마스크 토큰판을 견줌.
+
+| 판 | 앞 전체(class_view33) | 뒤 절반(cv33_b) | 합 |
+|---|---|---|---|
+| C(581de99) | 24/45 (53 %) | 13/31 (42 %) | 37/76 (49 %) |
+| 마스크 토큰(84c88e6) | 26/42 (62 %) | 15/26 (58 %) | 41/68 (60 %) |
+| **+ 본 횟수 ≥ 12 만 이름(채택)** | 21/31 (68 %) | 12/16 (75 %) | 33/47 (70 %) |
+
+- 마스크 토큰은 두 구간 모두 +9 · +16 점(같은 설정은 결정 재생이라 실행마다 같음 — 흔들림은 구간 사이 차로 봄).
+- 본 횟수 거르기: `embed::shown_name(id, n_obs)`(NAME_MIN_OBS 12) 를 화면 · view.json · 끝 요약 이름에 씀. 물체 지우기 판정(maps weak)은 그대로 `name`. 맞음도 함께 빠짐(앞 5 · 뒤 3 개, 예: 구급함 n6 · 문 n11), 틀림은 앞 5 · 뒤 8 개 빠짐.
+- 남은 틀림(합 14): 의자 뒷면 · 게시판 · 패널 → monitor / computer tower / cabinet / keyboard(마스크 토큰도 트랜스포머 층에서 둘레를 섞음), 문틀 → ruler, 바닥 → box.

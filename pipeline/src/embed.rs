@@ -179,6 +179,15 @@ pub fn name(id: u32, _sure: bool) -> Option<(String, f32)> {
     // 이름이 대부분 틀렸다(sofa · shoe · paper towel 등, docs/pose_experiments.md 병렬 C)
     common::prof::lock(&NAMES, common::prof::W::LockEmbed).as_ref()?.get(&id).filter(|n| n.1 > 0.0).cloned()
 }
+/// 화면 · 기록에 쓰는 이름: NAME_MIN_OBS 번 넘게 본 물체만(그 아래는 번진 · 조각 사진이라 강의실 녹화 두 구간에서 이름이 대부분 틀렸다,
+/// docs/pose_experiments.md 병렬 C 이어서 3). 물체 지우기 판정(maps)은 본 횟수와 상관없이 name 을 본다
+pub fn shown_name(id: u32, n_obs: u32) -> Option<(String, f32)> {
+    if n_obs < NAME_MIN_OBS {
+        return None;
+    }
+    name(id, true)
+}
+pub const NAME_MIN_OBS: u32 = 12;
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 /// 벡터 하나를 그 물체에 더함. v = 사진 전체 벡터(검색 줄 · 병합 · 구조물 판정), nv = 마스크 안 토큰 벡터(이름, maskpool).
 /// 돌려줌: 지금까지 사진 전체 벡터의 평균 방향(길이 1)

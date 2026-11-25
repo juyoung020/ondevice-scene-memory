@@ -1675,7 +1675,7 @@ fn run(a: &Args, seg: Box<dyn seg::Segmenter + Send>, io: &mut LoopIo) -> Box<dy
     // 물체 이름별 수: 화면에 쓰는 이름(사진으로 붙인 이름, 없으면 분할 이름 object)
     let mut by: std::collections::BTreeMap<String, u32> = Default::default();
     for o in &mem.objs {
-        let n = embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0);
+        let n = embed::shown_name(o.id, o.n_obs).map_or_else(|| o.name.clone(), |l| l.0);
         if embed::structure(o.id) != Some("ceiling") {
             *by.entry(n).or_default() += 1;
         }
@@ -2664,7 +2664,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
             to_embed.push((o.id, c.w, c.h, c.rgb.clone(), maskpool::weights(&c.mask, c.w as usize, c.h as usize)));
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
-        let look = embed::name(o.id, o.name != "object");
+        let look = embed::shown_name(o.id, o.n_obs);
         // 천장 면은 기억에 넣지 않음(위에서 볼 때 지도를 가림): 구조물 판정 표(--structural)로
         if embed::structure(o.id) == Some("ceiling") {
             continue;
@@ -2687,7 +2687,7 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
     }
     embed::submit(dir, to_embed);
     // 방 · 엣지 · map.pgm · view.json 짜기는 뷰 스레드가(본 스레드는 물체 JSON 과 격자 그림만 넘김)
-    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::name(o.id, o.name != "object").map_or_else(|| o.name.clone(), |l| l.0))).filter(|o| embed::structure(o.0) != Some("ceiling")).collect();
+    let ol: Vec<_> = mem.objs.iter().map(|o| (o.id, o.pos, o.extent, o.state == "gone", embed::shown_name(o.id, o.n_obs).map_or_else(|| o.name.clone(), |l| l.0))).filter(|o| embed::structure(o.0) != Some("ceiling")).collect();
     let traj = view.traj_update(traj);
     let wall = if view.live { wall_ms() } else { 0.0 };
     view.send(ViewJob { gi, res: grid.res, objs, ol, traj, stamp, pose, cam: cam.clone(), scene: scene.clone(), wall });

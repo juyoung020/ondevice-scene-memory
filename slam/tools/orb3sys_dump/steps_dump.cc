@@ -108,6 +108,8 @@ static long nmp(Frame &F) { long n = 0; for (int i = 0; i < F.N; i++) if (F.mvpM
 void Tracking::UpdateLastFrame() {
     typedef void (*F)(Tracking *); static F o = (F)dlsym(L(), "_ZN9ORB_SLAM38Tracking15UpdateLastFrameEv");
     if (trk(mCurrentFrame.mnId) && mLastFrame.mpReferenceKF) { pose("tlr", mCurrentFrame.mnId, mlRelativeFramePoses.back(), (long)mLastFrame.mpReferenceKF->mnId); pose("ref", mCurrentFrame.mnId, mLastFrame.mpReferenceKF->GetPose(), (long)mLastFrame.mpReferenceKF->GetMap()->GetId()); }
+    if (trk(mCurrentFrame.mnId)) { uint64_t h = 1469598103934665603ull; for (int i = 0; i < mLastFrame.N; i++) { MapPoint *p = mLastFrame.mvpMapPoints[i]; uint64_t v = (p ? p->mnId : ~0ull) * 2 + (mLastFrame.mvbOutlier[i] ? 1 : 0); h ^= v; h *= 1099511628211ull; }
+      pose("vel", mCurrentFrame.mnId, mVelocity, (long)(h & 0x7fffffff)); }
     o(this);
     if (trk(mCurrentFrame.mnId)) pose("ulf", mCurrentFrame.mnId, mLastFrame.GetPose(), nmp(mLastFrame));
 }

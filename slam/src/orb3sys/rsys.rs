@@ -479,6 +479,13 @@ impl TrackOps for Ops<'_> {
         let Some(ref_pose) = last.ref_kf.and_then(|k| g.atlas.kfs.get(&k)).map(|k| k.tcw) else { return false };
         if let Some(k) = last.ref_kf {
             trk_pose("tlr", cur.id, &tlr, k as i64);
+            let mut h = 1469598103934665603u64;
+            for i in 0..last.keys.len() {
+                let v = last.map_points[i].unwrap_or(u64::MAX).wrapping_mul(2).wrapping_add(last.outlier[i] as u64);
+                h ^= v;
+                h = h.wrapping_mul(1099511628211);
+            }
+            trk_pose("vel", cur.id, &s.velocity, (h & 0x7fffffff) as i64);
             trk_pose("ref", cur.id, &ref_pose, g.atlas.kfs[&k].map as i64);
         }
         let r = track::track_with_motion_model(cur, last, ref_pose, tlr, s.velocity, t.sensor, &mut g.atlas.mps);

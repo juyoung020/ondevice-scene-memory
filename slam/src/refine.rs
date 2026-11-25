@@ -23,6 +23,9 @@ const ICP_MAX_T: f64 = 0.2;
 const ICP_MAX_YAW: f64 = 4.0;
 /// 간선 표준편차: 이웃(m, °), 고리(m, °)
 const SEQ_SIG: (f64, f64) = (0.03, 0.7);
+/// 이웃 간선: 몇 칸 건너 이웃까지 깊이 ICP 로 잴지 · ICP 가 ORB 위치를 고칠 수 있는 최대 이동(m, 튐 바로잡기)
+const SEQ_SKIP: usize = 2;
+const SEQ_ICP_MAX_T: f64 = 0.4;
 const LOOP_SIG: (f64, f64) = (0.03, 0.5);
 
 pub struct Node<'a> {
@@ -286,25 +289,50 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
     if n < 3 {
         return vec![ident; n];
     }
-    let mut edges = Vec::new();
-    // ① 이웃
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|a, b| nodes[*a].t.total_cmp(&nodes[*b].t));
-    for w in order.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        if nodes[a].seg == nodes[b].seg && nodes[b].t - nodes[a].t < 2.0 {
-            let (dy, dp) = meas(&nodes[a].pose, &nodes[b].pose);
-            edges.push(Edge { i: a, j: b, dyaw: dy, dp, sig: SEQ_SIG, zmul: 3.0, robust: false });
-        }
-    }
-    let n_seq = edges.len();
-    // ② 고리: 깊이 ICP
+    // 깊이 점(이웃 · 고리 ICP 공용)
     use rayon::prelude::*;
     let tgt: Vec<Vec<Option<([f64; 3], [f64; 3])>>> = nodes.par_iter().map(|x| cam_pts(x.d, k)).collect();
     let src: Vec<Vec<[f64; 3]>> = tgt
         .iter()
         .map(|t| (0..SH).step_by(2).flat_map(|v| (0..SW).step_by(2).map(move |u| (u, v))).filter_map(|(u, v)| t[v * SW + u].map(|x| x.0)).collect())
         .collect();
+    let mut edges = Vec::new();
+    // ① 이웃: 시간 순 이웃(2 초 안, 한 칸 · 두 칸 건너)을 깊이 ICP 로 다듬은 측정. ICP 가 안 맞으면 같은 ORB 지도 안 이웃만 ORB 측정 그대로
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| nodes[*a].t.total_cmp(&nodes[*b].t));
+    let mut pairs: Vec<(usize, usize, bool)> = Vec::new();
+    for w in 0..order.len() {
+        for s_ in 1..=SEQ_SKIP {
+            if w + s_ < order.len() {
+                let (a, b) = (order[w], order[w + s_]);
+                if nodes[b].t - nodes[a].t < 2.0 {
+                    pairs.push((a, b, s_ == 1));
+                }
+            }
+        }
+    }
+    let seq: Vec<Option<Edge>> = pairs
+        .par_iter()
+        .map(|&(a, b, first)| {
+            let same = nodes[a].seg == nodes[b].seg;
+            let icp_e = (src[b].len() >= 500).then(|| icp(&nodes[a].pose, &tgt[a], &nodes[b].pose, &src[b], k)).flatten().and_then(|(delta, inl, frac)| {
+                let pb = mul(&delta, &nodes[b].pose);
+                let mv = ((pb[3] - nodes[b].pose[3]).powi(2) + (pb[7] - nodes[b].pose[7]).powi(2) + (pb[11] - nodes[b].pose[11]).powi(2)).sqrt();
+                (inl >= ICP_MIN_INLIERS && frac >= ICP_INLIER_FRAC && mv < SEQ_ICP_MAX_T).then(|| meas(&nodes[a].pose, &pb))
+            });
+            match icp_e {
+                Some((dy, dp)) => Some(Edge { i: a, j: b, dyaw: dy, dp, sig: SEQ_SIG, zmul: 3.0, robust: true }),
+                None if same && first => {
+                    let (dy, dp) = meas(&nodes[a].pose, &nodes[b].pose);
+                    Some(Edge { i: a, j: b, dyaw: dy, dp, sig: SEQ_SIG, zmul: 3.0, robust: false })
+                }
+                None => None,
+            }
+        })
+        .collect();
+    let n_seq_icp = seq.iter().flatten().filter(|e| e.robust).count();
+    edges.extend(seq.into_iter().flatten());
+    let n_seq = edges.len();
     let fwd = |p: &T34| [p[2], p[6], p[10]];
     let mut cands: Vec<(usize, usize)> = Vec::new();
     for i in 0..n {
@@ -482,7 +510,7 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
             [r[0], r[1], 0.0, x[i][1] - rp[0], r[4], r[5], 0.0, x[i][2] - rp[1], 0.0, 0.0, 1.0, x[i][3] - rp[2]]
         })
         .collect();
-    log.push(format!("마디 {n}, 이웃 간선 {n_seq}, 고리 후보 {n_try} → 받은 고리 {n_loop}, 가장 큰 고침 {:.2} m · {:.1}°", big.0, big.1));
+    log.push(format!("마디 {n}, 이웃 간선 {n_seq}(깊이 ICP {n_seq_icp}), 고리 후보 {n_try} → 받은 고리 {n_loop}, 가장 큰 고침 {:.2} m · {:.1}°", big.0, big.1));
     out
 }
 

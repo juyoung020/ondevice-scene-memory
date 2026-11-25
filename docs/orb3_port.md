@@ -54,9 +54,22 @@
 | Settings · 설정 yaml 읽기 · Converter | System | 지움(Rust 는 설정 구조체를 바로 받음) | 통합 |
 | GeometricCamera · Pinhole | Frame · 최적화 | `types::Camera` 로(왜곡 0) | 통합 |
 | KannalaBrandt8 · TwoViewReconstruction(단안 초기화) · ImuTypes · G2oTypes(IMU 가장자리) · 관성 초기화 | 단안 · 어안 · IMU 모드 전용 | 지움(안 씀) | 통합 |
-| Viewer · FrameDrawer · MapDrawer · Pangolin · GLEW · OpenGL | 뷰어(꺼 둠) | 지움 | 통합 |
+| Viewer · FrameDrawer · MapDrawer · Pangolin · GLEW · OpenGL | 뷰어(꺼 둠) | **패치에서 지움**(아래 'Pangolin 없이 빌드') | CV |
 | Boost serialization(Atlas 저장 · 읽기) | 지도 저장(지금 안 씀) | 지움, 필요해지면 Rust 직렬화 | 통합 |
 | System(스레드 3 개: 추적 · 지도 · 루프, 잠금) | 백엔드 | Rust 스레드 · 잠금으로 | 통합 |
+
+## Pangolin 없이 빌드
+
+`slam/cpp/ORB_SLAM3.patch` 가 Viewer · FrameDrawer · MapDrawer 와 Pangolin 참조를 걷어내고, `slam/build.rs` 는 Pangolin · GLEW · OpenGL 을 링크하지 않는다(PANGOLIN_DIR 없어짐).
+
+```sh
+git clone https://github.com/UZ-SLAMLab/ORB_SLAM3 && cd ORB_SLAM3 && git checkout 4452a3c
+git apply /path/to/slam/cpp/ORB_SLAM3.patch     # 손대지 않은 원본에 그대로 적용됨(11-25 확인)
+./build.sh                                     # Pangolin 설치 불필요
+ORB_SLAM3_DIR=$PWD cargo build -p slam
+```
+
+WSL 사본: `~/slam-bench/orb3-nopango`(빌드됨). 비트 비교 기준 빌드(`-ffp-contract=off`)도 같은 패치로 만든다.
 
 ## 공통 인터페이스(`slam/src/orb3rs/types.rs`)
 

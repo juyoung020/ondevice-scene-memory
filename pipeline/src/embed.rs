@@ -365,10 +365,17 @@ mod worker {
                 #[cfg(feature = "onnx")]
                 Net::Onnx(m) => {
                     let outs = m.run(vec![common::nn::Tensor::f(vec![1, 3, SIZE, SIZE], buf.to_vec())]).expect("embed run");
-                    let i = m.output_names().position(|n| n == "pooler_output").expect("embed model: pooler_output 없음");
-                    let o = outs.into_iter().nth(i).unwrap().into_f();
+                    let names: Vec<&str> = m.output_names().collect();
+                    let i = names.iter().position(|n| *n == "pooler_output").expect("embed model: pooler_output 없음");
+                    let tok = names.iter().position(|n| *n == "last_hidden_state");
+                    let mut outs: Vec<Option<common::nn::Tensor>> = outs.into_iter().map(Some).collect();
+                    let o = outs[i].take().unwrap().into_f();
                     assert_eq!(o.len(), DIM, "embed model output");
                     *v = o;
+                    // 마스크 안 이름 벡터(maskpool)용 토큰(64 × 768): 뒤에 이어 붙임
+                    if let Some(t) = tok {
+                        v.extend_from_slice(&outs[t].take().unwrap().into_f());
+                    }
                 }
                 #[cfg(feature = "dxrt")]
                 Net::Dx(e) => {

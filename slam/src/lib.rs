@@ -23,6 +23,7 @@ pub mod orb3sys;
 // ORB-SLAM3 장소 인식 · 루프 · 합치기 Rust 포팅(포터 LOOP)
 pub mod orb3loop;
 pub mod orb3cv;
+pub mod orb3ba;
 pub mod stitch;
 pub mod mapmerge;
 pub mod refine;

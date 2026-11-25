@@ -37,13 +37,15 @@ impl R<'_> {
 }
 
 fn dumps() -> Vec<String> {
-    std::env::var("ORBLOOP_DUMPS").map(|s| s.split(':').map(String::from).collect()).unwrap_or_default()
+    let v: Vec<String> = std::env::var("ORBLOOP_DUMPS").expect("입력 없음: ORBLOOP_DUMPS").split(':').map(String::from).collect();
+    assert!(!v.is_empty(), "입력 없음");
+    v
 }
 
 fn voc() -> Option<&'static Vocabulary> {
     static V: OnceLock<Option<Vocabulary>> = OnceLock::new();
     V.get_or_init(|| {
-        let p = std::env::var("ORBLOOP_VOC").ok()?;
+        let p = std::env::var("ORBLOOP_VOC").expect("입력 없음: ORBLOOP_VOC");
         let t = std::time::Instant::now();
         let v = Vocabulary::load(&p).unwrap();
         eprintln!("어휘 {} 노드 {} 단어, {:.2} s", v.parent.len(), v.size(), t.elapsed().as_secs_f64());
@@ -54,7 +56,7 @@ fn voc() -> Option<&'static Vocabulary> {
 
 #[test]
 fn vocab_text_eq_original_and_bin() {
-    let Some(p) = std::env::var("ORBLOOP_VOC").ok() else { return };
+    let p = std::env::var("ORBLOOP_VOC").expect("입력 없음: ORBLOOP_VOC");
     let t = std::time::Instant::now();
     let v = Vocabulary::load_text(&p).unwrap();
     let tt = t.elapsed().as_secs_f64();

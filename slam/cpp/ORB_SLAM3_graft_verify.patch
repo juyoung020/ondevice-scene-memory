@@ -1,0 +1,53 @@
+--- a/src/Tracking.cc
++++ b/src/Tracking.cc
+@@ -4159,6 +4159,12 @@
+ namespace ORB_SLAM3
+ {
+ 
++struct GraftProp { bool has = false; unsigned long from = 0, into = 0; Sophus::SE3f S; double t = 0, t_kf = -1; };
++// 병렬 A20: 다른 지도 재위치 → 옮겨 붙이기를 밖(우리 깊이 검증)에 맡기는 스위치와 남긴 제안(헤더 배치를 안 바꾸려 파일 안 정적 값)
++static double mnGraftKfT = -1.0;
++bool& GraftExternal() { static bool on = false; return on; }
++GraftProp& GraftProposal() { static GraftProp p; return p; }
++
+ // 지금 지도가 다른 지도에 재위치되면(같은 변환 두 번) 작은 지도를 큰 지도 좌표로 옮겨 하나로 합침.
+ // 빈틈 뒤 새 지도가 생겨도 예전 지도를 다시 보는 순간 한 지도로 이어짐.
+ void Tracking::TryGraft()
+@@ -4177,6 +4183,20 @@
+         if(pM == pCur || pM->IsBad() || pM->KeyFramesInMap() == 0) continue;
+         const bool ok = Relocalization(pM);
+         const Sophus::SE3f Tcw_m = mCurrentFrame.GetPose();
++        if(ok)
++        {
++            // 재위치에 쓴 점을 가장 많이 본 pM 키프레임(붙인 상대 장면 시각 기록용)
++            map<KeyFrame*, int> votes;
++            for(int i = 0; i < mCurrentFrame.N; i++)
++            {
++                MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
++                if(!pMP || mCurrentFrame.mvbOutlier[i]) continue;
++                for(auto &ob : pMP->GetObservations()) votes[ob.first]++;
++            }
++            KeyFrame* pBest = nullptr; int nb = -1;
++            for(auto &v : votes) if(v.first && (v.second > nb || (v.second == nb && v.first->mnId < pBest->mnId))) { nb = v.second; pBest = v.first; }
++            mnGraftKfT = pBest ? pBest->mTimeStamp : -1.0;
++        }
+         mCurrentFrame = Frame(saved);
+         mnLastRelocFrameId = savedReloc;
+         if(!ok) continue;
+@@ -4193,7 +4213,15 @@
+         mGraftS = S; mnGraftFrame = mCurrentFrame.mnId;
+         if(dt > 0.10f || da > 2.0f) return;
+         cout << "GRAFT map " << pCur->GetId() << " (" << pCur->KeyFramesInMap() << " kf) <-> map " << pM->GetId()
+-             << " (" << pM->KeyFramesInMap() << " kf) dt=" << dt << " da=" << da << endl;
++             << " (" << pM->KeyFramesInMap() << " kf) dt=" << dt << " da=" << da << std::fixed << std::setprecision(3)
++             << " t " << mCurrentFrame.mTimeStamp << " kf " << mnGraftKfT << std::defaultfloat << endl;
++        // 밖(우리 모듈)이 검증하기로 했으면 합치지 않고 제안만 남김(orb3_take_graft 가 가져감)
++        if(GraftExternal())
++        {
++            GraftProposal() = {true, pCur->GetId(), pM->GetId(), S, mCurrentFrame.mTimeStamp, mnGraftKfT};
++            mpGraftMap = nullptr;
++            return;
++        }
+         // 지도 잠금을 잡은 채라 다음 장면 시작(잠그기 전)에 합침
+         // 늘 지금 지도를 옮김(다른 스레드가 쥔 키프레임 · 지도는 지금 지도 쪽만 바뀜)
+         mpPendFrom = pCur; mpPendInto = pM; mPendS = S; mbPendMoveCam = true;

@@ -36,6 +36,8 @@ pub struct Node {
     pub up: V3,
     /// 지금 키프레임 → 지도 id(후보를 다른 지도로 거름)
     pub maps: Arc<HashMap<u64, u64>>,
+    /// 꼭 검증할 후보 시각(ORB 다른 지도 재위치가 낸 옮겨 붙이기 제안의 상대 키프레임 시각): 그 시각에 가장 가까운 저장 장면들도 후보에
+    pub force: Option<f64>,
 }
 
 /// 맞은 짝: 질의 장면(kf, rel) 와 후보 장면(kf, rel), 광학 좌표 변환 질의 ← 후보
@@ -52,6 +54,8 @@ pub struct Hit {
     pub score: f32,
     /// 깊이 맞춤까지 통과(바로 옮겨 붙여도 됨). 아니면 검증만 통과한 약한 짝: 끝난 뒤 지도 통째 맞춤의 후보로만 씀
     pub strong: bool,
+    /// force 로 검증한 장면의 결과
+    pub forced: bool,
 }
 
 struct Stored {
@@ -347,10 +351,18 @@ impl State {
         // 후보: 지금 다른 지도에 든 예전 장면
         let my_map = n.maps.get(&n.kf).copied();
         let nodes = &self.nodes;
-        let cands = match my_map {
+        let mut cands = match my_map {
             None => vec![],
             Some(m) => self.db.topk(&self.desc, TOPK, |id| nodes.get(id as usize).and_then(|s| n.maps.get(&s.kf)).is_some_and(|&cm| cm != m)),
         };
+        // ORB 제안 검증: 상대 키프레임 시각에 가장 가까운 저장 장면 4 개(2 초 안)를 맨 앞에(MegaLoc 점수 문턱 없이)
+        if let Some(tf) = n.force {
+            let mut near: Vec<(f64, usize)> = nodes.iter().enumerate().map(|(i, s)| ((s.t - tf).abs(), i)).filter(|x| x.0 < 2.0).collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let f: Vec<(i64, f32)> = near.iter().take(4).map(|x| (x.1 as i64, 1.0)).collect();
+            cands.retain(|c| !f.iter().any(|x| x.0 == c.0));
+            cands.splice(0..0, f);
+        }
         if let Some(l) = self.log.as_mut() {
             use std::io::Write as _;
             let _ = writeln!(l, "{:.3} node map {:?} cands {:?}", n.t, my_map, cands.iter().map(|c| (c.0, (c.1 * 100.0).round() / 100.0)).collect::<Vec<_>>());
@@ -360,6 +372,9 @@ impl State {
         let mut b = XFeatures::default();
         for &(cid, score) in &cands {
             if score < MIN_SCORE {
+                if n.force.is_some() {
+                    continue;
+                }
                 break;
             }
             let c = &self.nodes[cid as usize];
@@ -395,7 +410,7 @@ impl State {
                     let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2} tight {ag_tight:.2} T {}", n.t, c.t, t.iter().map(|v| format!("{v:.5}")).collect::<Vec<_>>().join(" "));
                 }
                 let strong = ov >= DEPTH_OVERLAP && ag >= DEPTH_AGREE;
-                hits.push(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score, strong });
+                hits.push(Hit { t: n.t, q_kf: n.kf, q_rel: n.rel, c_kf: c.kf, c_rel: c.rel, c_t: c.t, t_qc: t, inliers: v.inliers, score, strong, forced: n.force.is_some() });
                 if strong {
                     break;
                 }

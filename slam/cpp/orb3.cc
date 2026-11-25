@@ -15,6 +15,13 @@
 
 using namespace ORB_SLAM3;
 
+// 원본 고침(Tracking.cc)의 다른 지도 재위치 → 옮겨 붙이기 제안(밖에서 검증할 때). Tracking.cc 정의와 같아야 함
+namespace ORB_SLAM3 {
+struct GraftProp { bool has = false; unsigned long from = 0, into = 0; Sophus::SE3f S; double t = 0, t_kf = -1; };
+bool &GraftExternal();
+GraftProp &GraftProposal();
+}
+
 static void put34(const Sophus::SE3f &t, double *o) {
     const Eigen::Matrix<float, 3, 4> m = t.matrix3x4();
     for (int i = 0; i < 3; i++)
@@ -91,6 +98,26 @@ int orb3_graft(void *h, uint64_t from, uint64_t into, const double *s) {
     }
     const Sophus::SE3f S(Eigen::Quaternionf(r).normalized().toRotationMatrix(), t);
     return static_cast<System *>(h)->GetTracker()->RequestGraft(from, into, S) ? 1 : 0;
+}
+
+// 다른 지도 재위치 → 옮겨 붙이기를 바로 하지 않고 제안으로만 남김(on = 1). 받은 제안은 orb3_take_graft 로 가져가 검증 뒤 orb3_graft
+void orb3_graft_external(void *h, int on) {
+    (void)h;
+    GraftExternal() = on != 0;
+}
+
+// 남은 제안을 가져감(있으면 1): from · into 지도, s = into 좌표 ← from 좌표(3×4), t = 지금 장면 시각, t_kf = into 쪽 재위치 키프레임 시각
+int orb3_take_graft(void *h, uint64_t *from, uint64_t *into, double *s, double *t, double *t_kf) {
+    (void)h;
+    GraftProp &p = GraftProposal();
+    if (!p.has) return 0;
+    p.has = false;
+    *from = p.from;
+    *into = p.into;
+    put34(p.S, s);
+    *t = p.t;
+    *t_kf = p.t_kf;
+    return 1;
 }
 
 // 지도 스레드가 쌓인 키프레임을 다 처리할 때까지 기다림(최대 속도 재생)

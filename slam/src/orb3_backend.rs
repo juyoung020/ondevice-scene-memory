@@ -127,6 +127,10 @@ pub struct Orb3 {
     pend: Vec<(u64, u64, T34, f64)>,
     n_graft: i64,
     n_gapgraft: i64,
+    /// ORB 다른 지도 재위치가 낸 옮겨 붙이기 제안(우리 깊이 검증을 기다림): (제안, 검증 장면을 보냈나), 받음 · 거절 수
+    orb_prop: Option<(crate::orb3::GraftProposal, bool)>,
+    n_prop_ok: i64,
+    n_prop_no: i64,
     /// 모든 잇기 짝(약한 짝 포함, 끝난 뒤 지도 통째 맞춤 후보), 끝난 뒤 맞춤용 작은 깊이(장면 5 장마다: 시각, 기준 키프레임, 상대 위치, 160×120 mm)
     hits_all: Vec<stitch::Hit>,
     /// 빈틈 뒤 새 지도: (새 지도, 앞 지도, 앞 지도 ← 새 지도(카메라가 빈틈 동안 거의 안 움직였다고 봄), 시도 수), 앞 장면의 지도 · 위치
@@ -182,7 +186,9 @@ impl Orb3 {
         std::fs::write(&settings_path, yaml).map_err(|e| format!("{}: {e}", settings_path.display()))?;
         let t0 = Instant::now();
         let voc = vocab();
-        let sys = System::new(&voc, &settings_path.to_string_lossy())?;
+        let mut sys = System::new(&voc, &settings_path.to_string_lossy())?;
+        // ORB 다른 지도 재위치 → 옮겨 붙이기는 제안만, 우리 깊이 검증(XFeat 짝 + 깊이 PnP → 깊이 ICP · 깊이 맞춤 → 지도 통째 자유 공간)을 통과해야 합침
+        sys.graft_external(true);
         common::info!("ORB-SLAM3 RGB-D 준비 {:.1} 초(단어장 {voc})", t0.elapsed().as_secs_f64());
         let stitch = Stitch::start(&common::models::dir().to_string_lossy())?;
         let poses_f = if a.poses.is_empty() {
@@ -229,6 +235,9 @@ impl Orb3 {
             pend: Vec::new(),
             n_graft: 0,
             n_gapgraft: 0,
+            orb_prop: None,
+            n_prop_ok: 0,
+            n_prop_no: 0,
             hits_all: Vec::new(),
             gap_hyp: None,
             last_pose: None,
@@ -403,6 +412,34 @@ impl Orb3 {
         let q_a = mul(&pa, &h.q_rel);
         let c_b = mul(&pb, &h.c_rel);
         let s_ba = mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a));
+        // ORB 제안 검증: 강한 짝(깊이 ICP · 깊이 맞춤 통과)의 변환이 ORB 변환과 0.3 m · 5° 안이면 지도 통째 자유 공간 검사로
+        if h.forced
+            && let Some((p, _)) = &self.orb_prop
+            && (p.t - h.t).abs() < 1e-6
+        {
+            let (pf, pi, ps, pt, pk) = (p.from, p.into, p.s, p.t, p.t_kf);
+            let s_ours = if (ma, mb) == (pf, pi) { Some(s_ba) } else if (ma, mb) == (pi, pf) { Some(inv(&s_ba)) } else { None };
+            let d = s_ours.map(|so| moved(&so, &ps));
+            common::info!(
+                "ORB 제안 검증: 지도 {pf} → {pi} 장면 {pt:.3} ↔ 후보 {:.3}(ORB 키프레임 {pk:.3}) 맞은 점 {} 강함 {} ORB 변환과 차 {}",
+                h.c_t,
+                h.inliers,
+                h.strong,
+                d.map_or("다른 지도".into(), |d| format!("{:.3} m · {:.2}°", d.0, d.1.to_degrees()))
+            );
+            if h.strong
+                && let (Some(so), Some(d)) = (s_ours, d)
+                && d.0 < 0.3
+                && d.1 < 5f64.to_radians()
+            {
+                if self.try_graft(pf, pi, &so, &all, &format!("ORB 재위치 장면 {pt:.3} ↔ {pk:.3}(우리 짝 {:.3})", h.c_t)) {
+                    self.n_prop_ok += 1;
+                    self.orb_prop = None;
+                    self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
+                    return;
+                }
+            }
+        }
         common::info!("지도 잇기 후보: 지도 {ma} 장면 {:.2} ↔ 지도 {mb} 장면 {:.2} (맞은 점 {}, MegaLoc {:.2})", h.t, h.c_t, h.inliers, h.score);
         // 같은 두 지도의 최근(60 초) 후보 가운데 하나라도 같은 변환이면 받음(사이에 틀린 후보가 끼어도 됨)
         self.pend.retain(|p| t - p.3 < 60.0);
@@ -425,13 +462,13 @@ impl Orb3 {
             self.pend.push((mb, ma, s_ba, t));
             return;
         }
-        if self.try_graft(ma, mb, &s_ba, &all) {
+        if self.try_graft(ma, mb, &s_ba, &all, &format!("잇기 장면 {:.3} ↔ {:.3}", h.t, h.c_t)) {
             self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
         }
     }
 
     /// 지도 a 와 b(b ← a 변환 s_ba)를 지도 통째 자유 공간 검사 뒤 옮겨 붙임(작은 쪽을 큰 쪽으로). 옮겨 붙였으면 참
-    fn try_graft(&mut self, ma: u64, mb: u64, s_ba: &T34, all: &HashMap<u64, (u64, T34)>) -> bool {
+    fn try_graft(&mut self, ma: u64, mb: u64, s_ba: &T34, all: &HashMap<u64, (u64, T34)>, why: &str) -> bool {
         let s_ba = *s_ba;
         let (na, nb) = (self.map_kfs.get(&ma).copied().unwrap_or(0), self.map_kfs.get(&mb).copied().unwrap_or(0));
         // 지도 통째 자유 공간 검사(장면 한 장 짝은 반복되는 책상 · 모니터 줄에서 두 번 같은 틀린 변환을 낼 수 있음):
@@ -460,7 +497,7 @@ impl Orb3 {
         let ok = self.sys.graft(from, into, &s_ok);
         if ok {
             self.n_graft += 1;
-            common::info!("위치: 지도 {from} 를 지도 {into} 에 옮겨 붙임(신경망 장소 인식 + 지도 통째 자유 공간 검사)");
+            common::info!("위치: 지도 {from} 를 지도 {into} 에 옮겨 붙임(신경망 장소 인식 + 지도 통째 자유 공간 검사) GRAFT {why}");
         }
         ok
     }
@@ -497,6 +534,14 @@ impl Orb3 {
                 self.on_hit(h, f.t);
             }
         }
+        // 검증 장면을 보낸 제안이 아직 남아 있으면(받지 못함) 거절. 검증 결과는 보낸 다음 recv 에 옴
+        if let Some((p, true)) = &self.orb_prop
+            && self.stitch.pending == 0
+        {
+            common::info!("ORB 제안 거절: 지도 {} → {} 장면 {:.3} ↔ {:.3}(우리 깊이 검증 통과 못 함)", p.from, p.into, p.t, p.t_kf);
+            self.n_prop_no += 1;
+            self.orb_prop = None;
+        }
         let c0 = Instant::now();
         let (w, h) = (f.cam.width, f.cam.height);
         if self.block {
@@ -518,6 +563,12 @@ impl Orb3 {
         let tr = self.sys.track(&f.color, &near, w, h, f.t, up);
         self.s_track.push(c0.elapsed().as_secs_f64() * 1e3);
         let changed = self.sys.map_changed();
+        if let Some(p) = self.sys.take_graft() {
+            common::info!("ORB 제안(다른 지도 재위치): 지도 {} → {} 장면 {:.3} ↔ 키프레임 장면 {:.3}", p.from, p.into, p.t, p.t_kf);
+            if self.orb_prop.is_none() {
+                self.orb_prop = Some((p, false));
+            }
+        }
         let mut flags = 0u32;
         if self.last_map != Some(tr.map_id) {
             if self.last_map.is_some() {
@@ -550,7 +601,7 @@ impl Orb3 {
                 self.gap_hyp = None;
             } else {
                 self.gap_hyp = Some((gn, go, gs, tries + 1));
-                if self.try_graft(gn, go, &gs, &all) {
+                if self.try_graft(gn, go, &gs, &all, &format!("빈틈 장면 {:.3} ↔ {:.3}", f.t, self.last_ok_t)) {
                     self.gap_hyp = None;
                     self.n_gapgraft += 1;
                 }
@@ -613,7 +664,8 @@ impl Orb3 {
             }
         }
         // 지도 잇기에 장면 보내기(0.25 초마다, 1 초 평균 가속도로 본 IMU 위쪽이 믿을 만할 때)
-        if ok && f.t - self.last_node_t >= 0.25 && self.acc.len() >= 20 {
+        let force = self.orb_prop.as_ref().filter(|p| !p.1 && (p.0.t - f.t).abs() < 1e-6).map(|p| p.0.t_kf);
+        if ok && (f.t - self.last_node_t >= 0.25 || force.is_some()) && self.acc.len() >= 20 {
             if f.t - self.kfmap_t >= 1.0 || changed {
                 self.all_kfs(f.t);
             }
@@ -640,9 +692,22 @@ impl Orb3 {
                         h: c.height as usize,
                         up: m.map(|v| v / g),
                         maps: self.kfmap.clone(),
+                        force,
                     });
+                    if force.is_some()
+                        && let Some(p) = &mut self.orb_prop
+                    {
+                        p.1 = true;
+                    }
                 }
             }
+        }
+        if let Some((p, false)) = &self.orb_prop
+            && (p.t - f.t).abs() < 1e-6
+        {
+            common::info!("ORB 제안 거절: 지도 {} → {} 장면 {:.3}(검증 장면을 못 보냄)", p.from, p.into, p.t);
+            self.n_prop_no += 1;
+            self.orb_prop = None;
         }
         if changed && usable {
             flags |= MAP_CORRECTED;
@@ -999,7 +1064,7 @@ impl SlamBackend for Orb3Backend {
             s.n_sent_ok, s.n_held, s.n_lost, s.n_newmap, s.n_corr, s.n_regrav, s.n_repin, s.n_switch, s.n_spike, s.n_graph, s.n_nodes, s.dropped
         );
         common::info!("ms/장 위치추적 {}", summary(&s.s_track));
-        common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}(그 가운데 빈틈 이어 붙이기 {})", s.stitch.sent, s.stitch.hits, s.n_graft, s.n_gapgraft);
+        common::info!("지도 잇기: 보낸 장면 {} · 맞은 짝 {} · 옮겨 붙임 {}(그 가운데 빈틈 이어 붙이기 {}) · ORB 제안 받음 {} · 거절 {}", s.stitch.sent, s.stitch.hits, s.n_graft, s.n_gapgraft, s.n_prop_ok, s.n_prop_no);
         drop(s.poses_f.take());
         let _ = std::fs::remove_file(&s.settings_path);
         Ok(0)

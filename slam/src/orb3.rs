@@ -9,6 +9,8 @@ unsafe extern "C" {
     fn orb3_keyframes(h: *mut c_void, all: c_int, ids: *mut u64, maps: *mut u64, poses: *mut f64, cap: c_int) -> c_int;
     fn orb3_graft(h: *mut c_void, from: u64, into: u64, s: *const f64) -> c_int;
     fn orb3_wait_idle(h: *mut c_void);
+    fn orb3_graft_external(h: *mut c_void, on: c_int);
+    fn orb3_take_graft(h: *mut c_void, from: *mut u64, into: *mut u64, s: *mut f64, t: *mut f64, t_kf: *mut f64) -> c_int;
     fn orb3_kf_now(h: *mut c_void, id: u64, twc: *mut f64, map: *mut u64) -> c_int;
     fn orb3_free(h: *mut c_void);
 }
@@ -78,6 +80,29 @@ impl System {
     pub fn graft(&mut self, from: u64, into: u64, s: &[f64; 12]) -> bool {
         // SAFETY: s 는 12 칸
         unsafe { orb3_graft(self.0, from, into, s.as_ptr()) != 0 }
+    }
+}
+
+/// ORB 다른 지도 재위치가 낸 옮겨 붙이기 제안: from 지도를 into 지도로, s = into ← from, 지금 장면 시각 · into 쪽 키프레임 시각
+pub struct GraftProposal {
+    pub from: u64,
+    pub into: u64,
+    pub s: [f64; 12],
+    pub t: f64,
+    pub t_kf: f64,
+}
+
+impl System {
+    /// 다른 지도 재위치 → 옮겨 붙이기를 ORB 가 바로 하지 않고 제안으로만 남기게(우리 깊이 검증 뒤 graft)
+    pub fn graft_external(&mut self, on: bool) {
+        // SAFETY: 살아 있는 핸들
+        unsafe { orb3_graft_external(self.0, on as c_int) }
+    }
+
+    pub fn take_graft(&mut self) -> Option<GraftProposal> {
+        let mut p = GraftProposal { from: 0, into: 0, s: [0.0; 12], t: 0.0, t_kf: 0.0 };
+        // SAFETY: 출력 칸은 지역 값, s 는 12 칸
+        (unsafe { orb3_take_graft(self.0, &mut p.from, &mut p.into, p.s.as_mut_ptr(), &mut p.t, &mut p.t_kf) } != 0).then_some(p)
     }
 }
 

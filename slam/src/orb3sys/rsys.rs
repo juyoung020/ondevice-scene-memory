@@ -6,12 +6,12 @@
 //! 바꿔 끼우는 단위가 System 통째이기 때문, `mod.rs` 머리글). 구멍 목록은 [`HOLES`]. 이 판이 [`Orb3System`] 를 구현하므로
 //! 구멍이 다 메워지면 `orb3_backend` 가 `RustSystem` 을 그대로 연다.
 use super::mapping::{self, KfSteps, MapState, MappingStats};
+use super::graft::{self, GraftState};
 use super::threads::{LoopQueue, MapUpdate, Mapper};
 use super::{Orb3System, Track};
 use crate::orb3cv::system::{self as cvsys, SystemInit};
 use crate::orb3rs::extract::Extractor;
 use crate::orb3rs::track::{self, state, MapperStatus, NeedKfCtx, Tracker, TrackOps};
-use crate::orb3ba::lba::{self, ObsOrder};
 use crate::orb3loop::detect::best_covisibles;
 use crate::orb3rs::localmap::{self, NewMp, TriParams};
 use crate::orb3rs::matcher::Matcher;
@@ -19,7 +19,8 @@ use crate::orb3loop::crand::GlibcRand;
 use crate::orb3loop::dbow2::{BowVector, Vocabulary};
 use crate::orb3loop::kfdb::{KeyFrameDatabase, KfGraph, KfId as DbKf, MapId as DbMap};
 use crate::orb3loop::reloc::{relocalize, RustPnp};
-use crate::orb3rs::types::{Atlas, Frame, KeyFrame, KfId, Map, MapId, MapPoint, MpId};
+use crate::orb3rs::stdsort;
+use crate::orb3rs::types::{quat_from_mat, Atlas, Frame, KeyFrame, KfId, Map, MapId, MapPoint, MpId, Se3};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -32,7 +33,6 @@ pub const HOLES: &[&str] = &[
     "Tracking::TrackWithMotionModel",
     "Tracking::TrackLocalMap(SearchLocalPoints · PoseOptimization 엮기)",
     "Tracking::CreateNewKeyFrame",
-    "패치 DoPendingGraft",
     "LocalMapping::ProcessNewKeyFrame(UpdateConnections · ComputeBoW)",
     "LocalMapping::SearchInNeighbors",
 ];
@@ -51,6 +51,18 @@ pub struct RsSteps {
     pub recent: Vec<MpId>,
     pub tri: TriParams,
     pub th_depth: f32,
+    /// 마지막으로 본 지도 스레드 비우기 수(바뀌면 mlpRecentAddedMapPoints 비움 = ResetIfRequested)
+    pub reset_seen: u64,
+}
+
+impl RsSteps {
+    fn reset_if_requested(&mut self) {
+        let g = self.mapper.reset_gen();
+        if g != self.reset_seen {
+            self.reset_seen = g;
+            self.recent.clear();
+        }
+    }
 }
 
 impl KfSteps for RsSteps {
@@ -58,6 +70,7 @@ impl KfSteps for RsSteps {
         hole("LocalMapping::ProcessNewKeyFrame")
     }
     fn map_point_culling(&mut self, st: &mut MapState, kf: KfId) {
+        self.reset_if_requested();
         localmap::map_point_culling(&mut self.recent, kf, false, &mut st.atlas, &mut st.ext);
     }
     fn create_new_map_points(&mut self, st: &mut MapState, kf: KfId) {
@@ -69,7 +82,6 @@ impl KfSteps for RsSteps {
         let mut new = Vec::new();
         // 원본은 이웃마다 짝을 찾은 뒤 새 점을 바로 지도에 넣는다(다음 이웃 짝 찾기가 그 점을 봄) — 짝 찾기 전에 앞 이웃의 점을 넣음
         let atlas = std::cell::RefCell::new(&mut st.atlas);
-        let ext = std::cell::RefCell::new(&mut st.ext);
         let recent = std::cell::RefCell::new(&mut self.recent);
         localmap::create_new_map_points(
             &cur,
@@ -88,16 +100,14 @@ impl KfSteps for RsSteps {
                 let mut mp = MapPoint { id, map, pos: n.pos, first_frame: frame, first_kf: kf, ref_kf: kf, visible: 1, found: 1, ..Default::default() };
                 mp.add_observation(&a.kfs[&kf], n.idx1);
                 mp.add_observation(&a.kfs[&n.kf2], n.idx2);
-                let w = mp.n_obs;
                 a.kfs.get_mut(&kf).unwrap().map_points[n.idx1] = Some(id);
                 a.kfs.get_mut(&n.kf2).unwrap().map_points[n.idx2] = Some(id);
                 mp.compute_distinctive_descriptors(&a.kfs);
                 a.mps.insert(id, mp);
-                lba::mp_update_normal_and_depth(id, &mut a, ObsOrder(None));
+                crate::orb3rs::mapdata::mp_update_normal_and_depth(&mut a, id);
                 if let Some(mi) = a.maps.iter_mut().find(|x| x.id == map) {
                     mi.mps.push(id);
                 }
-                ext.borrow_mut().mp_nobs.insert(id, w);
                 recent.borrow_mut().push(id);
                 new.push(id);
             },
@@ -160,6 +170,10 @@ pub struct RustSystem {
     kfdb: Arc<std::sync::Mutex<Option<KeyFrameDatabase>>>,
     /// 원본 glibc rand(씨앗 1): Sim3Solver · MLPnP 가 한 수열을 나눠 씀
     rand: std::cell::RefCell<GlibcRand>,
+    /// System::mbResetActiveMap
+    reset_pending: bool,
+    /// 패치 옮겨 붙이기 칸
+    graft: GraftState,
 }
 
 impl RustSystem {
@@ -182,7 +196,7 @@ impl RustSystem {
             far_points: init.settings.th_far_points != 0.0,
             th_far_points: init.settings.th_far_points,
         };
-        let mut steps = RsSteps { mapper: Arc::clone(&mapper), recent: Vec::new(), tri, th_depth: init.tracking.th_depth };
+        let mut steps = RsSteps { mapper: Arc::clone(&mapper), recent: Vec::new(), tri, th_depth: init.tracking.th_depth, reset_seen: 0 };
         let loopq = LoopQueue::<KfId>::new();
         let (m2, map2, q2) = (Arc::clone(&mapper), Arc::clone(&map), Arc::clone(&loopq));
         let mapping = Some(std::thread::spawn(move || mapping::run(&m2, &map2, &q2, &mut steps)));
@@ -206,6 +220,8 @@ impl RustSystem {
             voc: None,
             kfdb: Arc::new(std::sync::Mutex::new(None)),
             rand: std::cell::RefCell::new(GlibcRand::new(1)),
+            reset_pending: false,
+            graft: GraftState::default(),
         })
     }
 
@@ -233,20 +249,12 @@ impl Drop for RustSystem {
 #[derive(Default)]
 struct Edits {
     last_reloc_frame_id: Option<u64>,
-    reset: bool,
 }
 
 impl Edits {
     fn apply(&self, t: &mut Tracker) {
         if let Some(id) = self.last_reloc_frame_id {
             t.last_reloc_frame_id = id;
-        }
-        if self.reset {
-            // Tracking::ResetActiveMap 의 상태 칸
-            t.state = state::NO_IMAGES_YET;
-            t.reference_kf = None;
-            t.last_kf = None;
-            t.velocity = false;
         }
     }
 }
@@ -363,42 +371,9 @@ impl TrackOps for Ops<'_> {
         s.last = None;
         s.changed = true;
     }
-    /// Tracking::ResetActiveMap(false): 지도 스레드 비우기 요청 → BoW DB 에서 지금 지도 지움 → Atlas::clearMap(지도 id 는 남김)
+    /// Track() 안의 mpSystem->ResetActiveMap(): 표지만 세움. 실제 Tracking::ResetActiveMap 은 다음 TrackRGBD 시작(장면 만들기 전)
     fn reset_active_map(&mut self) {
-        let s = &mut *self.s;
-        // RequestResetActiveMap: Rust 지도 스레드는 대기열을 다 비운 뒤에만 멈추므로 한가해질 때까지 기다린 뒤 지움
-        s.mapper.wait_idle();
-        {
-            let mut g = s.map.lock();
-            let st = &mut *g;
-            let cur = st.atlas.current;
-            let cur_id = st.atlas.maps[cur].id;
-            if let Some(db) = s.kfdb.lock().unwrap().as_mut() {
-                db.clear_map(&AtlasGraph::new(&st.atlas), cur_id as DbMap);
-            }
-            let kfs = std::mem::take(&mut st.atlas.maps[cur].kfs);
-            let mps = std::mem::take(&mut st.atlas.maps[cur].mps);
-            for k in kfs {
-                st.atlas.kfs.remove(&k);
-                st.ext.kf_track_ref.remove(&k);
-                st.ext.kf_not_erase.remove(&k);
-            }
-            for m in mps {
-                st.atlas.mps.remove(&m);
-                st.ext.mp_nobs.remove(&m);
-                st.ext.mp_track_ref.remove(&m);
-            }
-            st.atlas.maps[cur].origin_kf = None;
-            st.ext.map_init_kf.remove(&cur_id);
-        }
-        s.last_init_frame_id = s.next_frame;
-        let cur_frame = s.cur.as_ref().map(|f| f.id).unwrap_or(0);
-        s.initial_frame_id = cur_frame;
-        self.ed.last_reloc_frame_id = Some(cur_frame);
-        self.ed.reset = true;
-        s.cur = None;
-        s.last = None;
-        s.changed = true;
+        self.s.reset_pending = true;
     }
     /// Atlas::ChangeMap
     fn change_map(&mut self, map: MapId) {
@@ -428,8 +403,38 @@ impl TrackOps for Ops<'_> {
     fn create_new_keyframe(&mut self) -> KfId {
         hole("Tracking::CreateNewKeyFrame")
     }
+    /// 패치 Tracking::TryGraft: 지금 지도를 다른 지도(키프레임 많은 순)에 재위치해 보고, 같은 변환이 두 번이면 합치기 예약
     fn try_graft(&mut self) {
-        // 옮겨 붙이기 요청이 없으면 할 일 없음(원본 패치도 대기 중인 요청이 있을 때만)
+        let frame_id = self.s.cur.as_ref().expect("지금 장면").id;
+        let (cur, mut maps) = {
+            let g = self.s.map.lock();
+            if g.atlas.maps.len() < 2 || frame_id < self.s.graft.graft_try + 3 {
+                return;
+            }
+            let a = &g.atlas;
+            (a.maps[a.current].id, a.maps.iter().map(|m| (m.id, m.kfs.len(), m.bad)).collect::<Vec<_>>())
+        };
+        self.s.graft.graft_try = frame_id;
+        let tcw_cur = self.s.cur.as_ref().unwrap().tcw.expect("지금 자세");
+        let saved = self.s.cur.clone();
+        let saved_reloc = self.ed.last_reloc_frame_id;
+        // std::sort(KeyFramesInMap 큰 순) — 원본 순서(GetAllMaps = 포인터 순)는 id 순으로
+        stdsort::sort_by(&mut maps, &mut |a: &(MapId, usize, bool), b: &(MapId, usize, bool)| a.1 > b.1);
+        for (m, n, bad) in maps {
+            if m == cur || bad || n == 0 {
+                continue;
+            }
+            let ok = self.relocalization(Some(m));
+            let tcw_m = self.s.cur.as_ref().unwrap().tcw;
+            self.s.cur = saved.clone();
+            self.ed.last_reloc_frame_id = saved_reloc;
+            if !ok {
+                continue;
+            }
+            let s = tcw_m.expect("재위치 자세").inverse().mul(&tcw_cur);
+            graft::try_graft_step(&mut self.s.graft, frame_id, cur, m, s);
+            return;
+        }
     }
     fn all_maps(&mut self) -> Vec<(MapId, i32)> {
         let g = self.s.map.lock();
@@ -459,6 +464,9 @@ impl TrackOps for Ops<'_> {
 
 impl Orb3System for RustSystem {
     fn track(&mut self, rgb: &[u8], depth: &[u16], w: u32, h: u32, t: f64, _up: Option<[f64; 3]>) -> Track {
+        if std::mem::take(&mut self.reset_pending) {
+            self.reset_active_map_now();
+        }
         let (wu, hu) = (w as usize, h as usize);
         let mut gray = std::mem::take(&mut self.gray);
         let mut dep = std::mem::take(&mut self.depth);
@@ -471,6 +479,7 @@ impl Orb3System for RustSystem {
         self.gray = gray;
         self.depth = dep;
         self.last = self.cur.replace(f);
+        self.do_pending_graft();
         let mut tr = std::mem::take(&mut self.tracker);
         let mut ops = Ops { s: self, ed: Edits::default() };
         track::track_flow(&mut tr, id, t, &mut ops);
@@ -499,8 +508,12 @@ impl Orb3System for RustSystem {
     fn keyframes(&mut self, all: bool) -> Vec<(u64, u64, [f64; 12])> {
         cvsys::keyframes(&self.map.lock().atlas, all)
     }
-    fn graft(&mut self, _from: u64, _into: u64, _s: &[f64; 12]) -> bool {
-        hole("패치 DoPendingGraft")
+    /// 패치 RequestGraft(바깥): s = into ← from, 3×4 행 우선
+    fn graft(&mut self, from: u64, into: u64, s: &[f64; 12]) -> bool {
+        let r = [[s[0] as f32, s[1] as f32, s[2] as f32], [s[4] as f32, s[5] as f32, s[6] as f32], [s[8] as f32, s[9] as f32, s[10] as f32]];
+        let se = Se3 { q: quat_from_mat(&r), t: [s[3] as f32, s[7] as f32, s[11] as f32] };
+        let g = self.map.lock();
+        graft::request_graft(&mut self.graft, &g.atlas, from as MapId, into as MapId, se)
     }
     fn wait_idle(&mut self) {
         self.mapper.wait_idle()
@@ -511,6 +524,86 @@ impl Orb3System for RustSystem {
 }
 
 impl RustSystem {
+    /// Tracking::ResetActiveMap(false): 지도 스레드 비우기(지금 키프레임을 마친 뒤 대기열 · 최근 점 버림) → BoW DB 에서 지금 지도 지움
+    /// → Atlas::clearMap(지도 id 는 남김) → 추적 칸. 루프 스레드 비우기 요청은 루프 스레드가 엮이면 같은 자리에.
+    fn reset_active_map_now(&mut self) {
+        self.mapper.reset_active_map();
+        {
+            let mut g = self.map.lock();
+            let st = &mut *g;
+            let cur = st.atlas.current;
+            let cur_id = st.atlas.maps[cur].id;
+            if let Some(db) = self.kfdb.lock().unwrap().as_mut() {
+                db.clear_map(&AtlasGraph::new(&st.atlas), cur_id as DbMap);
+            }
+            let kfs = std::mem::take(&mut st.atlas.maps[cur].kfs);
+            let mps = std::mem::take(&mut st.atlas.maps[cur].mps);
+            for k in kfs {
+                st.atlas.kfs.remove(&k);
+                st.ext.kf_track_ref.remove(&k);
+            }
+            for m in mps {
+                st.atlas.mps.remove(&m);
+                st.ext.mp_track_ref.remove(&m);
+            }
+            st.atlas.maps[cur].origin_kf = None;
+        }
+        self.last_init_frame_id = self.next_frame;
+        let cur_frame = self.cur.as_ref().map(|f| f.id).unwrap_or(0);
+        self.initial_frame_id = cur_frame;
+        let t = &mut self.tracker;
+        t.state = state::NO_IMAGES_YET;
+        t.last_reloc_frame_id = cur_frame;
+        t.reference_kf = None;
+        t.last_kf = None;
+        t.velocity = false;
+        self.cur = None;
+        self.last = None;
+        self.changed = true;
+    }
+
+    /// 패치 DoPendingGraft(Track() 시작): 예약된 합치기를 지도 스레드를 멈추고 함. 루프 · 전체 최적화 중이면 다음 장면에
+    fn do_pending_graft(&mut self) {
+        let Some((from, into, s)) = self.graft.pending.take() else { return };
+        {
+            let g = self.map.lock();
+            let bad = |id: MapId| g.atlas.maps.iter().find(|m| m.id == id).is_none_or(|m| m.bad);
+            if bad(from) || bad(into) {
+                return;
+            }
+        }
+        if self.loop_busy() {
+            self.graft.pending = Some((from, into, s));
+            return;
+        }
+        let move_cam = self.current_map_id() == from as u64;
+        let s = graft::yaw_only(&s);
+        // GraftMap: 쌓인 키프레임 처리 끝 → 지도 스레드 멈춤 → 지도 잠금 안 옮기기 → 놓기
+        self.mapper.wait_idle();
+        let tok = self.mapper.request_stop();
+        tok.wait();
+        {
+            let mut g = self.map.lock();
+            graft::graft_map(&mut g.atlas, from, into, &s);
+        }
+        drop(tok);
+        if move_cam {
+            if let Some(l) = self.last.as_mut() {
+                if let Some(p) = l.tcw {
+                    l.set_pose(p.mul(&s.inverse()));
+                }
+            }
+            let mut g = self.map.lock();
+            g.atlas.current = g.atlas.maps.iter().position(|m| m.id == into).expect("into 지도");
+        }
+        self.changed = true;
+    }
+
+    /// 루프 닫기 · 합치기 · 전체 최적화가 돌고 있나(mMutexBusy · isRunningGBA) — 루프 스레드가 엮이기 전엔 늘 false
+    fn loop_busy(&self) -> bool {
+        false
+    }
+
     fn current_map_id(&self) -> u64 {
         let g = self.map.lock();
         g.atlas.maps.get(g.atlas.current).map(|m| m.id as u64).unwrap_or(0)

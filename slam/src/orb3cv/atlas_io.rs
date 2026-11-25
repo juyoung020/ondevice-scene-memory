@@ -121,51 +121,6 @@ fn ctx_eq(a: &FrameCtx, b: &FrameCtx) -> bool {
     a.cam == b.cam && a.pyr == b.pyr && [a.min_x, a.max_x, a.min_y, a.max_y, a.grid_inv_w, a.grid_inv_h].map(f32::to_bits) == [b.min_x, b.max_x, b.min_y, b.max_y, b.grid_inv_w, b.grid_inv_h].map(f32::to_bits)
 }
 
-/// MapPoint::EraseObservation. 원본 mObservations 는 KeyFrame* 주소 순이라 지운 뒤 새 기준 키프레임(begin)이 실행마다
-/// 다를 수 있다 — 여기선 id 순 첫째. 관측이 다 없어지면(원본은 빈 map 의 begin 을 읽는 미정의 동작) 기준은 그대로 두고, 그때는 nObs ≤ 2 라
-/// 점이 어차피 나쁨이 된다.
-pub fn mp_erase_observation(a: &mut Atlas, mp: u64, kf: u64) {
-    let Some(p) = a.mps.get_mut(&mp) else { return };
-    let Some((l, r)) = p.obs.remove(&kf) else { return };
-    if l != -1 {
-        // 카메라 2 없음(RGB-D): 오른쪽 좌표가 있으면 입체 관측
-        let stereo = a.kfs.get(&kf).is_some_and(|k| k.u_right.get(l as usize).is_some_and(|&u| u >= 0.0));
-        p.n_obs -= if stereo { 2 } else { 1 };
-    }
-    if r != -1 {
-        p.n_obs -= 1;
-    }
-    if p.ref_kf == kf {
-        if let Some(&first) = p.obs.keys().next() {
-            p.ref_kf = first;
-        }
-    }
-    if p.n_obs <= 2 {
-        mp_set_bad(a, mp);
-    }
-}
-
-/// MapPoint::SetBadFlag: 나쁨 표시, 관측 비우기, 관측하던 키프레임의 그 번호를 비우기(EraseMapPointMatch), 지도에서 빼기(EraseMapPoint)
-pub fn mp_set_bad(a: &mut Atlas, mp: u64) {
-    let Some(p) = a.mps.get_mut(&mp) else { return };
-    p.bad = true;
-    let obs = std::mem::take(&mut p.obs);
-    let map = p.map;
-    for (kf, (l, r)) in obs {
-        if let Some(k) = a.kfs.get_mut(&kf) {
-            for i in [l, r] {
-                if i != -1 {
-                    if let Some(s) = k.map_points.get_mut(i as usize) {
-                        *s = None;
-                    }
-                }
-            }
-        }
-    }
-    if let Some(m) = a.maps.iter_mut().find(|m| m.id == map) {
-        m.mps.retain(|&x| x != mp);
-    }
-}
 
 /// Atlas::PreSave 중 살아 있는 Atlas 를 바꾸는 부분: id 순 지도마다(나쁘지 않고 키프레임이 있는 것) Map::PreSave 의 첫 고리 —
 /// 나쁘지 않은 점마다 관측 사본을 돌며 다른 지도 · 나쁜 키프레임 관측을 EraseObservation. 키프레임 없는 지도는 SetMapBad 처럼 나쁨 표시.
@@ -194,7 +149,7 @@ pub fn pre_save(a: &mut Atlas) {
             for kf in obs {
                 let foreign = a.kfs.get(&kf).map_or(true, |k| k.map != mid || k.bad);
                 if foreign {
-                    mp_erase_observation(a, mp, kf);
+                    crate::orb3rs::mapdata::mp_erase_observation(a, mp, kf);
                 }
             }
         }

@@ -11,7 +11,7 @@
 //! 공통 타입(types.rs)에 없는 원본 칸은 [`TrackExt`] 옆 표에 둔다(통합 때 타입으로 옮길 후보):
 //! MapPoint::nObs · mnTrackReferenceForFrame, KeyFrame::mnTrackReferenceForFrame · mbNotErase, Map::mnInitKFid.
 use super::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// System::eSensor
 pub mod sensor {
@@ -44,19 +44,11 @@ pub const LOST_NEWMAP_S: f64 = 0.2;
 /// 공통 타입 밖의 원본 칸(옆 표)
 #[derive(Clone, Debug, Default)]
 pub struct TrackExt {
-    /// MapPoint::nObs(관측 수: 깊이 있는 관측 2, 없으면 1)
-    pub mp_nobs: HashMap<MpId, i32>,
     pub mp_track_ref: HashMap<MpId, u64>,
     pub kf_track_ref: HashMap<KfId, u64>,
-    pub kf_not_erase: HashSet<KfId>,
-    pub map_init_kf: HashMap<MapId, KfId>,
 }
 
 impl TrackExt {
-    #[inline]
-    pub fn nobs(&self, mp: MpId) -> i32 {
-        *self.mp_nobs.get(&mp).unwrap_or(&0)
-    }
     #[inline]
     pub fn kf_ref(&self, kf: KfId) -> u64 {
         *self.kf_track_ref.get(&kf).unwrap_or(&0)
@@ -140,7 +132,7 @@ pub fn tracked_map_points(atlas: &Atlas, ext: &TrackExt, kf: KfId, min_obs: i32)
         let m = &atlas.mps[mp];
         if !m.bad {
             if check {
-                if ext.nobs(*mp) >= min_obs {
+                if m.n_obs >= min_obs {
                     n += 1;
                 }
             } else {

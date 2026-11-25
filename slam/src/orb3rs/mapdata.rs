@@ -450,41 +450,53 @@ pub fn mp_set_bad_flag(a: &mut Atlas, mp: MpId) {
 
 /// MapPoint::Replace(old → new): 관측을 new 로 옮기고(이미 보던 kf 는 칸 비움) 찾은 · 보인 수 더하고 기술자 다시, old 는 지도에서 빼기
 pub fn mp_replace(a: &mut Atlas, old: MpId, new: MpId) {
+    if let Some(map) = mp_replace_parts(&mut a.kfs, &mut a.mps, old, new) {
+        if let Some(m) = a.map_mut(map) {
+            m.erase_map_point(old);
+        }
+    }
+}
+
+/// Replace 의 키프레임 · 점 부분(지도에서 빼기는 돌려준 지도 id 로 부른 쪽). old == new 면 None
+pub fn mp_replace_parts(kfs: &mut BTreeMap<KfId, KeyFrame>, mps: &mut BTreeMap<MpId, MapPoint>, old: MpId, new: MpId) -> Option<MapId> {
     if old == new {
-        return;
+        return None;
     }
     let (obs, nvisible, nfound, map) = {
-        let o = a.mps.get_mut(&old).unwrap();
+        let o = mps.get_mut(&old).unwrap();
         o.bad = true;
         o.replaced = Some(new);
         (std::mem::take(&mut o.obs), o.visible, o.found, o.map)
     };
     for (k, (l, r)) in obs {
-        let in_kf = a.mps[&new].obs.contains_key(&k);
+        let in_kf = mps[&new].obs.contains_key(&k);
         for idx in [l, r] {
             if idx == -1 {
                 continue;
             }
             if !in_kf {
-                a.kfs.get_mut(&k).unwrap().map_points[idx as usize] = Some(new);
-                let kk = &a.kfs[&k];
-                a.mps.get_mut(&new).unwrap().add_observation(kk, idx as usize);
+                kfs.get_mut(&k).unwrap().map_points[idx as usize] = Some(new);
+                mps.get_mut(&new).unwrap().add_observation(&kfs[&k], idx as usize);
             } else {
-                a.kfs.get_mut(&k).unwrap().map_points[idx as usize] = None;
+                kfs.get_mut(&k).unwrap().map_points[idx as usize] = None;
             }
         }
     }
-    let n = a.mps.get_mut(&new).unwrap();
+    let n = mps.get_mut(&new).unwrap();
     n.found += nfound;
     n.visible += nvisible;
-    n.compute_distinctive_descriptors(&a.kfs);
-    if let Some(m) = a.map_mut(map) {
-        m.erase_map_point(old);
-    }
+    n.compute_distinctive_descriptors(kfs);
+    Some(map)
 }
 
 /// MapPoint::UpdateNormalAndDepth: 관측 카메라 중심 → 점 단위 벡터의 평균, 기준 kf 거리 × 그 층 배율 = 최대 거리
 pub fn mp_update_normal_and_depth(a: &mut Atlas, mp: MpId) {
+    let obs: Vec<(KfId, (i32, i32))> = a.mps[&mp].obs.iter().map(|(k, v)| (*k, *v)).collect();
+    mp_update_normal_and_depth_obs(a, mp, &obs);
+}
+
+/// UpdateNormalAndDepth, 관측 순회 순서를 받음(원본 mObservations 는 KeyFrame* 주소 순 — 비트 시험이 덤프 순서를 넣음)
+pub fn mp_update_normal_and_depth_obs(a: &mut Atlas, mp: MpId, obs: &[(KfId, (i32, i32))]) {
     let p = &a.mps[&mp];
     if p.bad || p.obs.is_empty() {
         return;
@@ -492,9 +504,9 @@ pub fn mp_update_normal_and_depth(a: &mut Atlas, mp: MpId) {
     let pos = p.pos;
     let mut normal = [0.0f32; 3];
     let mut n = 0i32;
-    for (k, &(l, r)) in &p.obs {
+    for &(k, (l, r)) in obs {
         if l != -1 {
-            let ni = sub(&pos, &a.kfs[k].camera_center());
+            let ni = sub(&pos, &a.kfs[&k].camera_center());
             let nn = norm(&ni);
             normal = add(&normal, &[ni[0] / nn, ni[1] / nn, ni[2] / nn]);
             n += 1;
@@ -503,7 +515,8 @@ pub fn mp_update_normal_and_depth(a: &mut Atlas, mp: MpId) {
     }
     let rk = &a.kfs[&p.ref_kf];
     let dist = norm(&sub(&pos, &rk.camera_center()));
-    let (l, _) = p.index_in_keyframe(p.ref_kf);
+    // observations[pRefKF]: 없으면 기본 튜플 (0, 0)
+    let (l, _) = p.obs.get(&p.ref_kf).copied().unwrap_or((0, 0));
     let level = rk.keys[l as usize].octave as usize;
     let pyr = &rk.ctx.pyr;
     let max = dist * pyr.scale[level];

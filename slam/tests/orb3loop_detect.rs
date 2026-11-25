@@ -2,6 +2,7 @@
 //! DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF 호출마다 들어갈 때 상태 · 쓴 난수 · OptimizeSim3 입출력 · 나올 때 출력.
 //! OptimizeSim3 는 원본 FFI 도우미(`mlp_srv` 명령 4, 기준 빌드의 Optimizer::OptimizeSim3 를 가짜 키프레임으로 부름).
 //! ORBLOOP_LOOPDUMP=덤프1:덤프2 ORBLOOP_MLPSRV=.../mlp_srv cargo test --release -p slam --test orb3loop_detect
+//! ORBLOOP_RUST_S3=1 을 더하면 OptimizeSim3 를 Rust 판(`RustSim3`)으로 돌려 원본 기록과 비교
 use slam::orb3loop::detect::*;
 use slam::orb3rs::*;
 use std::collections::{BTreeMap, VecDeque};
@@ -180,6 +181,8 @@ struct Tally {
 /// 원본 OptimizeSim3 FFI + 원본 실행 기록과 입력 · 출력 비교
 struct Ffi<'a> {
     srv: &'a mut Srv,
+    /// ORBLOOP_RUST_S3 가 있으면 원본 FFI 대신 Rust OptimizeSim3(`RustSim3`)를 원본 기록과 비교
+    rust: bool,
     recs: VecDeque<OsimRec>,
     t: &'a mut Tally,
 }
@@ -187,6 +190,20 @@ struct Ffi<'a> {
 impl OptimizeSim3 for Ffi<'_> {
     fn optimize_sim3(&mut self, kf1: &KeyFrame, kf2: &KeyFrame, matches: &mut [Option<MpId>], s12: &mut G2oSim3, th2: f32, fix: bool, all: bool, mps: &BTreeMap<MpId, MapPoint>) -> i32 {
         let rec = self.recs.pop_front();
+        if self.rust {
+            let min = matches.to_vec();
+            let sin = *s12;
+            let r = RustSim3.optimize_sim3(kf1, kf2, matches, s12, th2, fix, all, mps);
+            self.t.osim_n += 1;
+            if let Some(rec) = rec {
+                let same = rec.kf1 == kf1.id && rec.kf2 == kf2.id && rec.min == min && sim_bits(&rec.sin, &sin) && rec.ret == r && rec.mout == matches && sim_bits(&rec.sout, s12);
+                self.t.osim_same += same as u64;
+                if !same && self.t.bad.len() < 10 {
+                    self.t.bad.push(format!("Rust OptimizeSim3 kf {}·{}: 결과 {r}/{} S {:?}/{:?}", kf1.id, kf2.id, rec.ret, s12, rec.sout));
+                }
+            }
+            return r;
+        }
         let mut b: Vec<u8> = vec![4];
         for kf in [kf1, kf2] {
             for v in kf.tcw.q.iter().chain(kf.tcw.t.iter()) {
@@ -339,7 +356,7 @@ fn run(path: &str, srv: &mut Srv, t: &mut Tally) {
                 }
                 v
             };
-            let mut ffi = Ffi { srv: &mut *srv, recs, t: &mut *t };
+            let mut ffi = Ffi { srv: &mut *srv, rust: std::env::var("ORBLOOP_RUST_S3").is_ok(), recs, t: &mut *t };
             let got = detect_common_regions_from_bow(&w, cur, fix, &cands, &mut ffi, &mut rf, &mut out);
             if !ffi.recs.is_empty() {
                 why.push(format!("원본 OptimizeSim3 {} 개 남음", ffi.recs.len()));
@@ -381,7 +398,7 @@ fn run(path: &str, srv: &mut Srv, t: &mut Tally) {
             let ret = r.u8() != 0;
             let (o_scw, o_n, o_mps, o_mm) = (r.sim(), r.i32(), r.mps(), r.mps());
             let w = World { kfs: &wd.kfs, mps: &wd.mps };
-            let mut ffi = Ffi { srv: &mut *srv, recs, t: &mut *t };
+            let mut ffi = Ffi { srv: &mut *srv, rust: std::env::var("ORBLOOP_RUST_S3").is_ok(), recs, t: &mut *t };
             let o = detect_and_refine_sim3_from_last_kf(&w, cur, member, matched, &scw, fix, &mut ffi);
             if !ffi.recs.is_empty() {
                 why.push("원본 OptimizeSim3 남음".into());

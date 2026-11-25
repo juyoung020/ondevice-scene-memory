@@ -339,8 +339,7 @@ fn mpcl(r: &mut R, t: &mut Tally, tbad: &mut Tally) {
         let visible = r.i32();
         let first = r.i64();
         let o = r.i32();
-        a.mps.insert(id, MapPoint { id, bad, found, visible, first_kf: first as u64, ..Default::default() });
-        ext.mp_nobs.insert(id, o);
+        a.mps.insert(id, MapPoint { id, bad, found, visible, first_kf: first as u64, n_obs: o, ..Default::default() });
         recent.push(id);
         bad0.push(bad);
     }
@@ -389,11 +388,12 @@ fn kfcl(r: &mut R, t: &mut Tally) {
             k.keys[i].octave = r.i32();
             k.u_right[i] = r.f32();
         }
+        k.not_erase = ne;
         if init {
-            ext.map_init_kf.insert(0, id);
-        }
-        if ne {
-            ext.kf_not_erase.insert(id);
+            match a.maps.iter_mut().find(|m| m.id == 0) {
+                Some(m) => m.init_kf_id = id,
+                None => a.maps.push(Map { id: 0, init_kf_id: id, ..Default::default() }),
+            }
         }
         local.push(id);
     }
@@ -401,9 +401,9 @@ fn kfcl(r: &mut R, t: &mut Tally) {
     for _ in 0..nu {
         let id = r.u64();
         let bad = r.b();
-        ext.mp_nobs.insert(id, r.i32());
+        let n_obs = r.i32();
         let no = r.u32();
-        let mut m = MapPoint { id, bad, ..Default::default() };
+        let mut m = MapPoint { id, bad, n_obs, ..Default::default() };
         for _ in 0..no {
             let k = r.u64();
             let li = r.i32();

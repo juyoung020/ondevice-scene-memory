@@ -395,3 +395,47 @@ pub fn detect_common_regions_from_bow<O: OptimizeSim3>(
     }
     false
 }
+
+/// OptimizeSim3 Rust 판(포터 CV `orb3cv::sim3opt`, 원본 실제 호출 37 개 비트 동일)
+pub struct RustSim3;
+
+impl OptimizeSim3 for RustSim3 {
+    fn optimize_sim3(
+        &mut self,
+        kf1: &KeyFrame,
+        kf2: &KeyFrame,
+        matches: &mut [Option<MpId>],
+        s12: &mut G2oSim3,
+        th2: f32,
+        fix_scale: bool,
+        all_points: bool,
+        mps: &BTreeMap<MpId, MapPoint>,
+    ) -> i32 {
+        use crate::orb3cv::sim3opt::{build_sim3_problem, optimize_sim3, Sim3Kf, Sim3Match};
+        let keys = |k: &KeyFrame| k.keys.iter().map(|p| (p.x, p.y, p.octave)).collect::<Vec<_>>();
+        let (k1, k2) = (keys(kf1), keys(kf2));
+        fn side<'a>(k: &'a KeyFrame, ku: &'a [(f32, f32, i32)]) -> Sim3Kf<'a> {
+            let c = &k.ctx.cam;
+            Sim3Kf { r: k.tcw.rot(), t: k.tcw.t, keys_un: ku, inv_level_sigma2: &k.ctx.pyr.inv_sigma2, cam: [c.fx, c.fy, c.cx, c.cy] }
+        }
+        let (s1, s2) = (side(kf1, &k1), side(kf2, &k2));
+        let ms: Vec<Sim3Match> = matches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let p2 = &mps[&(*m)?];
+                let mp1 = kf1.map_points.get(i).copied().flatten().map(|id| (mps[&id].pos, mps[&id].bad));
+                Some(Sim3Match { i, mp1, mp2: (p2.pos, p2.bad), i2: p2.obs.get(&kf2.id).map_or(-1, |o| o.0), track_scale_level2: p2.track_scale_level })
+            })
+            .collect();
+        let p = build_sim3_problem(&s1, &s2, &ms, *s12, th2, fix_scale, all_points);
+        let r = optimize_sim3(&p);
+        for (q, rej) in p.pairs.iter().zip(&r.rejected) {
+            if *rej {
+                matches[q.idx as usize] = None;
+            }
+        }
+        *s12 = r.s12;
+        r.n_in
+    }
+}

@@ -13,6 +13,7 @@ pub mod mlpnp;
 mod mlpnp_jacs;
 pub mod pinhole;
 pub mod pose_opt;
+pub mod mapdata;
 // 포터 TRACK: Tracking.cc 판단 · LocalMapping 컬링
 pub mod track;
 pub mod localmap;

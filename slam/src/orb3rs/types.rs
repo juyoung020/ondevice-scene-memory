@@ -164,6 +164,10 @@ pub struct KeyFrame {
     pub merge_edges: Vec<KfId>,
     /// mTcp(나쁨 표시 때 부모 기준 위치)
     pub tcp: Se3,
+    /// !mbFirstConnection(처음 연결로 부모를 정했음) · mbNotErase · mbToBeErased
+    pub first_conn_done: bool,
+    pub not_erase: bool,
+    pub to_be_erased: bool,
 }
 
 /// MapPoint
@@ -206,6 +210,14 @@ pub struct Map {
     pub origin_kf: Option<KfId>,
     pub bad: bool,
     pub change_id: i32,
+    /// mnInitKFid · mnMaxKFid · mpKFlowerID · mvpReferenceMapPoints · mnBigChangeIdx · mnMapChangeNotified
+    /// (kfs · mps 는 원본 std::set 처럼 id 순 정렬을 유지한다)
+    pub init_kf_id: KfId,
+    pub max_kf_id: KfId,
+    pub lower_kf: Option<KfId>,
+    pub ref_mps: Vec<MpId>,
+    pub big_change_idx: i32,
+    pub change_notified: i32,
 }
 
 /// Atlas: 지도들 + 키프레임 · 지도 점 저장소. 원본의 std::set<KeyFrame*>(포인터 주소 순)은 id 순으로 바꾼다

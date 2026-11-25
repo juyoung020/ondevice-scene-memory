@@ -12,6 +12,12 @@
   NeedNewKeyFrame 중 원본 호출 도중 입력이 바뀐 경우(장면당 0–7)는 따로 세고 그것도 전부 같음.
 - 통합판(7829f22) 병합 뒤 tum_360 · tum_floor 다시 돌려 불일치 0.
 
+## UpdateNormalAndDepth · UpdateConnections(`localmap::update_normal_and_depth` · `update_connections` · `add_connection` · `update_best_covisibles`)
+- tum_floor: 원본 순회(KeyFrame* 주소 순)가 id 순과 같은 호출은 전부 비트 동일 — UpdateNormalAndDepth 217,957/217,957, UpdateConnections 18/18.
+- 주소 순 ≠ id 순인 호출(UNDP 83,043 중 30,735 · UCON 154 중 75 다름)은 원본 자체가 실행마다 다른 부분: 법선 합 순서 끝자리,
+  같은 무게 키프레임의 순서(예: (2,41) · (3,41)). Rust 는 통합판 약속대로 id 순.
+- 덤프 UNDP · UCON 은 주소도 기록해 두 경우를 나눠 셈.
+
 ## 통합판 연결(`slam/src/orb3sys/steps.rs` TrackSteps: KfSteps)
 - 채움: MapPointCulling · KeyFrameCulling
 - 남음(hole): ProcessNewKeyFrame(ComputeBoW · UpdateNormalAndDepth · UpdateConnections 필요), CreateNewMapPoints 의 새 점 지도 넣기

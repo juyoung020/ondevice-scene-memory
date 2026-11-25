@@ -1,6 +1,7 @@
 //! 포터 TRACK — ORB-SLAM3 LocalMapping.cc 의 BA 호출을 뺀 판단들(RGB-D, 관성 없음).
 //! MapPointCulling · KeyFrameCulling(KeyFrame/MapPoint::SetBadFlag 가 관측 수에 미치는 효과 포함).
 //! 지역 BA 는 opt/orb3-rs-ba 몫이라 부르는 자리만: [`LocalMapperOps::local_ba`].
+use std::collections::BTreeMap;
 use super::track::{obs_weight, TrackExt};
 use super::types::*;
 
@@ -542,5 +543,113 @@ fn reproj_ok(cam: &Camera, p: &KfPose, x3d: &[f32; 3], z: f32, kp: &KeyPoint, ur
         let v = (cam.fy * y).mul_add(invz, cam.cy);
         let (ex, ey, er) = (u - kp.x, v - kp.y, ur2 - ur);
         !((er.mul_add(er, ex.mul_add(ex, ey * ey)) as f64) > 7.8 * s2 as f64)
+    }
+}
+
+/// MapPoint::UpdateNormalAndDepth(단일 카메라). 관측 순서 = obs 열쇠(KfId) 순 — 원본은 KeyFrame* 주소 순
+pub fn update_normal_and_depth(mp: MpId, atlas: &mut Atlas) {
+    let m = &atlas.mps[&mp];
+    if m.bad || m.obs.is_empty() {
+        return;
+    }
+    let pos = m.pos;
+    let mut normal = [0f32; 3];
+    let mut n = 0i32;
+    for (k, &(l, _r)) in m.obs.iter() {
+        if l != -1 {
+            let ow = atlas.kfs[k].twc.t;
+            let ni = [pos[0] - ow[0], pos[1] - ow[1], pos[2] - ow[2]];
+            let d = norm3(&ni);
+            for c in 0..3 {
+                normal[c] += ni[c] / d;
+            }
+            n += 1;
+        }
+    }
+    let rk = &atlas.kfs[&m.ref_kf];
+    let ow = rk.twc.t;
+    let pc = [pos[0] - ow[0], pos[1] - ow[1], pos[2] - ow[2]];
+    let dist = norm3(&pc);
+    let li = m.obs.get(&m.ref_kf).map(|o| o.0).unwrap_or(-1);
+    // 원본 observations[pRefKF]: 없으면 (0,0) 이 새로 생김 → 번호 0
+    let level = rk.keys[li.max(0) as usize].octave as usize;
+    let sc = &rk.ctx.pyr.scale;
+    let max_d = dist * sc[level];
+    let min_d = max_d / sc[rk.ctx.pyr.nlevels as usize - 1];
+    let nf = n as f32;
+    let m = atlas.mps.get_mut(&mp).unwrap();
+    m.max_dist = max_d;
+    m.min_dist = min_d;
+    m.normal = [normal[0] / nf, normal[1] / nf, normal[2] / nf];
+}
+
+/// KeyFrame::UpdateBestCovisibles: (무게, 키프레임) 오름차순 → 앞에 끼워 넣기(나쁜 것 뺌)
+pub fn update_best_covisibles(kf: KfId, atlas: &mut Atlas) {
+    let mut pairs: Vec<(i32, KfId)> = atlas.kfs[&kf].conn_weights.iter().map(|(&k, &w)| (w, k)).collect();
+    pairs.sort();
+    let ord: Vec<(KfId, i32)> = pairs.iter().rev().filter(|(_, k)| !atlas.kfs[k].bad).map(|&(w, k)| (k, w)).collect();
+    atlas.kfs.get_mut(&kf).unwrap().ordered_conn = ord;
+}
+
+/// KeyFrame::AddConnection
+pub fn add_connection(kf: KfId, other: KfId, w: i32, atlas: &mut Atlas) {
+    let k = atlas.kfs.get_mut(&kf).unwrap();
+    if k.conn_weights.get(&other) == Some(&w) {
+        return;
+    }
+    k.conn_weights.insert(other, w);
+    update_best_covisibles(kf, atlas);
+}
+
+/// KeyFrame::UpdateConnections(upParent = true). `init_kf` = 지도 mnInitKFid. 첫 연결(부모 없음)이면 부모 정함
+pub fn update_connections(kf: KfId, init_kf: KfId, atlas: &mut Atlas) {
+    let k = &atlas.kfs[&kf];
+    let map = k.map;
+    let mut counter: BTreeMap<KfId, i32> = BTreeMap::new();
+    for mp in k.map_points.iter().flatten() {
+        let m = &atlas.mps[mp];
+        if m.bad {
+            continue;
+        }
+        for o in m.obs.keys() {
+            let ok = &atlas.kfs[o];
+            if *o == kf || ok.bad || ok.map != map {
+                continue;
+            }
+            *counter.entry(*o).or_insert(0) += 1;
+        }
+    }
+    if counter.is_empty() {
+        return;
+    }
+    let (mut nmax, mut kmax) = (0, None);
+    let mut pairs: Vec<(i32, KfId)> = Vec::new();
+    for (&o, &c) in counter.iter() {
+        if c > nmax {
+            nmax = c;
+            kmax = Some(o);
+        }
+        if c >= 15 {
+            pairs.push((c, o));
+            add_connection(o, kf, c, atlas);
+        }
+    }
+    if pairs.is_empty() {
+        let o = kmax.unwrap();
+        pairs.push((nmax, o));
+        add_connection(o, kf, nmax, atlas);
+    }
+    pairs.sort();
+    let ord: Vec<(KfId, i32)> = pairs.iter().rev().map(|&(w, k)| (k, w)).collect();
+    let first = ord[0].0;
+    let k = atlas.kfs.get_mut(&kf).unwrap();
+    k.conn_weights = counter;
+    k.ordered_conn = ord;
+    if k.parent.is_none() && kf != init_kf {
+        k.parent = Some(first);
+        let p = atlas.kfs.get_mut(&first).unwrap();
+        if let Err(i) = p.children.binary_search(&kf) {
+            p.children.insert(i, kf);
+        }
     }
 }

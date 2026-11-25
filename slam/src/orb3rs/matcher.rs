@@ -437,4 +437,76 @@ impl Matcher {
         let _ = nmatches;
         m12.iter().enumerate().filter(|(_, j)| **j >= 0).map(|(i, j)| (i, *j as usize)).collect()
     }
+
+    /// SearchByBoW(KF1, KF2): 두 키프레임의 지도 점끼리 BoW 노드 안에서 짝(루프 · 합치기 후보 검사). 돌려줌: (짝 수, KF1 점마다 KF2 지도 점)
+    pub fn search_by_bow_kf_kf(&self, kf1: &KeyFrame, kf2: &KeyFrame, mps: &BTreeMap<MpId, MapPoint>) -> (i32, Vec<Option<MpId>>) {
+        let mut m12: Vec<Option<MpId>> = vec![None; kf1.map_points.len()];
+        let mut matched2 = vec![false; kf2.map_points.len()];
+        let mut rot_hist: Vec<Vec<u32>> = vec![Vec::new(); HISTO_LENGTH];
+        let mut nmatches = 0;
+        let v1: Vec<(&u32, &Vec<u32>)> = kf1.feat.iter().collect();
+        let v2: Vec<(&u32, &Vec<u32>)> = kf2.feat.iter().collect();
+        let (mut a, mut b) = (0usize, 0usize);
+        while a < v1.len() && b < v2.len() {
+            if v1[a].0 == v2[b].0 {
+                for &i1 in v1[a].1.iter() {
+                    let idx1 = i1 as usize;
+                    let Some(m1) = kf1.map_points[idx1] else { continue };
+                    if mps[&m1].bad {
+                        continue;
+                    }
+                    let d1 = &kf1.desc[idx1];
+                    let (mut best1, mut best_idx2, mut best2) = (256, -1i32, 256);
+                    for &i2 in v2[b].1.iter() {
+                        let idx2 = i2 as usize;
+                        if matched2[idx2] {
+                            continue;
+                        }
+                        let Some(m2) = kf2.map_points[idx2] else { continue };
+                        if mps[&m2].bad {
+                            continue;
+                        }
+                        let dist = desc_dist(d1, &kf2.desc[idx2]);
+                        if dist < best1 {
+                            best2 = best1;
+                            best1 = dist;
+                            best_idx2 = idx2 as i32;
+                        } else if dist < best2 {
+                            best2 = dist;
+                        }
+                    }
+                    if best1 < TH_LOW && (best1 as f32) < self.nn_ratio * best2 as f32 {
+                        m12[idx1] = kf2.map_points[best_idx2 as usize];
+                        matched2[best_idx2 as usize] = true;
+                        if self.check_ori {
+                            rot_hist[rot_bin(kf1.keys[idx1].angle, kf2.keys[best_idx2 as usize].angle)].push(idx1 as u32);
+                        }
+                        nmatches += 1;
+                    }
+                }
+                a += 1;
+                b += 1;
+            } else if v1[a].0 < v2[b].0 {
+                let key = *v2[b].0;
+                a = v1.partition_point(|x| *x.0 < key);
+            } else {
+                let key = *v1[a].0;
+                b = v2.partition_point(|x| *x.0 < key);
+            }
+        }
+        if self.check_ori {
+            let (i1, i2, i3) = three_maxima(&rot_hist);
+            for (i, v) in rot_hist.iter().enumerate() {
+                let i = i as i32;
+                if i == i1 || i == i2 || i == i3 {
+                    continue;
+                }
+                for &j in v {
+                    m12[j as usize] = None;
+                    nmatches -= 1;
+                }
+            }
+        }
+        (nmatches, m12)
+    }
 }

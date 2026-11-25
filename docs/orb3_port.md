@@ -86,7 +86,8 @@
 | Frame(RGB-D 생성 · 격자 · 위치 행렬 · 영역 검색 · 시야 판정 · 깊이 3D) · MapPoint(장면에서 만들기 · PredictScale) · KeyFrame(장면에서) | `orb3rs::frame` 옮김 | 짝짓기 시험 안에서 같이 확인 | — | — |
 | 짝짓기: SearchByProjection(지금, 앞 장면) | 옮김 | **비트 동일**: 강의실 30 쌍 · TUM office 20 쌍 × 위치 3 가지 = 150 번, 짝 122,590 개 전부 같음 | 원본 1.3–1.9 ms → Rust 0.85–0.98 ms(한 번) | — |
 | 짝짓기: SearchByProjection(지역 지도, isInFrustum 포함) · SearchByBoW(KF, F) · SearchByProjection(F, KF, 재위치) · SearchForTriangulation(+ Pinhole 극선 조건) | 옮김 | **비트 동일**: 50 쌍 × 4 가지 전부 같음(짝 46,424 · 21,504 · 41,490 · 2,916 개) | Rust 0.54–0.63 · 0.17 · 0.60–0.71 · 0.16–0.20 ms(원본 시간은 덤프에 안 잼) | — |
-| 짝짓기: Fuse 2 가지 · Sim3 투영 2 가지 · SearchBySim3 · SearchByBoW(KF, KF) | 남음 | | | |
+| 짝짓기: SearchByBoW(KF, KF) | 옮김 | **비트 동일**: 50 쌍(두 키프레임 각자 지도 점, 0.75) 전부 같음(짝 21,501 개) | Rust 0.54–0.59 ms | — |
+| 짝짓기: Fuse 2 가지 · Sim3 투영 2 가지 · SearchBySim3 | 남음 | | | |
 
 ## 정확도 브랜치 따라가기
 

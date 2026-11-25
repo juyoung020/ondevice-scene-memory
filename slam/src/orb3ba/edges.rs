@@ -166,7 +166,8 @@ fn dot2(a: &[f64], b: &[f64]) -> f64 {
     a[0] * b[0] + a[1] * b[1]
 }
 
-/// 한 간선의 2차 형식을 정점 블록에 더함(BaseBinaryEdge::constructQuadraticForm, 강건 커널 경로).
+/// 한 간선의 2차 형식을 정점 블록에 더함(BaseBinaryEdge::constructQuadraticForm).
+/// 강건 커널 경로는 W = ρ'·Ω 로 Hpl += (BᵀW)·A, 커널 없는 경로는 ρ' = 1 이고 Hpl += Bᵀ·(AᵀΩ)ᵀ(곱 순서가 다름).
 /// pt_h(3×3) · pt_b(3) = 점, ps_h(6×6) · ps_b(6) = 자세(None = 고정), hpl(6×3, 자세 행 × 점 열) = 섞인 블록
 pub fn quad_binary(
     ed: &Edge,
@@ -178,7 +179,11 @@ pub fn quad_binary(
     pose: Option<(&mut [f64; 36], &mut [f64; 6], &mut [f64; 18])>,
 ) {
     let om = &ed.info;
-    let delta = ed.delta.expect("LBA 이항 간선은 Huber");
+    let robust = ed.delta.is_some();
+    let rho1_of = |chi: f64| match ed.delta {
+        Some(d) => huber(chi, d).1,
+        None => 1.0,
+    };
     if ed.dim() == 3 {
         // omega_r = -Ω·e (0·1 행 = 묶음 fma, 2 행 = 차례 합), 인라인 χ²
         let mut w = [0.0; 3];
@@ -190,7 +195,7 @@ pub fn quad_binary(
         let y1 = fma(om[7], e[2], fma(om[4], e[1], om[1] * e[0]));
         let y2 = (om[8] * e[2] + om[5] * e[1]) + om[2] * e[0];
         let chi = fma(e[2], y2, y0 * e[0] + y1 * e[1]);
-        let (_, rho1) = huber(chi, delta);
+        let rho1 = rho1_of(chi);
         let mut wo = [0.0; 9];
         for k in 0..9 {
             wo[k] = rho1 * om[k];
@@ -223,7 +228,11 @@ pub fn quad_binary(
             }
             for c in 0..3 {
                 for r in 0..6 {
-                    hpl[c * 6 + r] += fused(xi[c * 3 + 2], t6[12 + r], fused(xi[c * 3 + 1], t6[6 + r], xi[c * 3] * t6[r]));
+                    hpl[c * 6 + r] += if robust {
+                        fused(xi[c * 3 + 2], t6[12 + r], fused(xi[c * 3 + 1], t6[6 + r], xi[c * 3] * t6[r]))
+                    } else {
+                        xj[r * 3] * t3[c] + (xj[r * 3 + 1] * t3[3 + c] + xj[r * 3 + 2] * t3[6 + c])
+                    };
                 }
             }
             for r in 0..6 {
@@ -241,7 +250,7 @@ pub fn quad_binary(
         let y0 = fma(om[2], e[1], om[0] * e[0]);
         let y1 = fma(om[3], e[1], om[1] * e[0]);
         let chi = y0 * e[0] + y1 * e[1];
-        let (_, rho1) = huber(chi, delta);
+        let rho1 = rho1_of(chi);
         let wo = [rho1 * om[0], rho1 * om[1], rho1 * om[2], rho1 * om[3]];
         let w = [w0 * rho1, w1 * rho1];
         for r in 0..3 {
@@ -268,7 +277,11 @@ pub fn quad_binary(
             }
             for c in 0..3 {
                 for r in 0..6 {
-                    hpl[c * 6 + r] += fused(xi[c * 2 + 1], t6[6 + r], xi[c * 2] * t6[r]);
+                    hpl[c * 6 + r] += if robust {
+                        fused(xi[c * 2 + 1], t6[6 + r], xi[c * 2] * t6[r])
+                    } else {
+                        xj[r * 2] * t3[c] + xj[r * 2 + 1] * t3[3 + c]
+                    };
                 }
             }
             for r in 0..6 {

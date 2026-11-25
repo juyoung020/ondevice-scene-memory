@@ -496,6 +496,17 @@ impl Orb3 {
             (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt()
         });
         let tr = self.sys.track(&f.color, &f.depth_mm, w, h, f.t, up);
+        // 최대 속도 재생: 지도 · 루프 스레드가 이 장면 일을 다 끝낸 뒤에 키프레임 위치를 읽음(읽는 때에 따라 실행마다 결과가 달라지지 않게)
+        if self.block {
+            self.sys.wait_idle();
+        }
+        // 시험용(환경 변수 ORB_TRACE = 파일): 장면마다 ORB 결과(실행끼리 같은지 비교)
+        if let Ok(p) = std::env::var("ORB_TRACE") {
+            use std::io::Write as _;
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(fh, "{:.6} {} {} {:.6} {:.6} {:.6}", f.t, tr.state, tr.map_id, tr.twc[3], tr.twc[7], tr.twc[11]);
+            }
+        }
         self.s_track.push(c0.elapsed().as_secs_f64() * 1e3);
         let changed = self.sys.map_changed();
         let mut flags = 0u32;
@@ -832,7 +843,7 @@ impl SlamBackend for Orb3Backend {
         for x in &per {
             *cnt.entry(x.1).or_default() += 1;
         }
-        let main_map = cnt.iter().max_by_key(|x| *x.1).map(|x| *x.0);
+        let main_map = cnt.iter().max_by_key(|x| (*x.1, std::cmp::Reverse(*x.0))).map(|x| *x.0);
         // 끝난 뒤 지도 통째 맞춤: 못 이은 지도를 가장 큰 지도에(깊이 자유 공간 검사, mapmerge)
         let mut xf: HashMap<u64, T34> = HashMap::new();
         if let (Some(mm), Some(k)) = (main_map, s.dk) {

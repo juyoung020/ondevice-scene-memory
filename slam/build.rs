@@ -14,8 +14,13 @@ fn main() {
         panic!("ORB-SLAM3 를 찾지 못함: {lib} (ORB_SLAM3_DIR 로 cpp/ORB_SLAM3.patch 를 적용해 빌드한 폴더를 알려 주기)");
     }
     // 원본 라이브러리를 빌드할 때와 같은 정의: 헤더 속 클래스 배치가 라이브러리와 같아야 함
-    cc::Build::new()
-        .cpp(true)
+    let mut b = cc::Build::new();
+    // 원본 패치의 순서 비교자(키프레임 · 점 · 지도 집합을 번호 순으로): 라이브러리와 같은 비교자여야 해 먼저 넣음
+    let order = format!("{orb}/include/OrderById.h");
+    if std::path::Path::new(&order).exists() {
+        b.flag("-include").flag(&order);
+    }
+    b.cpp(true)
         .file("cpp/orb3.cc")
         .flag("-std=c++17")
         .define("COMPILEDWITHC11", None)

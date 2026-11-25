@@ -263,7 +263,7 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
     let mut xf: HashMap<u64, T34> = HashMap::new();
     xf.insert(main, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     let mut order: Vec<u64> = maps.iter().filter(|x| *x.0 != main && x.1.len() >= MIN_FRAMES).map(|x| *x.0).collect();
-    order.sort_by_key(|m| std::cmp::Reverse(maps[m].len()));
+    order.sort_by_key(|m| (std::cmp::Reverse(maps[m].len()), *m));
     loop {
         let mut changed = false;
         for &m in &order {
@@ -294,7 +294,10 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
             }
             // 큰 쪽 장면: 붙은 지도 모두(main 좌표)
             let mut all: Vec<(T34, &[u16])> = Vec::new();
-            for (mm, t) in &xf {
+            // 지도 번호 순(HashMap 순서는 실행마다 달라 점 순서 · 결과가 흔들림)
+            let mut xs: Vec<(&u64, &T34)> = xf.iter().collect();
+            xs.sort_by_key(|x| *x.0);
+            for (mm, t) in xs {
                 for f in &maps[mm] {
                     all.push((mul(t, &f.pose), f.d));
                 }

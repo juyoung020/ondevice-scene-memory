@@ -173,7 +173,9 @@ fn look_name(names: &[String], vecs: &[f32], e: &[f32]) -> Option<(String, f32)>
 /// 그 물체의 사진으로 붙인 이름. 분할 모델이 이름을 준 물체(`sure` 참)는 몫 NAME_MIN 이상일 때만 바꾸고,
 /// 이름 없는 물체(object)는 몫 NAME_MIN_UNNAMED 이상이면 가장 닮은 이름을 쓴다. `--vocab` 이 없거나 벡터 계산 전이면 None
 pub fn name(id: u32, _sure: bool) -> Option<(String, f32)> {
-    common::prof::lock(&NAMES, common::prof::W::LockEmbed).as_ref()?.get(&id).cloned() // 기준 없이 가장 닮은 이름을 늘 붙임(사용자 결정 26-11-15)
+    // 1 · 2 등이 NAME_MARGIN 안으로 붙은(몫 0) 물체는 이름을 붙이지 않음: 강의실 녹화에서 이런 물체는 번진 · 조각 사진이라
+    // 이름이 대부분 틀렸다(sofa · shoe · paper towel 등, docs/pose_experiments.md 병렬 C)
+    common::prof::lock(&NAMES, common::prof::W::LockEmbed).as_ref()?.get(&id).filter(|n| n.1 > 0.0).cloned()
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
 /// 벡터 하나를 그 물체에 더함. 돌려줌: 지금까지 사진 벡터의 평균 방향(길이 1, 검색 줄 · 이름 · 구조물 판정이 쓰는 벡터)

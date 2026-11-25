@@ -2069,6 +2069,8 @@ fn smooth_depth(d: &[f32], w: usize, u: usize, v: usize) -> f32 {
 /// 카메라가 정한 때보다 CEIL_FLOOR_M 넘게 오르내리면(층이 바뀜) 다시 찾는다
 /// 카메라 깊이를 이 거리(m)까지만 씀(D435 깊이 오차 약 6.7 cm @ 4 m)
 const MAX_DEPTH_M: f64 = 4.0;
+/// 물체 사진(이름 붙이기 · 대표 사진)을 상자 둘레로 넓히는 몫(각 변마다 상자 폭 · 높이의 이 비율)
+const CROP_PAD: f32 = 0.15;
 /// 정한 천장 면(점 줄이 쓰고 물체 쪽이 읽음)
 static CEIL_TOP: std::sync::Mutex<Option<Plane>> = std::sync::Mutex::new(None);
 const CEIL_MIN_M: f64 = 0.3;
@@ -2549,16 +2551,31 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             continue;
         }
         // 사진은 그 물체의 지금 사진보다 클 때만 만든다(장면마다 모든 검출을 복사하지 않게)
+        // 사진은 상자보다 둘레를 CROP_PAD 만큼 넓혀 자른다(딱 맞는 상자는 물체 일부 · 무늬만 보여 SigLIP2 가 옷 · 쿠션 같은 엉뚱한 이름을 고름)
         let crop = || {
-            let mut crgb = Vec::with_capacity(bw * bh * 3);
-            let mut cdep = Vec::with_capacity(bw * bh);
-            for yy in 0..bh {
-                let o = ((y1 + yy) * w + x1) * 3;
-                crgb.extend_from_slice(&rgb[o..o + bw * 3]);
-                depth.extend_mm_trunc((y1 + yy) * w + x1, bw, &mut cdep);
+            // 정사각형으로: SigLIP2 는 사진을 256×256 으로 늘이므로 길쭉한 상자(의자 다리 · 문틀)는 찌그러져
+            // 사다리 · 드라이버 같은 이름이 붙었다. 긴 변 × (1 + 2·CROP_PAD) 한 변의 정사각형을 상자 가운데에 두고 화면 안으로 민다
+            let side = ((bw.max(bh) as f32 * (1.0 + 2.0 * CROP_PAD)) as usize).max(bw.max(bh)).min(w.min(h));
+            let (cw, ch) = (side.max(bw), side.max(bh));
+            // 시작 = 가운데 맞춤을 [a + b − s, a] 안으로(상자를 다 담게), 다시 화면 안으로(a + b ≤ lim 이라 상자는 여전히 담김)
+            let place = |a: usize, b: usize, s: usize, lim: usize| ((a + b / 2).saturating_sub(s / 2).clamp((a + b).saturating_sub(s), a)).min(lim - s);
+            let (cx1, cy1) = (place(x1, bw, cw, w), place(y1, bh, ch, h));
+            let mut crgb = Vec::with_capacity(cw * ch * 3);
+            let mut cdep = Vec::with_capacity(cw * ch);
+            let mut cm = vec![0u8; cw * ch];
+            for yy in 0..ch {
+                let o = ((cy1 + yy) * w + cx1) * 3;
+                crgb.extend_from_slice(&rgb[o..o + cw * 3]);
+                depth.extend_mm_trunc((cy1 + yy) * w + cx1, cw, &mut cdep);
             }
-            common::prof::copy(common::prof::C::Crop, bw * bh * (3 + 2 + 1));
-            Crop { w: bw as u32, h: bh as u32, rgb: crgb.into(), mask: std::sync::Arc::new(m.iter().map(|&b| if b { 255 } else { 0 }).collect()), depth: cdep.into() }
+            for yy in 0..bh {
+                let r = (y1 - cy1 + yy) * cw + (x1 - cx1);
+                for (d, &b) in cm[r..r + bw].iter_mut().zip(&m[yy * bw..(yy + 1) * bw]) {
+                    *d = if b { 255 } else { 0 };
+                }
+            }
+            common::prof::copy(common::prof::C::Crop, cw * ch * (3 + 2 + 1));
+            Crop { w: cw as u32, h: ch as u32, rgb: crgb.into(), mask: std::sync::Arc::new(cm), depth: cdep.into() }
         };
         let on_main = std::thread::current().name() == Some("main"); // 다시 쌓기 스레드가 같은 함수를 부를 때는 빼고
         if on_main {
@@ -2638,6 +2655,10 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
                 common::prof::copy(common::prof::C::CropShare, 0);
             }
             o.crop_saved = o.crop_ver;
+        }
+        if let Some(c) = o.view.take() {
+            if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() { println!("viewdbg O{} obs {}", o.id, o.n_obs); }
+            to_embed.push((o.id, c.w, c.h, c.rgb.clone()));
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");

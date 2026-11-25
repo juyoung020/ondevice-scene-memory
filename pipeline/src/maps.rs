@@ -220,6 +220,9 @@ fn box_overlap(a: &Obj, b: &Obj) -> f64 {
 /// 작은 쪽 굳은 칸 중 큰 쪽 굳은 칸과 겹쳐야 하는 비율(같은 물체 0.33, 나란한 모니터 둘 0.14)
 pub const LOOK_OVL: f32 = 0.25;
 
+/// 이름 붙이기용 시점 사진을 새로 잡는 관측 간격(같은 물체를 이만큼 더 볼 때마다, 사진 점수가 가장 큰 사진의 절반 이상일 때)
+pub const VIEW_EVERY: u32 = 20;
+
 #[derive(Clone)]
 pub struct Crop {
     pub w: u32,
@@ -251,6 +254,9 @@ pub struct Obj {
     pub stamp: u32,
     pub n_pts: usize, // 마지막으로 내보낸 점 수
     pub crop_saved: u32, // 파일로 쓴 사진의 crop_ver(같으면 다시 안 씀)
+    /// 이름 붙이기용 다른 시점 사진(가장 큰 사진 말고도 VIEW_EVERY 번 볼 때마다 넉넉히 큰 사진 하나): 사진 벡터 평균에 더할 것
+    pub view: Option<Crop>,
+    pub view_obs: u32, // 마지막으로 시점 사진을 잡은 때의 n_obs
     pub cells_saved: usize, // 점 파일을 쓸 때의 칸 수(5 % 넘게 늘어야 다시 씀)
     pub last_seg: u32, // 마지막으로 본 때의 Memory::n_seg
     /// 병합 검사가 필요함: 점 · 상태 · 사진 벡터 · 위치 · 이름이 바뀐 물체. 병합 단계는 이 물체와 그 이웃만 본다
@@ -573,7 +579,7 @@ impl Memory {
                 self.objs.push(Obj {
                     id, name: name.into(), votes: FastMap::default(), score: 0.0, n_obs: 0, first_pos: c, pos: c,
                     extent: ext, last_seen: stamp, miss: 0, state: "seen", cells: FastMap::default(), support: FastMap::default(),
-                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0, crop_saved: 0, cells_saved: 0, last_seg: self.n_seg,
+                    crop: None, crop_area: 0, crop_ver: 0, dirty: true, stamp: 0, n_pts: 0, crop_saved: 0, view: None, view_obs: 0, cells_saved: 0, last_seg: self.n_seg,
                     mdirty: true, solid: Default::default(), hist: Default::default(), emb: None, gcell: g,
                 });
                 self.centers.add(g, id);
@@ -630,6 +636,11 @@ impl Memory {
             o.crop_area = crop_area;
             o.crop = Some(crop());
             o.crop_ver += 1;
+            o.view_obs = o.n_obs;
+        } else if o.n_obs >= o.view_obs + VIEW_EVERY && crop_area * 2 >= o.crop_area {
+            // 한두 장(가장 크게 본 장면)만으로는 번짐 · 일부만 보임에 이름이 휘둘림: 여러 시점 사진을 평균에 더함
+            o.view = Some(crop());
+            o.view_obs = o.n_obs;
         }
         if first {
             self.moved(i);

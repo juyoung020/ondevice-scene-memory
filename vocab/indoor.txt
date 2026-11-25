@@ -101,3 +101,18 @@ envelope
 folder
 ruler
 battery
+person: a person; a person walking; a person sitting
+safety helmet: a white hard hat
+water dispenser: a water purifier; a water cooler
+computer tower: a desktop computer case; a PC tower under a desk
+power strip
+electrical outlet: a wall socket
+light switch
+partition: a desk divider panel
+locker
+projector
+projector screen
+first aid kit
+sign: a sign on the wall
+air purifier
+coat rack

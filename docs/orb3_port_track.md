@@ -7,7 +7,16 @@
 ## 비트 동일 확인된 것
 - Tracking: NeedNewKeyFrame · UpdateLocalKeyFrames · UpdateLocalPoints · CreateNewKeyFrame 새 점 · Track 흐름
 - LocalMapping: MapPointCulling · KeyFrameCulling · CreateNewMapPoints(RGB-D) · Triangulate(JacobiSVD)
-- TUM 360(756 장면): CreateNewMapPoints 201/201, 새 점 3299/3299, NeedNewKeyFrame 755/755
+- v5(6 장면: ds 3807 · desk2 640 · room 1362 · 360 756 · floor 1236 · rpy 723 장면) 모든 표 불일치 0.
+  ds: CreateNewMapPoints 1187/1187, 삼각측량 새 점 79300/79300, 새 키프레임 점 139775/139775.
+  NeedNewKeyFrame 중 원본 호출 도중 입력이 바뀐 경우(장면당 0–7)는 따로 세고 그것도 전부 같음.
+- 통합판(7829f22) 병합 뒤 tum_360 · tum_floor 다시 돌려 불일치 0.
+
+## 통합판 연결(`slam/src/orb3sys/steps.rs` TrackSteps: KfSteps)
+- 채움: MapPointCulling · KeyFrameCulling
+- 남음(hole): ProcessNewKeyFrame(ComputeBoW · UpdateNormalAndDepth · UpdateConnections 필요), CreateNewMapPoints 의 새 점 지도 넣기
+  (삼각측량 계산은 끝, MapPoint 생성 · UpdateNormalAndDepth 잇기 남음), SearchInNeighbors(Fuse)
+- Tracking 빈자리(StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame)는 다음 차례
 
 ## 고친 것
 - KeyFrame::UnprojectStereo 는 mvKeys(보정 전) 좌표를 씀 → `KeyFrame.keys_raw` 칸 추가

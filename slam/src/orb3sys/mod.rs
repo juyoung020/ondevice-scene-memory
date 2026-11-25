@@ -8,6 +8,7 @@
 pub mod loopflow;
 pub mod mapping;
 pub mod rsys;
+pub mod steps;
 pub mod threads;
 
 /// `crate::orb3::Track` 과 같은 뜻(추적 상태 · 카메라 → 세계 3×4 · 지도 id · 기준 키프레임)

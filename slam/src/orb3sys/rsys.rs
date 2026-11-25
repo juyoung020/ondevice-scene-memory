@@ -195,7 +195,7 @@ impl TrackOps for Ops<'_> {
         let f = self.s.cur.as_ref().expect("지금 장면");
         track::need_new_keyframe(&self.s.tracker, f, &*self.s.mapper, &ctx)
     }
-    fn create_new_keyframe(&mut self) {
+    fn create_new_keyframe(&mut self) -> KfId {
         hole("Tracking::CreateNewKeyFrame")
     }
     fn try_graft(&mut self) {

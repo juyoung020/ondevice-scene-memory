@@ -9,6 +9,8 @@ pub mod frame;
 pub mod stdsort;
 // 포터 OPT: 포즈 최적화 · PnP
 pub mod g2o_pose;
+pub mod mlpnp;
+mod mlpnp_jacs;
 pub mod pinhole;
 pub mod pose_opt;
 // 포터 TRACK: Tracking.cc 판단 · LocalMapping 컬링

@@ -233,6 +233,40 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 
 확인 안 한 것: 관측 3 개 미만 · 활성 간선 0 · Hessian 이 양이 아닌 경우(LDLT 실패 뒤 이전 x 재사용) 경로는 덤프에 나온 만큼만 확인(활성 간선 0 은 강의실 덤프에 있음). 보드(aarch64)에서는 `mul_add` 가 fmadd 라 같은 비트가 나와야 하나 보드에서 돌려 보지는 않음(보드 금지).
 
+#### MLPnPsolver(재위치 PnP + RANSAC)
+
+모듈:
+
+- `mlpnp.rs` — `MlpnpSolver`(생성자 + `SetRansacParameters` · `iterate` · `CheckInliers`), `compute_pose6`(MLPnP 6 점: 비평면 12 열 · 평면 9 열 두 경로), 가우스-뉴턴(최대 5 회), Eigen `JacobiSVD`(정사각 · 1x3 Householder 사전 QR), `FullPivHouseholderQR<Matrix3d>` 랭크, `SelfAdjointEigenSolver<Matrix3d>`(3x3 닫힌 꼴 삼중 대각화 + QR 단계), 행렬식 · 로드리게스.
+- `mlpnp_jacs.rs` — `mlpnpJacs`(2x6 야코비안, 식 1,000 줄) 생성 코드. `mlpnp_inv4.inc` — Eigen `compute_inverse_size4`(SSE 판) 생성 코드. 원본 오브젝트 GIMPLE(`-fdump-tree-optimized`, 원본 빌드 플래그 그대로)을 하네스 `gen/gimple_to_rust.py` · `gimple_vec2_to_rust.py` 로 그대로 옮김(FMA 자리 · 연산 순서 · `sincos` 합치기까지).
+- 난수는 `iterate(n, &mut |a, b| RandomInt(a, b))` 로 받는다 — 원본은 glibc `rand()` 하나를 Sim3Solver 등과 나눠 쓰므로 통합 쪽이 `opt/orb3-rs-loop` 의 `crand.rs`(glibc rand, 씨앗 1) 생성기 하나를 넘겨야 같은 수열.
+- 원본 `Refine()` 의 `computePose`(내점 전부)는 결과를 버리는 코드(mRi 를 갱신하지 않음)라 부르지 않고, `Refine` 의 `CheckInliers` 는 같은 mRi 로 다시 세는 것이라 직전 결과를 씀 — 출력 · 상태 비트는 같고 시간만 줄어듦.
+
+비트 맞추기에서 알아낸 것(Eigen 커널마다 GCC 의 FMA 합치기가 다름 — GIMPLE 을 읽어 정하고 하네스로 확인):
+
+- `JacobiSVD` 회전: 행(왼쪽) `x' = fma(c, x, s·y)`, `y' = fma(−s, x, c·y)`, 열(오른쪽)은 전치 회전으로 같은 꼴. U 는 `applyOnTheRight(j_leftᵀ)` 가 다시 전치해 j_left 그대로. `real_2x2_jacobi_svd` 의 2x2 왼쪽 회전은 2 칸 벡터 FMA.
+- 1x3 영공간(Householder): `tailSqNorm = fma(x2, x2, x1²)`, `beta = sqrt(fma(c0, c0, tail))`, Q 대각 `fma(−τe, e, 1)`.
+- AᵀA(GEMM gebp, 깊이 12): 4 열 묶음은 k < 8 을 짝 · 홀 두 누산기로 나눠 FMA 뒤 합치고 남은 k 를 FMA, 묶음 밖 열은 한 사슬. 9x9(평면)의 마지막 행은 "한 행씩" 경로 — k 0..8 을 ((0+2)+(4+6)) · ((1+3)+(5+7)) 로 따로 더한 뒤 FMA, 끝에 짝 + 홀.
+- 3x3 `U·Vᵀ`: 비평면 경로는 칸마다 곱 반올림 후 차례로 더함(합침 없음), 평면 경로는 지연 곱(목적지 16 바이트 정렬: 열마다 두 행 Packet FMA 사슬, 한 행 스칼라) — 같은 식인데 인라인 자리마다 다름.
+- 고정 3x3 곱 · 행렬×벡터: 0 · 1 행은 k 오름차순 FMA 사슬, 2 행은 `fma(x0, y0, fma(x2, y2, x1·y1))`(Eigen 펼친 합 p0 + (p1 + p2)). 노름은 `sqrt(fma(z, z, x² + y²))`, 내적은 `fma(a2, b2, a0b0 + a1b1)`.
+- `CheckInliers`: double 로 `fma(z, R02, fma(x, R00, y·R01)) + t` 를 float 로 내린 뒤 float 투영, `e² = fma(dx, dx, dy²)`.
+- 가우스-뉴턴의 JᵀJ 는 GEMM(6 행 = 반 · 4 분의 1 Packet, 열 0..4 묶음 · 4 · 5 단독), g = Jᵀr · dl = J dx 는 GEMV(0 에서 시작하는 FMA 사슬), LDLT 는 포즈 최적화의 `ldlt_factor6` · `ldlt_back6` 그대로 맞음.
+
+하네스(WSL `~/opt/orb3_opt_bg`): `run_mlpnp`(원본 RGB-D 실행 중 `MLPnPsolver::iterate` 를 가로채 입력 상태 · RandomInt(스레드별) · 출력 · 상태를 덤프, 원본 iterate 시간 측정. `HOP=n` 이면 지도 구간 안에서 n 번 순간 이동해 재위치를 일으킴), `libmlpref.so`(`mlpref.cc`: 라이브러리 원본 `computePose` · `mlpnp_gn` · `mlpnpJacs` · 로드리게스 · Eigen 약한 기호(JacobiSVD 생성자 · 4x4 역행렬 · 행렬식 · FullPivQR)를 dlsym 으로 부름 + computePose 비평면 · 평면 본문을 그대로 베낀 추적판), `rs/src/mlpnp_check.rs`(`unit` 함수별 무작위 대조, `trace`/`planar` 중간값 대조, `dump` 덤프 재실행 + 표본마다 원본 computePose 대조), `gen/`(GIMPLE → Rust 생성기).
+
+| 대상 | 데이터 | 호출 수 | 비트 같음 | 원본 µs | Rust µs |
+|---|---|---|---|---|---|
+| iterate(출력 · 상태 전부) | 강의실 ds_1118_121652 1,000 프레임 + 순간 이동 600 번 | 25,396(표본 32,385) | 25,396 / 25,396 | 108.5 / 호출 | 30.7 / 호출 |
+| iterate | TUM fr1_desk2 + 순간 이동 800 번 | 779(표본 2,909) | 779 / 779 | — | 96.5 / 호출 |
+| iterate | TUM desk2 → room 되감기(실패 시도 포함) | 21(표본 150) | 21 / 21 | — | — |
+| computePose(6 점) | 위 덤프 표본 | 4,682 | 4,682 / 4,682 | 56–75 | 22–25 |
+| computePose 비평면 · 평면(랭크 2) | 무작위 장면 각 5,000 | 10,000 | 10,000 / 10,000 | — | — |
+| 단위(무작위 각 3,000) | 영공간 · 야코비안 · 로드리게스 양방향 · 4x4 역행렬 · 행렬식 · 랭크(일반 · 평면) · SVD 3x3(U · V) · 12x12(V) · 가우스-뉴턴 | — | 전부 같음 | — | — |
+
+원본 iterate 시간은 `run_mlpnp` 안에서 원본 함수 호출을 잰 것(실행 중 다른 스레드와 같이 돎), Rust 는 같은 입력 재실행. 원본 대비 빠른 까닭: 결과를 버리는 Refine 의 내점 전부 computePose 를 건너뜀 · 고정 크기 행렬(동적 할당 없음)· 희소 행렬 P 없음. 원본 실행은 스레드 때문에 매번 재위치 시도 수가 다름(같은 설정에서 370 · 25,396 호출) — 비교는 덤프 단위라 영향 없음.
+
+확인 안 한 것: 평면 경로는 실제 덤프에 한 번도 나오지 않음(세계 원점을 지나는 평면 위 6 점에서만 생김) — 무작위 평면 장면으로만 확인. 최소 집합 6 이 아닌 설정(`SetRansacParameters` 의 minSet)은 옮기지 않음(원본 Tracking 은 6 만 씀). 고윳값 반복이 30·n 회를 넘는(수렴 실패) 경로 · NaN 입력 경로는 확인 못 함.
+
 ### 포터 CV (11-25)
 
 브랜치 `opt/orb3-rs-cv`(`opt/orb3-rust` 위). 하네스 WSL `~/opt/orb3_cv/`: `ref.cc`(OpenCV 4.6 시스템 판, 입력 · 출력 덤프) · `svd_ref.cc` · `set_ref.cc`(기준 빌드 `cxx.sh` 로 원본 라이브러리 링크), Rust 쪽 `rs/`(`#[path]` 로 `slam/src/orb3cv/*.rs` 를 그대로 끌어와 비교: `cargo run --release -- ../dump` · `--bin svd -- ../svd.bin` · `--bin settings -- ../yaml`). 덤프 · 설정이 없으면 실패.

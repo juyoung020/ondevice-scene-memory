@@ -291,3 +291,11 @@
 - 마스크 토큰은 두 구간 모두 +9 · +16 점(같은 설정은 결정 재생이라 실행마다 같음 — 흔들림은 구간 사이 차로 봄).
 - 본 횟수 거르기: `embed::shown_name(id, n_obs)`(NAME_MIN_OBS 12) 를 화면 · view.json · 끝 요약 이름에 씀. 물체 지우기 판정(maps weak)은 그대로 `name`. 맞음도 함께 빠짐(앞 5 · 뒤 3 개, 예: 구급함 n6 · 문 n11), 틀림은 앞 5 · 뒤 8 개 빠짐.
 - 남은 틀림(합 14): 의자 뒷면 · 게시판 · 패널 → monitor / computer tower / cabinet / keyboard(마스크 토큰도 트랜스포머 층에서 둘레를 섞음), 문틀 → ruler, 바닥 → box.
+
+### 병렬 C 이어서 4 — 기각 두 가지, 지금 화면
+
+- 지금 기본값 화면(parc_out21, 본 횟수 ≥ 12 만 이름): docs/img/parc_names_default.png.
+- **병합 뒤 이름 다시 매기기(기각)**: 합칠 때 흡수한 조각의 마스크 안 벡터 합 · 사진 수를 남는 물체에 더하고 이름을 다시 고름. 앞 구간(parc_out23) 68 % → 61 %
+  (monitor O3 → 이름 없음, 빈 자리 · 의자 → ladder · monitor · box 새로 틀림). 조각 사진이 섞여 본체 이름이 흐려진다. 되돌림.
+- **인코더 중간 층부터 마스크 밖 키 가리기(기각)**: tools/naming/midmask.py 로 층 L.. Softmax 앞에 키 무게 bias 를 더한 모델을 만들어 대표 사진 53 개(labels_out18.json, tools/naming/mid_eval.py)로 비교.
+  이름 붙은 것 중 맞음: 가리지 않음 65 %, L11 67 %, L9 55 %, L6 30 %, L3 14 %(일찍 가릴수록 SigLIP2 가 picture · cart 로 무너짐). L11 도 차이가 판정 흔들림 안이라 ORT 쪽으로 넘길 변경 없음.

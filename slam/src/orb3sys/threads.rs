@@ -277,17 +277,27 @@ impl<K> Drop for StopToken<K> {
 pub struct LoopQueue<K> {
     st: Mutex<(VecDeque<K>, bool)>,
     cv: Condvar,
+    /// 넣었지만 아직 다 처리하지 않은 수(재생 도구가 루프 스레드까지 기다릴 때)
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 impl<K> LoopQueue<K> {
     pub fn new() -> Arc<LoopQueue<K>> {
-        Arc::new(LoopQueue { st: Mutex::new((VecDeque::new(), false)), cv: Condvar::new() })
+        Arc::new(LoopQueue { st: Mutex::new((VecDeque::new(), false)), cv: Condvar::new(), pending: Default::default() })
     }
     /// InsertKeyFrame(지도 스레드가 처리를 끝낸 키프레임)
     pub fn insert(&self, k: K) {
         let mut s = self.st.lock().unwrap_or_else(|e| e.into_inner());
         s.0.push_back(k);
+        self.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.cv.notify_all();
+    }
+    /// 키프레임 하나 처리 끝(루프 흐름이 부름)
+    pub fn done(&self) {
+        self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst)
     }
     pub fn finish(&self) {
         let mut s = self.st.lock().unwrap_or_else(|e| e.into_inner());

@@ -60,7 +60,7 @@ fn main() {
         for v in tr.twc {
             write!(f, "\t{v:?}").unwrap();
         }
-        writeln!(f, "\t{ms:.3}").unwrap();
+        writeln!(f, "\t{ms:.3}\t{}", tr.ref_kf.map_or(-1, |k| k as i64)).unwrap();
         n += 1;
         if n % 500 == 0 {
             eprintln!("{n} 장, {:.1} s", t0.elapsed().as_secs_f64());

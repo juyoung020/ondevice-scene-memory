@@ -634,7 +634,14 @@ impl Orb3System for RustSystem {
         graft::request_graft(&mut self.graft, &g.atlas, from as MapId, into as MapId, se)
     }
     fn wait_idle(&mut self) {
-        self.mapper.wait_idle()
+        self.mapper.wait_idle();
+        // 재생 대조용: ORBSYS_WAIT_LOOP 가 있으면 루프 스레드 · 전역 BA 까지 기다림
+        if std::env::var_os("ORBSYS_WAIT_LOOP").is_some() {
+            while self.loopq.pending() > 0 || self.flow.busy() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.mapper.wait_idle();
+        }
     }
     fn kf_now(&mut self, id: u64) -> Option<(u64, [f64; 12])> {
         cvsys::kf_now(&self.map.lock().atlas, id)

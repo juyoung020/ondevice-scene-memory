@@ -225,6 +225,7 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
                 let v = ops.merge_accept(&self.map.lock());
                 if v == MergeVerdict::Abort {
                     ops.clear_merge(&mut self.map.lock());
+                    self.queue.done();
                     continue;
                 }
                 if v == MergeVerdict::Merge {
@@ -249,6 +250,7 @@ impl<M: Send + 'static, G: GbaOps<M>> LoopFlow<M, G> {
                 ops.clear_loop(&mut self.map.lock());
             }
             ops.done(kf);
+            self.queue.done();
         }
         self.join_gba();
         s.gba_applied = self.st.applied.load(Ordering::SeqCst);

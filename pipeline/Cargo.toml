@@ -25,7 +25,7 @@ slam = { path = "../slam", features = ["rsdriver"] }
 
 [features]
 default = ["onnx"]
-onnx = ["dep:ort", "dep:ndarray", "common/onnx", "sgview/search-onnx", "slam/onnx"]
+onnx = ["dep:ort", "dep:ndarray", "common/onnx", "slam/onnx", "sgview/search"]
 # 윈도우 PC 그래픽카드(DirectML)로 ONNX 모델 실행
 directml = ["onnx", "ort/directml"]
 dxrt = ["common/dxrt", "sgview/dxrt", "slam/dxrt"]

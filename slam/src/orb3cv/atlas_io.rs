@@ -6,7 +6,7 @@
 //!   ordered_conn 은 UpdateBestCovisibles(무게 · id 오름차순 정렬 뒤 뒤집기), 자식 · 루프 · 합침 가장자리는 std::set 처럼 id 순.
 //!   그 뒤 System 처럼 빈 지도를 하나 새로 만들어 현재 지도로 둔다. 키프레임 DB 에 넣기(pKFDB->add)는 부르는 쪽이 한다.
 //! - 원본 Map::PreSave 는 다른 지도 · 나쁜 키프레임 관측을 EraseObservation 으로 지우며(nObs 줄이기 · 기준 키프레임 바꾸기 ·
-//!   점 나쁨 표시까지) 살아 있는 지도를 바꾼다. 그 함수가 아직 Rust 에 없어서, 그런 관측이 남아 있으면 저장하지 않고 Err.
+//!   점 나쁨 표시까지) 살아 있는 지도를 바꾼다 — [`pre_save`](저장 전에 부름). `save` 는 그런 관측이 남아 있으면 Err.
 
 use crate::orb3rs::types::{Atlas, Desc, FrameCtx, KeyFrame, KeyPoint, Map, MapPoint, Se3};
 use std::collections::BTreeSet;
@@ -119,6 +119,86 @@ fn bad(m: &str) -> io::Error {
 
 fn ctx_eq(a: &FrameCtx, b: &FrameCtx) -> bool {
     a.cam == b.cam && a.pyr == b.pyr && [a.min_x, a.max_x, a.min_y, a.max_y, a.grid_inv_w, a.grid_inv_h].map(f32::to_bits) == [b.min_x, b.max_x, b.min_y, b.max_y, b.grid_inv_w, b.grid_inv_h].map(f32::to_bits)
+}
+
+/// MapPoint::EraseObservation. 원본 mObservations 는 KeyFrame* 주소 순이라 지운 뒤 새 기준 키프레임(begin)이 실행마다
+/// 다를 수 있다 — 여기선 id 순 첫째. 관측이 다 없어지면(원본은 빈 map 의 begin 을 읽는 미정의 동작) 기준은 그대로 두고, 그때는 nObs ≤ 2 라
+/// 점이 어차피 나쁨이 된다.
+pub fn mp_erase_observation(a: &mut Atlas, mp: u64, kf: u64) {
+    let Some(p) = a.mps.get_mut(&mp) else { return };
+    let Some((l, r)) = p.obs.remove(&kf) else { return };
+    if l != -1 {
+        // 카메라 2 없음(RGB-D): 오른쪽 좌표가 있으면 입체 관측
+        let stereo = a.kfs.get(&kf).is_some_and(|k| k.u_right.get(l as usize).is_some_and(|&u| u >= 0.0));
+        p.n_obs -= if stereo { 2 } else { 1 };
+    }
+    if r != -1 {
+        p.n_obs -= 1;
+    }
+    if p.ref_kf == kf {
+        if let Some(&first) = p.obs.keys().next() {
+            p.ref_kf = first;
+        }
+    }
+    if p.n_obs <= 2 {
+        mp_set_bad(a, mp);
+    }
+}
+
+/// MapPoint::SetBadFlag: 나쁨 표시, 관측 비우기, 관측하던 키프레임의 그 번호를 비우기(EraseMapPointMatch), 지도에서 빼기(EraseMapPoint)
+pub fn mp_set_bad(a: &mut Atlas, mp: u64) {
+    let Some(p) = a.mps.get_mut(&mp) else { return };
+    p.bad = true;
+    let obs = std::mem::take(&mut p.obs);
+    let map = p.map;
+    for (kf, (l, r)) in obs {
+        if let Some(k) = a.kfs.get_mut(&kf) {
+            for i in [l, r] {
+                if i != -1 {
+                    if let Some(s) = k.map_points.get_mut(i as usize) {
+                        *s = None;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(m) = a.maps.iter_mut().find(|m| m.id == map) {
+        m.mps.retain(|&x| x != mp);
+    }
+}
+
+/// Atlas::PreSave 중 살아 있는 Atlas 를 바꾸는 부분: id 순 지도마다(나쁘지 않고 키프레임이 있는 것) Map::PreSave 의 첫 고리 —
+/// 나쁘지 않은 점마다 관측 사본을 돌며 다른 지도 · 나쁜 키프레임 관측을 EraseObservation. 키프레임 없는 지도는 SetMapBad 처럼 나쁨 표시.
+/// (mnLastInitKFidMap 등 저장 형식에 안 담기는 칸은 다루지 않음.)
+pub fn pre_save(a: &mut Atlas) {
+    let mut ids: Vec<u64> = a.maps.iter().map(|m| m.id).collect();
+    ids.sort();
+    for mid in ids {
+        let Some(mi) = a.maps.iter().position(|m| m.id == mid) else { continue };
+        if a.maps[mi].bad {
+            continue;
+        }
+        if a.maps[mi].kfs.is_empty() {
+            a.maps[mi].bad = true;
+            continue;
+        }
+        let mut pts = a.maps[mi].mps.clone();
+        pts.sort();
+        pts.dedup();
+        for mp in pts {
+            let Some(p) = a.mps.get(&mp) else { continue };
+            if p.bad {
+                continue;
+            }
+            let obs: Vec<u64> = p.obs.keys().copied().collect();
+            for kf in obs {
+                let foreign = a.kfs.get(&kf).map_or(true, |k| k.map != mid || k.bad);
+                if foreign {
+                    mp_erase_observation(a, mp, kf);
+                }
+            }
+        }
+    }
 }
 
 /// System::SaveAtlas. next_frame = Frame::nNextId, next_map = Map::nNextId(원본이 함께 저장)
@@ -530,5 +610,52 @@ mod tests {
         let mut buf2 = Vec::new();
         save(&b, 123, 3, &mut buf2).unwrap();
         assert_eq!(buf, buf2);
+    }
+
+    #[test]
+    fn pre_save_erases_foreign_obs() {
+        let mut a = sample();
+        // 점 1: 다른 지도(10) · 나쁜 키프레임(6) 관측 섞기, nObs 를 넉넉히
+        let k0 = a.kfs[&0].u_right[3];
+        a.kfs.get_mut(&0).unwrap().u_right[3] = 1.0; // 입체
+        a.kfs.get_mut(&10).unwrap().u_right[4] = -1.0; // 단안
+        a.kfs.get_mut(&10).unwrap().map_points[4] = Some(1);
+        {
+            let p = a.mps.get_mut(&1).unwrap();
+            p.obs.clear();
+            p.obs.insert(0, (3, -1));
+            p.obs.insert(6, (2, -1));
+            p.obs.insert(10, (4, -1));
+            p.n_obs = 6;
+            p.ref_kf = 10;
+            p.bad = false;
+        }
+        // 점 2: 바깥 관측을 지우면 nObs ≤ 2 → 나쁨
+        {
+            let p = a.mps.get_mut(&2).unwrap();
+            p.obs.clear();
+            p.obs.insert(1, (5, -1));
+            p.obs.insert(11, (6, -1));
+            p.n_obs = 3;
+            p.bad = false;
+        }
+        a.kfs.get_mut(&1).unwrap().map_points[5] = Some(2);
+        assert!(save(&a, 1, 3, &mut Vec::new()).is_err());
+        pre_save(&mut a);
+        let p = &a.mps[&1];
+        assert_eq!(p.obs.keys().copied().collect::<Vec<_>>(), vec![0]);
+        // 6(나쁨, u_right 값에 따라 1 또는 2) · 10(단안 1)
+        let six = if a.kfs[&6].u_right[2] >= 0.0 { 2 } else { 1 };
+        assert_eq!(p.n_obs, 6 - six - 1);
+        assert_eq!(p.ref_kf, 0);
+        assert_eq!(p.bad, p.n_obs <= 2);
+        let q = &a.mps[&2];
+        assert!(q.bad && q.obs.is_empty());
+        assert_eq!(a.kfs[&1].map_points[5], None);
+        assert!(!a.maps[0].mps.contains(&2));
+        // 다른 지도 키프레임의 번호는 EraseObservation 이 비우지 않음(원본 그대로)
+        assert_eq!(a.kfs[&10].map_points[4], Some(1));
+        let _ = k0;
+        save(&a, 1, 3, &mut Vec::new()).unwrap();
     }
 }

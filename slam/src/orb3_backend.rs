@@ -416,12 +416,35 @@ impl Orb3 {
             self.pend.push((mb, ma, s_ba, t));
             return;
         }
-        self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
         let (na, nb) = (self.map_kfs.get(&ma).copied().unwrap_or(0), self.map_kfs.get(&mb).copied().unwrap_or(0));
-        let ok = if na <= nb { self.sys.graft(ma, mb, &s_ba) } else { self.sys.graft(mb, ma, &inv(&s_ba)) };
+        // 지도 통째 자유 공간 검사(장면 한 장 짝은 반복되는 책상 · 모니터 줄에서 두 번 같은 틀린 변환을 낼 수 있음):
+        // 작은 지도의 깊이 점을 큰 지도 장면 깊이에 투영해 맞음 비율 ≥ 0.62 · 작은 지도 깊이 6 장 이상일 때만 옮겨 붙이고, 다듬은 변환을 씀
+        let (from, into, start) = if na <= nb { (ma, mb, s_ba) } else { (mb, ma, inv(&s_ba)) };
+        let Some(k) = self.dk else { return };
+        let mut ff = Vec::new();
+        let mut fi = Vec::new();
+        for (_, kf, rel, d) in &self.deps {
+            if let Some(&(m, p)) = all.get(kf) {
+                let fr = crate::mapmerge::Frame { pose: mul(&p, rel), d };
+                if m == from {
+                    ff.push(fr);
+                } else if m == into {
+                    fi.push(fr);
+                }
+            }
+        }
+        let t0 = Instant::now();
+        let chk = crate::mapmerge::check(&ff, &fi, &start, &k);
+        let Some((s_ok, r, n_ag)) = chk else { return };
+        common::info!("지도 잇기 검사: 지도 {from}(깊이 {} 장) → 지도 {into}(깊이 {} 장) 맞음 비율 {r:.3} · 맞음 {n_ag}, {:.1} 초", ff.len(), fi.len(), t0.elapsed().as_secs_f64());
+        if r < 0.62 || n_ag < 300 || ff.len() < 6 {
+            return;
+        }
+        self.pend.retain(|p| p.0 != ma && p.1 != ma && p.0 != mb && p.1 != mb);
+        let ok = self.sys.graft(from, into, &s_ok);
         if ok {
             self.n_graft += 1;
-            common::info!("위치: 지도 {} 를 지도 {} 에 옮겨 붙임(신경망 장소 인식, 두 번 같은 변환)", if na <= nb { ma } else { mb }, if na <= nb { mb } else { ma });
+            common::info!("위치: 지도 {from} 를 지도 {into} 에 옮겨 붙임(신경망 장소 인식 + 지도 통째 자유 공간 검사)");
         }
     }
 
@@ -451,11 +474,10 @@ impl Orb3 {
         }
         // 최대 속도 재생(받는 쪽을 기다림)은 잇기 결과도 기다려 실시간처럼 제때 반영
         while let Some(r) = self.stitch.recv(self.block) {
+            // 약한 짝(깊이 맞춤 미달)도 옮겨 붙이기 후보로: 받는 것은 지도 통째 자유 공간 검사가 정함
             for h in r {
                 self.hits_all.push(h.clone());
-                if h.strong && std::env::var("NO_GRAFT").is_err() {
-                    self.on_hit(h, f.t);
-                }
+                self.on_hit(h, f.t);
             }
         }
         let c0 = Instant::now();
@@ -830,12 +852,15 @@ impl SlamBackend for Orb3Backend {
                     if ma != mb {
                         let q_a = mul(&pa, &h.q_rel);
                         let c_b = mul(&pb, &h.c_rel);
-                        hyps.push((ma, mb, mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a))));
+                        hyps.push((h.inliers, ma, mb, mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a))));
                     }
                 }
             }
             let t0 = Instant::now();
             let mut log = Vec::new();
+            // 맞은 점 많은 짝부터(지도마다 시작점 수에 한계가 있음)
+            hyps.sort_by_key(|x| std::cmp::Reverse(x.0));
+            let hyps: Vec<(u64, u64, T34)> = hyps.into_iter().map(|x| (x.1, x.2, x.3)).collect();
             xf = crate::mapmerge::merge(&maps, &hyps, &k, mm, &mut log);
             for l in &log {
                 common::info!("끝난 뒤 지도 맞춤: {l}");

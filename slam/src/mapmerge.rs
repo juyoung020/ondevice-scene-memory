@@ -25,6 +25,8 @@ const MAX_REF: usize = 200;
 const ACCEPT: f64 = 0.75;
 const MIN_AGREE: usize = 1500;
 const MARGIN: f64 = 0.1;
+/// 지도마다 다듬어 볼 시작점 수(후보는 맞은 점 많은 것부터 옴)
+const MAX_STARTS: usize = 6;
 /// 맞출 지도의 최소 장면 수(저장 깊이 장 수)
 const MIN_FRAMES: usize = 6;
 
@@ -314,7 +316,7 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
                     let da = (s[0] - x[0] + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
                     da.abs() < 5f64.to_radians() && (s[1] - x[1]).hypot(s[2] - x[2]) < 0.3
                 });
-                if !dup {
+                if !dup && starts.len() < MAX_STARTS {
                     starts.push(x);
                 }
             }
@@ -355,7 +357,9 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
                 .map(|r| ratio(r.1))
                 .fold(0.0, f64::max);
             let ok = ratio(best.1) >= ACCEPT && best.1 .0 >= MIN_AGREE && ratio(best.1) - second >= MARGIN;
-            log.push(format!("지도 {m}: 가장 좋은 {:.3} · 다른 곳 최고 {second:.3} → {}", ratio(best.1), if ok { "옮겨 붙임" } else { "안 붙임" }));
+            let l = format!("지도 {m}: 가장 좋은 {:.3} · 다른 곳 최고 {second:.3} → {}", ratio(best.1), if ok { "옮겨 붙임" } else { "안 붙임" });
+            common::info!("끝난 뒤 지도 맞춤: {l}");
+            log.push(l);
             if ok {
                 xf.insert(m, yaw_t(best.0[0], best.0[1], best.0[2], best.0[3]));
                 changed = true;
@@ -366,6 +370,29 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
         }
     }
     xf
+}
+
+/// 옮겨 붙이기 검사(실행 중): 작은 지도 from 을 큰 지도 into 에 start(into ← from)에서 시작해 자유 공간 점수로 다듬음.
+/// 돌려줌: (다듬은 into ← from, 맞음 비율, 맞음 수)
+pub fn check(from: &[Frame], into: &[Frame], start: &T34, k: &Intr) -> Option<(T34, f64, usize)> {
+    let mut pts = cloud(from, k);
+    if pts.len() < 200 || into.is_empty() {
+        return None;
+    }
+    if pts.len() > MAX_PTS {
+        let st = pts.len() as f64 / MAX_PTS as f64;
+        pts = (0..MAX_PTS).map(|i| pts[(i as f64 * st) as usize]).collect();
+    }
+    let st = (into.len() as f64 / MAX_REF as f64).max(1.0);
+    let refs: Vec<Ref> = (0..into.len().min(MAX_REF)).map(|i| &into[(i as f64 * st) as usize]).map(|f| Ref { w2c: inv(&f.pose), d: f.d }).collect();
+    // 시작 변환을 방위 + 이동으로(지도는 중력 맞춤)
+    let x0 = [start[4].atan2(start[0]), start[3], start[7], start[11]];
+    let r = refine(&pts, &refs, k, x0);
+    let dst = cloud(into, k);
+    let px = polish(&pts, &dst, r.0);
+    let ps = score(&pts, &refs, k, &yaw_t(px[0], px[1], px[2], px[3]));
+    let (x, s) = if ratio(ps) >= ratio(r.1) - 0.03 { (px, ps) } else { r };
+    Some((yaw_t(x[0], x[1], x[2], x[3]), ratio(s), s.0))
 }
 
 /// 조각 다시 놓기: 끝 지도를 빈틈(0.4 초 넘게 장면 없음)마다 조각으로 나눠, 가장 큰 조각부터 나머지 조각을 지금 자리에서 시작해

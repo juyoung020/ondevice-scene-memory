@@ -1026,7 +1026,6 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
             let st = g.sh;
             let (hq, wq) = (g.oh + (kh - 1) / st, g.ow + (kw - 1) / st);
             let nv = (g.oh - 1) * wq + g.ow;
-            let _ = hq;
             // 1×1 · 보폭 1 · 덧댐 0: 입력 채널 평면에서 판마다 바로 펴서(입력 전체 복사 없음)
             if kh == 1 && kw == 1 && st == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w {
                 for b in 0..nb {
@@ -1039,7 +1038,9 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
             // 출력 줄 묶음마다 일 하나: 그 줄들에 드는 위상 평면 줄(+ 아래로 (kh − 1) / s 줄)을 일꾼 자기 버퍼에 채우고 곧바로
             // 모든 출력 채널을 계산 — 평면이 그 코어 캐시에 있는 채로 읽힘(평면 전체를 메모리에 한 번 썼다 다시 읽지 않음)
             let halo = (kh - 1) / st;
-            let tasks = ((co * kk * nv) >> 19).clamp(1, 3 * pool::threads()).min(g.oh);
+            // 일 수: 일꾼마다 3 개까지(곱셈-덧셈 512 K 개당 하나), 그리고 한 일의 평면이 약 192 KB 안(L2 에 A 와 함께 머물게)
+            let mem = (g.c * st * st * (hq + g.oh) * wq * 4).div_ceil(192 << 10);
+            let tasks = ((co * kk * nv) >> 19).clamp(1, 3 * pool::threads()).max(mem).min(g.oh);
             let bh = g.oh.div_ceil(tasks);
             let nt = g.oh.div_ceil(bh);
             let hb = bh + halo;
@@ -1252,29 +1253,8 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                             let d = (y + g.pt) * pw + g.pl;
                             p[d..d + l].copy_from_slice(&plane[y * g.w..y * g.w + l]);
                         }
-                        for oy in 0..g.oh {
-                            let row = &mut o[oy * g.ow..(oy + 1) * g.ow];
-                            let mut x0 = 0;
-                            while x0 < g.ow {
-                                let l = 16.min(g.ow - x0);
-                                let mut acc = [0f32; 16];
-                                for ky in 0..kh {
-                                    let pr = &p[(oy + ky) * pw + x0..(oy + ky) * pw + x0 + kw - 1 + 16];
-                                    for kx in 0..kw {
-                                        let wgt = k[ky * kw + kx];
-                                        for (a, &x) in acc.iter_mut().zip(&pr[kx..kx + 16]) {
-                                            *a += wgt * x;
-                                        }
-                                    }
-                                }
-                                row[x0..x0 + l].copy_from_slice(&acc[..l]);
-                                x0 += 16;
-                            }
-                            for v in row.iter_mut() {
-                                *v += bb;
-                            }
-                            n.act.apply_in(row);
-                        }
+                        let (ow, oh, act) = (g.ow, g.oh, &n.act);
+                        simd::run(|| dw_rows(&p, pw, k, kh, kw, o, ow, oh, bb, act));
                     });
                     return;
                 }
@@ -1318,6 +1298,38 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
         return Err(format!("group {grp} 합성곱 없음"));
     }
     Ok(vec![Tensor::f(vec![nb, co, g.oh, g.ow], out)])
+}
+
+/// 채널별 보폭 1 출력 평면: 덧댄 평면 p(줄 폭 pw)에서 16 칸씩 무게 차례(ky, kx)대로 더하고 편향 · 활성
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn dw_rows(p: &[f32], pw: usize, k: &[f32], kh: usize, kw: usize, o: &mut [f32], ow: usize, oh: usize, bb: f32, act: &Act) {
+    for oy in 0..oh {
+        let row = &mut o[oy * ow..(oy + 1) * ow];
+        let mut x0 = 0;
+        while x0 < ow {
+            let l = 16.min(ow - x0);
+            let mut acc = [0f32; 16];
+            for ky in 0..kh {
+                let pr = &p[(oy + ky) * pw + x0..(oy + ky) * pw + x0 + kw - 1 + 16];
+                for kx in 0..kw {
+                    let wgt = k[ky * kw + kx];
+                    let s: &[f32; 16] = pr[kx..kx + 16].try_into().unwrap();
+                    for j in 0..16 {
+                        acc[j] += wgt * s[j];
+                    }
+                }
+            }
+            row[x0..x0 + l].copy_from_slice(&acc[..l]);
+            x0 += 16;
+        }
+    }
+    // 편향 · 활성은 평면 통째로(줄마다 부르면 짧은 줄에서 부르는 비용이 큼)
+    let o = &mut o[..oh * ow];
+    for v in o.iter_mut() {
+        *v += bb;
+    }
+    act.apply_in(o);
 }
 
 /// e[j] = p[2j], o[j] = p[2j + 1](j < e.len() = o.len(), p.len() ≥ 2 · e.len())

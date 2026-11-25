@@ -337,10 +337,13 @@ fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink)
                         #[cfg(target_arch = "x86_64")]
                         if q1 < p1 {
                             use std::arch::x86_64::*;
+                            // 다음 덩어리의 이 줄 전체(캐시 줄마다)
                             let nx = unsafe { (r as *const f32).add(q1 * NB) } as *const i8;
-                            unsafe {
-                                _mm_prefetch::<_MM_HINT_T0>(nx);
-                                _mm_prefetch::<_MM_HINT_T0>(nx.add(64));
+                            let nl = ((q1 + g).min(p1) - q1) * NB * 4;
+                            let mut o = 0;
+                            while o < nl {
+                                unsafe { _mm_prefetch::<_MM_HINT_T0>(nx.add(o)) };
+                                o += 64;
                             }
                         }
                         for (pi, d) in pb.chunks_mut(k * NB).enumerate() {
@@ -351,10 +354,17 @@ fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink)
                             d[l..].fill(0.0);
                         }
                     }
-                    for p in q0..q1 {
-                        ob.resize(rows, [0.0; NB]);
-                        unsafe { kern(a0, k, rows, mr, pb[(p - q0) * k * NB..].as_ptr(), std::ptr::null(), 0, ob) };
-                        sink.put(r0, p * NB, NB.min(n - p * NB), ob);
+                    // 줄 띠(2 묶음)마다 펴 둔 판들을 지나감: 출력 쓰기 흐름이 띠 줄 수만큼(64 줄을 한꺼번에 쓰면 떨어진 흐름 64 개)
+                    let band = if q1 - q0 > 1 { 2 * mr } else { rows };
+                    let mut rb = 0;
+                    while rb < rows {
+                        let rr = band.min(rows - rb);
+                        ob.resize(rr, [0.0; NB]);
+                        for p in q0..q1 {
+                            unsafe { kern(&a0[rb * k..], k, rr, mr, pb[(p - q0) * k * NB..].as_ptr(), std::ptr::null(), 0, ob) };
+                            sink.put(r0 + rb, p * NB, NB.min(n - p * NB), ob);
+                        }
+                        rb += rr;
                     }
                     q0 = q1;
                 }

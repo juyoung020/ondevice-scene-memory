@@ -36,7 +36,8 @@
 #undef protected
 using namespace ORB_SLAM3;
 
-static FILE *g = nullptr;
+static FILE *g = nullptr, *g_file = nullptr;
+static char *g_buf = nullptr; static size_t g_bufn = 0;
 static thread_local bool g_in = false;
 static thread_local bool g_merge = false;
 static thread_local int g_rel = 0;
@@ -174,6 +175,7 @@ void LoopClosing::MergeLocal() {
     mpLocalMapper->RequestStop();
     while (!mpLocalMapper->isStopped()) usleep(1000);
     mpLocalMapper->EmptyQueue();
+    g = open_memstream(&g_buf, &g_bufn);  // 합치기 하나를 다 쓴 뒤에만 파일로(끝날 때 잘린 기록 없게)
     W<uint32_t>(0x4752454du);  // MERG
     W<uint64_t>(mpCurrentKF->mnId); W<uint64_t>(mpMergeMatchedKF->mnId); W<uint8_t>(mbFixScale); W<uint8_t>(gba);
     wsim(mg2oMergeScw);
@@ -188,7 +190,7 @@ void LoopClosing::MergeLocal() {
     W<uint64_t>(mpAtlas->mpCurrentMap->mnId);
     wkfset(mpCurrentKF->mspMergeEdges); wkfset(mpMergeMatchedKF->mspMergeEdges);
     W<uint8_t>(mpCurrentKF->mbNotErase); W<uint8_t>(mpMergeMatchedKF->mbNotErase);
-    fflush(g); g_n++;
+    fclose(g); fwrite(g_buf, 1, g_bufn, g_file); fflush(g_file); free(g_buf); g_buf = nullptr; g = g_file; g_n++;
 }
 
 static void load(const std::string &f, std::vector<double> &ts, std::vector<std::string> &p) {
@@ -202,7 +204,7 @@ static void load(const std::string &f, std::vector<double> &ts, std::vector<std:
 // 입력: (seqdir order) 짝을 여럿 — 순서 "a-b,c-d:s". 여러 녹화를 이어 붙여 다른 지도가 생겼다 같은 곳을 다시 보게 함
 int main(int argc, char **argv) {
     if (argc < 6 || (argc - 4) % 2) { fprintf(stderr, "merge_dump voc yaml out.bin seqdir order [seqdir order ...]\n"); return 1; }
-    g = fopen(argv[3], "wb");
+    g = g_file = fopen(argv[3], "wb");
     std::vector<std::pair<std::string, std::string>> frames;  // rgb, depth 경로
     for (int a = 4; a + 1 < argc; a += 2) {
         std::string dir = argv[a];
@@ -232,7 +234,7 @@ int main(int argc, char **argv) {
         n++;
     }
     S.Shutdown();
-    fclose(g); g = nullptr;
+    fclose(g_file); g = g_file = nullptr;
     fprintf(stderr, "frames %d merges %ld", n, g_n); fputc(10, stderr);
     return 0;
 }

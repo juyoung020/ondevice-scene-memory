@@ -1,6 +1,6 @@
 //! 행렬곱 커널 단독 속도: gemmbench m k n [반복]
-//! B 를 미리 편 판(Packed) · 줄 주소 바로 읽기(Direct) · 판마다 펴기(Gather) 로 번갈아 돌려 최솟값 비교
-//! (Direct · Gather 의 B 는 1×1 합성곱처럼 k 줄이 n 칸씩 이어진 채널 평면)
+//! B 를 미리 편 판(Packed) · 판마다 펴기(Gather) 로 번갈아 돌려 최솟값 비교
+//! (Gather 의 B 는 k 줄이 n 칸씩 이어진 평면)
 use common::nn::gemm::{self, Panels, RowMajor};
 fn main() {
     let a: Vec<usize> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();
@@ -12,13 +12,12 @@ fn main() {
     let mut o = vec![0f32; m * n];
     let ap = gemm::pack_a(&x, m, k, k);
     let sink = RowMajor { out: o.as_mut_ptr(), ldc: n, col_bias: None, row_bias: None, act: if std::env::var_os("ACT").is_some() { common::nn::Act::Silu } else { common::nn::Act::None } };
-    let names = ["packed", "direct", "gather"];
-    let mut best = [f64::MAX; 3];
+    let names = ["packed", "gather"];
+    let mut best = [f64::MAX; 2];
     for r in 0..reps + 3 {
         for (i, b) in best.iter_mut().enumerate() {
             let p = match i {
                 0 => Panels::Packed(&pb),
-                1 => Panels::Direct { rows: &rows, avail: n },
                 _ => Panels::Gather { rows: &rows, avail: n },
             };
             let t = std::time::Instant::now();

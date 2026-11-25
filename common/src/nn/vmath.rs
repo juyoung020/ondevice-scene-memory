@@ -65,11 +65,26 @@ slice_fn!(sqrt_s, |x| x.sqrt());
 slice_fn!(neg_s, |x| -*x);
 
 /// 줄 하나 softmax(제자리)
+/// (최대 · 합은 16 칸 갈래로 나눠 더함: 벡터로 돌게)
 pub fn softmax_row(row: &mut [f32]) {
-    let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut ml = [f32::NEG_INFINITY; 16];
+    let mut ch = row.chunks_exact(16);
+    for c in &mut ch {
+        for (a, &b) in ml.iter_mut().zip(c) {
+            *a = a.max(b);
+        }
+    }
+    let m = ch.remainder().iter().fold(ml.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)), |a, &b| a.max(b));
     row.iter_mut().for_each(|x| *x -= m);
     exp_s(row);
-    let s: f32 = row.iter().sum();
+    let mut sl = [0f32; 16];
+    let mut ch = row.chunks_exact(16);
+    for c in &mut ch {
+        for (a, &b) in sl.iter_mut().zip(c) {
+            *a += b;
+        }
+    }
+    let s: f32 = sl.iter().sum::<f32>() + ch.remainder().iter().sum::<f32>();
     let k = 1.0 / s;
     row.iter_mut().for_each(|x| *x *= k);
 }

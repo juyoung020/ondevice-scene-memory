@@ -1,5 +1,5 @@
 //! 노드 하나 실행
-use super::gemm::{self, NB, Panels, RowMajor, Sink};
+use super::gemm::{self, Panels, RowMajor};
 use super::{Act, Data, Node, Pre, Tensor};
 use super::{buf, pool, simd, vmath};
 
@@ -13,7 +13,7 @@ type R = Result<Vec<Tensor>, String>;
 
 const PAR: usize = 1 << 15;
 
-fn need<'a>(ins: &[Option<&'a Tensor>], i: usize) -> Result<&'a Tensor, String> {
+pub(crate) fn need<'a>(ins: &[Option<&'a Tensor>], i: usize) -> Result<&'a Tensor, String> {
     ins.get(i).copied().flatten().ok_or(format!("입력 {i} 없음"))
 }
 
@@ -32,6 +32,7 @@ fn strides(s: &[usize]) -> Vec<usize> {
 pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
     let x = || need(ins, 0);
     match n.op.as_str() {
+        "Add" | "Sub" | "Mul" | "Div" if need(ins, 0)?.blk > 0 || need(ins, 1)?.blk > 0 => super::nchwc::binary(&n.op, need(ins, 0)?, need(ins, 1)?),
         "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" => binary(&n.op, need(ins, 0)?, need(ins, 1)?, n.ai("fmod", 0) != 0),
         "Relu" => unary_s(x()?, vmath::relu),
         "Sigmoid" => unary_s(x()?, vmath::sigmoid_s),
@@ -45,10 +46,13 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
             let t = x()?;
             Ok(vec![match n.ai("to", 1) {
                 1 | 10 | 11 => Tensor::f(t.shape.clone(), t.clone().into_f()),
-                9 => Tensor::i(t.shape.clone(), match &t.data {
-                    Data::F(v) => v.iter().map(|&a| (a != 0.0) as i64).collect(),
-                    Data::I(v) => v.iter().map(|&a| (a != 0) as i64).collect(),
-                }),
+                9 => Tensor::i(
+                    t.shape.clone(),
+                    match &t.data {
+                        Data::F(v) => v.iter().map(|&a| (a != 0.0) as i64).collect(),
+                        Data::I(v) => v.iter().map(|&a| (a != 0) as i64).collect(),
+                    },
+                ),
                 _ => Tensor::i(t.shape.clone(), t.ints()),
             }])
         }
@@ -65,13 +69,13 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 let known: usize = out.iter().enumerate().filter(|(i, _)| *i != p).map(|(_, d)| *d).product();
                 out[p] = total / known.max(1);
             }
-            Ok(vec![Tensor { shape: out, data: t.data.clone() }])
+            Ok(vec![Tensor { shape: out, data: t.data.clone(), blk: 0 }])
         }
         "Flatten" => {
             let t = x()?;
             let a = axis(n.ai("axis", 1), t.shape.len());
             let o: usize = t.shape[..a].iter().product();
-            Ok(vec![Tensor { shape: vec![o, t.len() / o.max(1)], data: t.data.clone() }])
+            Ok(vec![Tensor { shape: vec![o, t.len() / o.max(1)], data: t.data.clone(), blk: 0 }])
         }
         "Unsqueeze" => {
             let t = x()?;
@@ -83,7 +87,7 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
             for a in ax {
                 s.insert(a, 1);
             }
-            Ok(vec![Tensor { shape: s, data: t.data.clone() }])
+            Ok(vec![Tensor { shape: s, data: t.data.clone(), blk: 0 }])
         }
         "Squeeze" => {
             let t = x()?;
@@ -96,7 +100,7 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 }
                 None => t.shape.iter().copied().filter(|&d| d != 1).collect(),
             };
-            Ok(vec![Tensor { shape: s, data: t.data.clone() }])
+            Ok(vec![Tensor { shape: s, data: t.data.clone(), blk: 0 }])
         }
         "Transpose" => {
             let t = x()?;
@@ -105,6 +109,9 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
         }
         "Concat" => {
             let ts: Vec<&Tensor> = ins.iter().flatten().copied().collect();
+            if ts[0].blk > 0 {
+                return super::nchwc::concat(&ts);
+            }
             let r = ts[0].shape.len();
             let a = axis(n.ai("axis", 0), r);
             concat(&ts, a)
@@ -122,6 +129,9 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 }
             };
             let keep = n.ais("keep");
+            if t.blk > 0 {
+                return super::nchwc::split(t, &sizes, keep.as_deref());
+            }
             split(t, a, &sizes, keep.as_deref())
         }
         "Slice" => {
@@ -215,8 +225,8 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
         }
         "MatMul" => matmul(n, need(ins, 0)?, need(ins, 1)?),
         "Gemm" => gemm_op(n, ins),
-        "Conv" => conv(n, ins),
-        "ConvTranspose" => conv_t(n, ins),
+        "Conv" => super::nchwc::conv(n, ins),
+        "ConvTranspose" => super::nchwc::conv_t(n, ins),
         "MaxPool" | "AveragePool" => pool(n, x()?),
         "Resize" => resize(n, ins),
         o => Err(format!("연산 {o} 은 아직 없음")),
@@ -225,7 +235,10 @@ pub(crate) fn exec(n: &Node, ins: &[Option<&Tensor>]) -> R {
 
 /// 첫 입력을 넘겨 받아 제자리로 계산할 수 있는 노드인가
 pub(crate) fn in_place(n: &Node) -> bool {
-    matches!(n.op.as_str(), "Reshape" | "Flatten" | "Squeeze" | "Unsqueeze" | "Identity" | "Relu" | "Sigmoid" | "Tanh" | "Sqrt" | "Erf" | "Neg" | "Exp" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "LayerNorm")
+    matches!(
+        n.op.as_str(),
+        "Reshape" | "Flatten" | "Squeeze" | "Unsqueeze" | "Identity" | "Relu" | "Sigmoid" | "Tanh" | "Sqrt" | "Erf" | "Neg" | "Exp" | "Add" | "Sub" | "Mul" | "Div" | "Softmax" | "LayerNorm"
+    )
 }
 
 /// [`in_place`] 노드: x = 첫 입력(넘겨 받음), rest = 나머지 입력
@@ -235,7 +248,7 @@ pub(crate) fn exec_own(n: &Node, mut x: Tensor, rest: &[Option<&Tensor>]) -> R {
             // 모양만 계산(값은 그대로 옮김)
             let mut ins: Vec<Option<&Tensor>> = vec![None];
             ins.extend_from_slice(rest);
-            let probe = Tensor { shape: x.shape.clone(), data: Data::F(vec![]) };
+            let probe = Tensor { shape: x.shape.clone(), data: Data::F(vec![]), blk: 0 };
             ins[0] = Some(&probe);
             let shape = shape_only(n, &ins)?;
             x.shape = shape;
@@ -287,11 +300,10 @@ fn f32_un_s(f: fn(&mut [f32]), x: &mut Tensor) -> Result<(), String> {
 }
 
 fn unary_s(t: &Tensor, f: fn(&mut [f32])) -> R {
-    let mut x = Tensor::f(t.shape.clone(), copy(t.fv()?));
+    let mut x = Tensor { shape: t.shape.clone(), data: Data::F(copy(t.fv()?)), blk: t.blk };
     f32_un_s(f, &mut x)?;
     Ok(vec![x])
 }
-
 
 /// v(모양 shape) ⊙= w(넓혀 읽음, 결과 모양은 shape)
 fn bin_in_place(v: &mut [f32], shape: &[usize], w: &[f32], wsh: &[usize], op: impl Fn(f32, f32) -> f32 + Sync) {
@@ -384,7 +396,6 @@ fn shape_only(n: &Node, ins: &[Option<&Tensor>]) -> Result<Vec<usize>, String> {
         }
     })
 }
-
 
 fn bshape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
     let r = a.len().max(b.len());
@@ -546,11 +557,15 @@ fn map_data(t: &Tensor, shape: Vec<usize>, idx: impl Fn(usize) -> usize + Sync) 
     let len: usize = shape.iter().product();
     match &t.data {
         Data::F(v) => {
-            let o: Vec<f32> = if len > PAR { {
-                let mut o = buf::take::<f32>(len);
-                pool::chunks_mut(&mut o, PAR, |c, ch| ch.iter_mut().enumerate().for_each(|(i, x)| *x = v[idx(c * PAR + i)]));
-                o
-            } } else { (0..len).map(|i| v[idx(i)]).collect() };
+            let o: Vec<f32> = if len > PAR {
+                {
+                    let mut o = buf::take::<f32>(len);
+                    pool::chunks_mut(&mut o, PAR, |c, ch| ch.iter_mut().enumerate().for_each(|(i, x)| *x = v[idx(c * PAR + i)]));
+                    o
+                }
+            } else {
+                (0..len).map(|i| v[idx(i)]).collect()
+            };
             Tensor::f(shape, o)
         }
         Data::I(v) => Tensor::i(shape, (0..len).map(|i| v[idx(i)]).collect()),
@@ -830,10 +845,15 @@ fn topk(t: &Tensor, k: usize, a: usize, largest: bool) -> R {
         for i in 0..inner {
             let mut ord: Vec<usize> = (0..d).collect();
             let at = |j: usize| v[(o * d + j) * inner + i];
-            ord.sort_by(|&x, &y| {
-                let c = if largest { at(y).total_cmp(&at(x)) } else { at(x).total_cmp(&at(y)) };
-                c.then(x.cmp(&y))
-            });
+            // 값 · 번호 차례(전순서): 앞 k 개만 골라 정렬해도 전체 정렬의 앞 k 개와 같음
+            let cmp = |x: &usize, y: &usize| {
+                let c = if largest { at(*y).total_cmp(&at(*x)) } else { at(*x).total_cmp(&at(*y)) };
+                c.then(x.cmp(y))
+            };
+            if k < d {
+                ord.select_nth_unstable_by(k, cmp);
+            }
+            ord[..k].sort_by(cmp);
             for (j, &s) in ord[..k].iter().enumerate() {
                 vals[(o * k + j) * inner + i] = at(s);
                 idx[(o * k + j) * inner + i] = s as i64;
@@ -921,7 +941,13 @@ fn gemm_op(n: &Node, ins: &[Option<&Tensor>]) -> R {
             }
             let cv = c.map(|c| {
                 let v = c.fv().unwrap();
-                if v.len() == 1 { v[0] } else if v.len() == nn { v[j] } else { v[i * nn + j] }
+                if v.len() == 1 {
+                    v[0]
+                } else if v.len() == nn {
+                    v[j]
+                } else {
+                    v[i * nn + j]
+                }
             });
             o[i * nn + j] = alpha * s + beta * cv.unwrap_or(0.0);
         }
@@ -929,23 +955,23 @@ fn gemm_op(n: &Node, ins: &[Option<&Tensor>]) -> R {
     Ok(vec![Tensor::f(vec![m, nn], o)])
 }
 
-struct ConvGeo {
-    c: usize,
-    h: usize,
-    w: usize,
-    kh: usize,
-    kw: usize,
-    sh: usize,
-    sw: usize,
-    dh: usize,
-    dw: usize,
-    pt: usize,
-    pl: usize,
-    oh: usize,
-    ow: usize,
+pub(crate) struct ConvGeo {
+    pub c: usize,
+    pub h: usize,
+    pub w: usize,
+    pub kh: usize,
+    pub kw: usize,
+    pub sh: usize,
+    pub sw: usize,
+    pub dh: usize,
+    pub dw: usize,
+    pub pt: usize,
+    pub pl: usize,
+    pub oh: usize,
+    pub ow: usize,
 }
 
-fn geo(n: &Node, xs: &[usize], kh: usize, kw: usize) -> ConvGeo {
+pub(crate) fn geo(n: &Node, xs: &[usize], kh: usize, kw: usize) -> ConvGeo {
     let (c, h, w) = (xs[1], xs[2], xs[3]);
     let s = n.ais("strides").unwrap_or(vec![1, 1]);
     let d = n.ais("dilations").unwrap_or(vec![1, 1]);
@@ -957,7 +983,11 @@ fn geo(n: &Node, xs: &[usize], kh: usize, kw: usize) -> ConvGeo {
         let ow = w.div_ceil(sw);
         let ph = ((oh - 1) * sh + dh * (kh - 1) + 1).saturating_sub(h);
         let pw = ((ow - 1) * sw + dw * (kw - 1) + 1).saturating_sub(w);
-        p = if ap == "SAME_UPPER" { vec![(ph / 2) as i64, (pw / 2) as i64, (ph - ph / 2) as i64, (pw - pw / 2) as i64] } else { vec![(ph - ph / 2) as i64, (pw - pw / 2) as i64, (ph / 2) as i64, (pw / 2) as i64] };
+        p = if ap == "SAME_UPPER" {
+            vec![(ph / 2) as i64, (pw / 2) as i64, (ph - ph / 2) as i64, (pw - pw / 2) as i64]
+        } else {
+            vec![(ph - ph / 2) as i64, (pw - pw / 2) as i64, (ph / 2) as i64, (pw / 2) as i64]
+        };
     } else if ap == "VALID" {
         p = vec![0, 0, 0, 0];
     }
@@ -965,544 +995,6 @@ fn geo(n: &Node, xs: &[usize], kh: usize, kw: usize) -> ConvGeo {
     let oh = (h + pt + pb - dh * (kh - 1) - 1) / sh + 1;
     let ow = (w + pl + pr - dw * (kw - 1) - 1) / sw + 1;
     ConvGeo { c, h, w, kh, kw, sh, sw, dh, dw, pt, pl, oh, ow }
-}
-
-/// 합성곱 입력 채널 평면들(묶음 b · 채널 ci 차례): 이어 붙이기 · 나누기를 묶은 합성곱(n.cat)은 조각 텐서를 그대로 가리킴
-fn conv_input<'a>(n: &Node, ins: &[Option<&'a Tensor>]) -> Result<(Vec<usize>, Vec<&'a [f32]>), String> {
-    if n.cat.is_empty() {
-        let x = need(ins, 0)?;
-        let hw = x.shape[2] * x.shape[3];
-        return Ok((x.shape.clone(), x.fv()?.chunks(hw.max(1)).collect()));
-    }
-    let x0 = need(ins, n.cat[0].0)?;
-    let (nb, h, w) = (x0.shape[0], x0.shape[2], x0.shape[3]);
-    let hw = h * w;
-    let mut parts = vec![];
-    let mut c = 0;
-    for &(i, off, cnt) in &n.cat {
-        let t = need(ins, i)?;
-        if t.shape.len() != 4 || t.shape[0] != nb || t.shape[2] != h || t.shape[3] != w {
-            return Err(format!("이어 붙일 모양 {:?} ≠ {:?}", t.shape, x0.shape));
-        }
-        let cnt = if cnt == 0 { t.shape[1] - off } else { cnt };
-        parts.push((t.fv()?, t.shape[1], off, cnt));
-        c += cnt;
-    }
-    let mut ch = Vec::with_capacity(nb * c);
-    for b in 0..nb {
-        for &(v, tc, off, cnt) in &parts {
-            for k in off..off + cnt {
-                ch.push(&v[(b * tc + k) * hw..(b * tc + k + 1) * hw]);
-            }
-        }
-    }
-    Ok((vec![nb, c, h, w], ch))
-}
-
-fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
-    let (xs, chans) = conv_input(n, ins)?;
-    let wt = need(ins, 1)?;
-    let bias = ins.get(2).copied().flatten().map(|b| b.fv()).transpose()?;
-    let (co, kh, kw) = (wt.shape[0], wt.shape[2], wt.shape[3]);
-    let g = geo(n, &xs, kh, kw);
-    let grp = n.ai("group", 1) as usize;
-    let nb = xs[0];
-    let (ohw, chw) = (g.oh * g.ow, g.c * g.h * g.w);
-    let mut out = buf::take::<f32>(nb * co * ohw);
-    if grp == 1 {
-        let kk = g.c * kh * kw;
-        let owned;
-        let ap: &[f32] = match &n.pre {
-            Pre::ConvA(a) => a,
-            _ => {
-                owned = gemm::pack_a(wt.fv()?, co, kk, kk);
-                &owned
-            }
-        };
-        // 보폭 s(가로 세로 같음): 덧댄 입력을 s × s 위상 평면으로 나누면 보폭 1 문제 — 평면을 바로 읽는 행렬곱.
-        // 위상 (ry, rx) 평면[i][j] = 덧댄 입력[s·i + ry][s·j + rx], 무게 (ky, kx) = (s·qy + ry, s·qx + rx) 는 그 평면을 (qy, qx) 만큼 민 것.
-        // 출력 열 q = oy · wq + ox(줄 사이 wq − ow 열은 버림)
-        if g.sh == g.sw && g.dh == 1 && g.dw == 1 && g.sh <= 4 {
-            let st = g.sh;
-            let (hq, wq) = (g.oh + (kh - 1) / st, g.ow + (kw - 1) / st);
-            let nv = (g.oh - 1) * wq + g.ow;
-            // 1×1 · 보폭 1 · 덧댐 0: 입력 채널 평면에서 판마다 바로 펴서(입력 전체 복사 없음)
-            if kh == 1 && kw == 1 && st == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w {
-                for b in 0..nb {
-                    let rows: Vec<usize> = chans[b * g.c..(b + 1) * g.c].iter().map(|p| p.as_ptr() as usize).collect();
-                    let sink = ConvDirectSink { out: out[b * co * ohw..].as_mut_ptr(), wp: g.ow, ow: g.ow, ohw, nv: ohw, bias, act: n.act.clone() };
-                    gemm::gemm(ap, co, kk, ohw, Panels::Gather { rows: &rows, avail: ohw }, &sink);
-                }
-                return Ok(vec![Tensor::f(vec![nb, co, g.oh, g.ow], out)]);
-            }
-            // 출력 줄 묶음마다 일 하나: 그 줄들에 드는 위상 평면 줄(+ 아래로 (kh − 1) / s 줄)을 일꾼 자기 버퍼에 채우고 곧바로
-            // 모든 출력 채널을 계산 — 평면이 그 코어 캐시에 있는 채로 읽힘(평면 전체를 메모리에 한 번 썼다 다시 읽지 않음)
-            let halo = (kh - 1) / st;
-            // 일 수: 일꾼마다 3 개까지(곱셈-덧셈 512 K 개당 하나), 그리고 한 일의 평면이 약 192 KB 안(L2 에 A 와 함께 머물게)
-            let mem = (g.c * st * st * (hq + g.oh) * wq * 4).div_ceil(192 << 10);
-            let tasks = ((co * kk * nv) >> 19).clamp(1, 3 * pool::threads()).max(mem).min(g.oh);
-            let bh = g.oh.div_ceil(tasks);
-            let nt = g.oh.div_ceil(bh);
-            let hb = bh + halo;
-            let plane_l = hb * wq;
-            let offs: Vec<usize> = (0..g.c).flat_map(|ci| (0..kh).flat_map(move |ky| (0..kw).map(move |kx| ((ci * st + ky % st) * st + kx % st) * plane_l + (ky / st) * wq + kx / st))).collect();
-            let planes = g.c * st * st;
-            let nv_max = (bh - 1) * wq + g.ow;
-            let need = (offs.iter().max().unwrap() + nv_max.div_ceil(NB) * NB + 2 * NB).max(planes * plane_l);
-            let mr = gemm::mr_for(co);
-            for b in 0..nb {
-                let xb = &chans[b * g.c..(b + 1) * g.c];
-                let ob = Ptr(out[b * co * ohw..].as_mut_ptr());
-                pool::for_each(nt, &|t| {
-                    simd::run(|| {
-                        thread_local! {
-                            static TL: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<usize>, Vec<[f32; NB]>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
-                        }
-                        TL.with(|tl| {
-                            let mut tl = tl.borrow_mut();
-                            let (xp, pr, rows, tile) = &mut *tl;
-                            let (oy0, oy1) = (t * bh, ((t + 1) * bh).min(g.oh));
-                            if xp.len() < need {
-                                xp.resize(need, 0.0);
-                            }
-                            // 위상 평면 줄 채우기: 덧댄 줄 P[x] = 입력[y][x − pl](x < s · wq), 위상 rx 평면 칸 j = P[s · j + rx]
-                            pr.resize(st * wq, 0.0);
-                            let xs = g.pl.min(st * wq);
-                            let xe = (g.pl + g.w).min(st * wq);
-                            let li_n = oy1 - oy0 + halo;
-                            for ci in 0..g.c {
-                                let src = xb[ci];
-                                for ry in 0..st {
-                                    for li in 0..li_n {
-                                        let y = (st * (oy0 + li) + ry) as isize - g.pt as isize;
-                                        let base = (ci * st + ry) * st * plane_l + li * wq;
-                                        if y < 0 || y >= g.h as isize {
-                                            for rx in 0..st {
-                                                xp[base + rx * plane_l..base + rx * plane_l + wq].fill(0.0);
-                                            }
-                                            continue;
-                                        }
-                                        let row = &src[y as usize * g.w..(y as usize + 1) * g.w];
-                                        let pp: &mut [f32] = if st == 1 { &mut xp[base..base + wq] } else { &mut pr[..] };
-                                        pp[..xs].fill(0.0);
-                                        pp[xs..xe].copy_from_slice(&row[..xe - xs]);
-                                        pp[xe..].fill(0.0);
-                                        if st == 2 {
-                                            let (d0, d1) = xp[base..].split_at_mut(plane_l);
-                                            deint2(pr, &mut d0[..wq], &mut d1[..wq]);
-                                        } else if st > 2 {
-                                            for rx in 0..st {
-                                                for (j, v) in xp[base + rx * plane_l..base + rx * plane_l + wq].iter_mut().enumerate() {
-                                                    *v = pr[st * j + rx];
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            rows.clear();
-                            rows.extend(offs.iter().map(|&o| xp.as_ptr() as usize + o * 4));
-                            if co <= 16 {
-                                // 출력 채널이 적으면 출력 줄마다 32 칸씩(버리는 열 · 조각 계산 없음)
-                                tile.resize(co, [0.0; NB]);
-                                for oy in oy0..oy1 {
-                                    let mut x0 = 0;
-                                    while x0 < g.ow {
-                                        let len = NB.min(g.ow - x0);
-                                        // SAFETY: 평면 버퍼는 끝에 NB 이상 꼬리
-                                        unsafe { gemm::direct_rows(ap, kk, co, mr, rows, (oy - oy0) * wq + x0, tile) };
-                                        if let Some(bs) = bias {
-                                            for (c, r) in tile.iter_mut().enumerate() {
-                                                r.iter_mut().for_each(|x| *x += bs[c]);
-                                            }
-                                        }
-                                        n.act.apply_in(tile.as_flattened_mut());
-                                        for (c, r) in tile.iter().enumerate() {
-                                            // SAFETY: 출력 줄은 일마다 겹치지 않음
-                                            unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), ob.at(c * ohw + oy * g.ow + x0), len) };
-                                        }
-                                        x0 += NB;
-                                    }
-                                }
-                            } else {
-                                // 줄 띠(2 묶음)마다 이 묶음의 판들을 지나감(출력 쓰기 흐름은 띠 줄 수만큼)
-                                let nv_l = (oy1 - oy0 - 1) * wq + g.ow;
-                                let np_l = nv_l.div_ceil(NB);
-                                let sink = ConvDirectSink { out: ob.at(oy0 * g.ow), wp: wq, ow: g.ow, ohw, nv: nv_l, bias, act: n.act.clone() };
-                                let band = 2 * mr;
-                                let mut r0 = 0;
-                                while r0 < co {
-                                    let rr = band.min(co - r0);
-                                    tile.resize(rr, [0.0; NB]);
-                                    for p in 0..np_l {
-                                        // SAFETY: 평면 버퍼는 끝에 NB 이상 꼬리
-                                        unsafe { gemm::direct_rows(&ap[r0 * kk..], kk, rr, mr, rows, p * NB, tile) };
-                                        sink.put_in(r0, p * NB, NB.min(nv_l - p * NB), tile);
-                                    }
-                                    r0 += rr;
-                                }
-                            }
-                        })
-                    })
-                });
-            }
-            return Ok(vec![Tensor::f(vec![nb, co, g.oh, g.ow], out)]);
-        }
-        // 펴기 길은 한 덩어리 입력: 조각이면 이어 붙임
-        let joined;
-        let xv: &[f32] = if n.cat.is_empty() {
-            need(ins, 0)?.fv()?
-        } else {
-            joined = chans.concat();
-            &joined
-        };
-        for b in 0..nb {
-            let xb = &xv[b * chw..(b + 1) * chw];
-            let g = &g;
-            let direct = kh == 1 && kw == 1 && g.sh == 1 && g.sw == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w;
-            let mk = move |p: usize, buf: &mut [f32]| {
-                let c0 = p * NB;
-                let wv = NB.min(ohw - c0);
-                if direct {
-                    for ci in 0..g.c {
-                        let o = &mut buf[ci * NB..(ci + 1) * NB];
-                        o[..wv].copy_from_slice(&xb[ci * ohw + c0..ci * ohw + c0 + wv]);
-                        o[wv..].fill(0.0);
-                    }
-                    return;
-                }
-                let mut iy0 = [0isize; NB];
-                let mut ix0 = [0isize; NB];
-                for j in 0..wv {
-                    let (oy, ox) = ((c0 + j) / g.ow, (c0 + j) % g.ow);
-                    iy0[j] = (oy * g.sh) as isize - g.pt as isize;
-                    ix0[j] = (ox * g.sw) as isize - g.pl as isize;
-                }
-                let (hh, ww) = (g.h as isize, g.w as isize);
-                let one_row = c0 / g.ow == (c0 + wv - 1) / g.ow;
-                let mut kk = 0;
-                for ci in 0..g.c {
-                    let plane = &xb[ci * g.h * g.w..(ci + 1) * g.h * g.w];
-                    for ky in 0..g.kh {
-                        for kx in 0..g.kw {
-                            let o = &mut buf[kk * NB..(kk + 1) * NB];
-                            let (dy, dx) = ((ky * g.dh) as isize, (kx * g.dw) as isize);
-                            kk += 1;
-                            // 판이 출력 한 줄 안: 입력도 한 줄, 가로 보폭 sw
-                            if one_row {
-                                let iy = iy0[0] + dy;
-                                let xs = ix0[0] + dx;
-                                let xe = xs + (wv as isize - 1) * g.sw as isize;
-                                if iy < 0 || iy >= hh {
-                                    o.fill(0.0);
-                                    continue;
-                                }
-                                if xs >= 0 && xe < ww {
-                                    let src = &plane[(iy * ww + xs) as usize..];
-                                    if g.sw == 1 {
-                                        o[..wv].copy_from_slice(&src[..wv]);
-                                    } else {
-                                        for j in 0..wv {
-                                            o[j] = src[j * g.sw];
-                                        }
-                                    }
-                                    o[wv..].fill(0.0);
-                                    continue;
-                                }
-                            }
-                            for j in 0..NB {
-                                o[j] = if j < wv {
-                                    let (iy, ix) = (iy0[j] + dy, ix0[j] + dx);
-                                    if iy >= 0 && iy < hh && ix >= 0 && ix < ww { plane[(iy * ww + ix) as usize] } else { 0.0 }
-                                } else {
-                                    0.0
-                                };
-                            }
-                        }
-                    }
-                }
-            };
-            let sink = RowMajor { out: out[b * co * ohw..].as_mut_ptr(), ldc: ohw, col_bias: None, row_bias: bias, act: n.act.clone() };
-            gemm::gemm(ap, co, kk, ohw, Panels::Make(&mk), &sink);
-        }
-    } else if grp == g.c && co == g.c {
-        // 채널별(depthwise, 조각 입력 없음)
-        let xv = need(ins, 0)?.fv()?;
-        let wv = wt.fv()?;
-        let op = Ptr(out.as_mut_ptr());
-        pool::for_each(nb * co, &|bc| {
-            simd::run(|| {
-                let (b, c) = (bc / co, bc % co);
-                let plane = &xv[b * chw + c * g.h * g.w..b * chw + (c + 1) * g.h * g.w];
-                let k = &wv[c * kh * kw..(c + 1) * kh * kw];
-                let bb = bias.map(|b| b[c]).unwrap_or(0.0);
-                let o = unsafe { std::slice::from_raw_parts_mut(op.at(bc * ohw), ohw) };
-                if g.sh == 1 && g.sw == 1 && g.dh == 1 && g.dw == 1 {
-                    // 보폭 1: 덧댄 평면을 만들고 출력 16 칸씩 레지스터에서 무게 차례(ky, kx)대로 더함.
-                    // 덧댐 칸은 0 · 무게 = ±0 을 더하는 것이라(합은 +0 에서 시작) 건너뛴 것과 같은 값
-                    thread_local! {
-                        static PAD: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
-                    }
-                    PAD.with(|p| {
-                        let mut p = p.borrow_mut();
-                        let (ph, pw) = (g.oh + kh - 1, g.ow + kw - 1);
-                        p.clear();
-                        p.resize(ph * pw + 16, 0.0);
-                        for y in 0..g.h.min(ph - g.pt.min(ph)) {
-                            let l = g.w.min(pw.saturating_sub(g.pl));
-                            let d = (y + g.pt) * pw + g.pl;
-                            p[d..d + l].copy_from_slice(&plane[y * g.w..y * g.w + l]);
-                        }
-                        let (ow, oh, act) = (g.ow, g.oh, &n.act);
-                        simd::run(|| dw_rows(&p, pw, k, kh, kw, o, ow, oh, bb, act));
-                    });
-                    return;
-                }
-                for oy in 0..g.oh {
-                    let row = &mut o[oy * g.ow..(oy + 1) * g.ow];
-                    row.fill(0.0);
-                    for ky in 0..kh {
-                        let iy = (oy * g.sh + ky * g.dh) as isize - g.pt as isize;
-                        if iy < 0 || iy >= g.h as isize {
-                            continue;
-                        }
-                        let src = &plane[iy as usize * g.w..(iy as usize + 1) * g.w];
-                        for kx in 0..kw {
-                            let wgt = k[ky * kw + kx];
-                            let off = (kx * g.dw) as isize - g.pl as isize;
-                            // ox 범위: 0 ≤ ox·sw + off < w
-                            let lo = if off < 0 { ((-off) as usize).div_ceil(g.sw) } else { 0 };
-                            let hi = (((g.w as isize - off - 1) / g.sw as isize) + 1).clamp(0, g.ow as isize) as usize;
-                            if g.sw == 1 {
-                                if lo < hi {
-                                    let s = &src[(lo as isize + off) as usize..(hi as isize + off) as usize];
-                                    for (r, &x) in row[lo..hi].iter_mut().zip(s) {
-                                        *r += wgt * x;
-                                    }
-                                }
-                            } else {
-                                for ox in lo..hi {
-                                    row[ox] += wgt * src[(ox as isize * g.sw as isize + off) as usize];
-                                }
-                            }
-                        }
-                    }
-                    for v in row.iter_mut() {
-                        *v += bb;
-                    }
-                    n.act.apply(row);
-                }
-            })
-        });
-    } else {
-        return Err(format!("group {grp} 합성곱 없음"));
-    }
-    Ok(vec![Tensor::f(vec![nb, co, g.oh, g.ow], out)])
-}
-
-/// 채널별 보폭 1 출력 평면: 덧댄 평면 p(줄 폭 pw)에서 16 칸씩 무게 차례(ky, kx)대로 더하고 편향 · 활성
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn dw_rows(p: &[f32], pw: usize, k: &[f32], kh: usize, kw: usize, o: &mut [f32], ow: usize, oh: usize, bb: f32, act: &Act) {
-    for oy in 0..oh {
-        let row = &mut o[oy * ow..(oy + 1) * ow];
-        let mut x0 = 0;
-        while x0 < ow {
-            let l = 16.min(ow - x0);
-            let mut acc = [0f32; 16];
-            for ky in 0..kh {
-                let pr = &p[(oy + ky) * pw + x0..(oy + ky) * pw + x0 + kw - 1 + 16];
-                for kx in 0..kw {
-                    let wgt = k[ky * kw + kx];
-                    let s: &[f32; 16] = pr[kx..kx + 16].try_into().unwrap();
-                    for j in 0..16 {
-                        acc[j] += wgt * s[j];
-                    }
-                }
-            }
-            row[x0..x0 + l].copy_from_slice(&acc[..l]);
-            x0 += 16;
-        }
-    }
-    // 편향 · 활성은 평면 통째로(줄마다 부르면 짧은 줄에서 부르는 비용이 큼)
-    let o = &mut o[..oh * ow];
-    for v in o.iter_mut() {
-        *v += bb;
-    }
-    act.apply_in(o);
-}
-
-/// e[j] = p[2j], o[j] = p[2j + 1](j < e.len() = o.len(), p.len() ≥ 2 · e.len())
-#[inline(always)]
-fn deint2(p: &[f32], e: &mut [f32], o: &mut [f32]) {
-    let n = e.len().min(o.len()).min(p.len() / 2);
-    #[allow(unused_mut)]
-    let mut j = 0;
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: 기능 확인함, 16 칸씩 범위 안
-        j = unsafe { deint2_512(p, e, o, n) };
-    }
-    for j in j..n {
-        e[j] = p[2 * j];
-        o[j] = p[2 * j + 1];
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn deint2_512(p: &[f32], e: &mut [f32], o: &mut [f32], n: usize) -> usize {
-    use std::arch::x86_64::*;
-    // SAFETY: 부르는 쪽이 avx512f 확인, 읽기 · 쓰기는 j + 16 ≤ n 안
-    unsafe {
-        let ie = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
-        let io = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
-        let mut j = 0;
-        while j + 16 <= n {
-            let a = _mm512_loadu_ps(p.as_ptr().add(2 * j));
-            let b = _mm512_loadu_ps(p.as_ptr().add(2 * j + 16));
-            _mm512_storeu_ps(e.as_mut_ptr().add(j), _mm512_permutex2var_ps(a, ie, b));
-            _mm512_storeu_ps(o.as_mut_ptr().add(j), _mm512_permutex2var_ps(a, io, b));
-            j += 16;
-        }
-        j
-    }
-}
-
-/// 바로 읽기 합성곱 결과: 열 q = oy · wp + ox, ox ≥ ow 는 버림
-struct ConvDirectSink<'a> {
-    out: *mut f32,
-    wp: usize,
-    ow: usize,
-    ohw: usize,
-    nv: usize,
-    bias: Option<&'a [f32]>,
-    act: Act,
-}
-unsafe impl Sync for ConvDirectSink<'_> {}
-impl Sink for ConvDirectSink<'_> {
-    fn put(&self, r0: usize, c0: usize, w: usize, rows: &mut [[f32; NB]]) {
-        super::simd::run(|| self.put_in(r0, c0, w, rows))
-    }
-}
-
-impl ConvDirectSink<'_> {
-    #[inline(always)]
-    fn put_in(&self, r0: usize, c0: usize, w: usize, rows: &mut [[f32; NB]]) {
-        let w = w.min(self.nv.saturating_sub(c0));
-        if let Some(b) = self.bias {
-            for (i, r) in rows.iter_mut().enumerate() {
-                let b = b[r0 + i];
-                r.iter_mut().for_each(|x| *x += b);
-            }
-        }
-        self.act.apply_in(rows.as_flattened_mut());
-        // 열 → 출력 자리 조각(모든 줄이 같음): (덩어리 안 시작, 출력 평면 안 자리, 길이), 나눗셈은 한 번
-        let mut seg = [(0usize, 0usize, 0usize); NB];
-        let mut ns = 0;
-        let (mut oy, mut ox) = (c0 / self.wp, c0 % self.wp);
-        let mut j = 0;
-        while j < w {
-            if ox >= self.ow {
-                j += self.wp - ox;
-                ox = 0;
-                oy += 1;
-                continue;
-            }
-            let l = (self.ow - ox).min(w - j);
-            seg[ns] = (j, oy * self.ow + ox, l);
-            ns += 1;
-            j += l;
-            ox += l;
-        }
-        for (i, r) in rows.iter().enumerate() {
-            let o = (r0 + i) * self.ohw;
-            for &(j, d, l) in &seg[..ns] {
-                // SAFETY: (줄, 열) 칸이 일마다 겹치지 않음
-                unsafe { std::ptr::copy_nonoverlapping(r.as_ptr().add(j), self.out.add(o + d), l) };
-            }
-        }
-    }
-}
-
-
-struct ConvTSink<'a> {
-    out: *mut f32,
-    kh: usize,
-    kw: usize,
-    w: usize,
-    oh: usize,
-    ow: usize,
-    bias: Option<&'a [f32]>,
-    act: Act,
-}
-unsafe impl Sync for ConvTSink<'_> {}
-impl Sink for ConvTSink<'_> {
-    fn put(&self, r0: usize, c0: usize, wv: usize, rows: &mut [[f32; NB]]) {
-        super::simd::run(|| self.put_in(r0, c0, wv, rows))
-    }
-}
-
-impl ConvTSink<'_> {
-    #[inline(always)]
-    fn put_in(&self, r0: usize, c0: usize, wv: usize, rows: &mut [[f32; NB]]) {
-        let kk = self.kh * self.kw;
-        for (i, r) in rows.iter_mut().enumerate() {
-            let b = self.bias.map(|b| b[(r0 + i) / kk]).unwrap_or(0.0);
-            r[..wv].iter_mut().for_each(|x| *x += b);
-        }
-        self.act.apply_in(rows.as_flattened_mut());
-        // 줄 (co, dy, dx) 의 칸 j(입력 자리 y, xx) → 출력 (co, y·kh + dy, xx·kw + dx). dx = 0..kw 줄이 덩어리에 모두 있으면
-        // 엇갈려 이어 쓰기(출력 줄에 연속), 아니면 하나씩. 입력 자리는 하나씩 늘려 감(나눗셈은 처음 한 번)
-        let mut i = 0;
-        while i < rows.len() {
-            let row = r0 + i;
-            let (co, k) = (row / kk, row % kk);
-            let (dy, dx) = (k / self.kw, k % self.kw);
-            let g = if dx == 0 && i + self.kw <= rows.len() { self.kw } else { 1 };
-            let (mut y, mut xx) = (c0 / self.w, c0 % self.w);
-            for j in 0..wv {
-                let o = (co * self.oh + y * self.kh + dy) * self.ow + xx * self.kw + dx;
-                for d in 0..g {
-                    // SAFETY: 출력 칸은 일마다 겹치지 않음
-                    unsafe { *self.out.add(o + d) = rows[i + d][j] };
-                }
-                xx += 1;
-                if xx == self.w {
-                    xx = 0;
-                    y += 1;
-                }
-            }
-            i += g;
-        }
-    }
-}
-
-fn conv_t(n: &Node, ins: &[Option<&Tensor>]) -> R {
-    let x = need(ins, 0)?;
-    let wt = need(ins, 1)?;
-    let bias = ins.get(2).copied().flatten().map(|b| b.fv()).transpose()?;
-    let (ci, co, kh, kw) = (wt.shape[0], wt.shape[1], wt.shape[2], wt.shape[3]);
-    let s = n.ais("strides").unwrap_or(vec![1, 1]);
-    let p = n.ais("pads").unwrap_or(vec![0, 0, 0, 0]);
-    if s[0] as usize != kh || s[1] as usize != kw || p.iter().any(|&v| v != 0) || n.ai("group", 1) != 1 {
-        return Err("ConvTranspose 는 보폭 = 크기 · 덧댐 0 만".into());
-    }
-    let Pre::ConvTA(ap) = &n.pre else {
-        return Err("ConvTranspose 무게가 상수가 아님".into());
-    };
-    let (nb, h, w) = (x.shape[0], x.shape[2], x.shape[3]);
-    let (oh, ow) = (h * kh, w * kw);
-    let xv = x.fv()?;
-    let mut out = buf::take::<f32>(nb * co * oh * ow);
-    for b in 0..nb {
-        let xb = &xv[b * ci * h * w..(b + 1) * ci * h * w];
-        let hw = h * w;
-        let rows: Vec<usize> = (0..ci).map(|c| xb[c * hw..].as_ptr() as usize).collect();
-        let sink = ConvTSink { out: out[b * co * oh * ow..].as_mut_ptr(), kh, kw, w, oh, ow, bias, act: n.act.clone() };
-        gemm::gemm(ap, co * kh * kw, ci, hw, Panels::Gather { rows: &rows, avail: hw }, &sink);
-    }
-    Ok(vec![Tensor::f(vec![nb, co, oh, ow], out)])
 }
 
 fn pool(n: &Node, x: &Tensor) -> R {
@@ -1514,6 +1006,9 @@ fn pool(n: &Node, x: &Tensor) -> R {
     }
     let max = n.op == "MaxPool";
     let incl = n.ai("count_include_pad", 0) != 0;
+    if x.blk > 0 {
+        return super::nchwc::pool_blk(x, &g, max, incl);
+    }
     let nb = x.shape[0];
     let xv = x.fv()?;
     let mut out = buf::take::<f32>(nb * g.c * g.oh * g.ow);
@@ -1624,10 +1119,18 @@ fn resize(n: &Node, ins: &[Option<&Tensor>]) -> R {
         match ctm.as_str() {
             "asymmetric" => o / s,
             "align_corners" => {
-                if len_out == 1 { 0.0 } else { o * (len_in as f32 - 1.0) / (len_out as f32 - 1.0) }
+                if len_out == 1 {
+                    0.0
+                } else {
+                    o * (len_in as f32 - 1.0) / (len_out as f32 - 1.0)
+                }
             }
             "pytorch_half_pixel" => {
-                if len_out > 1 { (o + 0.5) / s - 0.5 } else { 0.0 }
+                if len_out > 1 {
+                    (o + 0.5) / s - 0.5
+                } else {
+                    0.0
+                }
             }
             _ => (o + 0.5) / s - 0.5,
         }
@@ -1641,13 +1144,22 @@ fn resize(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 "ceil" => v.ceil(),
                 "round_prefer_ceil" => (v + 0.5).floor(),
                 _ => {
-                    if v.fract() == 0.5 { v.floor() } else { v.round() }
+                    if v.fract() == 0.5 {
+                        v.floor()
+                    } else {
+                        v.round()
+                    }
                 }
             };
             (i.max(0.0) as usize).min(len - 1)
         };
         let ys: Vec<usize> = (0..oh).map(|y| pick(src(y, sc[2], h, oh), h)).collect();
         let xs: Vec<usize> = (0..ow).map(|x| pick(src(x, sc[3], w, ow), w)).collect();
+        if x.blk > 0 {
+            let yt: Vec<(usize, usize, f32)> = ys.iter().map(|&y| (y, y, 0.0)).collect();
+            let xt: Vec<(usize, usize, f32)> = xs.iter().map(|&x| (x, x, 0.0)).collect();
+            return super::nchwc::resize(x, oh, ow, &yt, &xt, false);
+        }
         pool::chunks_mut(&mut o, oh * ow, |c, op| {
             let plane = &xv[c * h * w..(c + 1) * h * w];
             for y in 0..oh {
@@ -1665,6 +1177,9 @@ fn resize(n: &Node, ins: &[Option<&Tensor>]) -> R {
         };
         let ys: Vec<_> = (0..oh).map(|y| lin(y, sc[2], h, oh)).collect();
         let xs: Vec<_> = (0..ow).map(|x| lin(x, sc[3], w, ow)).collect();
+        if x.blk > 0 {
+            return super::nchwc::resize(x, oh, ow, &ys, &xs, true);
+        }
         pool::chunks_mut(&mut o, oh * ow, |c, op| {
             let plane = &xv[c * h * w..(c + 1) * h * w];
             for (y, &(y0, y1, fy)) in ys.iter().enumerate() {
@@ -1680,4 +1195,3 @@ fn resize(n: &Node, ins: &[Option<&Tensor>]) -> R {
     }
     Ok(vec![Tensor::f(out, o)])
 }
-

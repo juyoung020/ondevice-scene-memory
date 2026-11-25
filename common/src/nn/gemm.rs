@@ -1,6 +1,6 @@
 //! f32 행렬곱 핵심: C[m, n] = A[m, k] · B[k, n].
-//! A 는 MR 줄씩 묶어 [k][MR] 로(줄 묶음). B 는 NB 열씩 [k][NB] 판(panel)으로 펴 두거나(펴기),
-//! 바로 읽기(B 의 j 째 줄 = 줄 주소표 rows[j] + 열 에서 NB 개 연속 — 합성곱은 위상 평면 · 입력 채널(이어 붙이기 조각 포함)을 그대로 읽음).
+//! A 는 MR 줄씩 묶어 [k][MR] 로(줄 묶음). B 는 NB 열씩 [k][NB] 판(panel)으로 미리 펴 두거나, 줄 주소표에서 판마다 편다(Gather).
+//! 합성곱은 여기를 쓰지 않음([`super::nchwc`]).
 //! 스레드는 판을 나눠 맡고, 판(k 는 KC 씩)을 캐시에 둔 채 모든 줄 묶음을 지나가게 한다.
 //! 합은 0 에서 시작해 k = 0, 1, … 차례로 FMA(커널마다 같은 비트).
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -8,20 +8,14 @@ use rayon::prelude::*;
 
 pub const NB: usize = 32;
 
-/// B 의 j 째 줄 시작: 펴 둔 판이면 bp + j·NB, 바로 읽기면 줄 주소 rows[j] + 열 col
 #[inline(always)]
-unsafe fn brow<const D: bool>(bp: *const f32, rows: *const usize, col: usize, j: usize) -> *const f32 {
-    if D { (*rows.add(j) as *const f32).add(col) } else { bp.add(j * NB) }
-}
-
-#[inline(always)]
-unsafe fn tile_scalar<const M: usize, const D: bool>(a: *const f32, k: usize, mr: usize, bp: *const f32, offs: *const usize, col: usize, out: &mut [[f32; NB]], add: bool) {
+unsafe fn tile_scalar<const M: usize>(a: *const f32, k: usize, mr: usize, bp: *const f32, out: &mut [[f32; NB]], add: bool) {
     let mut acc = [[0f32; NB]; M];
     if add {
         acc.copy_from_slice(&out[..M]);
     }
     for j in 0..k {
-        let b = std::slice::from_raw_parts(brow::<D>(bp, offs, col, j), NB);
+        let b = std::slice::from_raw_parts(bp.add(j * NB), NB);
         for m in 0..M {
             let x = *a.add(j * mr + m);
             for c in 0..NB {
@@ -34,7 +28,7 @@ unsafe fn tile_scalar<const M: usize, const D: bool>(a: *const f32, k: usize, mr
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn tile_avx512<const M: usize, const D: bool>(a: *const f32, k: usize, mr: usize, bp: *const f32, offs: *const usize, col: usize, out: &mut [[f32; NB]], add: bool) {
+unsafe fn tile_avx512<const M: usize>(a: *const f32, k: usize, mr: usize, bp: *const f32, out: &mut [[f32; NB]], add: bool) {
     use std::arch::x86_64::*;
     let mut a0 = [_mm512_setzero_ps(); M];
     let mut a1 = [_mm512_setzero_ps(); M];
@@ -45,11 +39,7 @@ unsafe fn tile_avx512<const M: usize, const D: bool>(a: *const f32, k: usize, mr
         }
     }
     for j in 0..k {
-        let b = brow::<D>(bp, offs, col, j);
-        if D {
-            _mm_prefetch::<_MM_HINT_T0>(b.add(NB) as *const i8);
-            _mm_prefetch::<_MM_HINT_T0>(b.add(NB + 16) as *const i8);
-        }
+        let b = bp.add(j * NB);
         let w0 = _mm512_loadu_ps(b);
         let w1 = _mm512_loadu_ps(b.add(16));
         for m in 0..M {
@@ -66,7 +56,7 @@ unsafe fn tile_avx512<const M: usize, const D: bool>(a: *const f32, k: usize, mr
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn tile_avx2<const M: usize, const D: bool>(a: *const f32, k: usize, mr: usize, bp: *const f32, offs: *const usize, col: usize, out: &mut [[f32; NB]], add: bool) {
+unsafe fn tile_avx2<const M: usize>(a: *const f32, k: usize, mr: usize, bp: *const f32, out: &mut [[f32; NB]], add: bool) {
     use std::arch::x86_64::*;
     let mut acc = [[_mm256_setzero_ps(); 4]; M];
     if add {
@@ -77,7 +67,7 @@ unsafe fn tile_avx2<const M: usize, const D: bool>(a: *const f32, k: usize, mr: 
         }
     }
     for j in 0..k {
-        let b = brow::<D>(bp, offs, col, j);
+        let b = bp.add(j * NB);
         let w: [__m256; 4] = std::array::from_fn(|q| _mm256_loadu_ps(b.add(q * 8)));
         for m in 0..M {
             let x = _mm256_broadcast_ss(&*a.add(j * mr + m));
@@ -95,7 +85,7 @@ unsafe fn tile_avx2<const M: usize, const D: bool>(a: *const f32, k: usize, mr: 
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn tile_neon<const M: usize, const D: bool>(a: *const f32, k: usize, mr: usize, bp: *const f32, offs: *const usize, col: usize, out: &mut [[f32; NB]], add: bool) {
+unsafe fn tile_neon<const M: usize>(a: *const f32, k: usize, mr: usize, bp: *const f32, out: &mut [[f32; NB]], add: bool) {
     use std::arch::aarch64::*;
     let mut acc = [[vdupq_n_f32(0.0); 8]; M];
     if add {
@@ -107,7 +97,7 @@ unsafe fn tile_neon<const M: usize, const D: bool>(a: *const f32, k: usize, mr: 
     }
     for j in 0..k {
         let x: [f32; M] = std::array::from_fn(|m| *a.add(j * mr + m));
-        let b = brow::<D>(bp, offs, col, j);
+        let b = bp.add(j * NB);
         for h in 0..2 {
             let w: [float32x4_t; 4] = std::array::from_fn(|q| vld1q_f32(b.add(h * 16 + q * 4)));
             for m in 0..M {
@@ -128,31 +118,31 @@ unsafe fn tile_neon<const M: usize, const D: bool>(a: *const f32, k: usize, mr: 
 macro_rules! rows_through {
     ($name:ident, $tile:ident, $($attr:tt)*) => {
         $($attr)*
-        unsafe fn $name<const D: bool>(a: &[f32], k: usize, rows: usize, mr: usize, bp: *const f32, offs: *const usize, col: usize, out: &mut [[f32; NB]]) {
+        unsafe fn $name(a: &[f32], k: usize, rows: usize, mr: usize, bp: *const f32, out: &mut [[f32; NB]]) {
             let a = a.as_ptr();
             // k 를 KC 씩: 판 조각(KC · NB)이 L1 에 머문 채 모든 줄 묶음이 지나감
             let mut k0 = 0;
             while k0 < k {
                 let kl = KC.min(k - k0);
                 let add = k0 > 0;
-                let (pk, ok) = if D { (bp, offs.add(k0)) } else { (bp.add(k0 * NB), offs) };
+                let pk = bp.add(k0 * NB);
                 let mut r = 0;
                 while r < rows {
                     let m = mr.min(rows - r);
                     let (x, o) = (a.add(r * k + k0 * m), &mut out[r..]);
                     match m {
-                        1 => $tile::<1, D>(x, kl, m, pk, ok, col, o, add),
-                        2 => $tile::<2, D>(x, kl, m, pk, ok, col, o, add),
-                        3 => $tile::<3, D>(x, kl, m, pk, ok, col, o, add),
-                        4 => $tile::<4, D>(x, kl, m, pk, ok, col, o, add),
-                        5 => $tile::<5, D>(x, kl, m, pk, ok, col, o, add),
-                        6 => $tile::<6, D>(x, kl, m, pk, ok, col, o, add),
-                        7 => $tile::<7, D>(x, kl, m, pk, ok, col, o, add),
-                        8 => $tile::<8, D>(x, kl, m, pk, ok, col, o, add),
-                        9 => $tile::<9, D>(x, kl, m, pk, ok, col, o, add),
-                        10 => $tile::<10, D>(x, kl, m, pk, ok, col, o, add),
-                        11 => $tile::<11, D>(x, kl, m, pk, ok, col, o, add),
-                        _ => $tile::<12, D>(x, kl, m, pk, ok, col, o, add),
+                        1 => $tile::<1>(x, kl, m, pk, o, add),
+                        2 => $tile::<2>(x, kl, m, pk, o, add),
+                        3 => $tile::<3>(x, kl, m, pk, o, add),
+                        4 => $tile::<4>(x, kl, m, pk, o, add),
+                        5 => $tile::<5>(x, kl, m, pk, o, add),
+                        6 => $tile::<6>(x, kl, m, pk, o, add),
+                        7 => $tile::<7>(x, kl, m, pk, o, add),
+                        8 => $tile::<8>(x, kl, m, pk, o, add),
+                        9 => $tile::<9>(x, kl, m, pk, o, add),
+                        10 => $tile::<10>(x, kl, m, pk, o, add),
+                        11 => $tile::<11>(x, kl, m, pk, o, add),
+                        _ => $tile::<12>(x, kl, m, pk, o, add),
                     }
                     r += m;
                 }
@@ -172,9 +162,9 @@ rows_through!(rows_avx2, tile_avx2, #[target_feature(enable = "avx2,fma")]);
 #[cfg(target_arch = "aarch64")]
 rows_through!(rows_neon, tile_neon, #[target_feature(enable = "neon")]);
 
-type Rows = unsafe fn(&[f32], usize, usize, usize, *const f32, *const usize, usize, &mut [[f32; NB]]);
-/// (펴 둔 판, 바로 읽기, MR)
-type Kern = (Rows, Rows, usize);
+type Rows = unsafe fn(&[f32], usize, usize, usize, *const f32, &mut [[f32; NB]]);
+/// (판 커널, MR)
+type Kern = (Rows, usize);
 
 fn kernel() -> Kern {
     static K: std::sync::OnceLock<Kern> = std::sync::OnceLock::new();
@@ -182,23 +172,23 @@ fn kernel() -> Kern {
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx512f") {
-                return (rows_avx512::<false>, rows_avx512::<true>, 12);
+                return (rows_avx512, 12);
             }
             if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-                return (rows_avx2::<false>, rows_avx2::<true>, 3);
+                return (rows_avx2, 3);
             }
         }
         #[cfg(target_arch = "aarch64")]
-        return (rows_neon::<false>, rows_neon::<true>, 3);
+        return (rows_neon, 3);
         #[allow(unreachable_code)]
-        (rows_scalar::<false>, rows_scalar::<true>, 3)
+        (rows_scalar, 3)
     })
 }
 
 /// m 줄에 쓸 줄 묶음 크기: 커널 최대(AVX-512 12, 그 밖 3)의 절반 이상에서 버리는 줄(마지막 묶음의 빈 줄)이 가장 적은 것
 /// (16 · 32 · 64 채널 → 8, 193 토큰 → 11). 큰 묶음과 작은 묶음의 FMA 비율은 거의 같고, 남는 줄 묶음이 느리다
 pub fn mr_for(m: usize) -> usize {
-    let mx = kernel().2;
+    let mx = kernel().1;
     let mut best = mx;
     for t in (mx.div_ceil(2)..=mx).rev() {
         if m.div_ceil(t) * t < m.div_ceil(best) * best {
@@ -269,11 +259,6 @@ pub fn pack_bt(bt: &[f32], k: usize, n: usize) -> Vec<f32> {
 pub enum Panels<'a> {
     /// 미리 편 판들([`pack_b`])
     Packed(&'a [f32]),
-    /// 판 번호 → 버퍼([k][NB])에 채우기
-    Make(&'a (dyn Fn(usize, &mut [f32]) + Sync)),
-    /// 바로 읽기: B[j][c] = *(rows[j] as *const f32 + c). 줄마다 avail 칸까지 읽어도 됨 —
-    /// 판 끝이 넘으면 그 판만 펴서 계산(바로 읽는 쪽이 꼬리를 덧댈 필요 없음)
-    Direct { rows: &'a [usize], avail: usize },
     /// 줄 주소표에서 판마다 펴서([k][NB] 연속) 모든 줄 묶음이 그 판을 지나감. 줄들이 서로 멀리(채널 평면마다) 떨어져
     /// 같은 캐시 집합에 몰리는 1×1 합성곱용(평면 크기가 4 KB 배수면 판이 L1 에 머물지 못함)
     Gather { rows: &'a [usize], avail: usize },
@@ -297,7 +282,7 @@ pub fn gemm(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink
 }
 
 fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink) {
-    let (kern, kdir, _) = kernel();
+    let (kern, _) = kernel();
     let mr = mr_for(m);
     let np = n.div_ceil(NB);
     let th = super::pool::threads();
@@ -361,7 +346,7 @@ fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink)
                         let rr = band.min(rows - rb);
                         ob.resize(rr, [0.0; NB]);
                         for p in q0..q1 {
-                            unsafe { kern(&a0[rb * k..], k, rr, mr, pb[(p - q0) * k * NB..].as_ptr(), std::ptr::null(), 0, ob) };
+                            unsafe { kern(&a0[rb * k..], k, rr, mr, pb[(p - q0) * k * NB..].as_ptr(), ob) };
                             sink.put(r0 + rb, p * NB, NB.min(n - p * NB), ob);
                         }
                         rb += rr;
@@ -370,7 +355,7 @@ fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink)
                 }
                 return;
             }
-            let band = if p1 - p0 > 1 && !matches!(b, Panels::Make(_)) { 2 * mr } else { rows };
+            let band = if p1 - p0 > 1 { 2 * mr } else { rows };
             let mut rb = 0;
             while rb < rows {
                 let rr = band.min(rows - rb);
@@ -378,24 +363,7 @@ fn gemm_in(ap: &[f32], m: usize, k: usize, n: usize, b: Panels, sink: &dyn Sink)
                 for p in p0..p1 {
                     ob.resize(rr, [0.0; NB]);
                     match &b {
-                        Panels::Packed(all) => unsafe { kern(a0, k, rr, mr, all[p * k * NB..(p + 1) * k * NB].as_ptr(), std::ptr::null(), 0, ob) },
-                        Panels::Make(f) => {
-                            pb.resize(k * NB, 0.0);
-                            f(p, pb);
-                            unsafe { kern(a0, k, rr, mr, pb.as_ptr(), std::ptr::null(), 0, ob) }
-                        }
-                        Panels::Direct { rows, avail } if p * NB + NB > *avail => {
-                            // 줄 끝을 넘는 끝 판만 펴기
-                            let wv = avail - p * NB;
-                            pb.resize(k * NB, 0.0);
-                            for (j, &r) in rows.iter().enumerate() {
-                                let src = unsafe { std::slice::from_raw_parts((r as *const f32).add(p * NB), wv) };
-                                pb[j * NB..j * NB + wv].copy_from_slice(src);
-                                pb[j * NB + wv..(j + 1) * NB].fill(0.0);
-                            }
-                            unsafe { kern(a0, k, rr, mr, pb.as_ptr(), std::ptr::null(), 0, ob) }
-                        }
-                        Panels::Direct { rows, .. } => unsafe { kdir(a0, k, rr, mr, std::ptr::null(), rows.as_ptr(), p * NB, ob) },
+                        Panels::Packed(all) => unsafe { kern(a0, k, rr, mr, all[p * k * NB..(p + 1) * k * NB].as_ptr(), ob) },
                         Panels::Gather { .. } => unreachable!(),
                     }
                     sink.put(r0 + rb, p * NB, NB.min(n - p * NB), ob);
@@ -443,11 +411,4 @@ impl RowMajor<'_> {
             unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), self.out.add((r0 + i) * self.ldc + c0), w) };
         }
     }
-}
-
-/// 판 하나를 바로 읽기로: B[j][c] = *(b[j] as *const f32 + col + c)(c < NB), A 는 [`pack_a`] 모양(묶음 mr 줄)의
-/// 묶음 경계에서 시작하는 rows 줄 → out[rows] (부르는 쪽이 NB 개 읽어도 되는 꼬리를 보장)
-pub unsafe fn direct_rows(a: &[f32], k: usize, rows: usize, mr: usize, b: &[usize], col: usize, out: &mut [[f32; NB]]) {
-    let (_, kdir, _) = kernel();
-    kdir(a, k, rows, mr, std::ptr::null(), b.as_ptr(), col, out)
 }

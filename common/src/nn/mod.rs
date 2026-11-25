@@ -1,9 +1,11 @@
 //! ONNX 모델을 Rust 로 직접 돌리는 실행기(ONNX Runtime 대신). 모델 파일의 그래프를 읽어 상수 접기 · 묶기(Conv+Relu/SiLU,
 //! MatMul+편향) · 무게 미리 펴기를 한 번 하고, 노드를 차례로 실행한다. f32 만(정수는 모양 · 번호 계산용 i64).
-//! 무거운 연산(Conv · MatMul · Gemm · ConvTranspose)은 [`gemm`] 의 판 행렬곱, 나머지는 rayon 으로 나눈 단순 반복.
+//! 합성곱(Conv · ConvTranspose)은 [`nchwc`] 배치(채널 B 개 묶음)를 모델 전체에 유지하며 그 커널로, MatMul · Gemm 은 [`gemm`] 의
+//! 판 행렬곱, 나머지는 일꾼 묶음([`pool`])으로 나눈 단순 반복.
 //! 지원하는 연산은 이 저장소 모델(MegaLoc · XFeat · SigLIP2 그림 · ObjectSAM)이 쓰는 것.
 pub mod buf;
 pub mod gemm;
+pub mod nchwc;
 mod ops;
 pub mod pool;
 pub mod proto;
@@ -22,14 +24,16 @@ pub enum Data {
 pub struct Tensor {
     pub shape: Vec<usize>,
     pub data: Data,
+    /// 0 = 보통 배치, B = NCHWc 채널 B 개 묶음([N][C/B][H][W][B], [`nchwc`])
+    pub blk: usize,
 }
 
 impl Tensor {
     pub fn f(shape: Vec<usize>, v: Vec<f32>) -> Tensor {
-        Tensor { shape, data: Data::F(v) }
+        Tensor { shape, data: Data::F(v), blk: 0 }
     }
     pub fn i(shape: Vec<usize>, v: Vec<i64>) -> Tensor {
-        Tensor { shape, data: Data::I(v) }
+        Tensor { shape, data: Data::I(v), blk: 0 }
     }
     pub fn len(&self) -> usize {
         match &self.data {
@@ -274,11 +278,14 @@ pub fn sigmoid(x: f32) -> f32 {
 pub(crate) enum Pre {
     None,
     /// MatMul/Gemm 의 상수 B: 판들, k, n, 열 편향
-    MatB { panels: Vec<f32>, k: usize, n: usize, bias: Option<Vec<f32>> },
-    /// Conv(group 1) 무게를 줄 묶음으로
-    ConvA(Vec<f32>),
-    /// ConvTranspose: [Co·kh·kw, C] 를 줄 묶음으로
-    ConvTA(Vec<f32>),
+    MatB {
+        panels: Vec<f32>,
+        k: usize,
+        n: usize,
+        bias: Option<Vec<f32>>,
+    },
+    /// Conv · ConvTranspose 상수 무게(NCHWc 로 펴기)
+    Conv(Box<nchwc::ConvPre>),
 }
 
 pub(crate) struct Node {
@@ -658,7 +665,7 @@ impl Model {
         let mut dead = vec![false; self.nodes.len()];
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
-            let heavy = matches!(n.pre, Pre::MatB { .. } | Pre::ConvA(_) | Pre::ConvTA(_)) || (n.op == "Conv" && n.ai("group", 1) > 1);
+            let heavy = matches!(n.pre, Pre::MatB { .. }) || n.op == "Conv" || n.op == "ConvTranspose";
             if !heavy || dead[i] || !matches!(n.act, Act::None) {
                 continue;
             }
@@ -790,23 +797,17 @@ impl Model {
                 }
                 "Conv" => {
                     let Some(w) = c(n.ins[1]) else { continue };
-                    if n.ai("group", 1) == 1 {
-                        let co = w.shape[0];
-                        let kk = w.len() / co;
-                        self.nodes[i].pre = Pre::ConvA(gemm::pack_a(w.fv()?, co, kk, kk));
+                    let (co, c, kh, kw) = (w.shape[0], w.shape[1], w.shape[2], w.shape[3]);
+                    let grp = n.ai("group", 1) as usize;
+                    if grp == 1 || (grp == co && c == 1) {
+                        self.nodes[i].pre = Pre::Conv(Box::new(nchwc::ConvPre::new(w.fv()?.to_vec(), co, c, kh, kw, grp != 1)));
                     }
                 }
                 "ConvTranspose" => {
                     let Some(w) = c(n.ins[1]) else { continue };
                     let (ci, co, kh, kw) = (w.shape[0], w.shape[1], w.shape[2], w.shape[3]);
-                    let wv = w.fv()?;
-                    let mut a = vec![0f32; co * kh * kw * ci];
-                    for c_ in 0..ci {
-                        for o in 0..co * kh * kw {
-                            a[o * ci + c_] = wv[c_ * co * kh * kw + o];
-                        }
-                    }
-                    self.nodes[i].pre = Pre::ConvTA(gemm::pack_a(&a, co * kh * kw, ci, ci));
+                    let (v, cov) = nchwc::conv_t_virtual(w.fv()?, ci, co, kh, kw);
+                    self.nodes[i].pre = Pre::Conv(Box::new(nchwc::ConvPre::new(v, cov, ci, 1, 1, false)));
                 }
                 _ => {}
             }
@@ -859,6 +860,21 @@ impl Model {
         }
         for (ni, n) in self.nodes.iter().enumerate() {
             let t0 = std::time::Instant::now();
+            // NCHWc 입력을 그대로 못 읽는 노드: 그 입력을 NCHW 로 바꿔 둠
+            let conv = {
+                let ins: Vec<Option<&Tensor>> = n.ins.iter().map(|s| s.and_then(|s| self.consts[s].as_ref().or(vals[s].as_ref()))).collect();
+                ins.iter().flatten().any(|t| t.blk > 0) && !nchwc::accepts(n, &ins)
+            };
+            if conv {
+                for s in n.ins.iter().flatten() {
+                    if vals[*s].as_ref().is_some_and(|t| t.blk > 0) {
+                        let p = nchwc::to_plain(vals[*s].as_ref().unwrap())?;
+                        if let Some(Tensor { data: Data::F(v), .. }) = vals[*s].replace(p) {
+                            buf::give(v);
+                        }
+                    }
+                }
+            }
             // 첫 입력을 이 노드가 마지막으로 쓰면 버퍼째 넘겨 받아 제자리 계산(모양 바꾸기 · 원소별)
             let s0 = n.ins.first().copied().flatten();
             let own = match s0 {
@@ -869,11 +885,7 @@ impl Model {
                 let ins: Vec<Option<&Tensor>> = n.ins.iter().skip(1).map(|s| s.and_then(|s| self.consts[s].as_ref().or(vals[s].as_ref()))).collect();
                 ops::exec_own(n, x, &ins).map_err(|e| format!("{}: {e}", n.op))?
             } else {
-                let ins: Vec<Option<&Tensor>> = n
-                    .ins
-                    .iter()
-                    .map(|s| s.and_then(|s| self.consts[s].as_ref().or(vals[s].as_ref())))
-                    .collect();
+                let ins: Vec<Option<&Tensor>> = n.ins.iter().map(|s| s.and_then(|s| self.consts[s].as_ref().or(vals[s].as_ref()))).collect();
                 if let Some(p) = n.ins.iter().zip(&ins).position(|(s, t)| s.is_some() && t.is_none()) {
                     return Err(format!("{}: 입력 {p} 이 아직 없음", n.op));
                 }
@@ -889,7 +901,16 @@ impl Model {
             }
             if prof {
                 if std::env::var("NN_PROF").as_deref() == Ok("2") {
-                    eprintln!("  {} {:?} g{} s{:?} {:.3} ms", n.op, vals[n.outs[0]].as_ref().map(|t| t.shape.clone()), n.ai("group", 1), n.ais("strides"), t0.elapsed().as_secs_f64() * 1e3);
+                    eprintln!(
+                        "  {} {:?} g{} s{:?} k{:?} b{} {:.3} ms",
+                        n.op,
+                        vals[n.outs[0]].as_ref().map(|t| t.shape.clone()),
+                        n.ai("group", 1),
+                        n.ais("strides"),
+                        n.ins.get(1).copied().flatten().and_then(|s| self.consts[s].as_ref()).map(|t| t.shape.clone()),
+                        vals[n.outs[0]].as_ref().map(|t| t.blk).unwrap_or(0),
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
                 }
                 *tm.entry(n.op.clone()).or_default() += t0.elapsed().as_secs_f64();
             }
@@ -901,7 +922,10 @@ impl Model {
         }
         self.outputs
             .iter()
-            .map(|o| self.consts[o.1].clone().or_else(|| vals[o.1].take()).ok_or(format!("출력 {} 없음", o.0)))
+            .map(|o| {
+                let t = self.consts[o.1].clone().or_else(|| vals[o.1].take()).ok_or(format!("출력 {} 없음", o.0))?;
+                if t.blk > 0 { nchwc::to_plain(&t) } else { Ok(t) }
+            })
             .collect()
     }
 }

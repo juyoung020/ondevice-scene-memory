@@ -50,6 +50,7 @@
 | DBoW2 · ORBvoc.txt 읽기 · KeyFrameDatabase · LoopClosing · Sim3Solver · Atlas 합치기 | 루프 스레드 · 재위치 | 옮김 | LOOP |
 | OpenCV imgproc(resize · GaussianBlur · cvtColor) · features2d(FAST) · calib3d(undistortPoints) · core(convertTo · copyMakeBorder) | ORBextractor · Tracking · Frame | resize · GaussianBlur · FAST 는 `orb3rs::extract`, cvtColor · convertTo · copyMakeBorder · undistortPoints 는 `orb3cv::img`(비트 동일) | CV |
 | OpenCV core(cv::Mat · 난수 cv::RNG 등) | 전역 | Rust 자료형으로 바꿈, 쓰는 곳마다 같은 계산으로 | CV |
+| g2o::Sim3(double) | 루프 · 합치기 · 본질 그래프 | `orb3cv::g2osim3`(비트 동일) | CV |
 | Sophus SE3f · Sim3f, Eigen float 수학 | 전역 | `types::Se3` 에 원본 순서 그대로의 곱 · 역 · 지수/로그 추가 | 통합(OPT · BA 가 쓰는 함수는 그쪽이 먼저 넣으면 받음) |
 | Settings · 설정 yaml 읽기 · Converter | System | `orb3cv::settings`(RGB-D 핀홀 설정 읽기 + Tracking · Frame 파생 값, 비트 동일), Converter 는 지움 | CV |
 | Eigen JacobiSVD · GeometricTools::Triangulate | LocalMapping(새 점 삼각측량) | `orb3cv::svd`(비트 동일) | CV |
@@ -298,6 +299,11 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - Atlas 저장 · 불러오기 `orb3cv::atlas_io`: Boost 형식은 읽을 쪽이 없어 우리 이진 형식으로. 남기는 칸 · 버리는 칸은 원본과 같게 — 저장은 id 순 지도마다 나쁘지 않은 키프레임 · 점, 다른 지도 · 나쁜 것을 가리키는 연결 · 자식 · 가장자리 · 점 번호는 빼거나 −1, 키프레임 없는 지도는 버림 / 불러오기는 MapPoint mnVisible · mnFound = 1 · 추적 임시 칸 0, ordered_conn = UpdateBestCovisibles, 그 뒤 새 빈 지도를 현재로(System). 원본 Map::PreSave 의 EraseObservation(살아 있는 지도를 바꿈)도 Rust 로 옮겨 System 저장이 먼저 부름(cd4e91f). 시험: 무작위 Atlas 저장 → 불러오기 → 다시 저장이 같은 바이트, 저장 칸 비트 같음.
 - System 진입 `orb3cv::system::SystemInit::open(설정, w, h)`: OrbSettings → TrackingParams → Camera · Pyramid(ORBextractor 층 표) · FrameCtx(ComputeImageBounds), System.LoadAtlasFromFile / SaveAtlasToFile(".osa" 붙임), GrabImageRGBD 의 회색 · 깊이 변환. newWidth(영상 줄이기)는 안 씀이라 Err.
 - `orb3rs::frame::depth_to_float` 를 원본 식(1.0f / 값, |값| < 1e-5 면 1)으로(나눗셈 결과는 전과 같음: f64 거쳐 f32 로 바꿔도 이중 반올림 없음).
+
+- **PreSave EraseObservation**(`atlas_io::pre_save` · `mp_erase_observation` · `mp_set_bad`): 원본 Map::PreSave 첫 고리 — id 순 지도마다 나쁘지 않은 점의 다른 지도 · 나쁜 키프레임 관측을 지우며 nObs(오른쪽 좌표 있으면 2) 줄이기, 기준 키프레임을 남은 관측 첫째로(원본은 주소 순 첫째 — 실행마다 다를 수 있음, 관측이 다 없어지면 원본은 미정의 동작이라 그대로 둠), nObs ≤ 2 면 SetBadFlag(관측 키프레임의 그 번호 비우기 · 지도에서 빼기). 키프레임 없는 지도는 나쁨 표시. `SystemInit::save_atlas` 가 먼저 부름. 시험 `pre_save_erases_foreign_obs`.
+- **g2o::Sim3**(`orb3cv::g2osim3`, double): 회전 행렬에서 · exp(7 벡터) · log(Eigen PartialPivLU 3×3 풀이 포함) · 역 · 곱 · 사상. 기준 빌드와 같은 플래그로 헤더를 컴파일한 probe(`~/opt/orb3_cv/sim3/probe.cc` → sim3.bin, `rs --bin sim3 -- ../sim3/sim3.bin`) 20 만 건 × 10 연산 **비트 동일**(작은 각 · 작은 σ 갈래 섞음). 알게 된 순서: Quaterniond(Matrix3d) 대각 합 (R22+R11)+R00, Matrix3d×Vector3d 행 0 · 1 은 pmadd FMA 사슬 · 행 2 는 스칼라 (a21v1+a22v2)+a20v0, log 의 `B*Omega*Omega` 는 (B·Ω)·Ω, 삼각 풀이는 완전 펼침(행마다 내적). 한계: probe 는 따로 컴파일한 함수라 LoopClosing.cc 안에 인라인될 때 순서가 다르면 그 자리에서 다시 대조해야 함.
+- **Orb3System 연결**: `orb3cv::system::keyframes` · `kf_now`(orb3.cc 의 orb3_keyframes · orb3_kf_now 를 Rust Atlas 로 — 지도 · 키프레임 id 순, 나쁜 키프레임은 mTcp 곱하며 부모로, 부모 고리면 None). 추적 · 지도 · 루프 본체가 다 옮겨지면 Rust 판 `Orb3System` 이 이것과 `SystemInit` 을 씀.
+- 루프 ↔ 지도 멈춤 원인(코드 읽기): 원본 LocalMapping 멈춤은 불 하나를 CorrectLoop · 전체 최적화 지도 갱신 · MergeLocal · GraftMap 이 같이 쓰고 Release 가 남의 요청까지 지움 + 전체 최적화 스레드가 갱신 내내 mMutexGBA 를 쥔 채 지역 지도 멈춤 · 지도 잠금을 기다림. 로그 끝 `*Loop detected → STOP → RELEASE → STOP`(전체 최적화의 STOP 뒤 RELEASE 없음). desk 단독 실행 18 번은 재현 안 됨(부하 겹칠 때 나옴) → gdb 역추적은 못 남김. 스레드 · 잠금 Rust 판은 통합 담당 `orb3sys::threads`(멈춤 토큰 개수) 기준.
 
 ## 포터 BA
 

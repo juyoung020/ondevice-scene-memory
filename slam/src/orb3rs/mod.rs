@@ -7,5 +7,9 @@ pub mod extract;
 pub mod matcher;
 pub mod frame;
 pub mod stdsort;
+// 포터 OPT: 포즈 최적화 · PnP
+pub mod g2o_pose;
+pub mod pinhole;
+pub mod pose_opt;
 
 pub use types::*;

@@ -1,6 +1,7 @@
 //! Frame(ORB-SLAM3 src/Frame.cc) · MapPoint 일부 옮김: RGB-D 장면 만들기, 격자, 위치 행렬, 시야 판정, 영역 안 특징점, 깊이로 3D.
 //! 왜곡 0(우리 설정)이라 mvKeysUn = mvKeys, 경계는 영상 크기 그대로.
 use super::types::*;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 impl FrameCtx {
@@ -263,5 +264,104 @@ impl Camera {
         }
         let dsqr = num * num / den;
         (dsqr as f64) < 3.84 * unc as f64
+    }
+}
+
+impl KeyFrame {
+    /// KeyFrame::IsInImage: min ≤ x < max
+    #[inline]
+    pub fn is_in_image(&self, x: f32, y: f32) -> bool {
+        let c = &self.ctx;
+        x >= c.min_x && x < c.max_x && y >= c.min_y && y < c.max_y
+    }
+    /// KeyFrame::GetFeaturesInArea(왼쪽, 층 제한 없음)
+    pub fn features_in_area(&self, x: f32, y: f32, r: f32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let c = &self.ctx;
+        let nminx = 0.max(((x - c.min_x - r) * c.grid_inv_w).floor() as i32);
+        if nminx >= GRID_COLS as i32 {
+            return out;
+        }
+        let nmaxx = (GRID_COLS as i32 - 1).min(((x - c.min_x + r) * c.grid_inv_w).ceil() as i32);
+        if nmaxx < 0 {
+            return out;
+        }
+        let nminy = 0.max(((y - c.min_y - r) * c.grid_inv_h).floor() as i32);
+        if nminy >= GRID_ROWS as i32 {
+            return out;
+        }
+        let nmaxy = (GRID_ROWS as i32 - 1).min(((y - c.min_y + r) * c.grid_inv_h).ceil() as i32);
+        if nmaxy < 0 {
+            return out;
+        }
+        for ix in nminx..=nmaxx {
+            for iy in nminy..=nmaxy {
+                for &j in self.grid[ix as usize * GRID_ROWS + iy as usize].iter() {
+                    let k = &self.keys[j as usize];
+                    if (k.x - x).abs() < r && (k.y - y).abs() < r {
+                        out.push(j);
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// GetMapPoints: 나쁘지 않은 지도 점 집합
+    pub fn map_point_set(&self, mps: &BTreeMap<MpId, MapPoint>) -> std::collections::BTreeSet<MpId> {
+        self.map_points.iter().flatten().filter(|m| !mps[*m].bad).copied().collect()
+    }
+}
+
+impl MapPoint {
+    /// AddObservation(KF, idx): 단일 카메라, 오른쪽 좌표 있으면 nObs += 2
+    pub fn add_observation(&mut self, kf: &KeyFrame, idx: usize) {
+        let e = self.obs.entry(kf.id).or_insert((-1, -1));
+        e.0 = idx as i32;
+        if kf.u_right[idx] >= 0.0 {
+            self.n_obs += 2;
+        } else {
+            self.n_obs += 1;
+        }
+    }
+    /// ComputeDistinctiveDescriptors: 관측 기술자 중 다른 것들과의 거리 중앙값이 가장 작은 것
+    pub fn compute_distinctive_descriptors(&mut self, kfs: &BTreeMap<KfId, KeyFrame>) {
+        if self.bad || self.obs.is_empty() {
+            return;
+        }
+        let mut ds: Vec<Desc> = Vec::with_capacity(self.obs.len());
+        for (k, (l, r)) in self.obs.iter() {
+            let kf = &kfs[k];
+            if !kf.bad {
+                if *l != -1 {
+                    ds.push(kf.desc[*l as usize]);
+                }
+                if *r != -1 {
+                    ds.push(kf.desc[*r as usize]);
+                }
+            }
+        }
+        if ds.is_empty() {
+            return;
+        }
+        let n = ds.len();
+        let mut d = vec![0i32; n * n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let x = desc_dist(&ds[i], &ds[j]);
+                d[i * n + j] = x;
+                d[j * n + i] = x;
+            }
+        }
+        let (mut best_median, mut best_idx) = (i32::MAX, 0);
+        for i in 0..n {
+            let mut v = d[i * n..i * n + n].to_vec();
+            v.sort_unstable();
+            let median = v[(0.5 * (n - 1) as f64) as usize];
+            if median < best_median {
+                best_median = median;
+                best_idx = i;
+            }
+        }
+        self.desc = ds[best_idx];
     }
 }

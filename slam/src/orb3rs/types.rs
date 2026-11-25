@@ -353,3 +353,88 @@ pub fn mat_inv(m: &M3) -> M3 {
     r[0] = [c0[0] * invdet, c0[1] * invdet, c0[2] * invdet];
     r
 }
+
+/// Eigen Quaternion(Matrix3) (Shoemake): 대각 합 (m00 + m11) + m22
+pub fn quat_from_mat(m: &M3) -> [f32; 4] {
+    let mut q = [0.0f32; 4];
+    let t = (m[0][0] + m[1][1]) + m[2][2];
+    if t > 0.0 {
+        let t = (t + 1.0).sqrt();
+        q[3] = 0.5 * t;
+        let t = 0.5 / t;
+        q[0] = (m[2][1] - m[1][2]) * t;
+        q[1] = (m[0][2] - m[2][0]) * t;
+        q[2] = (m[1][0] - m[0][1]) * t;
+    } else {
+        let mut i = 0;
+        if m[1][1] > m[0][0] {
+            i = 1;
+        }
+        if m[2][2] > m[i][i] {
+            i = 2;
+        }
+        let j = (i + 1) % 3;
+        let k = (j + 1) % 3;
+        let t = ((m[i][i] - m[j][j]) - m[k][k] + 1.0).sqrt();
+        q[i] = 0.5 * t;
+        let t = 0.5 / t;
+        q[3] = (m[k][j] - m[j][k]) * t;
+        q[j] = (m[j][i] + m[i][j]) * t;
+        q[k] = (m[k][i] + m[i][k]) * t;
+    }
+    q
+}
+
+/// Sophus::Sim3f: 정규화 안 한 사원수(제곱 노름 = 배율, x y z w) + t
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sim3 {
+    pub q: [f32; 4],
+    pub t: V3,
+}
+
+/// Quaternion::squaredNorm(SSE 묶음): (x²+z²)+(y²+w²)
+#[inline]
+pub fn quat_sqnorm(q: &[f32; 4]) -> f32 {
+    (q[0] * q[0] + q[2] * q[2]) + (q[1] * q[1] + q[3] * q[3])
+}
+
+impl Sim3 {
+    /// RxSO3::scale = 사원수 제곱 노름
+    pub fn scale(&self) -> f32 {
+        quat_sqnorm(&self.q)
+    }
+    /// RxSO3::rotationMatrix: 정규화한 사원수의 회전 행렬
+    pub fn rotation_matrix(&self) -> M3 {
+        Se3 { q: quat_normalize(self.q), t: [0.0; 3] }.rot()
+    }
+    /// RxSO3 * 점: s·p + (w·(2 v×p) + v×(2 v×p))
+    #[inline]
+    pub fn rxso3_mul(&self, p: &V3) -> V3 {
+        let s = self.scale();
+        let v = [self.q[0], self.q[1], self.q[2]];
+        let w = self.q[3];
+        let mut c = cross(&v, p);
+        c = [c[0] + c[0], c[1] + c[1], c[2] + c[2]];
+        let cc = cross(&v, &c);
+        [s * p[0] + (w * c[0] + cc[0]), s * p[1] + (w * c[1] + cc[1]), s * p[2] + (w * c[2] + cc[2])]
+    }
+    /// Sim3 * 점
+    #[inline]
+    pub fn mul_point(&self, p: &V3) -> V3 {
+        add(&self.rxso3_mul(p), &self.t)
+    }
+    /// Sim3::inverse: 사원수 역(켤레 / 제곱 노름), t' = R⁻¹(−t)
+    pub fn inverse(&self) -> Sim3 {
+        let n2 = quat_sqnorm(&self.q);
+        let q = [-self.q[0] / n2, -self.q[1] / n2, -self.q[2] / n2, self.q[3] / n2];
+        let r = Sim3 { q, t: [0.0; 3] };
+        let t = r.rxso3_mul(&[-self.t[0], -self.t[1], -self.t[2]]);
+        Sim3 { q, t }
+    }
+    /// SE3f(Scw.rotationMatrix(), Scw.translation() / Scw.scale())
+    pub fn to_se3(&self) -> Se3 {
+        let r = self.rotation_matrix();
+        let s = self.scale();
+        Se3 { q: quat_from_mat(&r), t: [self.t[0] / s, self.t[1] / s, self.t[2] / s] }
+    }
+}

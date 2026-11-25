@@ -500,7 +500,7 @@ impl TrackOps for Script {
     fn change_map(&mut self, map: MapId) {
         self.next(13, Some(map as i64));
     }
-    fn need_new_keyframe(&mut self) -> bool {
+    fn need_new_keyframe(&mut self, _t: &Tracker) -> bool {
         self.next(8, None) != 0
     }
     fn create_new_keyframe(&mut self) -> KfId {

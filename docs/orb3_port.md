@@ -196,7 +196,11 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - 지도 스레드는 큐가 빌 때만 `Stop()` 을 봄. 멈춤 요청 쪽이 여럿(CorrectLoop · MergeLocal · GBA 끝 · 우리 GraftMap)인데 `Release()` 하나가 `mbStopRequested` 를 통째로 지움 → 다른 요청자가 `isStopped()` 를 영영 못 볼 수 있음(GBA 끝 · GraftMap 은 `isFinished` 로만 빠져나옴, CorrectLoop 의 기다림은 빠질 길 없음).
 - 포팅판 방침: 지도 스레드 멈춤을 요청자별 토큰(세는 방식)으로, 큐 비우기는 지도 스레드 자신만, 루프 · 합치기 쪽 기다림에 종료 확인을 넣음. 원본 멈춤 스택을 얻으면 위 둘 중 어느 쪽인지 기록.
 - 구현: 통합 담당의 `orb3sys/threads.rs`(`Mapper::request_stop` → `StopToken`, 세는 표 · Condvar · 큐 먼저 비우고 멈춤 · `MapUpdate` 잠금 쥔 채 기다리면 패닉) 하나로 씀. LOOP 판 `stopctl.rs` 는 같은 일이라 지움.
-- `Tracking::Relocalization` 흐름: `orb3loop/reloc.rs` `relocalize`(후보 → SearchByBoW 0.75 → PnP 5 번씩 → PoseOptimization → 투영 보강 10/100 · 3/64, 원본 순서 그대로), PnP 는 `PnpFactory` 트레잇(원본 MLPnP FFI 또는 포터 OPT 의 Rust 판을 끼움). 부품(짝짓기 · PoseOptimization)은 비트 대조 끝난 것. **흐름 전체의 원본 대조 하네스와 MLPnP FFI 는 아직 없음**(TUM 에서 재위치가 거의 안 일어나 추적을 일부러 잃게 하는 입력이 필요).
+- `Tracking::Relocalization` 흐름: `orb3loop/reloc.rs` `relocalize`(후보 → SearchByBoW 0.75 → PnP 5 번씩 → PoseOptimization → 투영 보강 10/100 · 3/64, 원본 순서 그대로), PnP 는 `PnpFactory` 트레잇(원본 MLPnP FFI 또는 포터 OPT 의 Rust 판을 끼움). 부품(짝짓기 · PoseOptimization)은 비트 대조 끝난 것. 기본 PnP 는 포터 OPT 의 Rust MLPnP(`RustPnp`, 난수는 부르는 쪽 `GlibcRand` 를 빌림 — Sim3Solver 와 한 수열).
+- 재위치 흐름 대조(`slam/tests/orb3loop_reloc.rs`): 원본 기준 빌드를 되감기 · 건너뛰기 순서로 돌린 덤프(`~/opt/orb3_loop_bg/reloc/reloc_dump`, 후보 질의 직후의 장면 · 후보 키프레임 · 지도 점 · 들어올 때 장면 상태, iterate 마다 짝 · 난수 · 출력, 끝 결과)를 Rust 자료로 옮겨 `relocalize` 를 돌림. PnP 를 ① 원본 MLPnPsolver FFI(`mlp_srv`, 기준 빌드에 링크한 자식 프로세스, 원본 실행 난수를 그대로 받음) ② Rust MLPnP 두 가지로 끼워 둘 다 대조.
+  - TUM fr1_room(`0-500,120-500:3,600-1300:6`) 86 번 + 강의실 ds_1118(`0-900,200-900:4,1500-3800:10`) 150 번 = 재위치 236 번(성공 7) **236 / 236 같음**(성공 · 자세 비트 · 지도 점 · 이상치), iterate 26 / 26(짝 목록 · 결과 · 난수 수), FFI · Rust 둘 다.
+  - 실패한 재위치는 장면이 들어올 때 상태(앞 추적의 자세 · 짝)를 그대로 남기므로 덤프에 그 상태도 넣음.
+  - 실행: `ORBLOOP_RELOC=~/orbloop_reloc/room.bin:~/orbloop_reloc/ds.bin ORBLOOP_MLPSRV=~/opt/orb3_loop_bg/reloc/mlp_srv cargo test --release -p slam --test orb3loop_reloc`(입력 없으면 실패).
 
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.

@@ -299,3 +299,8 @@
   (monitor O3 → 이름 없음, 빈 자리 · 의자 → ladder · monitor · box 새로 틀림). 조각 사진이 섞여 본체 이름이 흐려진다. 되돌림.
 - **인코더 중간 층부터 마스크 밖 키 가리기(기각)**: tools/naming/midmask.py 로 층 L.. Softmax 앞에 키 무게 bias 를 더한 모델을 만들어 대표 사진 53 개(labels_out18.json, tools/naming/mid_eval.py)로 비교.
   이름 붙은 것 중 맞음: 가리지 않음 65 %, L11 67 %, L9 55 %, L6 30 %, L3 14 %(일찍 가릴수록 SigLIP2 가 picture · cart 로 무너짐). L11 도 차이가 판정 흔들림 안이라 ORT 쪽으로 넘길 변경 없음.
+- 캡처의 낯선 이름 원본 확인(대표 사진 확대): hammer#25 = 밝게 날아간 창틀 조각(틀림), light switch#68 = 번진 의자 등받이 가장자리(틀림), can#120 = 소화기 두 개(틀림), safety helmet#105 = 진짜 흰 안전모(맞음).
+  셋 다 본 횟수 4–9 번이라 지금 기본값(≥ 12)에서는 이름이 숨겨진다. 위 판정 수에 이미 틀림으로 들어 있다.
+- **낱말 표 손질(기각)**: chair 에 'the back of an office chair · a mesh chair backrest · the legs of a chair', bulletin board 에 'a pegboard with notices', floor 에 'a floor mat' 문장을 더해 다시 인코딩
+  (`ondevice view --search-model <siglip2 폴더> --encode-vocab`) — 대표 사진 53 개 결과가 한 개도 안 바뀜(65 %). 의자 뒷면 → monitor 는 사진 벡터 쪽 문제라 문장으로는 안 움직인다.
+  부정 낱말(1 등이면 이름 안 붙임)도 남은 틀림(n ≥ 12 의 10 개)이 대부분 '다른 진짜 물체 이름'(monitor · computer tower · keyboard · box)이라 걸러낼 낱말이 없다.

@@ -14,6 +14,7 @@ mod graph;
 mod chunks;
 mod kfstore;
 mod maps;
+mod maskpool;
 #[cfg(feature = "dxrt")]
 mod npu_test;
 mod out;
@@ -2653,14 +2654,14 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
                 out::jpg_rgb(&dir.join(format!("{base}_rgb.jpg")), c.w, c.h, c.rgb.clone());
                 out::png_gray(&dir.join(format!("{base}_mask.png")), c.w, c.h, c.mask.clone());
                 out::png_u16(&dir.join(format!("{base}_depth.png")), c.w, c.h, c.depth.clone());
-                to_embed.push((o.id, c.w, c.h, focus(&c)));
+                to_embed.push((o.id, c.w, c.h, c.rgb.clone(), maskpool::weights(&c.mask, c.w as usize, c.h as usize)));
                 common::prof::copy(common::prof::C::CropShare, 0);
             }
             o.crop_saved = o.crop_ver;
         }
         if let Some(c) = o.view.take() {
             if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() { println!("viewdbg O{} obs {}", o.id, o.n_obs); }
-            to_embed.push((o.id, c.w, c.h, focus(&c)));
+            to_embed.push((o.id, c.w, c.h, c.rgb.clone(), maskpool::weights(&c.mask, c.w as usize, c.h as usize)));
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");
@@ -2858,19 +2859,6 @@ fn crop_score(rgb: &[u8], w: usize, h: usize, x1: usize, y1: usize, bw: usize, b
     let edge = if x1 == 0 || y1 == 0 || x1 + bw >= w || y1 + bh >= h { 0.35 } else { 1.0 };
     ((bw * bh) as f32 * bright * crisp * edge) as u32
 }
-
-/// 사진 벡터용 사진: 마스크 밖 픽셀을 회색 쪽으로 FOCUS_DIM 만큼 흐리게(둘레는 남김). 정사각형 사진에서 둘레(책상 · 모니터)가
-/// 마스크 물체(의자)보다 커서 둘레 이름이 붙던 것을 줄인다
-fn focus(c: &Crop) -> std::sync::Arc<Vec<u8>> {
-    let mut o = c.rgb.as_ref().clone();
-    for (px, &m) in o.chunks_exact_mut(3).zip(c.mask.iter()) {
-        if m == 0 {
-            px.iter_mut().for_each(|v| *v = (*v as f32 + (128.0 - *v as f32) * FOCUS_DIM) as u8);
-        }
-    }
-    std::sync::Arc::new(o)
-}
-const FOCUS_DIM: f32 = 0.6;
 
 /// 최근 가장 선명했던 장면의 선명함(천천히 줄어듦, 장면마다 ×CRISP_DECAY)
 static CRISP_REF: std::sync::Mutex<f32> = std::sync::Mutex::new(0.0);

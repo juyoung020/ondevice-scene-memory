@@ -65,6 +65,8 @@ pub fn normalize(v: &mut [f32]) {
 
 /// 물체 번호 → 지금까지 계산한 사진 벡터의 합(이름 고르기용)
 static SUMS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
+/// 물체 번호 → 사진 전체 벡터의 합(검색 줄 · 병합)
+static VSUMS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<f32>>>> = std::sync::Mutex::new(None);
 
 /// 물체 번호 → 그 물체 사진 벡터들의 평균 방향(길이 1) · 바뀐 물체 기록((순번, 물체 번호), 순번은 차례로 늘고 리셋해도 이어 감).
 /// 계산 스레드가 채우고 물체 병합(maps::Memory::merge_pass)이 지난번 뒤에 바뀐 것만 가져간다
@@ -178,20 +180,29 @@ pub fn name(id: u32, _sure: bool) -> Option<(String, f32)> {
     common::prof::lock(&NAMES, common::prof::W::LockEmbed).as_ref()?.get(&id).filter(|n| n.1 > 0.0).cloned()
 }
 #[cfg_attr(not(any(feature = "onnx", feature = "dxrt")), allow(dead_code))]
-/// 벡터 하나를 그 물체에 더함. 돌려줌: 지금까지 사진 벡터의 평균 방향(길이 1, 검색 줄 · 이름 · 구조물 판정이 쓰는 벡터)
-fn put(id: u32, v: Vec<f32>) -> Vec<f32> {
-    // 이름은 그 물체의 사진 벡터를 모두 더한 평균 방향으로(사진 한 장의 흔들림·어두움에 덜 휘둘림)
-    let mean = {
+/// 벡터 하나를 그 물체에 더함. v = 사진 전체 벡터(검색 줄 · 병합 · 구조물 판정), nv = 마스크 안 토큰 벡터(이름, maskpool).
+/// 돌려줌: 지금까지 사진 전체 벡터의 평균 방향(길이 1)
+fn put(id: u32, v: Vec<f32>, nv: Vec<f32>) -> Vec<f32> {
+    // 이름은 그 물체의 마스크 안 벡터를 모두 더한 평균 방향으로(사진 한 장의 흔들림·어두움에 덜 휘둘림)
+    let name_mean = {
         let mut sums = SUMS.lock().unwrap();
-        let s = sums.get_or_insert_with(Default::default).entry(id).or_insert_with(|| vec![0.0; v.len()]);
-        s.iter_mut().zip(&v).for_each(|(a, b)| *a += b);
+        let s = sums.get_or_insert_with(Default::default).entry(id).or_insert_with(|| vec![0.0; nv.len()]);
+        s.iter_mut().zip(&nv).for_each(|(a, b)| *a += b);
         *NCOUNT.lock().unwrap().get_or_insert_with(Default::default).entry(id).or_insert(0) += 1;
         let mut m = s.clone();
         normalize(&mut m);
         m
     };
+    let mean = {
+        let mut sums = VSUMS.lock().unwrap();
+        let s = sums.get_or_insert_with(Default::default).entry(id).or_insert_with(|| vec![0.0; v.len()]);
+        s.iter_mut().zip(&v).for_each(|(a, b)| *a += b);
+        let mut m = s.clone();
+        normalize(&mut m);
+        m
+    };
     if let Some((names, vecs)) = VOCAB.get() {
-        if let Some(n) = look_name(names, vecs, &mean) {
+        if let Some(n) = look_name(names, vecs, &name_mean) {
             common::prof::lock(&NAMES, common::prof::W::LockEmbed).get_or_insert_with(Default::default).insert(id, n);
         }
     }
@@ -217,6 +228,7 @@ fn put(id: u32, v: Vec<f32>) -> Vec<f32> {
 /// 리셋: 물체 id 가 처음부터 다시 쓰이므로 id 별 이름·벡터 합을 비운다
 pub fn clear() {
     *SUMS.lock().unwrap() = None;
+    *VSUMS.lock().unwrap() = None;
     *MEANS.lock().unwrap() = None;
     *NAMES.lock().unwrap() = None;
     *STRUCTS.lock().unwrap() = None;
@@ -252,6 +264,7 @@ mod worker {
         w: u32,
         h: u32,
         rgb: std::sync::Arc<Vec<u8>>, // 물체 사진(기억의 사진과 나눠 씀)
+        tw: [f32; crate::maskpool::TOKENS], // 토큰마다 마스크가 덮은 몫(이름 벡터용)
         n: u64,                       // 맡긴 차례(결과를 늘 같게 하는 재생은 이 차례대로 반영)
     }
     /// 사진 벡터 줄(작업 풀에서 차례대로 도는 일): 전처리 · NPU 올리기 · 끝난 결과 정리. 스레드 없음(NPU 끝 알림이 이 줄에 일을 넣음)
@@ -264,7 +277,7 @@ mod worker {
     #[derive(Default)]
     struct Det {
         /// 끝난 벡터: (차례, 물체, 파일, 벡터)
-        staged: Vec<(u64, u32, PathBuf, Vec<f32>)>,
+        staged: Vec<(u64, u32, PathBuf, Vec<f32>, Vec<f32>)>,
         /// 맡겼고 아직 반영 · 건너뜀을 정하지 않은 사진: (차례, 회차, 물체)
         log: Vec<(u64, u64, u32)>,
         /// 건너뛸 차례(줄이 아직 시작 전이면 계산하지 않음)
@@ -372,6 +385,10 @@ mod worker {
                     assert_eq!(o.len(), DIM, "embed model output");
                     v.clear();
                     v.extend_from_slice(o);
+                    // 마스크 안 이름 벡터(maskpool)용 토큰: 뒤에 이어 붙임
+                    if let Some(t) = out.get("last_hidden_state") {
+                        v.extend_from_slice(t.try_extract_tensor::<f32>().unwrap().1);
+                    }
                 }
                 #[cfg(feature = "dxrt")]
                 Net::Dx(e) => {
@@ -401,6 +418,8 @@ mod worker {
     /// 사진 벡터 줄의 상태
     struct St {
         net: Option<Net>,
+        /// 마스크 안 토큰으로 이름 벡터를 만드는 머리(ONNX 모델만, NPU 모델은 토큰을 내지 않아 사진 전체 벡터로 이름)
+        head: Option<crate::maskpool::Head>,
         patches: bool,
         /// 입력 · 출력 버퍼 k 벌(올린 사진마다 한 벌, 받으면 그 자리를 다음 사진이 씀)
         ins: Vec<Vec<f32>>,
@@ -473,18 +492,23 @@ mod worker {
                 n.release(f.id);
             }
             let t1 = std::time::Instant::now();
-            let mut v = self.outs[slot].clone();
-            v.truncate(DIM);
+            let raw = &self.outs[slot];
+            let mut v = raw[..DIM].to_vec();
             normalize(&mut v);
+            let mut nv = match &self.head {
+                Some(h) if raw.len() == DIM * (1 + crate::maskpool::TOKENS) && f.job.tw.iter().any(|w| *w > 0.0) => h.pool(&raw[DIM..], &f.job.tw),
+                _ => v.clone(),
+            };
+            normalize(&mut nv);
             if DET.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut g = DETS.lock().unwrap();
                 let d = g.get_or_insert_with(Default::default);
                 if !d.cancel.contains(&f.job.n) {
-                    d.staged.push((f.job.n, f.job.id, f.job.path, v));
+                    d.staged.push((f.job.n, f.job.id, f.job.path, v, nv));
                 }
                 DET_CV.notify_all();
             } else {
-                apply(f.job.id, &f.job.path, v);
+                apply(f.job.id, &f.job.path, v, nv);
             }
             self.st.n += 1;
             self.st.pre += f.pre;
@@ -495,8 +519,8 @@ mod worker {
     }
 
     /// 벡터 하나를 물체에 반영: 검색 줄(벡터 파일) = 이 물체를 본 각도 모두의 평균 방향(길이 1)
-    fn apply(id: u32, path: &Path, v: Vec<f32>) {
-        let mean = put(id, v);
+    fn apply(id: u32, path: &Path, v: Vec<f32>, nv: Vec<f32>) {
+        let mean = put(id, v, nv);
         let bytes: Vec<u8> = mean.iter().flat_map(|x| x.to_le_bytes()).collect();
         common::prof::copy(common::prof::C::EmbedBytes, bytes.len());
         if crate::out::memory_only() {
@@ -517,7 +541,7 @@ mod worker {
         let mut net = Net::open(model);
         let patches = net.patches();
         let k = JOBS.load(std::sync::atomic::Ordering::Relaxed).max(1);
-        let st = St { net: None, patches, ins: vec![Vec::new(); k], outs: vec![Vec::new(); k], fly: (0..k).map(|_| None).collect(), queue: Default::default(), st: Stat::default(), last_pump: std::time::Instant::now(), force: false, cpu: !model.ends_with(".dxnn") };
+        let st = St { net: None, head: crate::maskpool::Head::load(model), patches, ins: vec![Vec::new(); k], outs: vec![Vec::new(); k], fly: (0..k).map(|_| None).collect(), queue: Default::default(), st: Stat::default(), last_pump: std::time::Instant::now(), force: false, cpu: !model.ends_with(".dxnn") };
         let lane = common::rt::SharedLane::new("embed", st, 0, None);
         // NPU 끝 알림(기다림 스레드 또는 DXRT 콜백) → 이 줄에 "자리 slot 끝" 일
         let l2 = lane.clone();
@@ -554,6 +578,7 @@ mod worker {
             let t = std::time::Instant::now();
             let mut v = Vec::new();
             net.run(&buf, &mut v);
+            v.truncate(DIM);
             if i > 0 {
                 ms += t.elapsed().as_secs_f64() * 1e3; // 첫 장은 모델 올리는 시간이 섞여 뺌
             }
@@ -578,13 +603,13 @@ mod worker {
     }
 
     /// 한 기록 회차에 바뀐 물체 사진(번호, 폭, 높이, 화소)을 한 묶음으로 사진 벡터 줄에. 밀린 사진은 물체(파일)마다 가장 새 것만
-    pub fn submit(dir: &Path, items: Vec<(u32, u32, u32, std::sync::Arc<Vec<u8>>)>) {
+    pub fn submit(dir: &Path, items: Vec<(u32, u32, u32, std::sync::Arc<Vec<u8>>, [f32; crate::maskpool::TOKENS])>) {
         if items.is_empty() {
             return;
         }
         let Some(lane) = LANE.lock().unwrap().clone() else { return };
         PENDING.fetch_add(items.len(), std::sync::atomic::Ordering::SeqCst);
-        let jobs: Vec<Job> = items.into_iter().map(|(id, w, h, rgb)| Job { id, path: dir.join(rel_path(id)), w, h, rgb, n: NEXT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }).collect();
+        let jobs: Vec<Job> = items.into_iter().map(|(id, w, h, rgb, tw)| Job { id, path: dir.join(rel_path(id)), w, h, rgb, tw, n: NEXT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }).collect();
         if DET.load(std::sync::atomic::Ordering::Relaxed) {
             // 같은 물체의 앞 회차 사진(아직 반영 전)은 건너뜀으로 표시하고 이 묶음을 기록
             let r = ROUND.load(std::sync::atomic::Ordering::Relaxed);
@@ -676,8 +701,8 @@ mod worker {
         }
         drop(g);
         v.sort_by_key(|x| x.0);
-        for (_, id, path, e) in v {
-            apply(id, &path, e);
+        for (_, id, path, e, ne) in v {
+            apply(id, &path, e, ne);
         }
     }
 
@@ -730,7 +755,7 @@ pub fn on() -> bool {
     false
 }
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
-pub fn submit(_dir: &Path, _items: Vec<(u32, u32, u32, std::sync::Arc<Vec<u8>>)>) {}
+pub fn submit(_dir: &Path, _items: Vec<(u32, u32, u32, std::sync::Arc<Vec<u8>>, [f32; crate::maskpool::TOKENS])>) {}
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]
 pub fn finish() {}
 #[cfg(not(any(feature = "onnx", feature = "dxrt")))]

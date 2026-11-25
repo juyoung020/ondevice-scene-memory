@@ -304,3 +304,5 @@
 - **낱말 표 손질(기각)**: chair 에 'the back of an office chair · a mesh chair backrest · the legs of a chair', bulletin board 에 'a pegboard with notices', floor 에 'a floor mat' 문장을 더해 다시 인코딩
   (`ondevice view --search-model <siglip2 폴더> --encode-vocab`) — 대표 사진 53 개 결과가 한 개도 안 바뀜(65 %). 의자 뒷면 → monitor 는 사진 벡터 쪽 문제라 문장으로는 안 움직인다.
   부정 낱말(1 등이면 이름 안 붙임)도 남은 틀림(n ≥ 12 의 10 개)이 대부분 '다른 진짜 물체 이름'(monitor · computer tower · keyboard · box)이라 걸러낼 낱말이 없다.
+- 정정: 앞서 올린 parc_names_default.png 는 포트 8096 에 옛 뷰어(parc_out18, 거르기 전)가 남아 새 뷰어가 못 떠서 옛 화면을 찍은 것이었다(view.json 은 맞았음: 25 · 68 · 120 = object).
+  옛 뷰어를 끄고 parc_out21 뷰어가 뜬 것(로그 `memory dir /home/rea/parc_out21`)을 확인한 뒤 다시 찍음 — 화면에 object#25 · object#68 · object#120, safety helmet#105 그대로.

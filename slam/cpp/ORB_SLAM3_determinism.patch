@@ -1,0 +1,416 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -53,9 +53,11 @@
+ 
+ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
+ 
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include ${PROJECT_SOURCE_DIR}/include/OrderById.h")
+ add_library(${PROJECT_NAME} SHARED
+ src/System.cc
+ src/Tracking.cc
++src/OrderById.cc
+ src/LocalMapping.cc
+ src/LoopClosing.cc
+ src/ORBextractor.cc
+--- a/include/LoopClosing.h
++++ b/include/LoopClosing.h
+@@ -71,6 +71,17 @@
+     // This function will run in a separate thread
+     void RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF);
+ 
++    // 재생 동기화: 루프 줄이 비고 루프 · 합치기 · 전체 최적화가 돌지 않음
++    bool IsIdleForSync(){
++        {
++            unique_lock<std::mutex> lq(mMutexLoopQueue);
++            if(!mlpLoopKeyFrameQueue.empty()) return false;
++        }
++        std::unique_lock<std::mutex> b(mMutexBusy, std::try_to_lock);
++        if(!b.owns_lock()) return false;
++        return !isRunningGBA();
++    }
++
+     bool isRunningGBA(){
+         unique_lock<std::mutex> lock(mMutexGBA);
+         return mbRunningGBA;
+--- a/src/Tracking.cc
++++ b/src/Tracking.cc
+@@ -4161,7 +4161,7 @@
+     const Frame saved(mCurrentFrame);
+     const unsigned int savedReloc = mnLastRelocFrameId;
+     vector<Map*> vpMaps = mpAtlas->GetAllMaps();
+-    sort(vpMaps.begin(), vpMaps.end(), [](Map* a, Map* b){ return a->KeyFramesInMap() > b->KeyFramesInMap(); });
++    sort(vpMaps.begin(), vpMaps.end(), [](Map* a, Map* b){ const auto na = a->KeyFramesInMap(), nb = b->KeyFramesInMap(); return na != nb ? na > nb : a->GetId() < b->GetId(); });
+     for(Map* pM : vpMaps)
+     {
+         if(pM == pCur || pM->IsBad() || pM->KeyFramesInMap() == 0) continue;
+@@ -4293,11 +4293,15 @@
+ {
+ void Tracking::WaitMappingIdle()
+ {
+-    for(int i = 0; i < 4000; i++)
++    // 재생(받는 쪽을 기다림)에서 실행마다 같은 결과: 지역 지도 스레드와 루프 스레드(루프 · 합치기 · 전체 최적화)가 다 끝날 때까지 기다림
++    int idle = 0;
++    for(int i = 0; i < 600000 && idle < 3; i++)
+     {
+-        if(mpLocalMapper->isStopped() || mpLocalMapper->isFinished()) return;
+-        if(mpLocalMapper->KeyframesInQueue() == 0 && mpLocalMapper->AcceptKeyFrames()) return;
+-        usleep(500);
++        if(mpLocalMapper->isFinished()) return;
++        const bool lm = mpLocalMapper->isStopped() || (mpLocalMapper->KeyframesInQueue() == 0 && mpLocalMapper->AcceptKeyFrames());
++        const bool lc = mpLoopClosing->IsIdleForSync();
++        idle = (lm && lc) ? idle + 1 : 0;
++        usleep(idle ? 200 : 500);
+     }
+ }
+ }
+--- a/src/KeyFrame.cc
++++ b/src/KeyFrame.cc
+@@ -210,7 +210,7 @@
+     for(map<KeyFrame*,int>::iterator mit=mConnectedKeyFrameWeights.begin(), mend=mConnectedKeyFrameWeights.end(); mit!=mend; mit++)
+        vPairs.push_back(make_pair(mit->second,mit->first));
+ 
+-    sort(vPairs.begin(),vPairs.end());
++    sort(vPairs.begin(),vPairs.end(),[](const pair<int,KeyFrame*>& a, const pair<int,KeyFrame*>& b){ return a.first != b.first ? a.first < b.first : a.second->mnId < b.second->mnId; });
+     list<KeyFrame*> lKFs;
+     list<int> lWs;
+     for(size_t i=0, iend=vPairs.size(); i<iend;i++)
+@@ -447,7 +447,7 @@
+         pKFmax->AddConnection(this,nmax);
+     }
+ 
+-    sort(vPairs.begin(),vPairs.end());
++    sort(vPairs.begin(),vPairs.end(),[](const pair<int,KeyFrame*>& a, const pair<int,KeyFrame*>& b){ return a.first != b.first ? a.first < b.first : a.second->mnId < b.second->mnId; });
+     list<KeyFrame*> lKFs;
+     list<int> lWs;
+     for(size_t i=0; i<vPairs.size();i++)
+--- a/src/Sim3Solver.cc
++++ b/src/Sim3Solver.cc
+@@ -122,6 +122,7 @@
+ 
+ void Sim3Solver::SetRansacParameters(double probability, int minInliers, int maxIterations)
+ {
++    DUtils::Random::SeedThread(1);
+     mRansacProb = probability;
+     mRansacMinInliers = minInliers;
+     mRansacMaxIts = maxIterations;    
+--- a/src/MLPnPsolver.cpp
++++ b/src/MLPnPsolver.cpp
+@@ -223,6 +223,7 @@
+ 	}
+ 
+ 	void MLPnPsolver::SetRansacParameters(double probability, int minInliers, int maxIterations, int minSet, float epsilon, float th2){
++		DUtils::Random::SeedThread(1);
+ 		mRansacProb = probability;
+ 	    mRansacMinInliers = minInliers;
+ 	    mRansacMaxIts = maxIterations;
+--- a/Thirdparty/DBoW2/DUtils/Random.cpp
++++ b/Thirdparty/DBoW2/DUtils/Random.cpp
+@@ -1,129 +1,133 @@
+-/*	
+- * File: Random.cpp
+- * Project: DUtils library
+- * Author: Dorian Galvez-Lopez
+- * Date: April 2010
+- * Description: manages pseudo-random numbers
+- * License: see the LICENSE.txt file
+- *
+- */
+-
+-#include "Random.h"
+-#include "Timestamp.h"
+-#include <cstdlib>
+-using namespace std;
+-
+-bool DUtils::Random::m_already_seeded = false;
+-
+-void DUtils::Random::SeedRand(){
+-	Timestamp time;
+-	time.setToCurrentTime();
+-	srand((unsigned)time.getFloatTime()); 
+-}
+-
+-void DUtils::Random::SeedRandOnce()
+-{
+-  if(!m_already_seeded)
+-  {
+-    DUtils::Random::SeedRand();
+-    m_already_seeded = true;
+-  }
+-}
+-
+-void DUtils::Random::SeedRand(int seed)
+-{
+-	srand(seed); 
+-}
+-
+-void DUtils::Random::SeedRandOnce(int seed)
+-{
+-  if(!m_already_seeded)
+-  {
+-    DUtils::Random::SeedRand(seed);
+-    m_already_seeded = true;
+-  }
+-}
+-
+-int DUtils::Random::RandomInt(int min, int max){
+-	int d = max - min + 1;
+-	return int(((double)rand()/((double)RAND_MAX + 1.0)) * d) + min;
+-}
+-
+-// ---------------------------------------------------------------------------
+-// ---------------------------------------------------------------------------
+-
+-DUtils::Random::UnrepeatedRandomizer::UnrepeatedRandomizer(int min, int max)
+-{
+-  if(min <= max)
+-  {
+-    m_min = min;
+-    m_max = max;
+-  }
+-  else
+-  {
+-    m_min = max;
+-    m_max = min;
+-  }
+-
+-  createValues();
+-}
+-
+-// ---------------------------------------------------------------------------
+-
+-DUtils::Random::UnrepeatedRandomizer::UnrepeatedRandomizer
+-  (const DUtils::Random::UnrepeatedRandomizer& rnd)
+-{
+-  *this = rnd;
+-}
+-
+-// ---------------------------------------------------------------------------
+-
+-int DUtils::Random::UnrepeatedRandomizer::get()
+-{
+-  if(empty()) createValues();
+-  
+-  DUtils::Random::SeedRandOnce();
+-  
+-  int k = DUtils::Random::RandomInt(0, m_values.size()-1);
+-  int ret = m_values[k];
+-  m_values[k] = m_values.back();
+-  m_values.pop_back();
+-  
+-  return ret;
+-}
+-
+-// ---------------------------------------------------------------------------
+-
+-void DUtils::Random::UnrepeatedRandomizer::createValues()
+-{
+-  int n = m_max - m_min + 1;
+-  
+-  m_values.resize(n);
+-  for(int i = 0; i < n; ++i) m_values[i] = m_min + i;
+-}
+-
+-// ---------------------------------------------------------------------------
+-
+-void DUtils::Random::UnrepeatedRandomizer::reset()
+-{
+-  if((int)m_values.size() != m_max - m_min + 1) createValues();
+-}
+-
+-// ---------------------------------------------------------------------------
+-
+-DUtils::Random::UnrepeatedRandomizer& 
+-DUtils::Random::UnrepeatedRandomizer::operator=
+-  (const DUtils::Random::UnrepeatedRandomizer& rnd)
+-{
+-  if(this != &rnd)
+-  {
+-    this->m_min = rnd.m_min;
+-    this->m_max = rnd.m_max;
+-    this->m_values = rnd.m_values;
+-  }
+-  return *this;
+-}
+-
+-// ---------------------------------------------------------------------------
+-
+-
++/*	
++ * File: Random.cpp
++ * Project: DUtils library
++ * Author: Dorian Galvez-Lopez
++ * Date: April 2010
++ * Description: manages pseudo-random numbers
++ * License: see the LICENSE.txt file
++ *
++ */
++
++#include "Random.h"
++#include "Timestamp.h"
++#include <cstdlib>
++using namespace std;
++
++bool DUtils::Random::m_already_seeded = false;
++
++void DUtils::Random::SeedRand(){
++	Timestamp time;
++	time.setToCurrentTime();
++	srand((unsigned)time.getFloatTime()); 
++}
++
++void DUtils::Random::SeedRandOnce()
++{
++  if(!m_already_seeded)
++  {
++    DUtils::Random::SeedRand();
++    m_already_seeded = true;
++  }
++}
++
++void DUtils::Random::SeedRand(int seed)
++{
++	srand(seed); 
++}
++
++void DUtils::Random::SeedRandOnce(int seed)
++{
++  if(!m_already_seeded)
++  {
++    DUtils::Random::SeedRand(seed);
++    m_already_seeded = true;
++  }
++}
++
++static thread_local unsigned int t_seed = 1;
++void DUtils::Random::SeedThread(unsigned int seed){ t_seed = seed; }
++
++int DUtils::Random::RandomInt(int min, int max){
++	int d = max - min + 1;
++	// 스레드마다 따로(추적 재위치 · 루프 검증 RANSAC 이 섞여 실행마다 달라지지 않게)
++	return int(((double)rand_r(&t_seed)/((double)RAND_MAX + 1.0)) * d) + min;
++}
++
++// ---------------------------------------------------------------------------
++// ---------------------------------------------------------------------------
++
++DUtils::Random::UnrepeatedRandomizer::UnrepeatedRandomizer(int min, int max)
++{
++  if(min <= max)
++  {
++    m_min = min;
++    m_max = max;
++  }
++  else
++  {
++    m_min = max;
++    m_max = min;
++  }
++
++  createValues();
++}
++
++// ---------------------------------------------------------------------------
++
++DUtils::Random::UnrepeatedRandomizer::UnrepeatedRandomizer
++  (const DUtils::Random::UnrepeatedRandomizer& rnd)
++{
++  *this = rnd;
++}
++
++// ---------------------------------------------------------------------------
++
++int DUtils::Random::UnrepeatedRandomizer::get()
++{
++  if(empty()) createValues();
++  
++  DUtils::Random::SeedRandOnce();
++  
++  int k = DUtils::Random::RandomInt(0, m_values.size()-1);
++  int ret = m_values[k];
++  m_values[k] = m_values.back();
++  m_values.pop_back();
++  
++  return ret;
++}
++
++// ---------------------------------------------------------------------------
++
++void DUtils::Random::UnrepeatedRandomizer::createValues()
++{
++  int n = m_max - m_min + 1;
++  
++  m_values.resize(n);
++  for(int i = 0; i < n; ++i) m_values[i] = m_min + i;
++}
++
++// ---------------------------------------------------------------------------
++
++void DUtils::Random::UnrepeatedRandomizer::reset()
++{
++  if((int)m_values.size() != m_max - m_min + 1) createValues();
++}
++
++// ---------------------------------------------------------------------------
++
++DUtils::Random::UnrepeatedRandomizer& 
++DUtils::Random::UnrepeatedRandomizer::operator=
++  (const DUtils::Random::UnrepeatedRandomizer& rnd)
++{
++  if(this != &rnd)
++  {
++    this->m_min = rnd.m_min;
++    this->m_max = rnd.m_max;
++    this->m_values = rnd.m_values;
++  }
++  return *this;
++}
++
++// ---------------------------------------------------------------------------
++
++
+--- a/Thirdparty/DBoW2/DUtils/Random.h
++++ b/Thirdparty/DBoW2/DUtils/Random.h
+@@ -28,6 +28,8 @@
+ 	 * Sets the random number seed to the current time
+ 	 */
+ 	static void SeedRand();
++	/// 이 스레드의 RandomInt 씨앗
++	static void SeedThread(unsigned int seed);
+ 	
+ 	/**
+ 	 * Sets the random number seed to the current time only the first
+--- a/include/OrderById.h
++++ b/include/OrderById.h
+@@ -0,0 +1,14 @@
++// 키프레임 · 지도 점 · 지도 포인터를 담는 std::set/map 순서를 메모리 주소 대신 번호(mnId)로.
++// 주소는 실행마다 달라(스레드 · 할당 순서) 최적화 간선 순서 · 후보 순서가 바뀌고 결과가 흔들림.
++// 모든 번역 단위에 -include 로 먼저 넣음(라이브러리 · 래퍼 모두 같은 비교자여야 함).
++#pragma once
++#include <functional>
++namespace ORB_SLAM3 { class KeyFrame; class MapPoint; class Map;
++bool OrderLess(const KeyFrame* a, const KeyFrame* b);
++bool OrderLess(const MapPoint* a, const MapPoint* b);
++bool OrderLess(const Map* a, const Map* b); }
++namespace std {
++template<> struct less<ORB_SLAM3::KeyFrame*> { bool operator()(const ORB_SLAM3::KeyFrame* a, const ORB_SLAM3::KeyFrame* b) const { return ORB_SLAM3::OrderLess(a, b); } };
++template<> struct less<ORB_SLAM3::MapPoint*> { bool operator()(const ORB_SLAM3::MapPoint* a, const ORB_SLAM3::MapPoint* b) const { return ORB_SLAM3::OrderLess(a, b); } };
++template<> struct less<ORB_SLAM3::Map*> { bool operator()(const ORB_SLAM3::Map* a, const ORB_SLAM3::Map* b) const { return ORB_SLAM3::OrderLess(a, b); } };
++}
+--- a/src/OrderById.cc
++++ b/src/OrderById.cc
+@@ -0,0 +1,15 @@
++#include "KeyFrame.h"
++#include "MapPoint.h"
++#include "Map.h"
++namespace ORB_SLAM3 {
++template<class T> static inline bool ByIdLess(const T* a, const T* b, unsigned long ia, unsigned long ib)
++{
++    if(a == b) return false;
++    if(!a || !b) return !a;
++    if(ia != ib) return ia < ib;
++    return a < b;
++}
++bool OrderLess(const KeyFrame* a, const KeyFrame* b) { return ByIdLess(a, b, a ? a->mnId : 0, b ? b->mnId : 0); }
++bool OrderLess(const MapPoint* a, const MapPoint* b) { return ByIdLess(a, b, a ? a->mnId : 0, b ? b->mnId : 0); }
++bool OrderLess(const Map* a, const Map* b) { return ByIdLess(a, b, a ? const_cast<Map*>(a)->GetId() : 0, b ? const_cast<Map*>(b)->GetId() : 0); }
++}

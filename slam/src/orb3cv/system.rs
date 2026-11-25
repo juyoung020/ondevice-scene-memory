@@ -78,8 +78,9 @@ impl SystemInit {
     }
 
     /// System::SaveAtlas(설정에 저장 파일이 있을 때)
-    pub fn save_atlas(&self, atlas: &Atlas, next_frame: u64) -> Result<(), String> {
+    pub fn save_atlas(&self, atlas: &mut Atlas, next_frame: u64) -> Result<(), String> {
         let Some(p) = &self.save_to else { return Ok(()) };
+        atlas_io::pre_save(atlas);
         let next_map = atlas.maps.iter().map(|m| m.id + 1).max().unwrap_or(0);
         let mut f = std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| format!("{p}: {e}"))?);
         atlas_io::save(atlas, next_frame, next_map, &mut f).map_err(|e| format!("{p}: {e}"))
@@ -112,7 +113,7 @@ ORBextractor.nFeatures: 1000\nORBextractor.scaleFactor: 1.2\nORBextractor.nLevel
         a.kfs.insert(0, k);
         a.maps[0].kfs.push(0);
         a.next_kf = 1;
-        s.save_atlas(&a, 7).unwrap();
+        s.save_atlas(&mut a, 7).unwrap();
         let y2 = dir.join("s2.yaml");
         std::fs::write(&y2, format!("{base}System.LoadAtlasFromFile: \"{}\"\n", atlas.display())).unwrap();
         let s2 = SystemInit::open(y2.to_str().unwrap(), 640, 480).unwrap();

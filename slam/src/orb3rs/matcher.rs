@@ -509,4 +509,355 @@ impl Matcher {
         }
         (nmatches, m12)
     }
+
+    /// SearchByProjection(KF, Scw, 점들, 짝, th, ratioHamming): 루프 · 합치기 후보 키프레임에 Sim3 로 투영(카메라 project).
+    /// matched 는 키프레임 점마다 이미 짝지어진 지도 점(들어 있는 점은 건너뜀)
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_by_projection_sim3(&self, kf: &KeyFrame, scw: &Sim3, points: &[MpId], matched: &mut [Option<MpId>], mps: &BTreeMap<MpId, MapPoint>, th: i32, ratio_hamming: f32) -> i32 {
+        self.sim3_proj(kf, scw, points, None, matched, mps, th, ratio_hamming, false)
+    }
+    /// SearchByProjection(KF, Scw, 점들, 점의 키프레임들, 짝, 짝 키프레임, th, ratioHamming): 투영은 fx·(x·(1/z))+cx 식
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_by_projection_sim3_kfs(&self, kf: &KeyFrame, scw: &Sim3, points: &[MpId], points_kfs: &[KfId], matched: &mut [Option<MpId>], matched_kf: &mut [Option<KfId>], mps: &BTreeMap<MpId, MapPoint>, th: i32, ratio_hamming: f32) -> i32 {
+        self.sim3_proj(kf, scw, points, Some((points_kfs, matched_kf)), matched, mps, th, ratio_hamming, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn sim3_proj(&self, kf: &KeyFrame, scw: &Sim3, points: &[MpId], mut kfs: Option<(&[KfId], &mut [Option<KfId>])>, matched: &mut [Option<MpId>], mps: &BTreeMap<MpId, MapPoint>, th: i32, ratio_hamming: f32, manual: bool) -> i32 {
+        let ctx = &kf.ctx;
+        let cam = &ctx.cam;
+        let tcw = scw.to_se3();
+        let ow = tcw.inverse().t;
+        let already: std::collections::BTreeSet<MpId> = matched.iter().flatten().copied().collect();
+        let mut nmatches = 0;
+        for (imp, &mid) in points.iter().enumerate() {
+            let mp = &mps[&mid];
+            if mp.bad || already.contains(&mid) {
+                continue;
+            }
+            let p3dw = mp.pos;
+            let p3dc = tcw.mul_point(&p3dw);
+            if p3dc[2] < 0.0 {
+                continue;
+            }
+            let (u, v) = if manual {
+                let invz = 1.0 / p3dc[2];
+                let x = p3dc[0] * invz;
+                let y = p3dc[1] * invz;
+                (cam.fx * x + cam.cx, cam.fy * y + cam.cy)
+            } else {
+                let uv = cam.project(&p3dc);
+                (uv[0], uv[1])
+            };
+            if !kf.is_in_image(u, v) {
+                continue;
+            }
+            let po = sub(&p3dw, &ow);
+            let dist = norm(&po);
+            if dist < mp.min_distance_invariance() || dist > mp.max_distance_invariance() {
+                continue;
+            }
+            if (dot(&po, &mp.normal) as f64) < 0.5 * dist as f64 {
+                continue;
+            }
+            let lv = mp.predict_scale(dist, &ctx.pyr);
+            let radius = th as f32 * ctx.pyr.scale[lv as usize];
+            let idxs = kf.features_in_area(u, v, radius);
+            if idxs.is_empty() {
+                continue;
+            }
+            let (mut best, mut best_idx) = (256, -1i32);
+            for &idx in idxs.iter() {
+                let idx = idx as usize;
+                if matched[idx].is_some() {
+                    continue;
+                }
+                let kl = kf.keys[idx].octave;
+                if kl < lv - 1 || kl > lv {
+                    continue;
+                }
+                let d = desc_dist(&mp.desc, &kf.desc[idx]);
+                if d < best {
+                    best = d;
+                    best_idx = idx as i32;
+                }
+            }
+            if best as f32 <= TH_LOW as f32 * ratio_hamming {
+                matched[best_idx as usize] = Some(mid);
+                if let Some((pk, mk)) = kfs.as_mut() {
+                    mk[best_idx as usize] = Some(pk[imp]);
+                }
+                nmatches += 1;
+            }
+        }
+        nmatches
+    }
+
+    /// Fuse(KF, 지도 점들, th, bRight = false): 키프레임에 투영해 이미 점이 있으면 합치고(Replace) 없으면 관측을 더함
+    pub fn fuse(&self, kf_id: KfId, kfs: &mut BTreeMap<KfId, KeyFrame>, points: &[Option<MpId>], mps: &mut BTreeMap<MpId, MapPoint>, th: f32) -> i32 {
+        let (tcw, ow, ctx) = {
+            let kf = &kfs[&kf_id];
+            (kf.tcw, kf.camera_center(), kf.ctx.clone())
+        };
+        let bf = ctx.cam.bf;
+        let mut nfused = 0;
+        for p in points {
+            let Some(pid) = *p else { continue };
+            let mp = &mps[&pid];
+            if mp.bad || mp.obs.contains_key(&kf_id) {
+                continue;
+            }
+            let p3dw = mp.pos;
+            let p3dc = tcw.mul_point(&p3dw);
+            if p3dc[2] < 0.0 {
+                continue;
+            }
+            let invz = 1.0 / p3dc[2];
+            let uv = ctx.cam.project(&p3dc);
+            let kf = &kfs[&kf_id];
+            if !kf.is_in_image(uv[0], uv[1]) {
+                continue;
+            }
+            let ur = uv[0] - bf * invz;
+            let po = sub(&p3dw, &ow);
+            let dist3d = norm(&po);
+            if dist3d < mp.min_distance_invariance() || dist3d > mp.max_distance_invariance() {
+                continue;
+            }
+            if (dot(&po, &mp.normal) as f64) < 0.5 * dist3d as f64 {
+                continue;
+            }
+            let lv = mp.predict_scale(dist3d, &ctx.pyr);
+            let radius = th * ctx.pyr.scale[lv as usize];
+            let idxs = kf.features_in_area(uv[0], uv[1], radius);
+            if idxs.is_empty() {
+                continue;
+            }
+            let (mut best, mut best_idx) = (256, -1i32);
+            for &idx in idxs.iter() {
+                let idx = idx as usize;
+                let kp = &kf.keys[idx];
+                let kl = kp.octave;
+                if kl < lv - 1 || kl > lv {
+                    continue;
+                }
+                let ex = uv[0] - kp.x;
+                let ey = uv[1] - kp.y;
+                if kf.u_right[idx] >= 0.0 {
+                    let er = ur - kf.u_right[idx];
+                    let e2 = ex * ex + ey * ey + er * er;
+                    if (e2 * ctx.pyr.inv_sigma2[kl as usize]) as f64 > 7.8 {
+                        continue;
+                    }
+                } else {
+                    let e2 = ex * ex + ey * ey;
+                    if (e2 * ctx.pyr.inv_sigma2[kl as usize]) as f64 > 5.99 {
+                        continue;
+                    }
+                }
+                let d = desc_dist(&mp.desc, &kf.desc[idx]);
+                if d < best {
+                    best = d;
+                    best_idx = idx as i32;
+                }
+            }
+            if best <= TH_LOW {
+                let bi = best_idx as usize;
+                if let Some(q) = kf.map_points[bi] {
+                    if !mps[&q].bad {
+                        if mps[&q].n_obs > mps[&pid].n_obs {
+                            replace_map_point(pid, q, kfs, mps);
+                        } else {
+                            replace_map_point(q, pid, kfs, mps);
+                        }
+                    }
+                } else {
+                    mps.get_mut(&pid).unwrap().add_observation(&kfs[&kf_id], bi);
+                    kfs.get_mut(&kf_id).unwrap().map_points[bi] = Some(pid);
+                }
+                nfused += 1;
+            }
+        }
+        nfused
+    }
+
+    /// Fuse(KF, Scw, 점들, th, vpReplacePoint): Sim3 로 투영해 합침. 이미 점이 있으면 replace[i] 에 적고(바꾸기는 부른 쪽), 없으면 관측 추가
+    #[allow(clippy::too_many_arguments)]
+    pub fn fuse_sim3(&self, kf_id: KfId, kfs: &mut BTreeMap<KfId, KeyFrame>, scw: &Sim3, points: &[MpId], mps: &mut BTreeMap<MpId, MapPoint>, th: f32, replace: &mut [Option<MpId>]) -> i32 {
+        let tcw = scw.to_se3();
+        let ow = tcw.inverse().t;
+        let (already, ctx) = {
+            let kf = &kfs[&kf_id];
+            (kf.map_point_set(mps), kf.ctx.clone())
+        };
+        let mut nfused = 0;
+        for (imp, &pid) in points.iter().enumerate() {
+            let mp = &mps[&pid];
+            if mp.bad || already.contains(&pid) {
+                continue;
+            }
+            let p3dw = mp.pos;
+            let p3dc = tcw.mul_point(&p3dw);
+            if p3dc[2] < 0.0 {
+                continue;
+            }
+            let uv = ctx.cam.project(&p3dc);
+            let kf = &kfs[&kf_id];
+            if !kf.is_in_image(uv[0], uv[1]) {
+                continue;
+            }
+            let po = sub(&p3dw, &ow);
+            let dist3d = norm(&po);
+            if dist3d < mp.min_distance_invariance() || dist3d > mp.max_distance_invariance() {
+                continue;
+            }
+            if (dot(&po, &mp.normal) as f64) < 0.5 * dist3d as f64 {
+                continue;
+            }
+            let lv = mp.predict_scale(dist3d, &ctx.pyr);
+            let radius = th * ctx.pyr.scale[lv as usize];
+            let idxs = kf.features_in_area(uv[0], uv[1], radius);
+            if idxs.is_empty() {
+                continue;
+            }
+            let (mut best, mut best_idx) = (i32::MAX, -1i32);
+            for &idx in idxs.iter() {
+                let idx = idx as usize;
+                let kl = kf.keys[idx].octave;
+                if kl < lv - 1 || kl > lv {
+                    continue;
+                }
+                let d = desc_dist(&mp.desc, &kf.desc[idx]);
+                if d < best {
+                    best = d;
+                    best_idx = idx as i32;
+                }
+            }
+            if best <= TH_LOW {
+                let bi = best_idx as usize;
+                if let Some(q) = kf.map_points[bi] {
+                    if !mps[&q].bad {
+                        replace[imp] = Some(q);
+                    }
+                } else {
+                    mps.get_mut(&pid).unwrap().add_observation(&kfs[&kf_id], bi);
+                    kfs.get_mut(&kf_id).unwrap().map_points[bi] = Some(pid);
+                }
+                nfused += 1;
+            }
+        }
+        nfused
+    }
+
+    /// SearchBySim3(KF1, KF2, 짝12, S12, th): 양쪽 지도 점을 서로에게 투영해 서로 고른 짝만 더함
+    pub fn search_by_sim3(&self, kf1: &KeyFrame, kf2: &KeyFrame, matches12: &mut [Option<MpId>], s12: &Sim3, th: f32, mps: &BTreeMap<MpId, MapPoint>) -> i32 {
+        let cam = &kf1.ctx.cam;
+        let (fx, fy, cx, cy) = (cam.fx, cam.fy, cam.cx, cam.cy);
+        let s21 = s12.inverse();
+        let (n1, n2) = (kf1.map_points.len(), kf2.map_points.len());
+        let mut am1 = vec![false; n1];
+        let mut am2 = vec![false; n2];
+        for i in 0..n1 {
+            if let Some(m) = matches12[i] {
+                am1[i] = true;
+                let idx2 = mps[&m].obs.get(&kf2.id).map(|x| x.0).unwrap_or(-1);
+                if idx2 >= 0 && (idx2 as usize) < n2 {
+                    am2[idx2 as usize] = true;
+                }
+            }
+        }
+        let side = |src: &KeyFrame, dst: &KeyFrame, s: &Sim3, am: &[bool]| -> Vec<i32> {
+            let mut out = vec![-1i32; src.map_points.len()];
+            for (i, m) in src.map_points.iter().enumerate() {
+                let Some(mid) = *m else { continue };
+                if am[i] {
+                    continue;
+                }
+                let mp = &mps[&mid];
+                if mp.bad {
+                    continue;
+                }
+                let pc = s.mul_point(&src.tcw.mul_point(&mp.pos));
+                if pc[2] < 0.0 {
+                    continue;
+                }
+                let invz = (1.0f64 / pc[2] as f64) as f32;
+                let x = pc[0] * invz;
+                let y = pc[1] * invz;
+                let u = fx * x + cx;
+                let v = fy * y + cy;
+                if !dst.is_in_image(u, v) {
+                    continue;
+                }
+                let dist3d = norm(&pc);
+                if dist3d < mp.min_distance_invariance() || dist3d > mp.max_distance_invariance() {
+                    continue;
+                }
+                let lv = mp.predict_scale(dist3d, &dst.ctx.pyr);
+                let radius = th * dst.ctx.pyr.scale[lv as usize];
+                let idxs = dst.features_in_area(u, v, radius);
+                if idxs.is_empty() {
+                    continue;
+                }
+                let (mut best, mut best_idx) = (i32::MAX, -1i32);
+                for &idx in idxs.iter() {
+                    let idx = idx as usize;
+                    let kl = dst.keys[idx].octave;
+                    if kl < lv - 1 || kl > lv {
+                        continue;
+                    }
+                    let d = desc_dist(&mp.desc, &dst.desc[idx]);
+                    if d < best {
+                        best = d;
+                        best_idx = idx as i32;
+                    }
+                }
+                if best <= TH_HIGH {
+                    out[i] = best_idx;
+                }
+            }
+            out
+        };
+        let m1 = side(kf1, kf2, &s21, &am1);
+        let m2 = side(kf2, kf1, s12, &am2);
+        let mut found = 0;
+        for i1 in 0..n1 {
+            let idx2 = m1[i1];
+            if idx2 >= 0 && m2[idx2 as usize] == i1 as i32 {
+                matches12[i1] = kf2.map_points[idx2 as usize];
+                found += 1;
+            }
+        }
+        found
+    }
+}
+
+/// MapPoint::Replace(old → new): old 의 관측을 new 로 옮기고 old 는 나쁨 표시(지도에서 지우기는 부른 쪽 Map 몫)
+pub fn replace_map_point(old: MpId, new: MpId, kfs: &mut BTreeMap<KfId, KeyFrame>, mps: &mut BTreeMap<MpId, MapPoint>) {
+    if old == new {
+        return;
+    }
+    let (obs, nvisible, nfound) = {
+        let o = mps.get_mut(&old).unwrap();
+        o.bad = true;
+        o.replaced = Some(new);
+        (std::mem::take(&mut o.obs), o.visible, o.found)
+    };
+    for (k, (l, r)) in obs {
+        let in_kf = mps[&new].obs.contains_key(&k);
+        for idx in [l, r] {
+            if idx == -1 {
+                continue;
+            }
+            if !in_kf {
+                kfs.get_mut(&k).unwrap().map_points[idx as usize] = Some(new);
+                mps.get_mut(&new).unwrap().add_observation(&kfs[&k], idx as usize);
+            } else {
+                kfs.get_mut(&k).unwrap().map_points[idx as usize] = None;
+            }
+        }
+    }
+    let n = mps.get_mut(&new).unwrap();
+    n.found += nfound;
+    n.visible += nvisible;
+    n.compute_distinctive_descriptors(kfs);
 }

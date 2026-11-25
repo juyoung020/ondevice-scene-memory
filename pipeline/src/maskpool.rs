@@ -205,3 +205,29 @@ mod tests {
         assert_eq!(w[8 * 4], 0.0);
     }
 }
+
+/// Rust 머리 = ONNX pooler_output 확인(모든 무게 1) · 마스크 무게 판을 파이썬 계산(tools/naming/maphead.py)과 견줄 값 출력.
+/// 모델이 없으면 건너뜀: ONDEVICE_MODELS=<모델 폴더> cargo test --release maskpool -- --nocapture
+#[cfg(all(test, feature = "onnx"))]
+mod onnx_tests {
+    #[test]
+    fn head_matches_onnx() {
+        let dir = std::env::var("ONDEVICE_MODELS").unwrap_or_default();
+        let model = format!("{dir}/siglip2-base-patch32-256/vision_model.onnx");
+        let Some(h) = super::Head::load(&model) else { return };
+        let mut sess = ort::session::Session::builder(common::ort::env()).unwrap().commit_from_file(&model).unwrap();
+        // 정해진 무늬 입력(파이썬과 같게): x[i] = sin(i · 0.001)
+        let x: Vec<f32> = (0..3 * 256 * 256).map(|i| (i as f32 * 0.001).sin()).collect();
+        let inp = ort::value::TensorRef::from_array_view(([1usize, 3, 256, 256], x.as_slice())).unwrap();
+        let out = sess.run(ort::inputs![inp]).unwrap();
+        let po = out["pooler_output"].try_extract_tensor::<f32>().unwrap().1.to_vec();
+        let lh = out["last_hidden_state"].try_extract_tensor::<f32>().unwrap().1.to_vec();
+        let all = h.pool(&lh, &[1.0; super::TOKENS]);
+        let d = all.iter().zip(&po).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        // 마스크 무게 판: 왼쪽 위 4×4 조각만, 몫 (k % 4 + 1)/4
+        let w: [f32; super::TOKENS] = std::array::from_fn(|k| if k % 8 < 4 && k / 8 < 4 { (k % 4 + 1) as f32 / 4.0 } else { 0.0 });
+        let m = h.pool(&lh, &w);
+        println!("maskpool: 모든 무게 1 → pooler 와 최대 차 {d:e}, 마스크 판 앞 4 값 {:?} 합 {}", &m[..4], m.iter().sum::<f32>());
+        assert!(d < 1e-3, "{d}");
+    }
+}

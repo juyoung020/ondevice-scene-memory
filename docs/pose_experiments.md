@@ -275,3 +275,5 @@
   n ≥ 12 거르기는 이 판에서 맞음 5 · 틀림 5 를 함께 빼 62 → 68 % — 맞음도 잃어 아직 안 넣음.
 - 보드 영향: NPU .dxnn 은 pooler 만 내므로 지금은 보드 이름이 예전 방식(토큰 없으면 사진 전체 벡터로 대체). 보드에 쓰려면 .dxnn 을 last_hidden_state(64×768) 출력으로 다시 컴파일하고 머리를 CPU(사진당 약 6 M 곱)에서.
 - ORT 포터에: embed.rs 의 ONNX 실행에서 last_hidden_state 를 pooler 뒤에 이어 붙이게 한 줄만 고침(Rust 이식판도 이 출력이 필요).
+- Rust 머리 확인(`cargo test --release maskpool`, 모델 있을 때만): 모든 무게 1 → ONNX pooler_output 과 최대 차 1.3e-5. 마스크 무게 판(왼쪽 위 4×4 조각)은 파이썬(tools/naming/maphead_check.py, 같은 입력)과 앞 4 값 · 합(25.1694 / 25.1694)이 소수 5 자리까지 같음.
+- 뷰어 캡처(parc_out18, `ondevice view` 포트 8096, 헤드리스 Chrome): docs/img/parc_names_maskpool.png — 화면 이름표가 대표 사진 판정표와 같다(chair · monitor · desk · first aid kit · safety helmet · bulletin board, 틀린 hammer · light switch · can · paper · computer tower 도 그대로 보임).

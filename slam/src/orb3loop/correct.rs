@@ -7,14 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::detect::G2oSim3;
 use super::graph::{connected_set, update_normal_and_depth};
-use crate::orb3rs::mapdata::kf_update_connections;
+use crate::orb3rs::mapdata::{kf_update_connections, mp_replace};
 use crate::orb3rs::Atlas;
 use crate::orb3rs::matcher::Matcher;
 
-/// MapPoint::Replace(공통 `mapdata` 몸통, 지도에서 빼기는 원본도 여기선 지도 집합이 없음)
-fn replace_map_point(old: MpId, new: MpId, kfs: &mut BTreeMap<KfId, KeyFrame>, mps: &mut BTreeMap<MpId, MapPoint>) {
-    crate::orb3rs::mapdata::mp_replace_parts(kfs, mps, old, new);
-}
 use crate::orb3rs::{quat_normalize, KeyFrame, KfId, MapPoint, MpId, Se3};
 
 impl G2oSim3 {
@@ -116,7 +112,7 @@ pub fn correct_loop<E: EssentialGraph>(inp: &LoopIn, a: &mut Atlas, corrected_by
     for (i, lm) in inp.loop_matched.iter().enumerate() {
         let Some(lm) = *lm else { continue };
         match a.kfs[&cur].map_points[i] {
-            Some(c) => replace_map_point(c, lm, &mut a.kfs, &mut a.mps),
+            Some(c) => mp_replace(a, c, lm),
             None => {
                 a.kfs.get_mut(&cur).unwrap().map_points[i] = Some(lm);
                 let p = a.mps.get_mut(&lm).unwrap();
@@ -126,18 +122,8 @@ pub fn correct_loop<E: EssentialGraph>(inp: &LoopIn, a: &mut Atlas, corrected_by
         }
     }
     // SearchAndFuse(CorrectedSim3, mvpLoopMapPoints)
-    let matcher = Matcher::new(0.8, true);
     let lmps: Vec<MpId> = inp.loop_mps.iter().map(|m| m.expect("mvpLoopMapPoints 에 NULL")).collect();
-    for (&k, siw) in &corrected {
-        let scw = siw.to_sophus();
-        let mut rep = vec![None; lmps.len()];
-        matcher.fuse_sim3(k, &mut a.kfs, &scw, &lmps, &mut a.mps, 4.0, &mut rep);
-        for (i, r) in rep.iter().enumerate() {
-            if let Some(r) = *r {
-                replace_map_point(r, lmps[i], &mut a.kfs, &mut a.mps);
-            }
-        }
-    }
+    search_and_fuse(&corrected, &lmps, a);
     let mut loop_conn: BTreeMap<KfId, BTreeSet<KfId>> = BTreeMap::new();
     for &k in &conn_kfs {
         let prev: Vec<KfId> = a.kfs[&k].ordered_conn.iter().map(|c| c.0).collect();
@@ -155,4 +141,19 @@ pub fn correct_loop<E: EssentialGraph>(inp: &LoopIn, a: &mut Atlas, corrected_by
     a.kfs.get_mut(&inp.matched).unwrap().add_loop_edge(cur);
     a.kfs.get_mut(&cur).unwrap().add_loop_edge(inp.matched);
     LoopOut { corrected, non_corrected: non, loop_conn, run_gba: !inp.imu_init, not_erase: [inp.matched, cur] }
+}
+
+/// LoopClosing::SearchAndFuse(KeyFrameAndPose, vpMapPoints): 보정 Sim3 마다 Fuse(th 4) 뒤 바꿀 점을 Replace
+pub fn search_and_fuse(corrected: &BTreeMap<KfId, G2oSim3>, pts: &[MpId], a: &mut Atlas) {
+    let matcher = Matcher::new(0.8, true);
+    for (&k, siw) in corrected {
+        let scw = siw.to_sophus();
+        let mut rep = vec![None; pts.len()];
+        matcher.fuse_sim3(k, &mut a.kfs, &scw, pts, &mut a.mps, 4.0, &mut rep);
+        for (i, r) in rep.iter().enumerate() {
+            if let Some(r) = *r {
+                mp_replace(a, r, pts[i]);
+            }
+        }
+    }
 }

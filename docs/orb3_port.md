@@ -105,6 +105,15 @@ WSL 사본: `~/slam-bench/orb3-nopango`(빌드됨). 비트 비교 기준 빌드(
 
 ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 전용이라 뺌).
 
+## 통합 상태(opt/orb3-rust, 11-25)
+
+- 받은 브랜치: LOOP(4b1e3ff까지) · OPT(a4fbc75) · CV(e805fef) · TRACK(dac48f1) · ORT(a79d7f1). 공통 `types.rs` 는 통합판을 유지(TRACK 판은 그 부분집합이라 그대로 빌드됨).
+- 빌드: `ORB_SLAM3_DIR=~/slam-bench/orb3-nopango`(화면 제거 패치판, PANGOLIN_DIR 불필요).
+- 병합 뒤 확인: 짝짓기 하네스(`~/opt/orb3_match` rs · rs3) 50 쌍 전부 비트 동일, LOOP 시험 9 개 통과(`ORBLOOP_DUMPS=~/orbloop_ref:~/orbloop_out2`), OPT 덤프 4,216 호출 비트 동일. TRACK 재생(`examples/orb3rs_track_replay`)은 지금 남은 덤프 `~/orbtrack_out/ds.bin` 이 TRACK 포터의 새 덤프 형식이라 대조 못 함(그쪽 결과 기록 `result_v2.txt`: tum_desk2 전 항목 비트 동일).
+- 공통 함정(LOOP): 기준 빌드(`-ffp-contract=off`)에서도 Eigen 이 명시적으로 부르는 pmadd(`_mm*_fmadd_ps`)는 FMA 로 남음 — Hessenberg applyHouseholderOnTheRight 행렬 곱 · 고유벡터 되돌리기 행렬 곱 등 Eigen 동적 행렬 곱을 옮길 때는 `mul_add`.
+- 원본 버그(포팅판에서 고칠 것): `*Loop detected` → `Local Mapping STOP` 뒤 멈추는 교착 — 원본 · 화면 제거판 둘 다 재현. 포팅판의 루프 닫기 · 지도 스레드 정지 신호에서 고친다.
+- 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀. 다음 단계는 System 흐름(추적 · 지도 · 루프 스레드)을 Rust 모듈로 엮어 `orb3_backend` 를 바꿔 끼우는 것 — 아직 안 옮긴 것: LocalMapping 의 BA 호출부(BA 포터 대기), LoopClosing 흐름 · CorrectLoop · MergeLocal, MLPnPsolver · Relocalization.
+
 ## 정확도 브랜치 따라가기
 
 포터 기준은 `opt/pose-class` e989ca3. 정확도 수정은 `opt/pose-para`(V 자 틀어짐 · 겹침 · 끝 지도 기울기 3 초 평균) · `opt/pose-parb`(실행마다 흔들림)에서 진행 중. 통합 담당이 그쪽의 `slam/cpp/ORB_SLAM3.patch` · `mapmerge.rs` · `refine.rs` · `stitch.rs` · `orb3_backend.rs` 변경을 주기적으로 보고, 확정된 것만 아래 목록에 넣어 해당 모듈 포팅 때 같이 옮긴다(병합하지 않음).

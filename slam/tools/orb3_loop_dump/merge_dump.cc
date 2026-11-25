@@ -64,6 +64,10 @@ static int64_t kfid(KeyFrame *p) { return p ? (int64_t)p->mnId : -1; }
 static void wmps(const std::vector<MapPoint *> &v) { W<uint32_t>(v.size()); for (auto *p : v) W<int64_t>(mpid(p)); }
 template <class C> static void wkfset(const C &s) { W<uint32_t>(s.size()); for (auto *k : s) W<uint64_t>(k->mnId); }
 
+// 지도 신원: 합치기 들어올 때(MERG) 지도 포인터마다 그때 번호. 원본 MergeLocal 의 ChangeId 뒤에는 합칠 지도와 옛 지도가
+// 같은 번호가 되므로, 덤프는 번호 대신 포인터 신원을 쓴다(원본 비교도 포인터)
+static std::map<Map *, uint64_t> g_ident;
+static uint64_t mid(Map *m) { auto it = g_ident.find(m); return it != g_ident.end() ? it->second : m->mnId; }
 // 지도 통째: 이 지도의 키프레임 전부(나쁜 것 포함, mspKeyFrames) · 그 키프레임이 가리키는 지도 점 전부
 static void dumpMap(Atlas *A) {
     std::map<long unsigned, KeyFrame *> S;
@@ -72,7 +76,7 @@ static void dumpMap(Atlas *A) {
     for (Map *b : A->mspBadMaps) ms.push_back(b);
     W<uint32_t>(ms.size());
     for (Map *M : ms) {
-        W<uint64_t>(M->mnId); W<uint8_t>(M->mbBad); W<uint8_t>(M == A->mpCurrentMap);
+        W<uint64_t>(mid(M)); W<uint8_t>(M->mbBad); W<uint8_t>(M == A->mpCurrentMap);
         W<int64_t>(kfid(M->mpKFinitial)); W<int64_t>(kfid(M->mpKFlowerID)); W<uint64_t>(M->mnInitKFid); W<uint64_t>(M->mnMaxKFid);
         wkfset(M->mspKeyFrames); W<uint32_t>(M->mspMapPoints.size()); for (MapPoint *p : M->mspMapPoints) W<uint64_t>(p->mnId);
         for (KeyFrame *k : M->mspKeyFrames) S[k->mnId] = k;
@@ -90,7 +94,7 @@ static void dumpMap(Atlas *A) {
     for (auto &e : S) {
         KeyFrame *k = e.second;
         W<uint64_t>(k->mnId); W<uint64_t>(k->mnFrameId); W<uint8_t>(k->mbBad); W<uint8_t>(k->mbNotErase); W<uint8_t>(k->mbFirstConnection);
-        W<int64_t>(k->mpMap ? (int64_t)k->mpMap->GetId() : -1);
+        W<int64_t>(k->mpMap ? (int64_t)mid(k->mpMap) : -1);
         wse3(k->mTcw); wse3(k->mTwc);
         wkeys(k->mvKeysUn); wdesc(k->mDescriptors); wfv(k->mvuRight); wfv(k->mvDepth);
         wmps(k->mvpMapPoints);
@@ -107,7 +111,7 @@ static void dumpMap(Atlas *A) {
     W<uint32_t>(mps.size());
     for (auto &e : mps) {
         MapPoint *p = e.second;
-        W<uint64_t>(p->mnId); W<uint8_t>(p->mbBad); W<int64_t>(p->mpMap ? (int64_t)p->mpMap->GetId() : -1);
+        W<uint64_t>(p->mnId); W<uint8_t>(p->mbBad); W<int64_t>(p->mpMap ? (int64_t)mid(p->mpMap) : -1);
         Wb(p->mWorldPos.data(), 12); Wb(p->mNormalVector.data(), 12);
         if (p->mDescriptor.empty()) { uint8_t z[32] = {0}; Wb(z, 32); } else Wb(p->mDescriptor.ptr(0), 32);
         W(p->mfMinDistance); W(p->mfMaxDistance); W<int32_t>(p->mnTrackScaleLevel);
@@ -179,10 +183,14 @@ void LoopClosing::MergeLocal() {
     W<uint32_t>(0x4752454du);  // MERG
     W<uint64_t>(mpCurrentKF->mnId); W<uint64_t>(mpMergeMatchedKF->mnId); W<uint8_t>(mbFixScale); W<uint8_t>(gba);
     wsim(mg2oMergeScw);
+    g_ident.clear();
+    for (Map *m : mpAtlas->mspMaps) g_ident[m] = m->mnId;
+    for (Map *m : mpAtlas->mspBadMaps) g_ident[m] = m->mnId;
     dumpMap(mpAtlas);
     g_merge = true; g_rel = 0; g_lc = this;
     orig(this);
     g_merge = false;
+    g_ident.clear();
     if (g_rel < 2) { fprintf(stderr, "MergeLocal Release %d", g_rel); fputc(10, stderr); abort(); }
     W<uint32_t>(0x45475245u);  // ERGE
     W<uint8_t>(mbRunningGBA);

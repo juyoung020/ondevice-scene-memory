@@ -361,14 +361,14 @@ index 93a50be..a7835d5 100644
              output << "\t-Stereo depth threshold : " << settings.thDepth_ << endl;
  
 diff --git a/src/Tracking.cc b/src/Tracking.cc
-index 5191451..de53e79 100644
+index 5191451..8477c7a 100644
 --- a/src/Tracking.cc
 +++ b/src/Tracking.cc
 @@ -39,6 +39,8 @@ using namespace std;
  
  namespace ORB_SLAM3
  {
-+static const double LOST_NEWMAP_S = 1.0;
++static const double LOST_NEWMAP_S = 0.2;
 +
  
  

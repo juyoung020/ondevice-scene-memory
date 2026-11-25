@@ -71,6 +71,10 @@ const DS: usize = 8;
 /// 두 장면 깊이가 변환 t_qc(질의 ← 후보)로 겹치는지: 후보 격자 점을 질의 영상에 투영해 질의 깊이와 비교.
 /// 돌려줌: (겹친 칸 비율, 겹친 칸 가운데 깊이가 맞는 비율). 맞음 = |차| < 5 cm + 깊이의 3 %
 fn depth_agree(qd: &[u16], cd: &[u16], w: usize, h: usize, kq: &Intr, kc: &Intr, t: &T34) -> (f64, f64) {
+    depth_agree_tol(qd, cd, w, h, kq, kc, t, 0.05, 0.03)
+}
+
+fn depth_agree_tol(qd: &[u16], cd: &[u16], w: usize, h: usize, kq: &Intr, kc: &Intr, t: &T34, a0: f64, a1: f64) -> (f64, f64) {
     let (gw, gh) = (w / DS, h / DS);
     let (mut n, mut over, mut good) = (0usize, 0usize, 0usize);
     for v in 0..gh {
@@ -99,7 +103,7 @@ fn depth_agree(qd: &[u16], cd: &[u16], w: usize, h: usize, kq: &Intr, kc: &Intr,
                 continue;
             }
             over += 1;
-            if (zq - y[2]).abs() < 0.05 + 0.03 * y[2] {
+            if (zq - y[2]).abs() < a0 + a1 * y[2] {
                 good += 1;
             }
         }
@@ -383,9 +387,10 @@ impl State {
                 let t0 = t;
                 t = icp(&qsmall, &c.small_d, w, h, &n.k, &c.k, &t0);
                 let (ov, ag) = depth_agree(&qsmall, &c.small_d, w, h, &n.k, &c.k, &t);
+                let ag_tight = depth_agree_tol(&qsmall, &c.small_d, w, h, &n.k, &c.k, &t, 0.02, 0.01).1;
                 if let Some(l) = self.log.as_mut() {
                     use std::io::Write as _;
-                    let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2}", n.t, c.t);
+                    let _ = writeln!(l, "{:.3} {:.3} depth overlap {ov:.2} agree {ag:.2} tight {ag_tight:.2}", n.t, c.t);
                 }
                 if ov < DEPTH_OVERLAP || ag < DEPTH_AGREE {
                     continue;

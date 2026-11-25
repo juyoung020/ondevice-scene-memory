@@ -249,9 +249,17 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - 맞추며 알게 된 원본 동작: `SE3f.cast<double>()` 은 SO3d 생성자를 거쳐 double 로 다시 정규화(`unit_quaternion().cast<double>()` 은 안 함 — CorrectLoop 의 NonCorrectedSim3 가 이쪽). Quaterniond 곱은 SSE2 Packet2d 판 식(`quatd_mul`). 원본 버릇: BoW 단계 `pMostBoWMatchesKF` 는 늘 후보 자신, `DetectCommonRegionsFromLastKF` 가 `vpMapPoints` 를 덮어씀, FindMatchesByProjection 의 2 단계 이웃은 걸러지지 않고 통째로 붙음, DetectAndReffine 은 OptimizeSim3 결과를 버림(모두 `detect.rs` 머리말).
 - 강의실 실행에서 원본이 두 번 멈춤(`Loop detected` 뒤 `Local Mapping STOP` 다음 진행 없음, 25 분)과 한 번 `std::system_error: Invalid argument` 로 죽음. 덤프 쪽 멈춤 요청 · 풀기(Release 하나가 다른 요청자의 멈춤까지 지움)가 원본의 그 위험을 더 드러냈을 수 있음 — 포팅판은 `orb3sys::threads` 의 StopToken.
 
+### CorrectLoop — `orb3loop/correct.rs`(+ `graph.rs` UpdateNormalAndDepth)
+- 옮긴 것: 지도 스레드가 멈춘 뒤 몸통 전부(현재 키프레임 UpdateConnections → 공시 키프레임 Sim3 보정 · SetPose → 지도 점 옮김(mnCorrectedByKF 첫 키프레임만) · UpdateNormalAndDepth · UpdateConnections → 루프 짝 점 Replace/AddMapPoint → SearchAndFuse(Fuse Sim3 th 4 · Replace) → LoopConnections → OptimizeEssentialGraph(트레잇, BA 몫) → 양쪽 루프 가장자리 · mbNotErase → GBA 띄울지). 공시성은 `orb3rs::mapdata`(통합판)의 kf_update_connections 를 씀. 멈춤 · 대기열 · GBA 멈춤은 부르는 쪽(`orb3sys::threads`).
+- 대조(`slam/tests/orb3loop_correct.rs`): 원본은 **번호 순 비교자 기준 빌드 `~/opt/orb3_refid`**(기준 빌드 + `opt/pose-parb` 패치 중 OrderById.h/.cc · CMake -include · KeyFrame 정렬 동률 번호 순만, `slam/tools/orb3_loop_dump/mk_refid.sh`). 주소 순 std::map<KeyFrame*> 순회(CorrectedSim3 로 점 보정 순서 · UpdateConnections 동률)가 실행마다 달라 주소 순 원본과는 비트 비교가 안 됨. `correct_dump` 가 CorrectLoop 앞부분(멈춤 요청 · EmptyQueue · GBA 멈춤 · 멈출 때까지)을 먼저 하고 지도 통째(지도 키프레임 + 지도 점이 가리키는 키프레임 전부, 지도 점 전부)를 덤프, OptimizeEssentialGraph 앞 · 뒤, 끝(마지막 LocalMapping::Release 직전 — 그 뒤엔 지도 스레드 · GBA 가 바로 돎)을 덤프. Essential 은 원본 결과(자세 · 점 위치 · 법선 · 거리)를 넣음.
+  - TUM fr1_room(`0-1362,0-700`) 루프 1 번(KF 215↔7, 지도 KF 216) + 강의실 ds_1118(`0-2400`) 1 번(KF 374↔325, 285): **2 / 2 같음** — Essential 앞(자세 · 점 위치 · 법선 · 거리 · 기술자 · 관측 · 키프레임 짝 · 연결 무게 · 순서 · NonCorrected/Corrected Sim3 · LoopConnections)과 끝 지도 전부 비트 동일.
+  - 빼고 본 칸: 지도 점 mnVisible · mnFound — 원본 실행에서 추적 스레드가 CorrectLoop 중에도 늘림(앞 2,361 · 950 개 점이 다름). Replace 의 합산은 그래서 이 대조로는 확인 안 됨.
+- 맞추며 알게 된 원본 동작: NonCorrectedSim3 는 `unit_quaternion().cast<double>()`(정규화 없음), Sic 는 `SE3f.cast<double>()`(double 재정규화). 보정 자세는 `SE3d(q, t/s).cast<float>()` = double 정규화 뒤 float 로 내려 다시 정규화(`G2oSim3::to_se3f`). UpdateNormalAndDepth 는 기준 키프레임이 관측에 없으면 0 번 점의 층을 씀.
+- 하네스 원본: `slam/tools/orb3_loop_dump/`(reloc_dump · loop_dump · correct_dump · mlp_srv(MLPnP · OptimizeSim3 FFI) · build_ref(id).sh · mk_refid.sh), 덤프 `~/orbloop_reloc/`.
+
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
-- `LoopClosing`(CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
+- `LoopClosing::MergeLocal`, `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
 - KeyFrameDatabase 대조는 실제 BoW + 만든 공시성 시나리오. 실제 실행 중 질의를 가로챈 대조는 안 함.
 - 강의실 녹화(ds_1118)는 BoW 단계만; Sim3 · 고유 풀이 대조는 TUM fr1_room 실행 하나.
 

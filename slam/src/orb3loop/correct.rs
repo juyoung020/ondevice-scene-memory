@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::detect::G2oSim3;
-use super::graph::{add_loop_edge, connected_set, update_connections, update_normal_and_depth};
+use super::graph::{connected_set, update_normal_and_depth};
+use crate::orb3rs::mapdata::kf_update_connections;
+use crate::orb3rs::Atlas;
 use crate::orb3rs::matcher::Matcher;
 
 /// MapPoint::Replace(공통 `mapdata` 몸통, 지도에서 빼기는 원본도 여기선 지도 집합이 없음)
@@ -70,63 +72,56 @@ pub struct LoopOut {
 }
 
 /// CorrectLoop 몸통(지도 스레드가 멈춘 뒤). `corrected_by` 는 지도 점 mnCorrectedByKF · mnCorrectedReference(계속 들고 다님)
-pub fn correct_loop<E: EssentialGraph>(
-    inp: &LoopIn,
-    kfs: &mut BTreeMap<KfId, KeyFrame>,
-    mps: &mut BTreeMap<MpId, MapPoint>,
-    corrected_by: &mut BTreeMap<MpId, (KfId, KfId)>,
-    ess: &mut E,
-) -> LoopOut {
+pub fn correct_loop<E: EssentialGraph>(inp: &LoopIn, a: &mut Atlas, corrected_by: &mut BTreeMap<MpId, (KfId, KfId)>, ess: &mut E) -> LoopOut {
     let cur = inp.cur;
-    update_connections(cur, kfs, mps, false);
-    let mut conn_kfs: Vec<KfId> = kfs[&cur].ordered_conn.iter().map(|c| c.0).collect();
+    kf_update_connections(a, cur, false);
+    let mut conn_kfs: Vec<KfId> = a.kfs[&cur].ordered_conn.iter().map(|c| c.0).collect();
     conn_kfs.push(cur);
     let mut corrected = BTreeMap::new();
     let mut non = BTreeMap::new();
     corrected.insert(cur, inp.scw);
-    let twc = kfs[&cur].twc;
-    let tcw = kfs[&cur].tcw;
+    let twc = a.kfs[&cur].twc;
+    let tcw = a.kfs[&cur].tcw;
     non.insert(cur, G2oSim3::from_se3_raw(&tcw));
-    kfs.get_mut(&cur).unwrap().set_pose(inp.scw.to_se3f());
+    a.kfs.get_mut(&cur).unwrap().set_pose(inp.scw.to_se3f());
     for &k in &conn_kfs {
         if k == cur {
             continue;
         }
-        let tiw = kfs[&k].tcw;
+        let tiw = a.kfs[&k].tcw;
         let tic = tiw.mul(&twc);
         let csiw = G2oSim3::from_se3(&tic).mul(&inp.scw);
         corrected.insert(k, csiw);
-        kfs.get_mut(&k).unwrap().set_pose(csiw.to_se3f());
+        a.kfs.get_mut(&k).unwrap().set_pose(csiw.to_se3f());
         non.insert(k, G2oSim3::from_se3_raw(&tiw));
     }
     for (&k, csiw) in &corrected {
         let cswi = csiw.inverse();
         let siw = non[&k];
-        let pts: Vec<Option<MpId>> = kfs[&k].map_points.clone();
+        let pts: Vec<Option<MpId>> = a.kfs[&k].map_points.clone();
         for m in pts.into_iter().flatten() {
-            if mps[&m].bad || corrected_by.get(&m).is_some_and(|c| c.0 == cur) {
+            if a.mps[&m].bad || corrected_by.get(&m).is_some_and(|c| c.0 == cur) {
                 continue;
             }
-            let p = mps[&m].pos.map(f64::from);
+            let p = a.mps[&m].pos.map(f64::from);
             let c = cswi.map(&siw.map(&p));
-            let mp = mps.get_mut(&m).unwrap();
+            let mp = a.mps.get_mut(&m).unwrap();
             mp.pos = c.map(|v| v as f32);
             corrected_by.insert(m, (cur, k));
-            update_normal_and_depth(mp, kfs);
+            update_normal_and_depth(mp, &a.kfs);
         }
         // bImuInit 이면 속도 보정(RGB-D 는 없음)
-        update_connections(k, kfs, mps, false);
+        kf_update_connections(a, k, false);
     }
     for (i, lm) in inp.loop_matched.iter().enumerate() {
         let Some(lm) = *lm else { continue };
-        match kfs[&cur].map_points[i] {
-            Some(c) => replace_map_point(c, lm, kfs, mps),
+        match a.kfs[&cur].map_points[i] {
+            Some(c) => replace_map_point(c, lm, &mut a.kfs, &mut a.mps),
             None => {
-                kfs.get_mut(&cur).unwrap().map_points[i] = Some(lm);
-                let kf = &kfs[&cur];
-                let p = mps.get_mut(&lm).unwrap();
-                p.add_observation(kf, i);
-                p.compute_distinctive_descriptors(kfs);
+                a.kfs.get_mut(&cur).unwrap().map_points[i] = Some(lm);
+                let p = a.mps.get_mut(&lm).unwrap();
+                p.add_observation(&a.kfs[&cur], i);
+                p.compute_distinctive_descriptors(&a.kfs);
             }
         }
     }
@@ -136,18 +131,18 @@ pub fn correct_loop<E: EssentialGraph>(
     for (&k, siw) in &corrected {
         let scw = siw.to_sophus();
         let mut rep = vec![None; lmps.len()];
-        matcher.fuse_sim3(k, kfs, &scw, &lmps, mps, 4.0, &mut rep);
+        matcher.fuse_sim3(k, &mut a.kfs, &scw, &lmps, &mut a.mps, 4.0, &mut rep);
         for (i, r) in rep.iter().enumerate() {
             if let Some(r) = *r {
-                replace_map_point(r, lmps[i], kfs, mps);
+                replace_map_point(r, lmps[i], &mut a.kfs, &mut a.mps);
             }
         }
     }
     let mut loop_conn: BTreeMap<KfId, BTreeSet<KfId>> = BTreeMap::new();
     for &k in &conn_kfs {
-        let prev: Vec<KfId> = kfs[&k].ordered_conn.iter().map(|c| c.0).collect();
-        update_connections(k, kfs, mps, false);
-        let mut s = connected_set(&kfs[&k]);
+        let prev: Vec<KfId> = a.kfs[&k].ordered_conn.iter().map(|c| c.0).collect();
+        kf_update_connections(a, k, false);
+        let mut s = connected_set(&a.kfs[&k]);
         for p in &prev {
             s.remove(p);
         }
@@ -156,8 +151,8 @@ pub fn correct_loop<E: EssentialGraph>(
         }
         loop_conn.insert(k, s);
     }
-    ess.optimize(kfs, mps, corrected_by, inp.matched, cur, &non, &corrected, &loop_conn, inp.fix_scale);
-    add_loop_edge(inp.matched, cur, kfs);
-    add_loop_edge(cur, inp.matched, kfs);
+    ess.optimize(&mut a.kfs, &mut a.mps, corrected_by, inp.matched, cur, &non, &corrected, &loop_conn, inp.fix_scale);
+    a.kfs.get_mut(&inp.matched).unwrap().add_loop_edge(cur);
+    a.kfs.get_mut(&cur).unwrap().add_loop_edge(inp.matched);
     LoopOut { corrected, non_corrected: non, loop_conn, run_gba: !inp.imu_init, not_erase: [inp.matched, cur] }
 }

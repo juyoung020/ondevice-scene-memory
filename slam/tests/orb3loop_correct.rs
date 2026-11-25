@@ -208,9 +208,17 @@ fn diff(kfs: &BTreeMap<KfId, KeyFrame>, mps: &BTreeMap<MpId, MapPoint>, d: &DMap
         add("점 기술자", p.desc != o.desc);
         add("점 관측", p.obs != o.obs);
         add("점 나쁨 · 바뀜", p.bad != o.bad || p.replaced != o.replaced);
-        add("점 nObs · 보임 · 찾음", p.n_obs != o.n_obs || p.visible != o.visible || p.found != o.found);
+        add("점 nObs", p.n_obs != o.n_obs);
+        // mnVisible · mnFound 는 추적 스레드가 CorrectLoop 중에도 늘림(원본도 같이 돎) — 따로 셈
+        add("점 보임 · 찾음(추적 스레드)", p.visible != o.visible || p.found != o.found);
     }
     c
+}
+
+/// 추적 스레드가 같이 바꾸는 칸(mnVisible · mnFound)은 판정에서 뺌(원본 실행 중 추적이 멈추지 않음)
+fn strip(mut d: BTreeMap<&'static str, usize>) -> BTreeMap<&'static str, usize> {
+    d.remove("점 보임 · 찾음(추적 스레드)");
+    d
 }
 
 struct Replay {
@@ -247,6 +255,7 @@ impl EssentialGraph for Replay {
             self.why.push("LoopConnections".into());
         }
         let d = diff(kfs, mps, &dm);
+        let d = strip(d);
         if !d.is_empty() {
             self.why.push(format!("Essential 앞 지도 {d:?}"));
         }
@@ -304,10 +313,15 @@ fn correct_loop_matches_original() {
             let gba = r.u8() != 0;
             let me = read_map(&mut r);
 
-            let DMap { mut kfs, mut mps, mut corrected_by, .. } = m0;
+            let DMap { mut kfs, mps, mut corrected_by, .. } = m0;
+            for k in kfs.values_mut() {
+                k.first_conn_done = true;
+            }
+            let mut atlas = Atlas { kfs, mps, ..Default::default() };
             let mut rep = Replay { before: Some((el, ec, ef, non, cor, lc, mb)), after: Some(ma), why: Vec::new() };
             let inp = LoopIn { cur, matched, scw, loop_mps: &loop_mps, loop_matched: &loop_matched, fix_scale: fix, imu_init: false };
-            let out = correct_loop(&inp, &mut kfs, &mut mps, &mut corrected_by, &mut rep);
+            let out = correct_loop(&inp, &mut atlas, &mut corrected_by, &mut rep);
+            let (kfs, mps) = (&atlas.kfs, &atlas.mps);
             let mut why = rep.why;
             if rep.before.is_some() {
                 why.push("Essential 안 불림".into());
@@ -315,7 +329,7 @@ fn correct_loop_matches_original() {
             if out.run_gba != gba {
                 why.push("GBA".into());
             }
-            let d = diff(&kfs, &mps, &me);
+            let d = strip(diff(kfs, mps, &me));
             if !d.is_empty() {
                 why.push(format!("끝 지도 {d:?}"));
             }

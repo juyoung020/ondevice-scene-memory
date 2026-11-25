@@ -6,7 +6,7 @@
 use super::atlas_io;
 use super::img::{self, ColorOrder};
 use super::settings::{OrbSettings, TrackingParams};
-use crate::orb3rs::types::{Atlas, FrameCtx, Map, Pyramid};
+use crate::orb3rs::types::{Atlas, FrameCtx, Map, Pyramid, Se3};
 use std::sync::Arc;
 
 pub struct SystemInit {
@@ -87,6 +87,53 @@ impl SystemInit {
     }
 }
 
+/// put34: SE3f.matrix3x4() 행 우선 f64
+fn put34(t: &Se3) -> [f64; 12] {
+    let r = t.rot();
+    let mut o = [0.0; 12];
+    for i in 0..3 {
+        for j in 0..3 {
+            o[i * 4 + j] = r[i][j] as f64;
+        }
+        o[i * 4 + 3] = t.t[i] as f64;
+    }
+    o
+}
+
+/// `Orb3System::keyframes` 의 Rust 판(orb3.cc orb3_keyframes): 지도 id 순 · 키프레임 id 순, 나쁜 것 빼고 (id, 지도, 카메라 → 세계)
+pub fn keyframes(a: &Atlas, all: bool) -> Vec<(u64, u64, [f64; 12])> {
+    let mut maps: Vec<&crate::orb3rs::types::Map> = if all { a.maps.iter().collect() } else { a.maps.get(a.current).into_iter().collect() };
+    maps.sort_by_key(|m| m.id);
+    let mut out = Vec::new();
+    for m in maps {
+        let mut ids = m.kfs.clone();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            if let Some(k) = a.kfs.get(&id).filter(|k| !k.bad) {
+                out.push((id, m.id, put34(&k.tcw.inverse())));
+            }
+        }
+    }
+    out
+}
+
+/// `Orb3System::kf_now` 의 Rust 판(orb3_kf_now): 나쁜 키프레임은 mTcp 를 곱하며 부모로 올라가 지금 위치
+pub fn kf_now(a: &Atlas, id: u64) -> Option<(u64, [f64; 12])> {
+    let mut k = a.kfs.get(&id)?;
+    let mut trw = Se3::default();
+    let mut hops = 0;
+    while k.bad {
+        trw = trw.mul(&k.tcp);
+        k = a.kfs.get(&k.parent?)?;
+        hops += 1;
+        if hops > a.kfs.len() {
+            return None; // 부모 고리(원본은 끝없이 돎)
+        }
+    }
+    Some((k.map, put34(&trw.mul(&k.tcw).inverse())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +168,22 @@ ORBextractor.nFeatures: 1000\nORBextractor.scaleFactor: 1.2\nORBextractor.nLevel
         assert_eq!(s2.atlas.maps.len(), 2);
         assert!(Arc::ptr_eq(&s2.atlas.kfs[&0].ctx, &s2.ctx));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kf_now_follows_parent() {
+        use crate::orb3rs::types::KeyFrame;
+        let mut a = Atlas::default();
+        let mut k0 = KeyFrame { id: 0, map: 0, ..Default::default() };
+        k0.set_pose(Se3 { q: [0.0, 0.0, 0.0, 1.0], t: [1.0, 2.0, 3.0] });
+        let mut k1 = KeyFrame { id: 1, map: 0, bad: true, parent: Some(0), ..Default::default() };
+        k1.tcp = Se3 { q: [0.0, 0.0, 0.0, 1.0], t: [0.5, 0.0, 0.0] };
+        a.kfs.insert(0, k0);
+        a.kfs.insert(1, k1);
+        a.maps.push(Map { id: 0, kfs: vec![1, 0], ..Default::default() });
+        assert_eq!(keyframes(&a, true).len(), 1);
+        let (m, t) = kf_now(&a, 1).unwrap();
+        assert_eq!(m, 0);
+        assert_eq!([t[3], t[7], t[11]], [-1.5, -2.0, -3.0]);
     }
 }

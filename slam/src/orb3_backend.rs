@@ -132,6 +132,7 @@ pub struct Orb3 {
     /// 빈틈 뒤 새 지도: (새 지도, 앞 지도, 앞 지도 ← 새 지도(카메라가 빈틈 동안 거의 안 움직였다고 봄), 시도 수), 앞 장면의 지도 · 위치
     gap_hyp: Option<(u64, u64, T34, u32)>,
     last_pose: Option<(u64, T34)>,
+    last_ok_t: f64,
     deps: Vec<(f64, u64, T34, Vec<u16>)>,
     /// IMU 기록(카메라 시각, 카메라 축 가속도, 자이로 크기): 끝난 지도 기울기 바로잡기
     imu_hist: Vec<(f64, [f64; 3], f64)>,
@@ -231,6 +232,7 @@ impl Orb3 {
             hits_all: Vec::new(),
             gap_hyp: None,
             last_pose: None,
+            last_ok_t: f64::MIN,
             deps: Vec::new(),
             imu_hist: Vec::new(),
             dk: None,
@@ -452,7 +454,7 @@ impl Orb3 {
         let chk = crate::mapmerge::check(&ff, &fi, &start, &k);
         let Some((s_ok, r, n_ag)) = chk else { return false };
         common::info!("지도 잇기 검사: 지도 {from}(깊이 {} 장) → 지도 {into}(깊이 {} 장) 맞음 비율 {r:.3} · 맞음 {n_ag}, {:.1} 초", ff.len(), fi.len(), t0.elapsed().as_secs_f64());
-        if r < 0.62 || n_ag < 300 || ff.len() < 6 {
+        if r < 0.62 || n_ag < 300 || ff.len() < 6 || fi.len() < 6 {
             return false;
         }
         let ok = self.sys.graft(from, into, &s_ok);
@@ -525,12 +527,14 @@ impl Orb3 {
         // 빈틈 뒤 새 지도는 앞 지도의 마지막 위치에서 이어진다고 보고 바로 옮겨 붙이기를 시도(새 지도 깊이 6 장부터 1 초마다, 최대 8 번)
         if ok {
             match self.last_pose {
-                Some((m, p)) if m != tr.map_id && self.gap_hyp.is_none_or(|g| g.0 != tr.map_id) => {
+                // 빈틈이 짧을 때(1.5 초 이하)만: 5 초 넘는 빈틈은 카메라가 다른 곳으로 가 있어 반복되는 책상 줄의 엉뚱한 자리에 붙음(37 차 950 빈틈)
+                Some((m, p)) if m != tr.map_id && self.gap_hyp.is_none_or(|g| g.0 != tr.map_id) && f.t - self.last_ok_t <= 1.5 => {
                     self.gap_hyp = Some((tr.map_id, m, mul(&p, &inv(&tr.twc)), 0));
                 }
                 _ => {}
             }
             self.last_pose = Some((tr.map_id, tr.twc));
+            self.last_ok_t = f.t;
         }
         if let Some((gn, go, gs, tries)) = self.gap_hyp
             && ok

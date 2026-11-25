@@ -14,7 +14,8 @@
 | 커널 없는 간선 경로(전역 BA: bRobust=false) — Hpl 이 Bᵀ·(AᵀΩ)ᵀ 순서 | `orb3ba::edges` | 강의실 9 호출을 커널 빼고 원본 g2o 로 다시 푼 결과(`NOROBUST=1 replay`)와 전부 같음 |
 | g2o::Sim3 exp · log(PartialPivLU 3×3 풀이 포함) · 곱 · 역 · map | `orb3ba::sim3` | 무작위 4 만 건(회전 · 척도 0 · 아주 작게 · 작게 · 크게) 전부 같음 — CV 포터가 가져다 쓸 것 |
 | LocalBundleAdjustment 그래프 만들기 · 이상치 정리 · 되써 넣기 | 남음(공통 자료 구조 `orb3rs::types` 받은 뒤) | |
-| GlobalBundleAdjustemnt · 합치기용 LBA(MergeLocal) 의 g2o 부분 | 같은 `optimize` 로 풀림(같은 간선 · 블록 솔버). 실제 덤프 비교 진행 중 | |
+| GlobalBundleAdjustemnt(루프 뒤 전역 BA, 커널 없음) 의 g2o 부분 | 같은 `optimize` | **비트 동일**: TUM room 전체(루프 검출 뒤) 실제 GBA 1 호출 — 정점 19,860 · 간선 93,821 · 반복 9, 끝 값 · χ² 전부 같음 |
+| 합치기용 LBA(MergeLocal: 5 번 Huber → 이상치 level 1 · 커널 뺌 → 10 번) 의 g2o 부분 | 같은 `optimize`(두 번째는 level 0 간선만 넣고 delta=None) | 덤프 장치는 있음(마술 수 0x4142474d), 지도 합치기가 일어난 녹화가 아직 없어 미비교 |
 | OptimizeEssentialGraph · OptimizeSim3 | **CV 포터(`opt/orb3-rs-cv`) 몫** | |
 
 ### 쓰는 법
@@ -36,7 +37,7 @@
 ### 하네스(저장소 밖, WSL `~/opt/orb3_ba_bg`)
 
 - `build.sh`: 기준 빌드(`~/opt/orb3_ref/ORB_SLAM3`)에 링크, `mkpatch.py` 가 원본 Optimizer.cc 의 LBA 에 덤프를 끼운 `libbadump.so`(먼저 링크해 원본 함수를 가림) · `ds_run`(녹화 rgb.txt · depth.txt 로 원본 RGB-D, 매 장면 지도 스레드 기다림, imu 있으면 위쪽 벡터) · `replay`(덤프를 원본 g2o 로 다시 풀기 · 한 호출의 첫 반복 단계 덤프).
-- 덤프: `ORB3_BA_DUMP=파일 ORB3_BA_MAX=개수 ./ds_run 단어장 설정 녹화폴더 장수 [imu.csv]`. 지금 쓰는 것: `~/orbba_ref/ds_lba.bin`(강의실 700 장, 4.6 MB), `tum_desk2.bin` · `tum_room.bin`(`tum.sh`, 앞 250 장).
+- 덤프(`mkpatch2.py`: LBA 0x4142414c · 전역 BA 0x41424247 · 합치기 LBA 0x4142474d, `ORB3_BA_ONLY=16진 마술 수` 로 한 종류만, 간선은 level 0 만): `ORB3_BA_DUMP=파일 ORB3_BA_MAX=개수 ./ds_run 단어장 설정 녹화폴더 장수 [imu.csv]`. 지금 쓰는 것: `~/orbba_ref/ds_lba.bin`(강의실 700 장, 4.6 MB), `tum_desk2.bin` · `tum_room.bin`(`tum.sh`, 앞 250 장), `room_gba.bin`(room 전체, 전역 BA 만, 16 MB). 큰 덤프 읽을 땐 `ulimit -c 0`.
 - 시험(`t.sh 이름 [호출]`, 입력 없으면 실패): `full_calls`(ORB3BA_DUMP 의 모든 호출을 끝까지), `stage_first_iteration` · `stage_solve`(ORB3BA_STAGE = `replay 덤프 단계파일 호출` 출력, `st.sh 호출` 이 둘 다), `se3_exp_oplus`(ORB3BA_SE3 = `se3/se3ref` 출력).
 - 원본 replay 자체가 현장 덤프와 χ² 1 개씩 다른 호출이 2 개 있음(정점은 같음) — Rust 는 현장 값과 같다.
 

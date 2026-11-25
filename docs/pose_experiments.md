@@ -241,4 +241,7 @@
 
 - 원인(대표 사진을 눈으로 대조, parc_out3 84 개 중 맞음 45 · 틀림 39, 약 54 %): 틀린 이름 대부분이 ① 길쭉한 상자 사진을 SigLIP2 가 256×256 으로 늘여 찌그러진 조각(의자 다리 → ladder · screwdriver, 의자 등받이 → sofa · stool) ② 낱말 표에 없는 물체(게시판 → monitor, 정수기 → cardboard, 본체 → drawer, 사람 다리 → floor/shoe) ③ 몇 번 못 본 번진 조각.
 - 바꾼 것(기본값): 물체 사진을 상자 둘레로 넓혀(CROP_PAD 0.15) **정사각형**으로 자름(찌그러짐 없앰), 가장 큰 사진 외에 VIEW_EVERY(20) 관측마다 다른 시점 사진도 평균에 더함, 1 · 2 등이 붙은 물체는 이름 안 붙임, 일반 실내 낱말 15 개 추가(person · water dispenser · computer tower · power strip · electrical outlet · sign 등).
-- 정사각형 자르기 판의 시험은 아직: WSL 파일 시스템이 읽기 전용(C: 꽉 참)이 되어 빌드가 막힘.
+- 결과(parc_out7, 대표 사진 82 장을 눈으로 대조): 이름 붙은 61 개 중 맞음 42(69 %, 전 54 %), 틀린 이름 39 → 19, 이름 없음(object) 21.
+  ladder · hat(진짜 안전모 제외) · jacket · sofa · hammer · robot · shoe 는 사라짐. 남은 틀림: 의자 조각 → stool(2), 정수기 → computer tower,
+  바닥 콘센트 → router, 번진 조각 → paper towel · tape · glass · refrigerator · speaker, 문 → locker. 관측 수로는 맞고 틀림이 갈리지 않음(틀림 11/19 이 9 번 이하, 맞음도 비슷).
+- 목표(80 %) 미달. 공개 TUM 녹화 비교는 아직.

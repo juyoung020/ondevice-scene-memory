@@ -363,3 +363,17 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - 낮은 층: `solver::Sys`(오차 · 선형화 · `build_system`), `Sys::schur_pattern` · `Sys::solve(&mut Schur, λ)`(슈어 + LDLT, 6 차 자세 · 3 차 점), `ldlt::Ldlt::{analyze, factorize, solve}`(차수 무관, 위 삼각 CCS 입력) — 7 차(Sim3) 블록 솔버는 이 LDLT 를 그대로 쓰면 된다.
 - `orb3ba::sim3::Sim3 { q, t, s }`: `exp` · `log` · `mul` · `inverse` · `map`. VertexSim3Expmap::oplus 는 `_fix_scale` 이면 **풀이 벡터 x 의 7 번째 칸을 제자리에서 0 으로 바꾼다**(그 뒤 computeScale 이 바뀐 x 를 씀).
 - 원본 χ² 비교 때 비활성 간선(정점 모두 고정)의 값은 초기화 안 된 메모리라 비교에서 뺀다.
+
+#### 전역 BA 전체(`orb3ba::gba`, 11-25)
+
+- `global_bundle_adjustment(atlas, ext, map, n_iter, stop, loop_kf, robust) -> GbaOut` (= GlobalBundleAdjustemnt → BundleAdjustment, RGB-D). 키프레임 · 점은 번호 순(원본 std::set 자리), 관측은 `ObsOrder`(기본 번호 순).
+  - 정점: 나쁘지 않은 키프레임(첫 키프레임만 고정), 점 id = 점 번호 + 최대 키프레임 번호 + 1, 관측이 하나도 안 걸린 점은 뺌. 왼쪽 칸 -1 관측은 간선 없이 nEdges 만 셈. Huber δ = √5.99 · √7.815(float), robust 거짓이면 커널 없음.
+  - 되써 넣기: loop_kf 가 지도 원점 키프레임이면 바로(자세 · 점 · UpdateNormalAndDepth), 아니면 `GbaOut { kf_gba: mTcwGBA, mp_gba: mPosGBA }` 를 돌려줌(mnBAGlobalForKF = loop_kf, 옮기기는 루프 쪽). mTcwGBA = SE3d(q,t).cast<float>(): double 정규화 → float → 다시 정규화. 원본의 dist > 1 갈래는 세기만 해서 뺌.
+- **비트 동일**: TUM room 전체, 루프 뒤 실제 전역 BA 1 호출(키프레임 279 · 점 19,155 · 간선 90,457 · 반복 8) — 그래프(정점 · 간선 순서 · 값) · 반복 수 · 모든 키프레임 mTcwGBA · 모든 점 mPosGBA 같음. 바로 쓰기 갈래(loop_kf = 원점)는 실제 입력이 없어 미비교(지역 BA 와 같은 SetPose · UpdateNormalAndDepth 를 씀).
+- 하네스 `~/opt/orb3_gba`(`gpatch.py` · `gbaw.h` · `build.sh`): 원본 BundleAdjustment 에 지도 상태 앞 · 뒤 덤프. **원본은 전역 BA 그래프를 만드는 동안 지도 스레드가 관측을 계속 바꾼다**(원본 자체 경합) → 하네스는 함수 동안 mMutexMapUpdate 를 쥐어 추적을 막고, 그래프가 실제로 읽은 점 위치 · 관측을 점마다 따로 기록(`used`)해 그것을 입력으로 씀. 실행: `ORB3_BA_ONLY=41424247 ORB3_BA_DUMP=~/orbba_ref/room_gba2.bin ORB3_GBA_WORLD=~/orbba_ref/room_gba2_w.bin ORB3_BA_MAX=4 ./ds_run 단어장 TUM1.yaml room 2000`, 시험 `ORB3GBA=~/orbba_ref/room_gba2 cargo test --release -p slam --lib orb3ba::gba_tests`.
+
+#### CV 포터가 쓸 것(Sim3 · 7 차 블록)
+
+- `orb3ba::sim3::Sim3 { q, t, s }` — `exp(&[f64;7])` · `log()` · `mul` · `inverse` · `map`(기준 빌드와 무작위 4 만 건 비트 동일).
+- `orb3ba::ldlt::Ldlt` — `analyze(n, ap, ai)`(위 삼각 CCS 패턴, 첫 풀이 때 한 번: AMD 순서 · 소거 나무) → `factorize(&values) -> bool`(대각 0 이면 false) → `solve(&b)`. 차수 무관, 7 차 블록도 fillCCS 순서(블록 열 · 블록 안 열 · 블록 행 · 블록 안 행, 대각 블록은 위 삼각만)로 넣으면 됨.
+- Levenberg 틀: `solver::optimize_stop` 의 반복부 — λ 초기값(user 값 또는 1e-5 · 최대 |대각|), 시도마다 push → setLambda → solve → update → restoreDiagonal → 오차 → ρ = (χ²₀ − χ²)/(Σ x(λx + b) + 1e-3), 좋으면 λ *= max(1/3, min(2/3, 1 − (2ρ − 1)³)) · ni = 2, 나쁘면 λ *= ni · ni *= 2 · pop, 시도 10 번, (ini − cur)·1e3 < ini 가 3 번 연속이면 멈춤. 7 차 판은 이 순서를 그대로 쓰고 블록 솔버만 바꿈(지금 코드는 6 · 3 고정 — 일반화가 필요하면 BA 에 요청).

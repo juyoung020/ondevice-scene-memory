@@ -18,6 +18,13 @@ pub mod backend;
 pub mod orb3;
 pub mod orb3rs;
 pub mod orb3_backend;
+// ORB-SLAM3 System 흐름(백엔드가 보는 자리 · 스레드 신호)
+pub mod orb3sys;
+// ORB-SLAM3 장소 인식 · 루프 · 합치기 Rust 포팅(포터 LOOP)
+pub mod orb3loop;
+pub mod orb3cv;
+// ORB-SLAM3 지역 · 전역 번들 조정 · 그래프 최적화(g2o 경로)를 비트 동일로 옮긴 것
+pub mod orb3ba;
 pub mod stitch;
 pub mod mapmerge;
 pub mod refine;

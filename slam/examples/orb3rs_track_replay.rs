@@ -90,7 +90,7 @@ fn kf_entry(a: &mut Atlas, id: KfId) -> &mut KeyFrame {
     a.kfs.entry(id).or_insert_with(|| KeyFrame { id, ..Default::default() })
 }
 
-fn nnkf(r: &mut R, t: &mut Tally) {
+fn nnkf(r: &mut R, t: &mut Tally, t_racy: &mut Tally) {
     let id = r.u64();
     let mut tr = Tracker { sensor: r.i32(), state: r.i32(), only_tracking: r.b(), ..Default::default() };
     let mut lm = Lm { stopped: r.b(), stop_req: r.b(), accept: false, init: false, queue: 0 };
@@ -120,6 +120,7 @@ fn nnkf(r: &mut R, t: &mut Tally) {
     let lts = r.f64();
     let has_last = r.b();
     let want = r.b();
+    let racy = r.b();
     let ctx = NeedKfCtx {
         n_kfs,
         ref_tracked: Box::new(move |min_obs| refs.iter().filter(|(bad, o)| !bad && *o >= min_obs).count() as i32),
@@ -127,7 +128,12 @@ fn nnkf(r: &mut R, t: &mut Tally) {
         last_kf_ts: if has_last { Some(lts) } else { None },
     };
     let got = need_new_keyframe(&tr, &f, &lm, &ctx);
-    t.add(got == want, || format!("장면 {id}: 원본 {want} rust {got}"));
+    if racy {
+        // 원본이 부르는 도중 다른 스레드가 입력을 바꿈: 덤프 값으로는 원본 판단을 다시 만들 수 없어 따로 셈
+        t_racy.add(got == want, || format!("장면 {id}: 원본 {want} rust {got}"));
+    } else {
+        t.add(got == want, || format!("장면 {id}: 원본 {want} rust {got}"));
+    }
 }
 
 fn read_kf(r: &mut R, a: &mut Atlas, ext: &mut TrackExt, addr: &mut HashMap<KfId, u64>) {
@@ -497,8 +503,9 @@ impl TrackOps for Script {
     fn need_new_keyframe(&mut self) -> bool {
         self.next(8, None) != 0
     }
-    fn create_new_keyframe(&mut self) {
+    fn create_new_keyframe(&mut self) -> KfId {
         self.next(9, None);
+        0
     }
     fn try_graft(&mut self) {
         // 붙이기 시도 속 재위치들(TryGraft 는 PLT 를 안 거쳐 사건이 안 묶임): 끝까지 남은 재위치 · 지도 바꾸기를 먹음
@@ -574,12 +581,165 @@ fn trak(r: &mut R, t: &mut Tally, states: &mut BTreeMap<i32, u64>) {
     });
 }
 
+
+static POSE_DIFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn read_kfdata(r: &mut R, keys_same: &mut u64) -> KeyFrame {
+    let id = r.u64();
+    let q = [r.f32(), r.f32(), r.f32(), r.f32()];
+    let t = [r.f32(), r.f32(), r.f32()];
+    // 원본 KeyFrame 이 들고 있는 mRwc · mTwc.translation()(SetPose 때 계산) — Rust kf_pose 와 비트 비교
+    let mut rwc0 = [[0f32; 3]; 3];
+    for row in rwc0.iter_mut() {
+        for v in row.iter_mut() {
+            *v = r.f32();
+        }
+    }
+    let ow0 = [r.f32(), r.f32(), r.f32()];
+    let kp = kf_pose(&Se3 { q, t });
+    if kp.rwc_stored != rwc0 || kp.ow != ow0 {
+        POSE_DIFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let _nleft = r.i32();
+    let _cam2 = r.b();
+    let n = r.u32() as usize;
+    let mut k = KeyFrame { id, tcw: Se3 { q, t }, ..Default::default() };
+    for _ in 0..n {
+        let x = r.f32();
+        let y = r.f32();
+        let octave = r.i32();
+        let (kx, ky) = (r.f32(), r.f32());
+        if kx.to_bits() != x.to_bits() || ky.to_bits() != y.to_bits() {
+            *keys_same += 1;
+        }
+        k.keys.push(KeyPoint { x, y, octave, ..Default::default() });
+        k.keys_raw.push([kx, ky]);
+        k.u_right.push(r.f32());
+        k.depth.push(r.f32());
+    }
+    k
+}
+
+fn cnmp(r: &mut R, t: &mut Tally, stats: &mut [u64; 3]) {
+    let mono = r.b();
+    let inertial = r.b();
+    let far = r.b();
+    let th_far = r.f32();
+    let (fx, fy, cx, cy, invfx, invfy, mb, mbf, sf) = (r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32());
+    let par = [r.f32(), r.f32(), r.f32(), r.f32()];
+    assert!(par == [fx, fy, cx, cy]);
+    let nl = r.u32();
+    let mut scale = Vec::new();
+    let mut sigma2 = Vec::new();
+    for _ in 0..nl {
+        scale.push(r.f32());
+        sigma2.push(r.f32());
+    }
+    let mut diff_keys = 0;
+    let cur = read_kfdata(r, &mut diff_keys);
+    let nn = r.u32();
+    let mut nb = Vec::new();
+    for _ in 0..nn {
+        let k = read_kfdata(r, &mut diff_keys);
+        let _cam = (r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32(), r.f32());
+        nb.push(k);
+    }
+    let ntri = r.u32();
+    let mut tri: Vec<(u64, Vec<(usize, usize)>)> = Vec::new();
+    for _ in 0..ntri {
+        let k = r.u64();
+        let n = r.u32();
+        tri.push((k, (0..n).map(|_| (r.u32() as usize, r.u32() as usize)).collect()));
+    }
+    let nchk = r.u32();
+    let chk: Vec<bool> = (0..nchk).map(|_| r.b()).collect();
+    let nadd = r.u32();
+    let want: Vec<NewMp> = (0..nadd)
+        .map(|_| {
+            let pos = [r.f32(), r.f32(), r.f32()];
+            let i1 = r.i32();
+            let k2 = r.u64();
+            let i2 = r.i32();
+            NewMp { kf2: k2, idx1: i1 as usize, idx2: i2 as usize, pos }
+        })
+        .collect();
+    let prm = TriParams {
+        cam: Camera { fx, fy, cx, cy, invfx, invfy, bf: mbf, b: mb, th_depth: 0.0, width: 0, height: 0 },
+        scale,
+        sigma2,
+        scale_factor: sf,
+        monocular: mono,
+        inertial,
+        far_points: far,
+        th_far_points: th_far,
+    };
+    let refs: Vec<&KeyFrame> = nb.iter().collect();
+    let mut ti = 0;
+    let mut ci = 0;
+    let mut got = Vec::new();
+    let mut order_ok = true;
+    create_new_map_points(
+        &cur,
+        &refs,
+        &prm,
+        &mut |k2| {
+            if ti >= tri.len() || tri[ti].0 != k2 {
+                order_ok = false;
+                return Vec::new();
+            }
+            ti += 1;
+            tri[ti - 1].1.clone()
+        },
+        &mut || {
+            ci += 1;
+            chk.get(ci - 1).copied().unwrap_or(false)
+        },
+        &mut |m| got.push(m),
+    );
+    stats[0] += want.len() as u64;
+    let bits = |p: &[f32; 3]| p.map(|v| v.to_bits());
+    let same_pts = got.iter().zip(&want).filter(|(g, w)| g.kf2 == w.kf2 && g.idx1 == w.idx1 && g.idx2 == w.idx2 && bits(&g.pos) == bits(&w.pos)).count();
+    stats[1] += same_pts as u64;
+    stats[2] += diff_keys;
+    let ok = order_ok && ti == tri.len() && got.len() == want.len() && same_pts == want.len();
+    t.add(ok, || {
+        let d = got.iter().zip(&want).find(|(g, w)| !(g.kf2 == w.kf2 && g.idx1 == w.idx1 && g.idx2 == w.idx2 && bits(&g.pos) == bits(&w.pos)));
+        format!("키프레임 {}: 새 점 원본 {} rust {} 같은 {same_pts} 짝 순서 {order_ok} 처음 다른 {:?}", cur.id, want.len(), got.len(), d)
+    });
+}
+
+fn tria(r: &mut R, t: &mut Tally) {
+    let x1 = [r.f32(), r.f32(), r.f32()];
+    let x2 = [r.f32(), r.f32(), r.f32()];
+    let mut t1 = [[0f32; 4]; 3];
+    let mut t2 = [[0f32; 4]; 3];
+    for i in 0..3 {
+        for j in 0..4 {
+            t1[i][j] = r.f32();
+        }
+    }
+    for i in 0..3 {
+        for j in 0..4 {
+            t2[i][j] = r.f32();
+        }
+    }
+    let ok = r.b();
+    let x = [r.f32(), r.f32(), r.f32()];
+    let got = triangulate(&x1, &x2, &t1, &t2);
+    let same = match got {
+        Some(g) => ok && g.map(|v| v.to_bits()) == x.map(|v| v.to_bits()),
+        None => !ok,
+    };
+    t.add(same, || format!("원본 {ok} {x:?} rust {got:?}"));
+}
+
 fn main() {
     let path = std::env::args().nth(1).expect("dump.bin");
     let d = std::fs::read(&path).unwrap();
     let mut o = 0;
     let mut tal: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut cn_stats = [0u64; 2];
+    let mut cnmp_stats = [0u64; 3];
     let mut states = BTreeMap::new();
     let mut lost_frames = 0u64;
     let mut frames = 0u64;
@@ -590,7 +750,11 @@ fn main() {
         o += 8 + n;
         let mut r = R { b: body, o: 0 };
         match tag.as_str() {
-            "NNKF" => nnkf(&mut r, tal.entry("NeedNewKeyFrame").or_default()),
+            "NNKF" => {
+                let mut racy = std::mem::take(tal.entry("NeedNewKeyFrame(도중 입력 바뀜 · 참고)").or_default());
+                nnkf(&mut r, tal.entry("NeedNewKeyFrame").or_default(), &mut racy);
+                *tal.entry("NeedNewKeyFrame(도중 입력 바뀜 · 참고)").or_default() = racy;
+            }
             "ULKF" => {
                 let mut a = std::mem::take(tal.entry("UpdateLocalKeyFrames").or_default());
                 let mut b = std::mem::take(tal.entry("UpdateLocalKeyFrames 기준 KF").or_default());
@@ -613,6 +777,8 @@ fn main() {
                 tal.insert("MapPointCulling 남김", a);
                 tal.insert("MapPointCulling 나쁨", b);
             }
+            "CNMP" => cnmp(&mut r, tal.entry("CreateNewMapPoints").or_default(), &mut cnmp_stats),
+            "TRIA" => tria(&mut r, tal.entry("Triangulate(JacobiSVD)").or_default()),
             "KFCL" => kfcl(&mut r, tal.entry("KeyFrameCulling").or_default()),
             "TRAK" => trak(&mut r, tal.entry("Track 흐름").or_default(), &mut states),
             "FRAM" => {
@@ -632,6 +798,8 @@ fn main() {
         println!("| {k} | {} | {} |", v.n, v.same);
     }
     println!("새 지도 점 {} 개 중 위치 비트 같음 {}", cn_stats[0], cn_stats[1]);
+    println!("삼각측량 새 점 {} 개 중 짝 · 위치 비트 같음 {} (mvKeys≠mvKeysUn {})", cnmp_stats[0], cnmp_stats[1], cnmp_stats[2]);
+    println!("키프레임 mRwc · Ow 가 Rust kf_pose 와 다른 경우 {}", POSE_DIFF.load(std::sync::atomic::Ordering::Relaxed));
     for (k, v) in &tal {
         for e in &v.examples {
             println!("  [{k}] {e}");

@@ -130,6 +130,8 @@ pub struct KeyFrame {
     pub map: MapId,
     pub timestamp: f64,
     pub keys: Vec<KeyPoint>,
+    /// mvKeys(왜곡 보정 전 x, y). UnprojectStereo 가 씀
+    pub keys_raw: Vec<[f32; 2]>,
     pub desc: Vec<Desc>,
     pub u_right: Vec<f32>,
     pub depth: Vec<f32>,

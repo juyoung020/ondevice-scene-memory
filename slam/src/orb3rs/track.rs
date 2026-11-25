@@ -460,7 +460,8 @@ pub trait TrackOps {
     fn reset_active_map(&mut self);
     fn change_map(&mut self, map: MapId);
     fn need_new_keyframe(&mut self) -> bool;
-    fn create_new_keyframe(&mut self);
+    /// 새 키프레임 id 를 돌려줌
+    fn create_new_keyframe(&mut self) -> KfId;
     fn try_graft(&mut self);
     /// 지도 표: (id, 키프레임 수) — 원본 GetAllMaps 순서
     fn all_maps(&mut self) -> Vec<(MapId, i32)>;
@@ -571,7 +572,11 @@ pub fn track_flow(t: &mut Tracker, frame_id: u64, ts: f64, ops: &mut dyn TrackOp
         ops.post_track_cleanup(both);
         let need = ops.need_new_keyframe();
         if need && (ok || (t.insert_kfs_lost && t.state == state::RECENTLY_LOST && is_imu(t.sensor))) {
-            ops.create_new_keyframe();
+            // CreateNewKeyFrame 끝: mpReferenceKF · mnLastKeyFrameId · mpLastKeyFrame
+            let kf = ops.create_new_keyframe();
+            t.reference_kf = Some(kf);
+            t.last_kf_frame_id = frame_id;
+            t.last_kf = Some(kf);
         }
     }
     if t.state == state::LOST {

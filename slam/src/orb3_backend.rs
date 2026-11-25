@@ -937,6 +937,13 @@ impl SlamBackend for Orb3Backend {
         let mut outp: Vec<(f64, T34, u64)> = per.iter().zip(&orig).filter(|x| Some(x.0 .1) == main_map).map(|(x, o)| (x.0, mul(&a_end, &x.2), *o)).collect();
         let (n_lv, max_lv) = level(&mut outp, &s.imu_hist);
         common::info!("끝난 지도 기울기 바로잡기: 장면 {n_lv} 개, 가장 큰 바로잡음 {max_lv:.1}°");
+        {
+            let dd: Vec<(f64, &[u16])> = s.deps.iter().map(|x| (x.0, x.3.as_slice())).collect();
+            if let Some(k) = s.dk {
+                let (r, m, n) = crate::refine::manhattan(&mut outp, &dd, &k);
+                common::info!("끝난 지도 방위 바로잡기: 잰 장면 {n} 개, 기준 {r:.1}°, 가장 큰 바로잡음 {m:.1}°");
+            }
+        }
         // 끝난 지도 다듬기: 다른 때 같은 곳을 본 장면끼리 깊이 ICP + 방위 · 이동 위치 그래프(refine)
         if let Some(k) = s.dk {
             let at: HashMap<u64, usize> = outp.iter().enumerate().map(|(i, x)| (x.0.to_bits(), i)).collect();

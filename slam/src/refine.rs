@@ -87,6 +87,84 @@ fn cam_pts(d: &[u16], k: &Intr) -> Vec<Option<([f64; 3], [f64; 3])>> {
     out
 }
 
+/// 맨해튼 방위 바로잡기의 가우스 폭(초)과 수평 법선 판정(|n.z| 이하)
+const MAN_SIG: f64 = 2.0;
+const MAN_HZ: f64 = 0.15;
+
+/// 끝난 지도 방위 바로잡기(병렬 A2): 강의실은 벽 · 책상이 서로 직각이라 장면 깊이의 수평 법선 방위(4 배 각 원형 평균)가 모든 장면에서
+/// 같아야 함. ORB 지도 안 방위 표류(같은 녹화에서 10–35° 로 흔들려 책상 줄이 V 자)를 장면마다 측정의 가우스(MAN_SIG) 가중 평균으로 재
+/// 전체 기준과의 차만큼 z 축으로 돌리고, 위치는 시간 순 이웃 장면 이동을 같은 회전으로 돌려 다시 이어 붙임.
+/// frames: 시간 순 (시각, 위치, 지도), deps: (시각, 160×120 깊이). 돌려줌: (기준 방위 °, 가장 큰 바로잡음 °, 잰 장면 수)
+pub fn manhattan(frames: &mut [(f64, T34, u64)], deps: &[(f64, &[u16])], k: &Intr) -> (f64, f64, usize) {
+    let at: std::collections::HashMap<u64, usize> = frames.iter().enumerate().map(|(i, f)| (f.0.to_bits(), i)).collect();
+    // (시각, cos4a, sin4a, 강도)
+    let mut ms: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for (t, d) in deps {
+        let Some(&i) = at.get(&t.to_bits()) else { continue };
+        let p = &frames[i].1;
+        let (mut c, mut s, mut n) = (0.0, 0.0, 0usize);
+        for (_, nc) in cam_pts(d, k).into_iter().flatten() {
+            let w = rot(p, &nc);
+            if w[2].abs() >= MAN_HZ {
+                continue;
+            }
+            let a = 4.0 * w[1].atan2(w[0]);
+            c += a.cos();
+            s += a.sin();
+            n += 1;
+        }
+        if n >= 200 {
+            let (c, s) = (c / n as f64, s / n as f64);
+            ms.push((*t, c, s, c * c + s * s));
+        }
+    }
+    if ms.is_empty() {
+        return (0.0, 0.0, 0);
+    }
+    let rc = ms.iter().fold((0.0, 0.0), |a, m| (a.0 + m.1 * m.3, a.1 + m.2 * m.3));
+    let refa = rc.1.atan2(rc.0) / 4.0;
+    let mut e: Vec<Option<f64>> = frames
+        .iter()
+        .map(|f| {
+            let (mut c, mut s, mut w) = (0.0, 0.0, 0.0);
+            let lo = ms.partition_point(|m| m.0 < f.0 - 3.0 * MAN_SIG);
+            for m in ms[lo..].iter().take_while(|m| m.0 <= f.0 + 3.0 * MAN_SIG) {
+                let g = m.3 * (-0.5 * ((m.0 - f.0) / MAN_SIG).powi(2)).exp();
+                c += g * m.1;
+                s += g * m.2;
+                w += g;
+            }
+            (w > 1e-3).then(|| wrap(s.atan2(c) - 4.0 * refa) / 4.0)
+        })
+        .collect();
+    // 빈 곳은 가장 가까운 값
+    let known: Vec<usize> = (0..e.len()).filter(|&i| e[i].is_some()).collect();
+    for i in 0..e.len() {
+        if e[i].is_none() {
+            let j = known.partition_point(|&j| j < i);
+            let c = [j.checked_sub(1).map(|x| known[x]), known.get(j).copied()].into_iter().flatten().min_by_key(|&x| x.abs_diff(i));
+            e[i] = c.and_then(|c| e[c]);
+        }
+    }
+    let mut maxa: f64 = 0.0;
+    let (mut pp, mut pn) = ([0.0; 3], [0.0; 3]);
+    for (i, f) in frames.iter_mut().enumerate() {
+        let a = e[i].unwrap_or(0.0);
+        maxa = maxa.max(a.abs());
+        let z = rz(-a);
+        let p = [f.1[3], f.1[7], f.1[11]];
+        let n = if i == 0 { p } else { let d = rot(&z, &[p[0] - pp[0], p[1] - pp[1], p[2] - pp[2]]); [pn[0] + d[0], pn[1] + d[1], pn[2] + d[2]] };
+        pp = p;
+        pn = n;
+        let mut q = mul(&z, &f.1);
+        q[3] = n[0];
+        q[7] = n[1];
+        q[11] = n[2];
+        f.1 = q;
+    }
+    (refa.to_degrees(), maxa.to_degrees(), ms.len())
+}
+
 /// 마디 j 를 마디 i 에 맞추는 4 자유도 ICP(세계 좌표에서 j 에 곱할 변환 Δ). 돌려줌: (Δ, 맞은 점 수, 맞은 비율)
 fn icp(pi: &T34, ti: &[Option<([f64; 3], [f64; 3])>], pj: &T34, sj: &[[f64; 3]], k: &Intr) -> Option<(T34, usize, f64)> {
     let wi = inv(pi);
@@ -511,6 +589,10 @@ mod tests {
             }
             let (n, m) = crate::orb3_backend::level(&mut frames, &imu);
             eprintln!("level: {n} 장, 최대 {m:.2}°");
+        }
+        if std::env::var("NO_MAN").is_err() {
+            let (r, m, n) = manhattan(&mut frames, &deps, &k);
+            eprintln!("manhattan: 기준 {r:.1}°, 최대 {m:.1}°, 잰 장면 {n}");
         }
         let mut pf = frames.clone();
         // 조각 다시 놓기(실행에는 안 씀)

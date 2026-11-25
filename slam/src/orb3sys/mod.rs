@@ -12,6 +12,7 @@ pub mod kfgraph;
 pub mod graft;
 pub mod loopflow;
 pub mod mapping;
+pub mod mergeops;
 pub mod rsys;
 pub mod threads;
 

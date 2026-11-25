@@ -9,3 +9,4 @@ pub mod reloc;
 pub mod detect;
 pub mod graph;
 pub mod correct;
+pub mod merge;

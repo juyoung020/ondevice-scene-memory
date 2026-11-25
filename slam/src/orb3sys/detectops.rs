@@ -169,6 +169,14 @@ pub struct RsLoop<O: OptimizeSim3 + Send> {
     pub opt: O,
     /// 점 mnCorrectedByKF · mnCorrectedReference
     pub corrected_by: std::collections::BTreeMap<MpId, (KfId, KfId)>,
+    /// mnBALocalForMerge(맞춤 BA)
+    pub marks: crate::orb3ba::mlba::MergeMarks,
+}
+
+impl<O: OptimizeSim3 + Send> RsLoop<O> {
+    pub fn new(db: std::sync::Arc<std::sync::Mutex<Option<KeyFrameDatabase>>>, rand: std::sync::Arc<std::sync::Mutex<GlibcRand>>, opt: O) -> Self {
+        RsLoop { det: Detector::new(), db, rand, opt, corrected_by: Default::default(), marks: Default::default() }
+    }
 }
 
 impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
@@ -183,8 +191,20 @@ impl<O: OptimizeSim3 + Send> super::loopflow::LoopOps<MapState> for RsLoop<O> {
     fn merge_accept(&mut self, _: &MapState) -> super::loopflow::MergeVerdict {
         super::loopflow::MergeVerdict::Merge
     }
-    fn merge_local(&mut self, _: &mut MapState) -> Option<u64> {
-        super::rsys::hole("LoopClosing::MergeLocal")
+    /// MergeLocal(관성 없음 · RGB-D) = 포터 LOOP `merge_local`(원본 1/1) + 맞춤 BA(`orb3ba::mlba`) · 합치기 본질 그래프(CV, `mergeops`).
+    /// 입력 mg2oMergeScw = mg2oMergeSlw(Run 이 넘기는 그대로)
+    fn merge_local(&mut self, st: &mut MapState, gba_running: bool) -> Option<u64> {
+        let b = &self.det.mg;
+        let cur = b.last_current_kf.expect("mpCurrentKF");
+        let matched = b.matched_kf.expect("mpMergeMatchedKF");
+        let cur_map = st.atlas.kfs[&cur].map;
+        let bef = st.atlas.kfs.iter().filter(|(_, k)| k.map == cur_map).map(|(id, k)| (*id, k.tcw)).collect();
+        let inp = crate::orb3loop::merge::MergeIn { cur, matched, scw: b.slw, gba_running };
+        let MapState { atlas, ext, .. } = st;
+        let mut lba = super::mergeops::RsMergeLba { ext, marks: &mut self.marks };
+        let mut ess = super::mergeops::RsMergeEss { bef };
+        let out = crate::orb3loop::merge::merge_local(&inp, atlas, &mut lba, &mut ess, &mut |_, _, _| {});
+        out.relaunch_gba.then_some(out.map as u64)
     }
     /// 관성 없음: 기울기 검사 없이 받아들임
     fn loop_accept(&mut self, _: &MapState) -> bool {

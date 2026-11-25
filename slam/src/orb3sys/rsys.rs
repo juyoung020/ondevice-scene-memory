@@ -8,7 +8,11 @@
 use super::mapping::{self, KfSteps, MapState, MappingStats};
 use super::graft::{self, GraftState};
 use super::kfgraph::AtlasGraph;
+use super::detectops::RsLoop;
+use super::gbaops::RsGba;
+use super::loopflow::{LoopFlow, LoopStats};
 use super::threads::{LoopQueue, MapUpdate, Mapper};
+use crate::orb3loop::detect::RustSim3;
 use super::{Orb3System, Track};
 use crate::orb3cv::system::{self as cvsys, SystemInit};
 use crate::orb3rs::extract::Extractor;
@@ -257,7 +261,11 @@ pub struct RustSystem {
     /// KeyFrameDatabase(키프레임 넣기는 루프 스레드 몫)
     kfdb: Arc<std::sync::Mutex<Option<KeyFrameDatabase>>>,
     /// 원본 glibc rand(씨앗 1): Sim3Solver · MLPnP 가 한 수열을 나눠 씀
-    rand: std::cell::RefCell<GlibcRand>,
+    /// 루프 스레드(`RsLoop`)와 같은 하나를 나눠 씀(원본 rand() 는 프로세스 하나의 수열)
+    rand: Arc<std::sync::Mutex<GlibcRand>>,
+    /// LoopClosing 스레드 · 전역 BA
+    flow: Arc<LoopFlow<MapState, RsGba>>,
+    looping: Option<JoinHandle<LoopStats>>,
     /// System::mbResetActiveMap
     reset_pending: bool,
     /// 패치 옮겨 붙이기 칸
@@ -292,6 +300,12 @@ impl RustSystem {
         let loopq = LoopQueue::<KfId>::new();
         let (m2, map2, q2) = (Arc::clone(&mapper), Arc::clone(&map), Arc::clone(&loopq));
         let mapping = Some(std::thread::spawn(move || mapping::run(&m2, &map2, &q2, &mut steps)));
+        let kfdb = Arc::new(std::sync::Mutex::new(None));
+        let rand = Arc::new(std::sync::Mutex::new(GlibcRand::new(1)));
+        let flow = Arc::new(LoopFlow::new(Arc::clone(&map), Arc::clone(&mapper), Arc::clone(&loopq), RsGba));
+        let ops = RsLoop::new(Arc::clone(&kfdb), Arc::clone(&rand), RustSim3);
+        let f2 = Arc::clone(&flow);
+        let looping = Some(std::thread::Builder::new().name("orb3-loop".into()).spawn(move || f2.run(ops)).expect("루프 스레드"));
         Ok(RustSystem {
             init,
             extractor,
@@ -311,8 +325,10 @@ impl RustSystem {
             initial_frame_id: 0,
             voc: None,
             voc_steps,
-            kfdb: Arc::new(std::sync::Mutex::new(None)),
-            rand: std::cell::RefCell::new(GlibcRand::new(1)),
+            kfdb,
+            rand,
+            flow,
+            looping,
             reset_pending: false,
             graft: GraftState::default(),
             velocity: Se3::default(),
@@ -330,8 +346,12 @@ impl RustSystem {
     /// 끝내기: 지도 스레드 · 루프 대기열을 닫고 통계를 돌려줌
     pub fn shutdown(&mut self) -> Option<MappingStats> {
         self.mapper.finish();
+        let st = self.mapping.take().and_then(|h| h.join().ok());
         self.loopq.finish();
-        self.mapping.take().and_then(|h| h.join().ok())
+        if let Some(h) = self.looping.take() {
+            let _ = h.join();
+        }
+        st
     }
 }
 
@@ -480,8 +500,11 @@ impl TrackOps for Ops<'_> {
             let db = db.as_mut().expect("KeyFrameDatabase");
             db.detect_reloc(&AtlasGraph::new(&g.atlas), &bow, pmap as DbMap).into_iter().map(|k| k as KfId).collect::<Vec<_>>()
         };
-        let mut pnp = RustPnp { rand: &s.rand };
-        let ok = relocalize(f, &cands, &g.atlas.kfs, &g.atlas.mps, &mut pnp);
+        // 루프 스레드와 같은 수열: 잠금 안에서 잠깐 빌려 씀
+        let mut rg = s.rand.lock().unwrap();
+        let cell = std::cell::RefCell::new(std::mem::replace(&mut *rg, GlibcRand::new(1)));
+        let ok = relocalize(f, &cands, &g.atlas.kfs, &g.atlas.mps, &mut RustPnp { rand: &cell });
+        *rg = cell.into_inner();
         if ok {
             self.ed.last_reloc_frame_id = Some(f.id);
         }
@@ -789,9 +812,9 @@ impl RustSystem {
         self.changed = true;
     }
 
-    /// 루프 닫기 · 합치기 · 전체 최적화가 돌고 있나(mMutexBusy · isRunningGBA) — 루프 스레드가 엮이기 전엔 늘 false
+    /// 루프 닫기 · 합치기 · 전체 최적화가 돌고 있나(mMutexBusy · isRunningGBA)
     fn loop_busy(&self) -> bool {
-        false
+        self.flow.busy()
     }
 
     fn current_map_id(&self) -> u64 {

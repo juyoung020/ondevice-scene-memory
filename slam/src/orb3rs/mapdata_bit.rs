@@ -410,7 +410,7 @@ fn original_dumps() {
                     addrs.insert(id, addr);
                     let nk = r.u32() as usize;
                     let mut s = Static {
-                        addr, oct: Vec::with_capacity(nk), ur: Vec::with_capacity(nk), desc: Vec::with_capacity(nk) };
+                        _addr: addr, oct: Vec::with_capacity(nk), ur: Vec::with_capacity(nk), desc: Vec::with_capacity(nk) };
                     for _ in 0..nk {
                         s.oct.push(r.i32());
                         s.ur.push(r.f32());

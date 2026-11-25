@@ -414,3 +414,59 @@
 +bool OrderLess(const MapPoint* a, const MapPoint* b) { return ByIdLess(a, b, a ? a->mnId : 0, b ? b->mnId : 0); }
 +bool OrderLess(const Map* a, const Map* b) { return ByIdLess(a, b, a ? const_cast<Map*>(a)->GetId() : 0, b ? const_cast<Map*>(b)->GetId() : 0); }
 +}
+--- a/src/KeyFrameDatabase.cc
++++ b/src/KeyFrameDatabase.cc
+@@ -119,7 +119,7 @@
+                 {
+                     if(pKFi->mnLoopQuery!=pKF->mnId)
+                     {
+-                        pKFi->mnLoopWords=0;
++                        pKFi->mnLoopWords=0; pKFi->mLoopScore=0; // 이번 질의 점수만(지난 질의 · 초기화 안 된 값 섞이지 않게)
+                         if(!spConnectedKeyFrames.count(pKFi))
+                         {
+                             pKFi->mnLoopQuery=pKF->mnId;
+@@ -247,7 +247,7 @@
+                 {
+                     if(pKFi->mnLoopQuery!=pKF->mnId)
+                     {
+-                        pKFi->mnLoopWords=0;
++                        pKFi->mnLoopWords=0; pKFi->mLoopScore=0; // 이번 질의 점수만(지난 질의 · 초기화 안 된 값 섞이지 않게)
+                         if(!spConnectedKeyFrames.count(pKFi))
+                         {
+                             pKFi->mnLoopQuery=pKF->mnId;
+@@ -260,7 +260,7 @@
+                 {
+                     if(pKFi->mnMergeQuery!=pKF->mnId)
+                     {
+-                        pKFi->mnMergeWords=0;
++                        pKFi->mnMergeWords=0; pKFi->mMergeScore=0; // 이번 질의 점수만(지난 질의 · 초기화 안 된 값 섞이지 않게)
+                         if(!spConnectedKeyFrames.count(pKFi))
+                         {
+                             pKFi->mnMergeQuery=pKF->mnId;
+@@ -490,7 +490,7 @@
+                 }
+                 if(pKFi->mnPlaceRecognitionQuery!=pKF->mnId)
+                 {
+-                    pKFi->mnPlaceRecognitionWords=0;
++                    pKFi->mnPlaceRecognitionWords=0; pKFi->mPlaceRecognitionScore=0; // 이번 질의 점수만(지난 질의 · 초기화 안 된 값 섞이지 않게)
+                     pKFi->mnPlaceRecognitionQuery=pKF->mnId;
+                     lKFsSharingWords.push_back(pKFi);
+                 }
+@@ -623,7 +623,7 @@
+ 
+                 if(pKFi->mnPlaceRecognitionQuery!=pKF->mnId)
+                 {
+-                    pKFi->mnPlaceRecognitionWords=0;
++                    pKFi->mnPlaceRecognitionWords=0; pKFi->mPlaceRecognitionScore=0; // 이번 질의 점수만(지난 질의 · 초기화 안 된 값 섞이지 않게)
+                     if(!spConnectedKF.count(pKFi))
+                     {
+ 
+@@ -752,7 +752,7 @@
+                 if(pKFi->mnRelocQuery!=q)
+                 {
+                     if(pKFi->GetMap() != pMap) continue;
+-                    pKFi->mnRelocWords=0;
++                    pKFi->mnRelocWords=0; pKFi->mRelocScore=0; // 이번 질의 점수만(지난 질의 · 초기화 안 된 값 섞이지 않게)
+                     pKFi->mnRelocQuery=q;
+                     lKFsSharingWords.push_back(pKFi);
+                 }

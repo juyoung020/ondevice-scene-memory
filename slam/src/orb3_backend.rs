@@ -394,6 +394,13 @@ impl Orb3 {
         let q_a = mul(&pa, &h.q_rel);
         let c_b = mul(&pb, &h.c_rel);
         let s_ba = mul(&mul(&c_b, &inv(&h.t_qc)), &inv(&q_a));
+        // 시험용(ORB_TRACE): 잇기 입력을 그대로(실행끼리 어디서 갈리는지)
+        if let Ok(p) = std::env::var("ORB_TRACE") {
+            use std::io::Write as _;
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(fh, "HIT {} {} q_rel {:?} c_rel {:?} t_qc {:?} pa {:?} pb {:?}", h.q_kf, h.c_kf, h.q_rel, h.c_rel, h.t_qc, pa, pb);
+            }
+        }
         common::info!("지도 잇기 후보: 지도 {ma} 장면 {:.2} ↔ 지도 {mb} 장면 {:.2} (맞은 점 {}, MegaLoc {:.2})", h.t, h.c_t, h.inliers, h.score);
         // 같은 두 지도의 최근(60 초) 후보 가운데 하나라도 같은 변환이면 받음(사이에 틀린 후보가 끼어도 됨)
         self.pend.retain(|p| t - p.3 < 60.0);
@@ -506,7 +513,7 @@ impl Orb3 {
             if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                 // 모든 키프레임 위치 합(지도가 실행마다 같은지)
                 let kv = self.sys.keyframes(true);
-                let ks = kv.iter().fold(0.0f64, |s, (id, m, p)| s + (*id as f64 + 1.0) * (p[3] + 2.0 * p[7] + 3.0 * p[11]) + *m as f64);
+                let ks = kv.iter().fold(0.0f64, |s, (id, m, p)| s + (*id as f64 + 1.0) * (p[3] + 2.0 * p[7] + 3.0 * p[11] + 5.0 * p[0] + 7.0 * p[5] + 11.0 * p[9]) + *m as f64);
                 let _ = writeln!(fh, "{:.6} {} {} {:.6} {:.6} {:.6} kf {} {:.6}", f.t, tr.state, tr.map_id, tr.twc[3], tr.twc[7], tr.twc[11], kv.len(), ks);
             }
         }

@@ -495,8 +495,28 @@ mod tests {
         let mut log = Vec::new();
         let t0 = std::time::Instant::now();
         let deps: Vec<(f64, &[u16])> = nt.iter().zip(&depths).map(|(t, d)| (t.0, d.as_slice())).collect();
+        // 기울기 바로잡기 전 위치(stitch.log.maps 의 큰 지도)로 시험: LEVEL_IMU=imu0.csv 면 IMU 를 읽어 끝난 뒤와 같은 level() 을 먼저
+        if let Ok(ip) = std::env::var("LEVEL_IMU") {
+            let cal = crate::imu::Calib::parse(crate::imu::DEFAULT_CALIB).unwrap();
+            let mut imu: Vec<(f64, [f64; 3], f64)> = Vec::new();
+            for l in std::fs::read_to_string(ip).unwrap().lines() {
+                if l.starts_with('#') {
+                    continue;
+                }
+                let v: Vec<f64> = l.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                let r = &cal.r_ci;
+                let a = [v[4], v[5], v[6]];
+                let ac = [0, 1, 2].map(|i| r[i][0] as f64 * a[0] + r[i][1] as f64 * a[1] + r[i][2] as f64 * a[2]);
+                imu.push((v[0] * 1e-9 - cal.shift, ac, (v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt()));
+            }
+            let (n, m) = crate::orb3_backend::level(&mut frames, &imu);
+            eprintln!("level: {n} 장, 최대 {m:.2}°");
+        }
         let mut pf = frames.clone();
-        crate::mapmerge::realign_pieces(&mut pf, &deps, &k, &mut log);
+        // 조각 다시 놓기(실행에는 안 씀)
+        if std::env::var("REALIGN").is_ok() {
+            crate::mapmerge::realign_pieces(&mut pf, &deps, &k, &mut log);
+        }
         eprintln!("{log:?}");
         log.clear();
         frames = pf;

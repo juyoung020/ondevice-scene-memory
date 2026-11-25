@@ -645,10 +645,15 @@ impl Orb3 {
     }
 }
 
+/// 바로잡음을 매끈하게 하는 가우스 폭(초): 장면마다 가속도로 잰 위는 손 흔들림 · 치우침으로 1–2° 씩 튀어, 그대로 쓰면 먼 점이 몇 cm 씩 흩어져 벽 · 바닥이 여러 겹(병렬 A 1 차)
+const LEVEL_SIG: f64 = 3.0;
+/// 측정값이 매끈한 값과 이만큼(°) 넘게 다르면 그 장면은 측정값(ORB 회전 튐)
+const LEVEL_SPIKE: f64 = 4.0;
+
 /// 끝난 지도 기울기 바로잡기: 장면마다 ±0.5 초 가속도 평균(가만히 있을 때: 크기 g ± 0.3, 자이로 평균 < 0.6 rad/s)을 지도 축으로 보낸 '위' 가
-/// 지도 z 와 어긋난 만큼 장면 방향을 돌림(위치는 그대로). 가만하지 않은 장면은 같은 ORB 지도에서 앞뒤 1.5 초 안 가만한 장면들의 어긋남 평균(가우스 0.25 초), 없으면 5 초 안 가장 가까운 것.
+/// 지도 z 와 어긋난 만큼 장면 방향을 돌림. 바로잡음은 같은 ORB 지도에서 가만한 장면들 어긋남의 가우스(LEVEL_SIG) 평균(튐만 제 측정값), 없으면 5 초 안 가장 가까운 것.
 /// ORB 지도 안 기울기 표류 · 몇 장짜리 회전 튐을 중력 측정으로 누름. fr: (시각, 장면 위치, 원래 ORB 지도). 돌려줌: (돌린 장면 수, 가장 큰 각 °)
-fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f64) {
+pub(crate) fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f64) {
     if imu.len() < 2 {
         return (0, 0.0);
     }
@@ -693,8 +698,8 @@ fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f6
                     continue;
                 }
                 let dt = (x.0 - t).abs();
-                if dt <= 1.5 {
-                    let k = (-0.5 * (dt / 0.25).powi(2)).exp();
+                if dt <= 3.0 * LEVEL_SIG {
+                    let k = (-0.5 * (dt / LEVEL_SIG).powi(2)).exp();
                     w += k;
                     for c in 0..3 {
                         r[c] += k * v[c];
@@ -704,10 +709,13 @@ fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f6
                     near = Some((dt, v));
                 }
             }
-            if let Some(v) = meas[i] {
-                Some(v)
-            } else if w > 0.0 {
-                Some(r.map(|v| v / w))
+            if w > 0.0 {
+                let sm = r.map(|v| v / w);
+                match meas[i] {
+                    // 몇 장짜리 회전 튐: 매끈한 값과 크게 다르면 그 장면 측정값
+                    Some(v) if ((v[0] - sm[0]).powi(2) + (v[1] - sm[1]).powi(2)).sqrt().to_degrees() > LEVEL_SPIKE => Some(v),
+                    _ => Some(sm),
+                }
             } else {
                 near.map(|n| n.1)
             }

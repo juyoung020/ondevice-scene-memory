@@ -1007,34 +1007,39 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
             }
             for b in 0..nb {
                 let xb = &xv[b * chw..(b + 1) * chw];
-                let mut xp = buf::zeros::<f32>(need);
+                // 덮어쓸 버퍼(0 채우기 없음): 덧댐 · 범위 밖은 평면을 채울 때 직접 0
+                let mut xp = buf::take::<f32>(need);
+                xp[planes * plane..].fill(0.0);
                 // 평면 하나 채우기(채널 ci, 위상 ry · rx)
                 let body = |pi: usize, dst: &mut [f32]| {
                     let (ci, ry, rx) = (pi / (st * st), (pi / st) % st, pi % st);
                     let src = &xb[ci * g.h * g.w..(ci + 1) * g.h * g.w];
+                    // x = st · j + rx − pl 가 0 ≤ x < w 인 j 범위
+                    let off = rx as isize - g.pl as isize;
+                    let j0 = (if off < 0 { ((-off) as usize).div_ceil(st) } else { 0 }).min(wq);
+                    let j1 = ((((g.w as isize - 1 - off) / st as isize) + 1).clamp(0, wq as isize) as usize).max(j0);
                     for i in 0..hq {
+                        let d = &mut dst[i * wq..(i + 1) * wq];
                         let y = (st * i + ry) as isize - g.pt as isize;
-                        if y < 0 || y >= g.h as isize {
+                        if y < 0 || y >= g.h as isize || j1 == j0 {
+                            d.fill(0.0);
                             continue;
                         }
                         let row = &src[y as usize * g.w..(y as usize + 1) * g.w];
-                        let d = &mut dst[i * wq..(i + 1) * wq];
+                        d[..j0].fill(0.0);
+                        d[j1..].fill(0.0);
+                        let x0 = ((st * j0) as isize + off) as usize;
+                        let n = j1 - j0;
                         if st == 1 {
-                            // x = j − pl
-                            let j0 = g.pl.min(wq);
-                            let n = g.w.min(wq - j0);
-                            d[j0..j0 + n].copy_from_slice(&row[..n]);
+                            d[j0..j1].copy_from_slice(&row[x0..x0 + n]);
+                        } else if st == 2 {
+                            let s2 = &row[x0..x0 + 2 * (n - 1) + 1];
+                            for (j, v) in d[j0..j1].iter_mut().enumerate() {
+                                *v = s2[2 * j];
+                            }
                         } else {
-                            // x = st · j + rx − pl 가 0 ≤ x < w 인 j 만(분기 없는 보폭 읽기)
-                            let off = rx as isize - g.pl as isize;
-                            let j0 = if off < 0 { ((-off) as usize).div_ceil(st) } else { 0 };
-                            let j1 = (((g.w as isize - 1 - off) / st as isize) + 1).clamp(0, wq as isize) as usize;
-                            if j1 > j0 {
-                                let x0 = (st * j0) as isize + off;
-                                let src = &row[x0 as usize..];
-                                for (j, v) in d[j0..j1].iter_mut().enumerate() {
-                                    *v = src[j * st];
-                                }
+                            for (j, v) in d[j0..j1].iter_mut().enumerate() {
+                                *v = row[x0 + j * st];
                             }
                         }
                     }

@@ -46,6 +46,10 @@ unsafe fn tile_avx512<const M: usize, const D: bool>(a: *const f32, k: usize, mr
     }
     for j in 0..k {
         let b = brow::<D>(bp, offs, j);
+        if D {
+            _mm_prefetch::<_MM_HINT_T0>(b.add(NB) as *const i8);
+            _mm_prefetch::<_MM_HINT_T0>(b.add(NB + 16) as *const i8);
+        }
         let w0 = _mm512_loadu_ps(b);
         let w1 = _mm512_loadu_ps(b.add(16));
         for m in 0..M {

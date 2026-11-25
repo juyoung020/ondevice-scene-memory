@@ -15,7 +15,7 @@ pub fn zeros<T: Copy + Default + 'static>(n: usize) -> Vec<T> {
         // 맞는 것 중 가장 작은 것
         let mut best: Option<usize> = None;
         for (i, v) in f.iter().enumerate() {
-            if v.len() >= n && best.is_none_or(|b| f[b].len() > v.len()) {
+            if v.capacity() >= n && v.capacity() <= 2 * n && best.is_none_or(|b| f[b].capacity() > v.capacity()) {
                 best = Some(i);
             }
         }
@@ -35,9 +35,10 @@ pub fn take<T: Copy + Default + 'static>(n: usize) -> Vec<T> {
     }
     let got = {
         let mut f = FREE.lock().unwrap();
+        // 담을 수 있는 것 중 가장 작은 것
         let mut best: Option<usize> = None;
         for (i, v) in f.iter().enumerate() {
-            if v.len() >= n && best.is_none_or(|b| f[b].len() > v.len()) {
+            if v.capacity() >= n && v.capacity() <= 2 * n && best.is_none_or(|b| f[b].capacity() > v.capacity()) {
                 best = Some(i);
             }
         }
@@ -45,7 +46,12 @@ pub fn take<T: Copy + Default + 'static>(n: usize) -> Vec<T> {
     };
     let v = match got {
         Some(mut v) => {
-            v.truncate(n);
+            // 채워진 길이보다 길면 모자란 곳만 0
+            if v.len() >= n {
+                v.truncate(n);
+            } else {
+                v.resize(n, 0.0);
+            }
             v
         }
         None => vec![0f32; n],
@@ -66,8 +72,8 @@ pub fn give(v: Vec<f32>) {
     let mut f = FREE.lock().unwrap();
     if f.len() >= KEEP {
         // 가장 작은 것을 버림
-        let (i, _) = f.iter().enumerate().min_by_key(|(_, v)| v.len()).unwrap();
-        if f[i].len() >= v.len() {
+        let (i, _) = f.iter().enumerate().min_by_key(|(_, v)| v.capacity()).unwrap();
+        if f[i].capacity() >= v.capacity() {
             return;
         }
         f.swap_remove(i);

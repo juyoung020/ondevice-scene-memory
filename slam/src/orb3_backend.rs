@@ -453,7 +453,7 @@ impl Orb3 {
         while let Some(r) = self.stitch.recv(self.block) {
             for h in r {
                 self.hits_all.push(h.clone());
-                if h.strong {
+                if h.strong && std::env::var("NO_GRAFT").is_err() {
                     self.on_hit(h, f.t);
                 }
             }
@@ -691,10 +691,12 @@ fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f6
             }
         })
         .collect();
+    let mut rots: Vec<[f64; 9]> = Vec::with_capacity(fr.len());
     for (f, c) in fr.iter_mut().zip(corr) {
-        let Some(r) = c else { continue };
+        let r = c.unwrap_or([0.0; 3]);
         let a = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
         if a < 1e-9 {
+            rots.push([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
             continue;
         }
         let k = r.map(|v| v / a);
@@ -719,8 +721,34 @@ fn level(fr: &mut [(f64, T34, u64)], imu: &[(f64, [f64; 3], f64)]) -> (usize, f6
             }
         }
         f.1 = q;
+        rots.push(rot);
         n_done += 1;
         max_a = max_a.max(a.to_degrees());
+    }
+    // 위치도 같은 만큼: ORB 지도마다 시간 순으로 앞 장면과의 이동을 그 장면 바로잡음 회전으로 돌려 이어 붙임(지도가 기운 채 쌓인 높이 비탈을 폄,
+    // 장면 방향만 돌리면 이웃 장면끼리 깊이가 어긋남). 지도의 첫 장면은 그대로
+    let mut by_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, f) in fr.iter().enumerate() {
+        by_map.entry(f.2).or_default().push(i);
+    }
+    for v in by_map.values_mut() {
+        v.sort_by(|a, b| fr[*a].0.total_cmp(&fr[*b].0));
+        let mut prev_old = [fr[v[0]].1[3], fr[v[0]].1[7], fr[v[0]].1[11]];
+        let mut prev_new = prev_old;
+        for &i in v.iter().skip(1) {
+            let old = [fr[i].1[3], fr[i].1[7], fr[i].1[11]];
+            let d = [old[0] - prev_old[0], old[1] - prev_old[1], old[2] - prev_old[2]];
+            let r = &rots[i];
+            let nw = [
+                prev_new[0] + r[0] * d[0] + r[1] * d[1] + r[2] * d[2],
+                prev_new[1] + r[3] * d[0] + r[4] * d[1] + r[5] * d[2],
+                prev_new[2] + r[6] * d[0] + r[7] * d[1] + r[8] * d[2],
+            ];
+            fr[i].1[3] = nw[0];
+            fr[i].1[7] = nw[1];
+            fr[i].1[11] = nw[2];
+            (prev_old, prev_new) = (old, nw);
+        }
     }
     (n_done, max_a)
 }

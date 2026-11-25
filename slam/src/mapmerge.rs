@@ -368,6 +368,82 @@ pub fn merge(maps: &HashMap<u64, Vec<Frame>>, hyps: &[(u64, u64, T34)], k: &Intr
     xf
 }
 
+/// 조각 다시 놓기: 끝 지도를 빈틈(0.4 초 넘게 장면 없음)마다 조각으로 나눠, 가장 큰 조각부터 나머지 조각을 지금 자리에서 시작해
+/// 자유 공간 점수로 다시 맞춤(실행 중 잘못 옮겨 붙인 조각 · 표류한 조각). 받은 조각만 옮기고 나머지는 그대로.
+/// frames: (시각, 위치, _) 끝 지도 장면, depth: (시각, 작은 깊이). 돌려줌: 옮긴 조각 수
+pub fn realign_pieces(frames: &mut [(f64, T34, u64)], depth: &[(f64, &[u16])], k: &Intr, log: &mut Vec<String>) -> usize {
+    let mut order: Vec<usize> = (0..frames.len()).collect();
+    order.sort_by(|a, b| frames[*a].0.total_cmp(&frames[*b].0));
+    let mut piece = vec![0u64; frames.len()];
+    let mut cur = 0u64;
+    for w in 0..order.len() {
+        if w > 0 && frames[order[w]].0 - frames[order[w - 1]].0 > 0.4 {
+            cur += 1;
+        }
+        piece[order[w]] = cur;
+    }
+    let at: HashMap<u64, usize> = frames.iter().enumerate().map(|(i, f)| (f.0.to_bits(), i)).collect();
+    let mut maps: HashMap<u64, Vec<Frame>> = HashMap::new();
+    for (t, d) in depth {
+        if let Some(&i) = at.get(&t.to_bits()) {
+            maps.entry(piece[i]).or_default().push(Frame { pose: frames[i].1, d });
+        }
+    }
+    let mut cnt: HashMap<u64, usize> = HashMap::new();
+    for p in &piece {
+        *cnt.entry(*p).or_default() += 1;
+    }
+    // 조각마다 나머지 모두에 대한 지금 자리 점수가 낮은 것부터, 지금 자리에서 다듬어 크게 나아지면 옮김(두 바퀴)
+    let mut moved = 0;
+    let mut keys: Vec<u64> = maps.keys().copied().collect();
+    keys.sort_unstable();
+    let ident = [0.0f64; 4];
+    for _round in 0..2 {
+        let mut todo: Vec<(f64, u64, Vec<[f64; 3]>, (usize, usize))> = Vec::new();
+        for &p in &keys {
+            if maps[&p].len() < MIN_FRAMES {
+                continue;
+            }
+            let mut pts = cloud(&maps[&p], k);
+            if pts.len() > MAX_PTS {
+                let st = pts.len() as f64 / MAX_PTS as f64;
+                pts = (0..MAX_PTS).map(|i| pts[(i as f64 * st) as usize]).collect();
+            }
+            let others: Vec<&Frame> = keys.iter().filter(|q| **q != p).flat_map(|q| maps[q].iter()).collect();
+            let st = (others.len() as f64 / MAX_REF as f64).max(1.0);
+            let refs: Vec<Ref> = (0..others.len().min(MAX_REF)).map(|i| others[(i as f64 * st) as usize]).map(|f| Ref { w2c: inv(&f.pose), d: f.d }).collect();
+            let s0 = score(&pts, &refs, k, &yaw_t(0.0, 0.0, 0.0, 0.0));
+            todo.push((ratio(s0), p, pts, s0));
+        }
+        todo.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (r0, p, pts, s0) in todo {
+            if r0 >= ACCEPT || s0.0 + s0.1 < MIN_AGREE {
+                continue;
+            }
+            let others: Vec<&Frame> = keys.iter().filter(|q| **q != p).flat_map(|q| maps[q].iter()).collect();
+            let st = (others.len() as f64 / MAX_REF as f64).max(1.0);
+            let refs: Vec<Ref> = (0..others.len().min(MAX_REF)).map(|i| others[(i as f64 * st) as usize]).map(|f| Ref { w2c: inv(&f.pose), d: f.d }).collect();
+            let (x, s1) = refine(&pts, &refs, k, ident);
+            let ok = ratio(s1) >= ratio(s0) + 0.15 && ratio(s1) >= 0.7 && s1.0 >= MIN_AGREE;
+            log.push(format!("조각 {p}(장면 {}): 지금 {:.3} → 다듬어 {:.3} (방위 {:.1}° 이동 {:.2} {:.2} {:.2}) {}", cnt[&p], r0, ratio(s1), x[0].to_degrees(), x[1], x[2], x[3], if ok { "옮김" } else { "그대로" }));
+            if ok {
+                let t = yaw_t(x[0], x[1], x[2], x[3]);
+                for (i, f) in frames.iter_mut().enumerate() {
+                    if piece[i] == p {
+                        f.1 = mul(&t, &f.1);
+                    }
+                }
+                for f in maps.get_mut(&p).unwrap().iter_mut() {
+                    f.pose = mul(&t, &f.pose);
+                }
+                moved += 1;
+            }
+        }
+    }
+    log.push(format!("조각 {} 개, 옮긴 조각 {moved}", cnt.len()));
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

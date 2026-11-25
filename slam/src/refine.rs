@@ -2,7 +2,8 @@
 //! 지도 조각 사이 몇십 cm 어긋남(벽 · 책상 두 겹)을 없앤다. 기울기는 앞에서 중력으로 맞춰 두었으므로 방위만 푼다.
 //!
 //! 마디 = 작은 깊이(160×120)가 있는 장면. 간선: ① 같은 ORB 지도에서 시간상 이웃한 마디(지금 상대 위치를 그대로 측정으로)
-//! ② 다른 때(3 초 넘게 떨어진) 1.5 m · 35° 안에서 본 마디 짝을 깊이 점-면 ICP 로 다듬은 상대 위치(겹친 점 · 잔차로 거름, 코시 가중).
+//! ② 다른 때(3 초 넘게 떨어진) 1.5 m · 35° 안에서 본 마디 짝을 깊이 점-면 ICP 로 다듬은 상대 위치(겹친 점 · 잔차로 거름, 코시 가중)
+//! ③ 마디 하나짜리 바닥 높이: 그 장면 깊이로 잰 카메라 높이로 z − 높이 = 바닥(한 층 방은 바닥이 평평), 코시 가중.
 pub type T34 = [f64; 12];
 use crate::mapmerge::{inv, mul, Intr, SCALE, SH, SW};
 
@@ -14,10 +15,10 @@ const LOOP_DIST: f64 = 1.5;
 const LOOP_ANG: f64 = 35.0;
 const LOOP_PER_NODE: usize = 4;
 /// ICP 받는 기준: 맞은 점(5 cm 안) 비율 · 수, 고친 크기 한계
-const ICP_INLIER_FRAC: f64 = 0.5;
+const ICP_INLIER_FRAC: f64 = 0.7;
 const ICP_MIN_INLIERS: usize = 300;
-const ICP_MAX_T: f64 = 0.5;
-const ICP_MAX_YAW: f64 = 10.0;
+const ICP_MAX_T: f64 = 0.2;
+const ICP_MAX_YAW: f64 = 4.0;
 /// 간선 표준편차: 이웃(m, °), 고리(m, °)
 const SEQ_SIG: (f64, f64) = (0.03, 0.7);
 const LOOP_SIG: (f64, f64) = (0.03, 0.5);
@@ -154,6 +155,8 @@ struct Edge {
     dyaw: f64,
     dp: [f64; 3],
     sig: (f64, f64),
+    /// 높이 표준편차 배수(이웃 간선은 크게: 기울었던 지도의 높이 차를 바닥 쪽이 이기게)
+    zmul: f64,
     robust: bool,
 }
 
@@ -162,6 +165,38 @@ fn meas(pi: &T34, pj: &T34) -> (f64, [f64; 3]) {
     let d = [pj[3] - pi[3], pj[7] - pi[7], pj[11] - pi[11]];
     let (s, c) = yi.sin_cos();
     (wrap(yj - yi), [c * d[0] + s * d[1], -s * d[0] + c * d[1], d[2]])
+}
+
+/// 바닥 높이 표준편차(m)
+const FLOOR_SIG: f64 = 0.03;
+
+/// 카메라에서 바닥까지 높이: 세계 위를 향한 법선(cos > 0.95)의 점들 카메라 아래 깊이를 2 cm 칸으로 모아 1.0–2.2 m 에서 가장 낮은 큰 면(이웃 칸 합 100 점 이상)
+fn floor_height(pose: &T34, t: &[Option<([f64; 3], [f64; 3])>]) -> Option<f64> {
+    let mut hst = [0usize; 60];
+    let mut sum = [0.0f64; 60];
+    for (p, n) in t.iter().flatten() {
+        let wn = rot(pose, n);
+        if wn[2].abs() < 0.95 {
+            continue;
+        }
+        let h = -rot(pose, p)[2];
+        if !(1.0..2.2).contains(&h) {
+            continue;
+        }
+        let b = ((h - 1.0) / 0.02) as usize;
+        hst[b] += 1;
+        sum[b] += h;
+    }
+    // 가장 낮은 큰 면(의자 앉는 면 · 책상은 바닥보다 위): 이웃 칸 합 100 점 이상인 가장 깊은 칸
+    let win = |b: usize| (b.saturating_sub(1)..(b + 2).min(60)).map(|q| hst[q]).sum::<usize>();
+    let b = (0..60).rev().find(|&b| win(b) >= 100 && hst[b] * 3 >= win(b))?;
+    // 이웃 칸까지 평균
+    let (mut s, mut k) = (0.0, 0usize);
+    for q in b.saturating_sub(1)..(b + 2).min(60) {
+        s += sum[q];
+        k += hst[q];
+    }
+    Some(s / k as f64)
 }
 
 /// 다듬기: 마디마다 세계 쪽에 곱할 변환(새 = Δ · 옛)
@@ -179,7 +214,7 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
         let (a, b) = (w[0], w[1]);
         if nodes[a].seg == nodes[b].seg && nodes[b].t - nodes[a].t < 2.0 {
             let (dy, dp) = meas(&nodes[a].pose, &nodes[b].pose);
-            edges.push(Edge { i: a, j: b, dyaw: dy, dp, sig: SEQ_SIG, robust: false });
+            edges.push(Edge { i: a, j: b, dyaw: dy, dp, sig: SEQ_SIG, zmul: 3.0, robust: false });
         }
     }
     let n_seq = edges.len();
@@ -243,12 +278,25 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
                 return None;
             }
             let (dy, dp) = meas(&nodes[i].pose, &pj2);
-            Some(Edge { i, j, dyaw: dy, dp, sig: LOOP_SIG, robust: true })
+            Some(Edge { i, j, dyaw: dy, dp, sig: LOOP_SIG, zmul: 1.0, robust: true })
         })
         .collect();
     let n_try = cands.len();
     edges.extend(found.into_iter().flatten());
     let n_loop = edges.len() - n_seq;
+    // ③ 바닥 높이: 마디마다 카메라에서 바닥까지 높이(위 향한 평면 가운데 카메라 아래 1.0–2.2 m 의 가장 큰 무리, 책상 면은 0.8 m 안팎이라 빠짐)
+    let floor_h: Vec<Option<f64>> = nodes.iter().zip(&tgt).map(|(m, t)| floor_height(&m.pose, t)).collect();
+    let fz: Vec<f64> = nodes.iter().zip(&floor_h).filter_map(|(m, h)| h.map(|h| m.pose[11] - h)).collect();
+    let floor_ref = {
+        let mut v = fz.clone();
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied()
+    };
+    if let Some(f) = floor_ref {
+        let mut v: Vec<f64> = fz.iter().map(|z| (z - f).abs()).collect();
+        v.sort_by(f64::total_cmp);
+        log.push(format!("바닥: 잰 마디 {}/{n}, 바닥 높이 {f:.3} m, 마디 바닥 어긋남 중앙 {:.3} · p90 {:.3} m", fz.len(), v[v.len() / 2], v[v.len() * 9 / 10]));
+    }
     // 위치 그래프(가우스-뉴턴, 마디 0 고정): 변수 마디마다 (방위, x, y, z)
     let mut x: Vec<[f64; 4]> = nodes.iter().map(|m| [yaw_of(&m.pose), m.pose[3], m.pose[7], m.pose[11]]).collect();
     let x0 = x.clone();
@@ -266,7 +314,7 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
                 wrap(xj[0] - xi[0] - e.dyaw) / e.sig.1.to_radians(),
                 (c * d[0] + s * d[1] - e.dp[0]) / e.sig.0,
                 (-s * d[0] + c * d[1] - e.dp[1]) / e.sig.0,
-                (d[2] - e.dp[2]) / e.sig.0,
+                (d[2] - e.dp[2]) / (e.sig.0 * e.zmul),
             ];
             let chi2: f64 = r.iter().map(|v| v * v).sum();
             // 코시 가중(척도 3 시그마)
@@ -285,12 +333,12 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
             jm[1][2] = -s * it;
             jm[2][1] = s * it;
             jm[2][2] = -c * it;
-            jm[3][3] = -it;
+            jm[3][3] = -it / e.zmul;
             jm[1][5] = c * it;
             jm[1][6] = s * it;
             jm[2][5] = -s * it;
             jm[2][6] = c * it;
-            jm[3][7] = it;
+            jm[3][7] = it / e.zmul;
             let idx = |q: usize| if q < 4 { 4 * e.i + q } else { 4 * e.j + q - 4 };
             for a in 0..8 {
                 let mut ga = 0.0;
@@ -305,6 +353,21 @@ pub fn refine(nodes: &[Node], k: &Intr, log: &mut Vec<String>) -> Vec<T34> {
                     }
                     h[(idx(a), idx(b))] += w * hab;
                 }
+            }
+        }
+        // 바닥 높이(마디 하나짜리): z − 카메라 높이 = 바닥, 코시 가중. 모든 마디에 처음 값 쪽 약한 끌림(떨어진 조각이 떠다니지 않게)
+        for i in 0..n {
+            if let (Some(hh), Some(f)) = (floor_h[i], floor_ref) {
+                let r = (x[i][3] - hh - f) / FLOOR_SIG;
+                let w = 1.0 / (1.0 + r * r / 9.0);
+                cost += 9.0 * (1.0 + r * r / 9.0).ln();
+                g[4 * i + 3] += w * r / FLOOR_SIG;
+                h[(4 * i + 3, 4 * i + 3)] += w / (FLOOR_SIG * FLOOR_SIG);
+            }
+            for q in 0..4 {
+                let sg = if q == 0 { 10f64.to_radians() } else { 10.0 };
+                g[4 * i + q] += (x[i][q] - x0[i][q]) / (sg * sg);
+                h[(4 * i + q, 4 * i + q)] += 1.0 / (sg * sg);
             }
         }
         // 마디 0 고정
@@ -431,6 +494,26 @@ mod tests {
         let k = Intr { fx: 614.201904, fy: 614.689209, cx: 324.950439, cy: 241.556976 };
         let mut log = Vec::new();
         let t0 = std::time::Instant::now();
+        let deps: Vec<(f64, &[u16])> = nt.iter().zip(&depths).map(|(t, d)| (t.0, d.as_slice())).collect();
+        let mut pf = frames.clone();
+        crate::mapmerge::realign_pieces(&mut pf, &deps, &k, &mut log);
+        eprintln!("{log:?}");
+        log.clear();
+        frames = pf;
+        let nodes: Vec<Node> = (0..depths.len()).map(|i| {
+            let p = frames.iter().find(|f| f.0 == nt[i].0).unwrap().1;
+            Node { t: nt[i].0, pose: p, seg: nt[i].1, d: &depths[i] }
+        }).collect();
+        if std::env::var("NO_REFINE").is_ok() {
+            let mut o = String::new();
+            for f in &frames {
+                o += &crate::orb3_backend::tum_line(f.0, &f.1);
+                o += "
+";
+            }
+            std::fs::write(&out, o).unwrap();
+            return;
+        }
         let dl = refine(&nodes, &k, &mut log);
         eprintln!("{log:?} {:.1} s", t0.elapsed().as_secs_f64());
         apply_deltas(&mut frames, &nt, &dl);

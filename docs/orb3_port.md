@@ -178,6 +178,8 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - `CorrectLoop` 가 `mpLocalMapper->EmptyQueue()` 를 **루프 스레드에서** 부름 → `ProcessNewKeyFrame` 이 지도 스레드의 처리와 겹쳐 돎(같은 mpCurrentKeyFrame · mlpRecentAddedMapPoints 를 두 스레드가 씀).
   - 지도 스레드는 큐가 빌 때만 `Stop()` 을 봄. 멈춤 요청 쪽이 여럿(CorrectLoop · MergeLocal · GBA 끝 · 우리 GraftMap)인데 `Release()` 하나가 `mbStopRequested` 를 통째로 지움 → 다른 요청자가 `isStopped()` 를 영영 못 볼 수 있음(GBA 끝 · GraftMap 은 `isFinished` 로만 빠져나옴, CorrectLoop 의 기다림은 빠질 길 없음).
 - 포팅판 방침: 지도 스레드 멈춤을 요청자별 토큰(세는 방식)으로, 큐 비우기는 지도 스레드 자신만, 루프 · 합치기 쪽 기다림에 종료 확인을 넣음. 원본 멈춤 스택을 얻으면 위 둘 중 어느 쪽인지 기록.
+- 구현: `orb3loop/stopctl.rs` `StopCtl` — `request(drain)` 이 표(`StopToken`, 버리면 풀림)를 주고 요청 수를 셈, 마지막 표가 풀릴 때만 지도 스레드가 다시 돎. `drain` 요청은 지도 스레드가 `check_stop(queue_empty)` 에서 `Some(true)` 를 받아 스스로 큐를 비운 뒤 멈춤(이미 멈춰 있으면 깨워 비우게 함). `wait_stopped` 는 `finish()` 로 빠짐. 시험: 요청자 둘 중 하나가 먼저 풀어도 남은 쪽이 멈춤을 보는 200 회 · 종료로 기다림 풀림(`cargo test -p slam --lib orb3loop::stopctl`). 원본의 SetNotStop 은 `set_not_stop`.
+- `Tracking::Relocalization` 흐름: `orb3loop/reloc.rs` `relocalize`(후보 → SearchByBoW 0.75 → PnP 5 번씩 → PoseOptimization → 투영 보강 10/100 · 3/64, 원본 순서 그대로), PnP 는 `PnpFactory` 트레잇(원본 MLPnP FFI 또는 포터 OPT 의 Rust 판을 끼움). 부품(짝짓기 · PoseOptimization)은 비트 대조 끝난 것. **흐름 전체의 원본 대조 하네스와 MLPnP FFI 는 아직 없음**(TUM 에서 재위치가 거의 안 일어나 추적을 일부러 잃게 하는 입력이 필요).
 
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.

@@ -313,3 +313,7 @@
 - 전체 실행 눈 판정: 앞(parc_out25) 15/20(75 %), 뒤 절반(parc_out26) 9/10(90 %), **합 24/30 = 80 %**(전 33/47 = 70 %).
 - 대가: 이름 붙는 물체 47 → 30. 맞던 이름 중 bulletin board · first aid kit · jacket · door(앞) · box · bulletin board(뒤) 등이 object 로 바뀜.
 - 남은 틀림 6: 게시판 → window, 의자 → table · monitor(2) · computer tower, 문틀 → ruler.
+- 문턱 0.01 판 뷰어 캡처(옛 뷰어 꺼짐 확인 `listen before: 0`, 로그 `memory dir parc_out25`): docs/img/parc_names_margin01.png — 화면 이름이 판정표와 같다.
+- 원본 영상 프레임 대조(물체 last_seen 시각의 rgb 프레임, 틀림 6 · 맞음 일부): O85 monitor = 실제로 옆으로 본 모니터(맞음으로 정정, 대표 사진에선 의자 등받이로 오판),
+  O176 computer tower = 책상 밑 본체(맞음으로 정정). O22 window(타공 게시판) · O88 monitor(게시판) · O27 table(의자) · O5 ruler(책상 다리 패널)는 틀림 유지, O3 · O52 monitor · O80 chair 맞음 확인.
+  정정 뒤 합 26/30 = **87 %**(앞 17/20, 뒤 9/10). 앞 차수들의 같은 물체(의자 뒷면 → monitor, chair/partition 표기)도 실제로는 모니터 · 본체였을 수 있어 앞 판 수치는 조금 낮게 잡혔을 수 있다.

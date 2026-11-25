@@ -2478,6 +2478,8 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
     let mut eb = EB.with(|c| c.take());
     // 깊이 > 0.2 m 판정: 원래 값이면 문턱 값 하나와 비교(나눗셈 없이 같은 판정)
     let raw_th = depth.raw().zip(depth.raw_above(0.2));
+    // 장면 번짐 몫(1 = 최근 가장 선명한 장면만큼 선명): 흔들려 번진 장면의 사진은 이름이 엉뚱해져(종이 수건 · 테이프 · 유리) 사진 점수를 깎는다
+    let blur_q = if dets.as_ref().is_some_and(|d| !d.is_empty()) && map_ok { frame_crisp(rgb, w, h) } else { 1.0 };
     for d in dets.iter().flatten().filter(|_| map_ok) {
         let c_obj = Instant::now();
         let name = "object";
@@ -2582,7 +2584,7 @@ fn map_frame(_a: &Args, k: [f64; 4], t: f64, r_: &M3, pwc_: &V3, floor_z: f64, d
             common::prof::time(common::prof::T::ObjPoints, c_obj);
         }
         let c_up = Instant::now();
-        let id = mem.update(name, d.score, &pts, med as f32, t, crop_score(rgb, w, h, x1, y1, bw, bh, m), crop, None);
+        let id = mem.update(name, d.score, &pts, med as f32, t, (crop_score(rgb, w, h, x1, y1, bw, bh, m) as f32 * blur_q * blur_q) as u32, crop, None);
         if on_main {
             common::prof::time(common::prof::T::ObjUpdate, c_up);
         }
@@ -2651,14 +2653,14 @@ fn write_view(dir: &Path, grid: &Grid, mem: &mut Memory, view: &mut ViewWorker, 
                 out::jpg_rgb(&dir.join(format!("{base}_rgb.jpg")), c.w, c.h, c.rgb.clone());
                 out::png_gray(&dir.join(format!("{base}_mask.png")), c.w, c.h, c.mask.clone());
                 out::png_u16(&dir.join(format!("{base}_depth.png")), c.w, c.h, c.depth.clone());
-                to_embed.push((o.id, c.w, c.h, c.rgb.clone()));
+                to_embed.push((o.id, c.w, c.h, focus(&c)));
                 common::prof::copy(common::prof::C::CropShare, 0);
             }
             o.crop_saved = o.crop_ver;
         }
         if let Some(c) = o.view.take() {
             if std::env::var("ONDEVICE_NAME_DEBUG").is_ok() { println!("viewdbg O{} obs {}", o.id, o.n_obs); }
-            to_embed.push((o.id, c.w, c.h, c.rgb.clone()));
+            to_embed.push((o.id, c.w, c.h, focus(&c)));
         }
         // 이름: 사진이 닮은 이름(--vocab)이 있으면 그것, 없으면 분할 모델이 준 이름
         let look = embed::name(o.id, o.name != "object");
@@ -2852,8 +2854,47 @@ fn crop_score(rgb: &[u8], w: usize, h: usize, x1: usize, y1: usize, bw: usize, b
     let (mean, sharp) = (sum as f32 / n as f32, grad as f32 / n as f32);
     let bright = (mean / 60.0).clamp(0.2, 1.0);
     let crisp = (sharp / 6.0).clamp(0.3, 1.0);
-    let edge = if x1 == 0 || y1 == 0 || x1 + bw >= w || y1 + bh >= h { 0.6 } else { 1.0 };
+    // 가장자리에 닿은 사진은 물체 일부만 보여 이름이 틀리기 쉬움(문 일부 → locker): 다 보인 사진을 크게 앞세움
+    let edge = if x1 == 0 || y1 == 0 || x1 + bw >= w || y1 + bh >= h { 0.35 } else { 1.0 };
     ((bw * bh) as f32 * bright * crisp * edge) as u32
+}
+
+/// 사진 벡터용 사진: 마스크 밖 픽셀을 회색 쪽으로 FOCUS_DIM 만큼 흐리게(둘레는 남김). 정사각형 사진에서 둘레(책상 · 모니터)가
+/// 마스크 물체(의자)보다 커서 둘레 이름이 붙던 것을 줄인다
+fn focus(c: &Crop) -> std::sync::Arc<Vec<u8>> {
+    let mut o = c.rgb.as_ref().clone();
+    for (px, &m) in o.chunks_exact_mut(3).zip(c.mask.iter()) {
+        if m == 0 {
+            px.iter_mut().for_each(|v| *v = (*v as f32 + (128.0 - *v as f32) * FOCUS_DIM) as u8);
+        }
+    }
+    std::sync::Arc::new(o)
+}
+const FOCUS_DIM: f32 = 0.6;
+
+/// 최근 가장 선명했던 장면의 선명함(천천히 줄어듦, 장면마다 ×CRISP_DECAY)
+static CRISP_REF: std::sync::Mutex<f32> = std::sync::Mutex::new(0.0);
+const CRISP_DECAY: f32 = 0.99;
+/// 장면 번짐 몫(0.1..1): 영상 전체 밝기 차를 가로 · 세로로 따로 재어 작은 쪽(한 방향 흔들림은 그 방향 차만 지움)을
+/// 최근 가장 선명한 장면의 값과 비교. 다시 쌓기 스레드는 기준을 읽기만 한다
+fn frame_crisp(rgb: &[u8], w: usize, h: usize) -> f32 {
+    let luma = |o: usize| (rgb[o * 3] as i32 * 77 + rgb[o * 3 + 1] as i32 * 150 + rgb[o * 3 + 2] as i32 * 29) >> 8;
+    let (mut gx, mut gy, mut n) = (0u64, 0u64, 0u64);
+    for y in (0..h - 1).step_by(4) {
+        for x in (0..w - 1).step_by(4) {
+            let o = y * w + x;
+            let a = luma(o);
+            gx += luma(o + 1).abs_diff(a) as u64;
+            gy += luma(o + w).abs_diff(a) as u64;
+            n += 1;
+        }
+    }
+    let s = gx.min(gy) as f32 / n.max(1) as f32;
+    let mut r = CRISP_REF.lock().unwrap();
+    if std::thread::current().name() == Some("main") {
+        *r = (*r * CRISP_DECAY).max(s);
+    }
+    if *r <= 0.0 { 1.0 } else { (s / *r).clamp(0.1, 1.0) }
 }
 
 /// 장면 보관 예산 기본값: 시작할 때 쓸 수 있는 메모리(MemAvailable)의 15 %(리눅스), 그 밖은 3000 MB.

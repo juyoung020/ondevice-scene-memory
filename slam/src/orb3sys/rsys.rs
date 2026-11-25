@@ -107,44 +107,8 @@ impl KfSteps for RsSteps {
         localmap::map_point_culling(&mut self.recent, kf, false, &mut st.atlas, &mut st.ext);
     }
     fn create_new_map_points(&mut self, st: &mut MapState, kf: KfId) {
-        let cur = st.atlas.kfs[&kf].clone();
-        let nb: Vec<KeyFrame> = best_covisibles(&cur, 10).iter().map(|k| st.atlas.kfs[k].clone()).collect();
-        let refs: Vec<&KeyFrame> = nb.iter().collect();
         let mapper = Arc::clone(&self.mapper);
-        let m = Matcher::new(0.6, false);
-        let mut new = Vec::new();
-        // 원본은 이웃마다 짝을 찾은 뒤 새 점을 바로 지도에 넣는다(다음 이웃 짝 찾기가 그 점을 봄) — 짝 찾기 전에 앞 이웃의 점을 넣음
-        let atlas = std::cell::RefCell::new(&mut st.atlas);
-        let recent = std::cell::RefCell::new(&mut self.recent);
-        localmap::create_new_map_points(
-            &cur,
-            &refs,
-            &self.tri,
-            &mut |k2| {
-                let a = atlas.borrow();
-                m.search_for_triangulation(&a.kfs[&kf], &a.kfs[&k2], false, false)
-            },
-            &mut || mapper.check_new_keyframes(),
-            &mut |n: NewMp| {
-                let mut a = atlas.borrow_mut();
-                let id = a.next_mp;
-                a.next_mp += 1;
-                let (map, frame) = (a.kfs[&kf].map, a.kfs[&kf].frame_id);
-                let mut mp = MapPoint { id, map, pos: n.pos, first_frame: frame, first_kf: kf, ref_kf: kf, visible: 1, found: 1, ..Default::default() };
-                mp.add_observation(&a.kfs[&kf], n.idx1);
-                mp.add_observation(&a.kfs[&n.kf2], n.idx2);
-                a.kfs.get_mut(&kf).unwrap().map_points[n.idx1] = Some(id);
-                a.kfs.get_mut(&n.kf2).unwrap().map_points[n.idx2] = Some(id);
-                mp.compute_distinctive_descriptors(&a.kfs);
-                a.mps.insert(id, mp);
-                crate::orb3rs::mapdata::mp_update_normal_and_depth(&mut a, id);
-                if let Some(mi) = a.maps.iter_mut().find(|x| x.id == map) {
-                    mi.mps.push(id);
-                }
-                recent.borrow_mut().push(id);
-                new.push(id);
-            },
-        );
+        create_new_map_points_into(&mut st.atlas, kf, &self.tri, &mut self.recent, &mut || mapper.check_new_keyframes());
     }
     /// LocalMapping::SearchInNeighbors(단안 · 관성 아님). mnFuseTargetForKF · mnFuseCandidateForKF 표시는 이 호출 안의 집합
     fn search_in_neighbors(&mut self, st: &mut MapState, kf: KfId) {
@@ -209,6 +173,49 @@ impl KfSteps for RsSteps {
         let abort = &self.mapper;
         localmap::keyframe_culling(&local, false, &|_| th, &|| abort.abort_ba().load(std::sync::atomic::Ordering::SeqCst), &mut st.atlas, &mut st.ext);
     }
+}
+
+/// LocalMapping::CreateNewMapPoints(RGB-D) 전체: 짝 찾기 · 삼각측량(포터 TRACK) + 새 점 넣기(MapPoint(x3D, KF, 지도) ·
+/// AddObservation 둘 · AddMapPoint 둘 · ComputeDistinctiveDescriptors · UpdateNormalAndDepth · Atlas::AddMapPoint · mlpRecentAddedMapPoints).
+/// `check_new` = CheckNewKeyFrames. 돌려줌: 새 점들(순서대로)
+pub fn create_new_map_points_into(atlas: &mut Atlas, kf: KfId, tri: &TriParams, recent: &mut Vec<MpId>, check_new: &mut dyn FnMut() -> bool) -> Vec<MpId> {
+    let cur = atlas.kfs[&kf].clone();
+    let nb: Vec<KeyFrame> = best_covisibles(&cur, 10).iter().map(|k| atlas.kfs[k].clone()).collect();
+    let refs: Vec<&KeyFrame> = nb.iter().collect();
+    let m = Matcher::new(0.6, false);
+    let mut new = Vec::new();
+    // 원본은 이웃마다 짝을 찾은 뒤 새 점을 바로 지도에 넣는다(다음 이웃 짝 찾기가 그 점을 봄)
+    let atlas = std::cell::RefCell::new(atlas);
+    localmap::create_new_map_points(
+        &cur,
+        &refs,
+        tri,
+        &mut |k2| {
+            let a = atlas.borrow();
+            m.search_for_triangulation(&a.kfs[&kf], &a.kfs[&k2], false, false)
+        },
+        check_new,
+        &mut |n: NewMp| {
+            let mut a = atlas.borrow_mut();
+            let id = a.next_mp;
+            a.next_mp += 1;
+            let (map, frame) = (a.kfs[&kf].map, a.kfs[&kf].frame_id);
+            let mut mp = MapPoint { id, map, pos: n.pos, first_frame: frame, first_kf: kf, ref_kf: kf, visible: 1, found: 1, ..Default::default() };
+            mp.add_observation(&a.kfs[&kf], n.idx1);
+            mp.add_observation(&a.kfs[&n.kf2], n.idx2);
+            a.kfs.get_mut(&kf).unwrap().map_points[n.idx1] = Some(id);
+            a.kfs.get_mut(&n.kf2).unwrap().map_points[n.idx2] = Some(id);
+            mp.compute_distinctive_descriptors(&a.kfs);
+            a.mps.insert(id, mp);
+            crate::orb3rs::mapdata::mp_update_normal_and_depth(&mut a, id);
+            if let Some(mi) = a.maps.iter_mut().find(|x| x.id == map) {
+                mi.add_map_point(id);
+            }
+            recent.push(id);
+            new.push(id);
+        },
+    );
+    new
 }
 
 impl MapperStatus for Mapper<KfId> {

@@ -8,7 +8,9 @@ pub type T34 = [f64; 12];
 use crate::mapmerge::{inv, mul, Intr, SCALE, SH, SW};
 
 const ZMIN: f64 = 0.3;
-const ZMAX: f64 = 4.0;
+/// 지도 · 위치 추적에 쓰는 가장 먼 깊이(m, 병렬 A4)
+pub const NEAR_M: f64 = 2.5;
+const ZMAX: f64 = NEAR_M;
 /// 고리 후보: 시간 차(초) 이상, 카메라 거리(m) · 보는 방향 각 이하, 마디마다 최대 수
 const LOOP_DT: f64 = 3.0;
 const LOOP_DIST: f64 = 1.5;

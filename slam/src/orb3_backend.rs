@@ -512,7 +512,10 @@ impl Orb3 {
             let m = self.acc.iter().fold([0.0; 3], |s, x| [s[0] + x.1[0], s[1] + x.1[1], s[2] + x.1[2]]).map(|v| v / self.acc.len() as f64);
             (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt()
         });
-        let tr = self.sys.track(&f.color, &f.depth_mm, w, h, f.t, up);
+        // 병렬 A4: 위치 추적에는 가까운 깊이(NEAR_M 안)만 — 먼 깊이(3–4 m 앞 모니터 옆면 등)는 시선 방향으로 번져 지도를 비스듬하게 만듦
+        let lim = (crate::refine::NEAR_M * f.depth_per_m as f64) as u16;
+        let near: Vec<u16> = f.depth_mm.iter().map(|&d| if d > lim { 0 } else { d }).collect();
+        let tr = self.sys.track(&f.color, &near, w, h, f.t, up);
         self.s_track.push(c0.elapsed().as_secs_f64() * 1e3);
         let changed = self.sys.map_changed();
         let mut flags = 0u32;

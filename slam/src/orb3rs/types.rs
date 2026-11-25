@@ -59,7 +59,7 @@ pub struct Camera {
     /// mbf = 기준선 × fx (RGB-D 는 설정의 Stereo.b × fx)
     pub bf: f32,
     pub b: f32,
-    /// mThDepth = bf × ThDepth / fx
+    /// mThDepth = 설정 Stereo.b × ThDepth (Tracking::newParameterLoader)
     pub th_depth: f32,
     pub width: i32,
     pub height: i32,

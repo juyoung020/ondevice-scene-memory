@@ -995,7 +995,7 @@ fn conv(n: &Node, ins: &[Option<&Tensor>]) -> R {
                 .flat_map(|ci| (0..kh).flat_map(move |ky| (0..kw).map(move |kx| ((ci * st + ky % st) * st + kx % st) * plane + (ky / st) * wq + kx / st)))
                 .collect();
             let planes = g.c * st * st;
-            let need = (offs.iter().max().unwrap() + np * NB).max(planes * plane);
+            let need = (offs.iter().max().unwrap() + np * NB + 16).max(planes * plane);
             // 1×1 · 보폭 1 · 덧댐 0 이고 끝 판이 입력 안에서 끝나면 입력을 그대로 읽음(복사 없음)
             if kh == 1 && kw == 1 && st == 1 && g.pt == 0 && g.pl == 0 && g.oh == g.h && g.ow == g.w && need <= chw {
                 for b in 0..nb {
@@ -1202,26 +1202,34 @@ impl ConvDirectSink<'_> {
             }
         }
         self.act.apply_in(rows.as_flattened_mut());
-        for (i, r) in rows.iter_mut().enumerate() {
-            let row = r0 + i;
-            let v = &r[..w];
-            // 출력 줄 조각마다 이어 붙여 쓰기
-            let mut j = 0;
-            while j < w {
-                let q = c0 + j;
-                let (oy, ox) = (q / self.wp, q % self.wp);
-                if ox >= self.ow {
-                    j += self.wp - ox;
-                    continue;
-                }
-                let l = (self.ow - ox).min(w - j);
+        // 열 → 출력 자리 조각(모든 줄이 같음): (덩어리 안 시작, 출력 평면 안 자리, 길이), 나눗셈은 한 번
+        let mut seg = [(0usize, 0usize, 0usize); NB];
+        let mut ns = 0;
+        let (mut oy, mut ox) = (c0 / self.wp, c0 % self.wp);
+        let mut j = 0;
+        while j < w {
+            if ox >= self.ow {
+                j += self.wp - ox;
+                ox = 0;
+                oy += 1;
+                continue;
+            }
+            let l = (self.ow - ox).min(w - j);
+            seg[ns] = (j, oy * self.ow + ox, l);
+            ns += 1;
+            j += l;
+            ox += l;
+        }
+        for (i, r) in rows.iter().enumerate() {
+            let o = (r0 + i) * self.ohw;
+            for &(j, d, l) in &seg[..ns] {
                 // SAFETY: (줄, 열) 칸이 일마다 겹치지 않음
-                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr().add(j), self.out.add(row * self.ohw + oy * self.ow + ox), l) };
-                j += l;
+                unsafe { std::ptr::copy_nonoverlapping(r.as_ptr().add(j), self.out.add(o + d), l) };
             }
         }
     }
 }
+
 
 struct ConvTSink<'a> {
     out: *mut f32,

@@ -202,9 +202,18 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
   - 실패한 재위치는 장면이 들어올 때 상태(앞 추적의 자세 · 짝)를 그대로 남기므로 덤프에 그 상태도 넣음.
   - 실행: `ORBLOOP_RELOC=~/orbloop_reloc/room.bin:~/orbloop_reloc/ds.bin ORBLOOP_MLPSRV=~/opt/orb3_loop_bg/reloc/mlp_srv cargo test --release -p slam --test orb3loop_reloc`(입력 없으면 실패).
 
+### 공통 영역 찾기(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF) — `orb3loop/detect.rs`
+- 옮긴 것: FindMatchesByProjection · DetectCommonRegionsFromLastKF · DetectAndReffineSim3FromLastKF · DetectCommonRegionsFromBoW, g2o::Sim3(double: 사원수 곱 · 점 회전 · 행렬↔사원수 · 곱 · toSophus). OptimizeSim3 는 트레잇(BA 몫이 오면 바꿔 낌).
+- 대조(`slam/tests/orb3loop_detect.rs`): 원본 기준 빌드에 `~/opt/orb3_loop_bg/reloc/loop_dump`(두 함수 · OptimizeSim3 · RandomInt 가로챔)를 링크해 돌림. 호출마다 들어갈 때 상태(현재 키프레임 둘레 2 단계 · 후보 둘레 3 단계 공시 키프레임, 그 지도 점과 관측, 출력 칸의 이전 값), 안에서 쓴 난수, OptimizeSim3 입출력, 나올 때 출력. OptimizeSim3 은 원본 FFI(`mlp_srv` 명령 4: 기준 빌드의 Optimizer::OptimizeSim3 를 가짜 키프레임 · 지도 점으로 부름).
+  - TUM fr1_room(`0-1362,0-700` 되감기) + 강의실 ds_1118(`0-2400`): 호출 33(참 2) **33 / 33 같음**(결과 · 찾은 키프레임 · gScw 비트 · 일치 수 · 점 목록 · 난수 수), OptimizeSim3 13 / 13(입력 짝 · S · 결과 · 남은 짝 · S 비트). 앞선 실행 덤프(room · ds 3 개 루프)로도 52 / 52 · 13 / 13.
+  - OptimizeSim3 까지 간 호출은 모두, 나머지는 25 개 중 하나만 남김(덤프 크기). LastKF 단계는 실제 실행에 드물어 BoW 로 찾은 직후 같은 상태로 원본 DetectAndReffineSim3FromLastKF 를 한 번 더 불러 덤프(지도를 바꾸지 않는 함수).
+  - 덤프하는 동안 지도 스레드를 멈춤(RequestStop · isStopped 대기 · Release). 안 멈추면 원본 루프 스레드가 지도 스레드와 같이 돌아 덤프 뒤 상태가 바뀜 — 처음 실행에서 254 호출 중 32 개가 그래서 난수 범위(Sim3 짝 수)가 달랐음.
+- 맞추며 알게 된 원본 동작: `SE3f.cast<double>()` 은 SO3d 생성자를 거쳐 double 로 다시 정규화(`unit_quaternion().cast<double>()` 은 안 함 — CorrectLoop 의 NonCorrectedSim3 가 이쪽). Quaterniond 곱은 SSE2 Packet2d 판 식(`quatd_mul`). 원본 버릇: BoW 단계 `pMostBoWMatchesKF` 는 늘 후보 자신, `DetectCommonRegionsFromLastKF` 가 `vpMapPoints` 를 덮어씀, FindMatchesByProjection 의 2 단계 이웃은 걸러지지 않고 통째로 붙음, DetectAndReffine 은 OptimizeSim3 결과를 버림(모두 `detect.rs` 머리말).
+- 강의실 실행에서 원본이 두 번 멈춤(`Loop detected` 뒤 `Local Mapping STOP` 다음 진행 없음, 25 분)과 한 번 `std::system_error: Invalid argument` 로 죽음. 덤프 쪽 멈춤 요청 · 풀기(Release 하나가 다른 요청자의 멈춤까지 지움)가 원본의 그 위험을 더 드러냈을 수 있음 — 포팅판은 `orb3sys::threads` 의 StopToken.
+
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
-- `Tracking::Relocalization` 흐름, `LoopClosing`(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
+- `LoopClosing`(CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
 - KeyFrameDatabase 대조는 실제 BoW + 만든 공시성 시나리오. 실제 실행 중 질의를 가로챈 대조는 안 함.
 - 강의실 녹화(ds_1118)는 BoW 단계만; Sim3 · 고유 풀이 대조는 TUM fr1_room 실행 하나.
 

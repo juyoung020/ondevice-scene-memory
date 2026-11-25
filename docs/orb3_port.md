@@ -391,15 +391,18 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 
 | 원본 | Rust | 비교(기준 빌드 덤프, `~/orbs3_ref`) | 결과 |
 |---|---|---|---|
-| Optimizer::OptimizeSim3 — 그래프 만들기 · Levenberg 5 번 · χ² > th2 이상치 지우기 · 강건 커널 떼고 5/10 번 · nIn | `build_sim3_problem` · `optimize_sim3` | TUM room ×3 · 360 ×3 · ETH3D large_loop_1 ×2 의 실제 호출 37 개(그래프 만들기 입력까지 덤프한 것 8 개) — 첫 최적화 S12 · 간선 χ² · 반복 수 · nIn · 끝 S12 · 지운 짝 | **비트 동일** |
+| Optimizer::OptimizeSim3 — 그래프 만들기 · Levenberg 5 번 · χ² > th2 이상치 지우기 · 강건 커널 떼고 5/10 번 · nIn | `build_sim3_problem` · `optimize_sim3` | TUM room ×3(+끊김 순서 2) · 360 ×3 · ETH3D large_loop_1 ×2 · 강의실 ds_1118_121652 의 실제 호출 68 개(그래프 만들기 입력까지 덤프한 것 39 개) — 첫 최적화 S12 · 간선 χ² · 반복 수 · nIn · 끝 S12 · 지운 짝 | **비트 동일** |
 | 첫 반복 단계(H 7×7 · b · λ 넣어 푼 x) | `sim3_first_stage` | room 4 호출(`s3stage stage`) | **비트 동일** |
 | g2o LinearSolverDense = Eigen 3.4 LDLT<MatrixXd>(대각 피벗) | `dense_ldlt_solve` | 무작위 7×7 2 만 건(0 열 · 음 · 0 행렬 섞음) | **비트 동일** |
-| OptimizeEssentialGraph(루프 판) — 그래프 만들기(LoopConnections · 신장 트리 · 루프 · 공시성 ≥100 간선) · Levenberg 20 번(λ₀ 1e-16, SimplicialLDLT = `orb3ba::ldlt`) · Tiw(SE3f) · 점 고치기 | `build_eg_loop` · `optimize_essential_graph` · `sim3_to_se3f` · `eg_loop_points` | 실제 루프 9 번(정점 118–293 · 간선 599–2184) 끝 정점 · χ² · 반복 수, 키프레임 자세 1,870, 점 13.3 만 + 첫 반복 단계(오차 · 간선마다 야코비안 · Hpp 블록 2,455 · b · x) | **비트 동일** |
-| OptimizeEssentialGraph(합치기 판) | 최적화 핵심은 같은 `optimize_essential_graph`(그래프 만들기 · 마무리는 남음) | 합치기가 나는 입력을 못 만듦(TUM · ETH3D · slamint 끊김 시퀀스에서 합치기 0 번) | 미검증 |
+| OptimizeEssentialGraph(루프 판) — 그래프 만들기(LoopConnections · 신장 트리 · 루프 · 공시성 ≥100 간선) · Levenberg 20 번(λ₀ 1e-16, SimplicialLDLT = `orb3ba::ldlt`) · Tiw(SE3f) · 점 고치기 | `build_eg_loop` · `optimize_essential_graph` · `sim3_to_se3f` · `eg_loop_points` | 실제 루프 12 번(정점 118–300 · 간선 599–3511, 그래프 만들기 포함 5 번) 끝 정점 · χ² · 반복 수, 키프레임 자세 1,870, 점 13.3 만 + 첫 반복 단계(오차 · 간선마다 야코비안 · Hpp 블록 2,455 · b · x) | **비트 동일** |
+| OptimizeEssentialGraph(합치기 판) — 세 목록(고정 · 고정 고침 · 안 고정) 그래프 만들기(축척 자유 정점) · 20 번 · SE3d(R, t/s)→SE3f · mTcw/mTwcBefMerge · 점 고치기 | `build_eg_merge` · `optimize_essential_graph` · `merge_kf_update` · `merge_point` | TUM room 끊김 순서 2 개(`ORDER`)에서 난 합치기 2 번(정점 100 · 107): 그래프 · 끝 정점 · 활성 간선 χ² · 반복 수 · 키프레임 88 · 점 6,519 | **비트 동일** |
 
 - 쓰는 법: OptimizeSim3 는 `Sim3Kf`(Tcw 회전 행 우선 · 이동, mvKeysUn, mvInvLevelSigma2, 카메라) 둘 + `Sim3Match`(vpMatches1 있는 자리) → `build_sim3_problem` → `optimize_sim3`(결과 nIn · S12 · 짝마다 지움). 본질 그래프는 `EgLoopInput`(키프레임을 원본 vpKFs 순서로 · 루프 · 자식 · 공시성 목록 순서 그대로) → `build_eg_loop` → `optimize_essential_graph(&mut g.vertices, &g.edges, 20)` → `sim3_to_se3f` · `eg_loop_points`. 원본 순서가 std::set 주소 순인 자리(vpKFs · GetLoopEdges · LoopConnections)는 호출자가 준 순서를 따름 — Rust Atlas 는 id 순으로 준다.
 - 맞추며 알게 된 것: 고정 7×7 에 작은 곱을 더하는 대입은 모든 열에서 0..6 행이 Packet2d 묶음(FMA 사슬) · 6 행 낱개(반 나눔 합). 7 길이 연속 내적은 ((m0+(m2+m4))+(m1+(m3+m5)))+m6. 전치 왼쪽(행 우선) 곱은 전부 낱개. LDLT GEMV 는 앞 4 · 다음 2 행 묶음(AVX-512 반 · 4 분의 1 묶음). VertexSim3Expmap::oplus 가 고정 축척일 때 풀이 벡터 x[6] 을 0 으로 바꿔 computeScale 에도 들어감. OptimizeSim3 의 KF2 밖 점은 `cv::KeyPoint(Point2f, mnTrackScaleLevel)` 둘째 인자가 size 라 octave 0 의 정보 행렬을 씀(원본 그대로). 실패한 선형 풀이 · 미정의 갈래(풀이 실패 시 이전 x)는 덤프에 없음.
-- BA 와의 경계: `orb3ba::ldlt::Ldlt`(analyze · factorize · solve) 만 가져다 씀. BA 쪽 "남음" 표의 OptimizeEssentialGraph · OptimizeSim3 는 여기서 끝남(합치기 판 그래프 만들기만 남음). GlobalBA · 합치기용 BA 는 BA 몫.
+- **g2o RobustKernelHuber 의 dsqr 은 float 칸**(robust_kernel_impl.h `float dsqr`): ρ0 = 2·√e·δ − (f32)δ², 안팎 판정도 그 값. double 로 두면 강의실 Sim3 호출 하나가 4 번째 반복부터 끝 비트가 갈림(χ² 합 → ρ → λ). BA 의 Huber 도 같은 칸을 씀 — `orb3ba::edges::huber` 확인 필요.
+- 합치기 판 원본 동작: 고정 목록 정점은 Swi 가 기본 Sim3(I) 라 좋은 자세끼리 간선 측정 = vCorrectedSwc[j]⁻¹ 그대로, 고정 고침 · 안 고정 정점은 _fix_scale 기본 false(축척 자유, 6 행/열이 살아 있음 → 7×7 대입 규칙이 6 행까지 맞는 것 확인). 두 정점 다 고정인 간선은 오차를 안 계산해 원본 χ² 가 초기화 안 된 값 — 비교에서 뺌.
+- 끊김 · 합치기 입력 만들기: `~/opt/orb3_cv/s3opt/ds_run2`(ds_run + 환경 `ORDER="a:b,c:d"` 장면 구간 순서, 시각은 1/30 초씩). TUM room `ORDER=0:350,700:1300,1300:1301,50:400` · `0:300,650:1250,30:350` 에서 합치기 1 번씩 남(덤프 `~/orbs3_ref/mg_room2.bin` · `mg_0_300_650_1250_30_350.bin`). BA 와 같이 씀.
+- BA 와의 경계: `orb3ba::ldlt::Ldlt`(analyze · factorize · solve) 만 가져다 씀. BA 쪽 "남음" 표의 OptimizeEssentialGraph(두 판) · OptimizeSim3 는 여기서 끝남. GlobalBA · 합치기용 BA 는 BA 몫.
 - 하네스(저장소 밖 WSL `~/opt/orb3_cv/s3opt`): `mkpatch.py`+`mkpatch_add.py` 가 원본 Optimizer.cc 에 덤프를 끼워 `libs3dump.so`(build.sh, 기준 빌드에 링크), `run2.sh 이름 폴더 설정`(`ORB3_S3_DUMP`), `egstage`(본질 그래프 다시 풀기 · 첫 반복 단계), `s3stage ldlt|stage`. Rust 비교: `~/opt/orb3_cv/rs` 의 `--bin s3opt 덤프들…` · `--bin egst` · `--bin s3st`. 덤프가 없으면 실패.
 
 ## 포터 BA

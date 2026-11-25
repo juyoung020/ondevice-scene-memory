@@ -11,6 +11,7 @@
 //! 하네스: 저장소 밖 WSL `~/opt/orb3_cv/s3opt`(원본 덤프) · `~/opt/orb3_cv/rs --bin s3opt`(비교).
 use super::g2osim3::{G2oSim3, V3d};
 use crate::orb3ba::ldlt::Ldlt;
+use crate::orb3rs::types::Se3;
 use std::collections::BTreeMap;
 
 #[inline(always)]
@@ -65,10 +66,10 @@ fn prods(a: &[f64], b: &[f64]) -> Vec<f64> {
     a.iter().zip(b).map(|(x, y)| x * y).collect()
 }
 
-/// g2o RobustKernelHuber::robustify → (ρ0, ρ1)
+/// g2o RobustKernelHuber::robustify → (ρ0, ρ1). 이 판 g2o 는 dsqr 을 float 칸에 담음(setDelta: dsqr = δ²)
 #[inline]
 pub fn huber(e: f64, delta: f64) -> (f64, f64) {
-    let dsqr = delta * delta;
+    let dsqr = ((delta * delta) as f32) as f64;
     if e <= dsqr {
         (e, 1.0)
     } else {
@@ -1127,6 +1128,161 @@ pub fn eg_loop_points(g: &EgGraph, cur_kf: u32, mps: &[EgMp]) -> Vec<(u32, [f32;
         out.push((r, correct_point(&srw, &cswr, &m.pos)));
     }
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// 합치기 판 OptimizeEssentialGraph(KeyFrame* pCurKF, vpFixedKFs, vpFixedCorrectedKFs, vpNonFixedKFs, vpNonCorrectedMPs)
+
+/// 합치기 판 키프레임 입력(세 목록 각각 원본 순서). 자세는 Sophus SE3f(사원수 [x,y,z,w] · 이동)
+#[derive(Clone, Debug)]
+pub struct MgKf {
+    pub id: u32,
+    pub bad: bool,
+    /// GetPose() · mTcwBefMerge · GetPoseInverse() · mTwcBefMerge
+    pub pose: Se3,
+    pub tcw_bef_merge: Se3,
+    pub twc: Se3,
+    pub twc_bef_merge: Se3,
+    pub parent: Option<u32>,
+    pub children: Vec<u32>,
+    pub loop_edges: Vec<u32>,
+    pub covis100: Vec<(u32, bool)>,
+}
+
+pub struct MgInput {
+    pub fixed: Vec<MgKf>,
+    pub fixed_corrected: Vec<MgKf>,
+    pub non_fixed: Vec<MgKf>,
+}
+
+pub struct MgGraph {
+    pub vertices: Vec<EgVertex>,
+    pub edges: Vec<EgEdge>,
+    /// vpBadPose(점 고치기가 씀)
+    pub bad_pose: BTreeMap<u32, bool>,
+}
+
+fn se3_to_sim3(t: &Se3) -> G2oSim3 {
+    se3f_to_sim3(&t.q, &t.t)
+}
+
+/// 합치기 판 그래프 만들기. 원본 그대로: 고정 목록 정점은 Swi 가 기본값(좋은 자세끼리 간선도 Sjw·I), 축척 자유 정점(_fix_scale 기본 false)
+pub fn build_eg_merge(inp: &MgInput) -> MgGraph {
+    let min_feat = 100;
+    let mut scw: BTreeMap<u32, G2oSim3> = BTreeMap::new();
+    let mut cswc: BTreeMap<u32, G2oSim3> = BTreeMap::new();
+    let mut good: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut badp: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut verts: BTreeMap<u32, EgVertex> = BTreeMap::new();
+    let mut add_v = |verts: &mut BTreeMap<u32, EgVertex>, id: u32, est: G2oSim3, fixed: bool, fix_scale: bool| {
+        // 같은 id 두 번이면 원본 addVertex 가 실패해 처음 것이 남음
+        verts.entry(id).or_insert(EgVertex { id: id as i32, fixed, fix_scale, est });
+    };
+    for k in &inp.fixed {
+        if k.bad {
+            continue;
+        }
+        let s = se3_to_sim3(&k.pose);
+        cswc.insert(k.id, s.inverse());
+        add_v(&mut verts, k.id, s, true, true);
+        good.insert(k.id, true);
+        badp.insert(k.id, false);
+    }
+    let mut sid = std::collections::BTreeSet::new();
+    for k in &inp.fixed_corrected {
+        if k.bad {
+            continue;
+        }
+        let s = se3_to_sim3(&k.pose);
+        cswc.insert(k.id, s.inverse());
+        scw.insert(k.id, se3_to_sim3(&k.tcw_bef_merge));
+        add_v(&mut verts, k.id, s, true, false);
+        sid.insert(k.id);
+        good.insert(k.id, true);
+        badp.insert(k.id, true);
+    }
+    for k in &inp.non_fixed {
+        if k.bad || sid.contains(&k.id) {
+            continue;
+        }
+        let s = se3_to_sim3(&k.pose);
+        scw.insert(k.id, s);
+        add_v(&mut verts, k.id, s, false, false);
+        sid.insert(k.id);
+        good.insert(k.id, false);
+        badp.insert(k.id, true);
+    }
+    let vertices: Vec<EgVertex> = verts.into_values().collect();
+    let pos: BTreeMap<u32, usize> = vertices.iter().enumerate().map(|(i, v)| (v.id as u32, i)).collect();
+    let all: Vec<&MgKf> = inp.fixed.iter().chain(&inp.fixed_corrected).chain(&inp.non_fixed).collect();
+    let sp: std::collections::BTreeSet<u32> = all.iter().map(|k| k.id).collect();
+    let g = |id: u32| *good.get(&id).unwrap_or(&false);
+    let b = |id: u32| *badp.get(&id).unwrap_or(&false);
+    let vscw = |id: u32| scw.get(&id).copied().unwrap_or_default();
+    let vcs = |id: u32| cswc.get(&id).copied().unwrap_or_default();
+    let mut edges = Vec::new();
+    let mut push = |a: u32, c: u32, m: G2oSim3| {
+        if let (Some(&i), Some(&j)) = (pos.get(&a), pos.get(&c)) {
+            edges.push(EgEdge { v0: i, v1: j, meas: m });
+        }
+    };
+    // 관계: 좋은 자세끼리 → vCorrectedSwc[j]⁻¹, 나쁜 자세끼리 → vScw[j]
+    let rel = |i: u32, j: u32| -> Option<G2oSim3> {
+        if g(i) && g(j) {
+            Some(vcs(j).inverse())
+        } else if b(i) && b(j) {
+            Some(vscw(j))
+        } else {
+            None
+        }
+    };
+    for k in &all {
+        let i = k.id;
+        let swi = if b(i) { vscw(i).inverse() } else { G2oSim3::default() };
+        if let Some(p) = k.parent {
+            if sp.contains(&p) {
+                if let Some(sjw) = rel(i, p) {
+                    push(i, p, sjw.mul(&swi));
+                }
+            }
+        }
+        for &l in &k.loop_edges {
+            if sp.contains(&l) && l < i {
+                if let Some(slw) = rel(i, l) {
+                    push(i, l, slw.mul(&swi));
+                }
+            }
+        }
+        for &(n, nbad) in &k.covis100 {
+            if Some(n) != k.parent && !k.children.contains(&n) && !k.loop_edges.contains(&n) && sp.contains(&n) && !nbad && n < i {
+                if let Some(snw) = rel(i, n) {
+                    push(i, n, snw.mul(&swi));
+                }
+            }
+        }
+    }
+    MgGraph { vertices, edges, bad_pose: badp }
+}
+
+/// 합치기 판 마무리 자세: Sophus::SE3d(R, t/s) → cast<float>()
+pub fn sim3_to_se3f_merge(s: &G2oSim3) -> Se3 {
+    let q = s.r;
+    let n = ((q[0] * q[0] + q[2] * q[2]) + (q[1] * q[1] + q[3] * q[3])).sqrt();
+    let qd = [q[0] / n, q[1] / n, q[2] / n, q[3] / n];
+    let qf = crate::orb3rs::types::quat_normalize([qd[0] as f32, qd[1] as f32, qd[2] as f32, qd[3] as f32]);
+    Se3 { q: qf, t: [(s.t[0] / s.s) as f32, (s.t[1] / s.s) as f32, (s.t[2] / s.s) as f32] }
+}
+
+/// 합치기 판 마무리 한 키프레임: (새 Tcw, mTcwBefMerge, mTwcBefMerge, 새 Twc)
+pub fn merge_kf_update(old_pose: &Se3, old_twc: &Se3, est: &G2oSim3) -> (Se3, Se3, Se3, Se3) {
+    let t = sim3_to_se3f_merge(est);
+    let twc = t.inverse();
+    (t, *old_pose, *old_twc, twc)
+}
+
+/// 합치기 판 점 고치기(기준 키프레임이 vpBadPose 일 때): P' = (Twr · Tnc⁻¹) · P
+pub fn merge_point(twr: &Se3, tnc_wr: &Se3, p: &[f32; 3]) -> [f32; 3] {
+    twr.mul(&tnc_wr.inverse()).mul_point(p)
 }
 
 #[cfg(test)]

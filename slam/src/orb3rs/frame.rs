@@ -12,10 +12,12 @@ impl FrameCtx {
 }
 
 impl Camera {
-    /// Pinhole 값(fx · fy · cx · cy, bf = 기준선 × fx, th_depth = 설정 ThDepth(기준선 배수))
-    pub fn pinhole(fx: f32, fy: f32, cx: f32, cy: f32, bf: f32, th_depth_factor: f32, w: i32, h: i32) -> Camera {
-        // Tracking: mThDepth = mbf * ThDepth / fx, Frame: mb = mbf / fx
-        Camera { fx, fy, cx, cy, invfx: 1.0 / fx, invfy: 1.0 / fy, bf, b: bf / fx, th_depth: bf * th_depth_factor / fx, width: w, height: h }
+    /// Pinhole 값(fx · fy · cx · cy, b = 설정 Stereo.b, th_depth = 설정 Stereo.ThDepth).
+    /// Settings: bf = b·fx, Tracking::newParameterLoader: mThDepth = b·ThDepth(ORB-SLAM2 식 bf·ThDepth/fx 와 마지막 비트가 다를 수 있음), Frame: mb = mbf/fx.
+    /// 설정 파일에서 바로 만들려면 `orb3cv::settings::OrbSettings::tracking().camera(..)`.
+    pub fn pinhole(fx: f32, fy: f32, cx: f32, cy: f32, b: f32, th_depth: f32, w: i32, h: i32) -> Camera {
+        let bf = b * fx;
+        Camera { fx, fy, cx, cy, invfx: 1.0 / fx, invfy: 1.0 / fy, bf, b: bf / fx, th_depth: b * th_depth, width: w, height: h }
     }
     /// Pinhole::project: fx·x/z + cx
     #[inline]

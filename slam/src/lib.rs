@@ -18,6 +18,7 @@ pub mod backend;
 pub mod orb3;
 pub mod orb3_backend;
 pub mod orb3rs;
+pub mod orb3cv;
 pub mod stitch;
 pub mod mapmerge;
 pub mod refine;

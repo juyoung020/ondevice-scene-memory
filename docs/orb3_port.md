@@ -48,10 +48,11 @@
 | Optimizer LocalBA(+ 우리 중력 항 EdgeGravityUp) · GlobalBA · EssentialGraph · OptimizeSim3 · g2o(Levenberg · 희소 Cholesky · SE3Quat · Sim3 · 정점/가장자리) | 지도 · 루프 스레드 | 옮김 | BA |
 | OptimizableTypes(EdgeSE3ProjectXYZ 등) | Optimizer | 옮김 | OPT · BA |
 | DBoW2 · ORBvoc.txt 읽기 · KeyFrameDatabase · LoopClosing · Sim3Solver · Atlas 합치기 | 루프 스레드 · 재위치 | 옮김 | LOOP |
-| OpenCV imgproc(resize · GaussianBlur · cvtColor) · features2d(FAST) | ORBextractor · Tracking | resize · GaussianBlur · FAST 옮김(비트 동일), cvtColor 남음 | CV(없으면 통합) |
+| OpenCV imgproc(resize · GaussianBlur · cvtColor) · features2d(FAST) · calib3d(undistortPoints) · core(convertTo · copyMakeBorder) | ORBextractor · Tracking · Frame | resize · GaussianBlur · FAST 는 `orb3rs::extract`, cvtColor · convertTo · copyMakeBorder · undistortPoints 는 `orb3cv::img`(비트 동일) | CV |
 | OpenCV core(cv::Mat · 난수 cv::RNG 등) | 전역 | Rust 자료형으로 바꿈, 쓰는 곳마다 같은 계산으로 | CV |
 | Sophus SE3f · Sim3f, Eigen float 수학 | 전역 | `types::Se3` 에 원본 순서 그대로의 곱 · 역 · 지수/로그 추가 | 통합(OPT · BA 가 쓰는 함수는 그쪽이 먼저 넣으면 받음) |
-| Settings · 설정 yaml 읽기 · Converter | System | 지움(Rust 는 설정 구조체를 바로 받음) | 통합 |
+| Settings · 설정 yaml 읽기 · Converter | System | `orb3cv::settings`(RGB-D 핀홀 설정 읽기 + Tracking · Frame 파생 값, 비트 동일), Converter 는 지움 | CV |
+| Eigen JacobiSVD · GeometricTools::Triangulate | LocalMapping(새 점 삼각측량) | `orb3cv::svd`(비트 동일) | CV |
 | GeometricCamera · Pinhole | Frame · 최적화 | `types::Camera` 로(왜곡 0) | 통합 |
 | KannalaBrandt8 · TwoViewReconstruction(단안 초기화) · ImuTypes · G2oTypes(IMU 가장자리) · 관성 초기화 | 단안 · 어안 · IMU 모드 전용 | 지움(안 씀) | 통합 |
 | Viewer · FrameDrawer · MapDrawer · Pangolin · GLEW · OpenGL | 뷰어(꺼 둠) | **패치에서 지움**(아래 'Pangolin 없이 빌드') | CV |
@@ -130,3 +131,22 @@ WSL 사본: `~/slam-bench/orb3-nopango`(빌드됨). 비트 비교 기준 빌드(
 
 - `~/opt/orb3_geom`: g.cc(SE3 정규화 · 점 · 역 · 곱 · 회전 행렬 · R·p+t · norm · dot, 20 만 건), g3.cc(3×3 곱 · 역 · hat · 극선 F 행렬, 10 만 건). FMA 빌드와는 수만 건씩 달랐고(위 "공통 규칙"), 기준 빌드와는 전부 같음.
 - `~/opt/orb3_match`: ref.cc 가 원본 Frame(RGB-D) 을 만들고 앞 장면(위치 I)의 깊이 있는 점마다 MapPoint(Frame 생성자) → 지금 장면 위치 3 가지(그대로 · 뒤로 0.1 m · 돌림+앞으로 0.1 m: bForward · bBackward · 보통 가지 모두)로 SearchByProjection(th 15) → 짝 덤프. rs 가 같은 회색 · 깊이(float)로 Rust 추출 · Frame · MapPoint · 짝짓기 후 비교. BoW(FeatureVector)는 원본 ORBvoc 로 C++ 가 계산해 덤프(`bow.bin`), Rust 는 그것을 받아 씀(BoW 자체는 LOOP 몫). 같은 쌍에서 지역 지도 투영(isInFrustum 0.5, th 3) · SearchByBoW(0.7) · 재위치 투영(th 10, ORBdist 100) · 삼각측량 짝(0.6, 방향 검사 없음, 위치 돌림+0.1 m)도 비교.
+
+### 포터 CV (11-25)
+
+브랜치 `opt/orb3-rs-cv`(`opt/orb3-rust` 위). 하네스 WSL `~/opt/orb3_cv/`: `ref.cc`(OpenCV 4.6 시스템 판, 입력 · 출력 덤프) · `svd_ref.cc` · `set_ref.cc`(기준 빌드 `cxx.sh` 로 원본 라이브러리 링크), Rust 쪽 `rs/`(`#[path]` 로 `slam/src/orb3cv/*.rs` 를 그대로 끌어와 비교: `cargo run --release -- ../dump` · `--bin svd -- ../svd.bin` · `--bin settings -- ../yaml`). 덤프 · 설정이 없으면 실패.
+
+| 모듈 | 원본 | 비교 | 결과 |
+|---|---|---|---|
+| `orb3cv::img::cvt_gray` | cvtColor RGB/BGR/RGBA/BGRA2GRAY(15 비트 고정소수) | TUM fr1_desk · desk2 18 장 × 4 배치, 2,211 만 칸 | **비트 동일** |
+| `orb3cv::img::depth_to_f32` | `convertTo(CV_32F, 1/DepthMapFactor)` | 같은 18 장 553 만 칸 | **비트 동일** |
+| `orb3cv::img::copy_make_border_reflect101` | copyMakeBorder BORDER_REFLECT_101(19 칸 · 영상보다 넓은 테두리) | 632 만 + 2.5 만 칸 | **비트 동일** |
+| `orb3cv::img::undistort_points` | undistortPoints(K, 왜곡 5 · 8 계수, P = K) — Frame::UndistortKeyPoints | 점 14.3 만 × 2 | **비트 동일** |
+| `orb3cv::svd::jacobi_svd` | Eigen 3.4.0 JacobiSVD(정사각 f32, V · U) | 4×4 20 만(무작위 · 크기 10^±4 섞임 · 계수 부족 · 0 · 같은 행) · 3×3 U·V 10 만 | **비트 동일**(특이값 · V · U · 0 아닌 수) |
+| `orb3cv::svd::triangulate` | GeometricTools::Triangulate | 실제 같은 두 시점 배치 20 만 | **비트 동일** |
+| `orb3cv::settings` | Settings(RGB-D 핀홀) + Tracking::newParameterLoader · Frame 파생 값 | 예제 설정 4 개 + 무작위 40 개(newWidth · 왜곡 · thFarPoints 섞음) | **비트 동일** |
+
+- RGB-D 는 `needToUndistort` 가 단안에서만 참이라 mDistCoef = 0 → undistortPoints 는 실제로 불리지 않음(옮겨는 둠). copyMakeBorder 도 ORB 추출이 테두리를 읽지 않아 쓰는 곳 없음. 남은 OpenCV 쓰임(RGB-D 경로)은 이것으로 끝: cv::resize(System, newWidth 가 있을 때만 — `orb3rs::extract` 의 resize 와 같은 함수) · cv::Mat 그릇.
+- SVD · Rodrigues: 원본 RGB-D 경로에 OpenCV SVD · Rodrigues 는 없음(전부 Eigen). Eigen JacobiSVD 는 LocalMapping 삼각측량(4×4)에만 — 옮김. 단안 초기화 · IMU 쪽 JacobiSVD(TwoViewReconstruction · ImuTypes)는 안 씀.
+- **고친 것**: `orb3rs::frame::Camera::pinhole` 의 `th_depth = bf·ThDepth/fx`(ORB-SLAM2 식)는 원본 3 판(Settings 경로) `mThDepth = b·ThDepth` 와 마지막 비트가 다름(무작위 설정 36 개 중 12 개). 인자를 설정 `b` 로 받게 바꿈(쓰는 곳 없었음). 설정에서 바로: `OrbSettings::parse(..)?.tracking().camera(w, h)`.
+- 화면 제거판 · 원본 TUM 실행(각 3 번, `~/opt/orb3_cv_bg/tum.txt`, ATE m): desk 원본 0.0192 · **멈춤** · 0.0168, 제거판 **멈춤** · 0.0223 · 0.0166 / room 원본 0.0660 · 0.0756 · 0.0739, 제거판 0.0751 · 0.0744 · 0.0632. 900 초 멈춤은 원본(Pangolin 있음)에도 같은 꼴로 나옴(로그 끝 `*Loop detected` → `Local Mapping STOP` 뒤 진행 없음) → 화면 제거 탓 아님, 원본의 루프 닫기 · 지도 스레드 멈춤. 실행마다 흔들림은 `opt/pose-parb` 의 결정성 작업 몫.

@@ -135,9 +135,8 @@ fn read_world(path: &str) -> BTreeMap<i32, (Before, Option<After>)> {
                 let mark = r.u64();
                 let rk = r.i64();
                 let obs = r.obs();
-                ext.mp_nobs.insert(id, nobs);
                 marks.mp.insert(id, mark);
-                atlas.mps.insert(id, MapPoint { id, map, bad, pos, obs, ref_kf: rk.max(0) as u64, ..Default::default() });
+                atlas.mps.insert(id, MapPoint { id, map, bad, pos, obs, n_obs: nobs, ref_kf: rk.max(0) as u64, ..Default::default() });
             }
             let map_id = atlas.kfs[&main].map;
             atlas.maps.push(Map { id: map_id, ..Default::default() });
@@ -194,6 +193,13 @@ fn check(base: &str) -> usize {
                     }
             });
         if !vsame {
+            let oi: std::collections::HashSet<i32> = c1.problem.vertices.iter().map(|v| v.id).collect();
+            let mi: std::collections::HashSet<i32> = mine.iter().map(|v| v.id).collect();
+            let mut extra: Vec<_> = mi.difference(&oi).copied().collect();
+            extra.sort();
+            let mut miss: Vec<_> = oi.difference(&mi).copied().collect();
+            miss.sort();
+            eprintln!("  우리만 {} {:?} / 원본만 {} {:?}", extra.len(), &extra[..extra.len().min(10)], miss.len(), &miss[..miss.len().min(10)]);
             diffs.push(format!("정점 {} / {}", mine.len(), c1.problem.vertices.len()));
         }
         let ids = |e: &super::Edge, pp: &super::Problem| (pp.vertices[e.v0].id, pp.vertices[e.v1].id);
@@ -227,20 +233,27 @@ fn check(base: &str) -> usize {
                 diffs.push(format!("키프레임 {id} 점 칸"));
             }
         }
+        // 앞 기록에 법선 · 거리가 없으므로 그 비교는 이 BA 가 다시 계산한 점(그래프의 점)만
+        let in_graph: std::collections::HashSet<u64> = g.mps.iter().map(|x| x.0).collect();
         for (id, o) in &af.mps {
             let m = &atlas.mps[id];
+            let check_nd = in_graph.contains(id);
             let same = m.bad == o.bad
                 && b3(&m.pos) == b3(&o.pos)
-                && (o.bad || (b3(&m.normal) == b3(&o.normal) && m.min_dist.to_bits() == o.min.to_bits() && m.max_dist.to_bits() == o.max.to_bits()))
-                && ext.nobs(*id) == o.nobs
+                && (o.bad || !check_nd || (b3(&m.normal) == b3(&o.normal) && m.min_dist.to_bits() == o.min.to_bits() && m.max_dist.to_bits() == o.max.to_bits()))
+                && m.n_obs == o.nobs
                 && (o.ref_kf < 0 || m.ref_kf == o.ref_kf as u64)
                 && m.obs == o.obs;
             if !same {
+                if diffs.iter().filter(|d| d.starts_with("점")).count() < 2 {
+                    eprintln!("  점 {id}: 나쁨 {}/{} 위치 {:?}/{:?} 법선 {:?}/{:?} 거리 {} {}/{} {} 관측수 {}/{} 기준 {}/{} 관측 {:?}/{:?} 앞 {:?}", m.bad, o.bad, m.pos, o.pos, m.normal, o.normal, m.min_dist, m.max_dist, o.min, o.max, m.n_obs, o.nobs, m.ref_kf, o.ref_kf, m.obs, o.obs, b4.atlas.mps[id].obs);
+                }
                 diffs.push(format!("점 {id}"));
             }
         }
         eprintln!(
-            "{base} 호출 {idx}: 조정 {} 고정 {} 정점 {} 간선 {} 반복 {:?} 지운 관측 {} — 다름 {}",
+            "{base} 호출 {idx}(주 {}): 조정 {} 고정 {} 정점 {} 간선 {} 반복 {:?} 지운 관측 {} — 다름 {}",
+            b4.main,
             b4.adjust.len(),
             b4.fixed.len(),
             g.problem.vertices.len(),

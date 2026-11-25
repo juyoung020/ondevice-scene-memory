@@ -698,6 +698,123 @@ void Tracking::StereoInitialization() {
     ev(5, 0, mState);
 }
 
+// ---------------- LocalMapping 단계 통째(PNKF · SINB): 단계 앞뒤 지도 조각 ----------------
+static int g_nb_every = 16;  // 키프레임 번호 표본 간격
+// 키프레임 통째(짝짓기 · 관측 · 공시성 · 신장 트리가 읽는 칸)
+static void put_kf_full(Buf &B, KeyFrame *k) {
+    B.w<uint64_t>(k->mnId); B.w<uint64_t>(k->mnFrameId); B.w<int64_t>(k->GetMap() ? (int64_t)k->GetMap()->GetId() : -1); B.w<double>(k->mTimeStamp);
+    B.w<uint8_t>(k->isBad()); B.w<uint8_t>(k->mbNotErase); B.w<uint8_t>(k->mbFirstConnection);
+    put_pose(B, k->GetPose()); put_pose(B, k->GetPoseInverse());
+    B.w<uint32_t>(k->N);
+    std::vector<MapPoint *> mp = k->GetMapPointMatches();
+    for (int i = 0; i < k->N; i++) {
+        const cv::KeyPoint &p = k->mvKeysUn[i];
+        B.w(p.pt.x); B.w(p.pt.y); B.w(p.size); B.w(p.angle); B.w(p.response); B.w<int32_t>(p.octave);
+        B.w(k->mvKeys[i].pt.x); B.w(k->mvKeys[i].pt.y);
+        put_desc(B, k->mDescriptors, i); B.w(k->mvuRight[i]); B.w(k->mvDepth[i]);
+        B.w<uint64_t>(mid(mp[i]));
+    }
+    B.w<uint32_t>(k->mBowVec.size());
+    for (auto &w : k->mBowVec) { B.w<uint32_t>(w.first); B.w<double>(w.second); }
+    put_feat(B, k->mFeatVec);
+    B.w<uint32_t>(k->mConnectedKeyFrameWeights.size());
+    for (auto &c : k->mConnectedKeyFrameWeights) { B.w<uint64_t>(c.first->mnId); B.w<int32_t>(c.second); }
+    B.w<uint32_t>(k->mvpOrderedConnectedKeyFrames.size());
+    for (size_t i = 0; i < k->mvpOrderedConnectedKeyFrames.size(); i++) { B.w<uint64_t>(k->mvpOrderedConnectedKeyFrames[i]->mnId); B.w<int32_t>(k->mvOrderedWeights[i]); }
+    B.w<uint64_t>(kid(k->GetParent()));
+    std::set<KeyFrame *> ch = k->GetChilds();
+    B.w<uint32_t>(ch.size()); for (KeyFrame *c : ch) B.w<uint64_t>(c->mnId);
+}
+static void put_mp_full(Buf &B, MapPoint *m) {
+    B.w<uint64_t>(m->mnId); B.w<int64_t>(m->GetMap() ? (int64_t)m->GetMap()->GetId() : -1); B.w<uint8_t>(m->isBad());
+    Eigen::Vector3f X = m->GetWorldPos(), N = m->GetNormal();
+    for (int k = 0; k < 3; k++) B.w(X[k]);
+    for (int k = 0; k < 3; k++) B.w(N[k]);
+    put_desc(B, m->GetDescriptor(), 0);
+    B.w<int32_t>(m->Observations()); B.w(m->mfMinDistance); B.w(m->mfMaxDistance);
+    B.w<uint64_t>(kid(m->GetReferenceKeyFrame())); B.w<uint64_t>(m->mnFirstKFid); B.w<uint64_t>(m->mnFirstFrame);
+    B.w<uint64_t>(mid(m->GetReplaced())); B.w<int32_t>(m->mnVisible); B.w<int32_t>(m->mnFound);
+    auto obs = m->GetObservations();
+    B.w<uint32_t>(obs.size());
+    for (auto &o : obs) { B.w<uint64_t>(o.first->mnId); B.w<int32_t>(std::get<0>(o.second)); B.w<int32_t>(std::get<1>(o.second)); }
+}
+// 지도 조각: 중심 키프레임들 + 그 점들 + 점을 보는 키프레임들(통째), 참조만 되는 키프레임은 짧게(번호 · 나쁨 · 지도)
+struct Region { std::vector<KeyFrame *> kfs; std::vector<MapPoint *> mps; std::vector<KeyFrame *> stubs; };
+static Region region(const std::vector<KeyFrame *> &core) {
+    Region R; std::set<KeyFrame *> ks; std::set<MapPoint *> ms;
+    for (KeyFrame *k : core) if (ks.insert(k).second) R.kfs.push_back(k);
+    for (KeyFrame *k : core) for (MapPoint *m : k->GetMapPointMatches()) if (m && ms.insert(m).second) R.mps.push_back(m);
+    for (MapPoint *m : R.mps) for (auto &o : m->GetObservations()) if (ks.insert(o.first).second) R.kfs.push_back(o.first);
+    // 통째 키프레임의 점 중 아직 없는 것도(교체 · 관측 지우기가 닿음)
+    for (size_t i = 0; i < R.kfs.size(); i++) for (MapPoint *m : R.kfs[i]->GetMapPointMatches()) if (m && ms.insert(m).second) R.mps.push_back(m);
+    std::set<KeyFrame *> st;
+    auto ref = [&](KeyFrame *k) { if (k && !ks.count(k) && st.insert(k).second) R.stubs.push_back(k); };
+    for (KeyFrame *k : R.kfs) {
+        for (auto &c : k->mConnectedKeyFrameWeights) ref(c.first);
+        ref(k->GetParent()); for (KeyFrame *c : k->GetChilds()) ref(c);
+    }
+    for (MapPoint *m : R.mps) { for (auto &o : m->GetObservations()) ref(o.first); ref(m->GetReferenceKeyFrame()); }
+    return R;
+}
+static void put_region(Buf &B, Region &R) {
+    B.w<uint32_t>(R.kfs.size()); for (KeyFrame *k : R.kfs) put_kf_full(B, k);
+    B.w<uint32_t>(R.mps.size()); for (MapPoint *m : R.mps) put_mp_full(B, m);
+    B.w<uint32_t>(R.stubs.size());
+    for (KeyFrame *k : R.stubs) { B.w<uint64_t>(k->mnId); B.w<uint8_t>(k->isBad()); B.w<int64_t>(k->GetMap() ? (int64_t)k->GetMap()->GetId() : -1); }
+}
+// 결과: 같은 키프레임 · 점(통째)
+static void put_region_out(Buf &B, Region &R) {
+    for (KeyFrame *k : R.kfs) put_kf_full(B, k);
+    for (MapPoint *m : R.mps) put_mp_full(B, m);
+}
+static void put_map(Buf &B, KeyFrame *K) {
+    Map *M = K->GetMap();
+    B.w<int64_t>(M->GetId()); B.w<uint64_t>(M->GetInitKFid());
+    std::vector<KeyFrame *> v = M->GetAllKeyFrames();
+    B.w<uint8_t>(std::find(v.begin(), v.end(), K) != v.end());
+}
+
+void LocalMapping::ProcessNewKeyFrame() {
+    typedef void (*Fn)(LocalMapping *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM312LocalMapping18ProcessNewKeyFrameEv");
+    KeyFrame *K = nullptr;
+    { std::unique_lock<std::mutex> l(mMutexNewKFs); if (!mlNewKeyFrames.empty()) K = mlNewKeyFrames.front(); }
+    if (!K || K->mnId % g_nb_every != 0) { o(this); return; }
+    std::unique_lock<std::mutex> lkMap(K->GetMap()->mMutexMapUpdate);
+    K->ComputeBoW();  // 원본도 맨 앞에서(이미 있으면 그대로)
+    Region R = region({K});
+    Buf B;
+    B.w<uint64_t>(K->mnId); put_map(B, K);
+    put_region(B, R);
+    const size_t n0 = mlpRecentAddedMapPoints.size();
+    o(this);
+    put_map(B, K);
+    put_region_out(B, R);
+    std::vector<uint64_t> added;
+    { auto it = mlpRecentAddedMapPoints.begin(); std::advance(it, std::min(n0, mlpRecentAddedMapPoints.size())); for (; it != mlpRecentAddedMapPoints.end(); ++it) added.push_back((*it)->mnId); }
+    B.w<uint32_t>(added.size()); for (auto a : added) B.w<uint64_t>(a);
+    B.flush("PNKF");
+}
+
+void LocalMapping::SearchInNeighbors() {
+    typedef void (*Fn)(LocalMapping *); static Fn o = (Fn)orig_sym("_ZN9ORB_SLAM312LocalMapping17SearchInNeighborsEv");
+    KeyFrame *K = mpCurrentKeyFrame;
+    if (K->mnId % g_nb_every != 0) { o(this); return; }
+    std::unique_lock<std::mutex> lkMap(K->GetMap()->mMutexMapUpdate);
+    // 대상 키프레임(원본과 같은 규칙, 표시 칸은 건드리지 않음)
+    std::vector<KeyFrame *> core{K}; std::set<KeyFrame *> mk;
+    for (KeyFrame *k : K->GetBestCovisibilityKeyFrames(10)) if (!k->isBad() && mk.insert(k).second) core.push_back(k);
+    const size_t n1 = core.size();
+    for (size_t i = 1; i < n1; i++) for (KeyFrame *k : core[i]->GetBestCovisibilityKeyFrames(20)) if (!k->isBad() && k != K && mk.insert(k).second) core.push_back(k);
+    Region R = region(core);
+    Buf B;
+    B.w<uint64_t>(K->mnId); B.w<uint8_t>(mbAbortBA);
+    put_region(B, R);
+    o(this);
+    B.w<uint8_t>(mbAbortBA);
+    put_region_out(B, R);
+    B.flush("SINB");
+}
+
 // ---------------- Track() 흐름: 하위 호출 결과를 사건으로 ----------------
 #define HOOK_BOOL(cls, name, mangled, code) \
 bool cls::name() { typedef bool (*Fn)(cls *); static Fn o = (Fn)orig_sym(mangled); bool r = o(this); ev(code, 0, r); return r; }
@@ -762,6 +879,7 @@ int main(int argc, char **argv) {
     if (argc > 6) g_ulmp_every = atoi(argv[6]);
     if (argc > 7) g_sync = atoi(argv[7]);
     if (getenv("SLP_EVERY")) g_slp_every = atoi(getenv("SLP_EVERY"));
+    if (getenv("NB_EVERY")) g_nb_every = atoi(getenv("NB_EVERY"));
     std::vector<double> tr, td; std::vector<std::string> pr, pd;
     load(dir + "/rgb.txt", tr, pr); load(dir + "/depth.txt", td, pd);
     System S(argv[1], argv[2], System::RGBD, false);

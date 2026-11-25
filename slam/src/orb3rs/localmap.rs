@@ -1,6 +1,9 @@
 //! 포터 TRACK — ORB-SLAM3 LocalMapping.cc 의 BA 호출을 뺀 판단들(RGB-D, 관성 없음).
 //! MapPointCulling · KeyFrameCulling(KeyFrame/MapPoint::SetBadFlag 가 관측 수에 미치는 효과 포함).
 //! 지역 BA 는 opt/orb3-rs-ba 몫이라 부르는 자리만: [`LocalMapperOps::local_ba`].
+use crate::orb3loop::detect::best_covisibles;
+use crate::orb3rs::matcher::Matcher;
+use std::collections::BTreeMap;
 use super::mapdata::{kf_set_bad_flag, mp_set_bad_flag};
 use super::track::TrackExt;
 use super::types::*;
@@ -144,8 +147,8 @@ fn rot_left(m: &mut [[f32; 4]; 4], p: usize, q: usize, c: f32, s: f32) {
     }
     for k in 0..4 {
         let (x, y) = (m[p][k], m[q][k]);
-        m[p][k] = c.mul_add(x, s * y);
-        m[q][k] = (-s).mul_add(x, c * y);
+        m[p][k] = (c * x + s * y);
+        m[q][k] = ((-s) * x + c * y);
     }
 }
 
@@ -157,8 +160,8 @@ fn rot_right(m: &mut [[f32; 4]; 4], p: usize, q: usize, c: f32, s: f32) {
     }
     for k in 0..4 {
         let (x, y) = (m[k][p], m[k][q]);
-        m[k][p] = c.mul_add(x, (-s) * y);
-        m[k][q] = s.mul_add(x, c * y);
+        m[k][p] = (c * x + (-s) * y);
+        m[k][q] = (s * x + c * y);
     }
 }
 
@@ -173,16 +176,16 @@ fn real_2x2_jacobi_svd(w: &[[f32; 4]; 4], p: usize, q: usize) -> ((f32, f32), (f
     } else {
         let t = m11 + m00;
         let u = t / d;
-        let tmp = u.mul_add(u, 1.0).sqrt();
+        let tmp = (u * u + 1.0).sqrt();
         s1 = 1.0 / tmp;
         c1 = u / tmp;
         if !(c1 == 1.0 && s1 == 0.0) {
             let (a, b) = (m00, m10);
-            m00 = c1.mul_add(a, s1 * b);
-            m10 = (-s1).mul_add(a, c1 * b);
+            m00 = (c1 * a + s1 * b);
+            m10 = ((-s1) * a + c1 * b);
             let (a, b) = (m01, m11);
-            m01 = c1.mul_add(a, s1 * b);
-            m11 = (-s1).mul_add(a, c1 * b);
+            m01 = (c1 * a + s1 * b);
+            m11 = ((-s1) * a + c1 * b);
         }
     }
     let _ = m10;
@@ -194,17 +197,17 @@ fn real_2x2_jacobi_svd(w: &[[f32; 4]; 4], p: usize, q: usize) -> ((f32, f32), (f
         sr = 0.0;
     } else {
         let tau = (m00 - m11) / deno;
-        let w = tau.mul_add(tau, 1.0).sqrt();
+        let w = (tau * tau + 1.0).sqrt();
         let t = if tau > 0.0 { 1.0 / (w + tau) } else { 1.0 / (tau - w) };
         let nsign: f32 = if t > 0.0 { -1.0 } else { 1.0 };
-        let n = 1.0 / t.mul_add(t, 1.0).sqrt();
+        let n = 1.0 / (t * t + 1.0).sqrt();
         sr = ((m01 / m01.abs()) * nsign) * t.abs() * n;
         cr = n;
     }
     // j_left = rot1 · j_right^T, j_right^T = (cr, −sr)
     let ms = -sr;
-    let sl = c1.mul_add(ms, s1 * cr);
-    let cl = (-s1).mul_add(ms, c1 * cr);
+    let sl = (c1 * ms + s1 * cr);
+    let cl = ((-s1) * ms + c1 * cr);
     ((cl, sl), (cr, sr))
 }
 
@@ -212,10 +215,10 @@ fn real_2x2_jacobi_svd(w: &[[f32; 4]; 4], p: usize, q: usize) -> ((f32, f32), (f
 pub fn triangulate(xn1: &[f32; 3], xn2: &[f32; 3], t1: &[[f32; 4]; 3], t2: &[[f32; 4]; 3]) -> Option<[f32; 3]> {
     let mut a = [[0f32; 4]; 4];
     for c in 0..4 {
-        a[0][c] = xn1[0].mul_add(t1[2][c], -t1[0][c]);
-        a[1][c] = xn1[1].mul_add(t1[2][c], -t1[1][c]);
-        a[2][c] = xn2[0].mul_add(t2[2][c], -t2[0][c]);
-        a[3][c] = xn2[1].mul_add(t2[2][c], -t2[1][c]);
+        a[0][c] = (xn1[0] * t1[2][c] + -t1[0][c]);
+        a[1][c] = (xn1[1] * t1[2][c] + -t1[1][c]);
+        a[2][c] = (xn2[0] * t2[2][c] + -t2[0][c]);
+        a[3][c] = (xn2[1] * t2[2][c] + -t2[1][c]);
     }
     let mut scale = 0f32;
     for r in &a {
@@ -300,7 +303,7 @@ use super::track::{pose_inverse_matrices, quat_to_rot, unproject};
 /// 3 원소 내적(Eigen redux a0b0 + (a1b1 + a2b2), GCC 합치기: fma(a0, b0, fma(a2, b2, a1·b1)))
 #[inline]
 pub fn dot3(a: &[f32; 3], b: &[f32; 3]) -> f32 {
-    a[0].mul_add(b[0], a[2].mul_add(b[2], a[1] * b[1]))
+    (a[0] * b[0] + (a[2] * b[2] + a[1] * b[1]))
 }
 #[inline]
 fn mat_vec(m: &[[f32; 3]; 3], x: &[f32; 3]) -> [f32; 3] {
@@ -473,16 +476,100 @@ fn reproj_ok(cam: &Camera, p: &KfPose, x3d: &[f32; 3], z: f32, kp: &KeyPoint, ur
         let u = cam.fx * x / z + cam.cx;
         let v = cam.fy * y / z + cam.cy;
         let (ex, ey) = (u - kp.x, v - kp.y);
-        !((ex.mul_add(ex, ey * ey) as f64) > 5.991 * s2 as f64)
+        !(((ex * ex + ey * ey) as f64) > 5.991 * s2 as f64)
     } else {
-        let u = (cam.fx * x).mul_add(invz, cam.cx);
-        let ur2 = (-cam.bf).mul_add(invz, u);
-        let v = (cam.fy * y).mul_add(invz, cam.cy);
+        let u = ((cam.fx * x) * invz + cam.cx);
+        let ur2 = ((-cam.bf) * invz + u);
+        let v = ((cam.fy * y) * invz + cam.cy);
         let (ex, ey, er) = (u - kp.x, v - kp.y, ur2 - ur);
-        !((er.mul_add(er, ex.mul_add(ex, ey * ey)) as f64) > 7.8 * s2 as f64)
+        !(((er * er + (ex * ex + ey * ey)) as f64) > 7.8 * s2 as f64)
     }
 }
 
+/// LocalMapping::ProcessNewKeyFrame(BoW 는 부르는 쪽이 채움): 관측 추가 · UpdateNormalAndDepth · ComputeDistinctiveDescriptors,
+/// 추적이 넣은 새 점은 mlpRecentAddedMapPoints 로, UpdateConnections, Atlas::AddKeyFrame
+pub fn process_new_keyframe(atlas: &mut Atlas, kf: KfId, recent: &mut Vec<MpId>) {
+        let slots = atlas.kfs[&kf].map_points.clone();
+        for (i, slot) in slots.iter().enumerate() {
+            let Some(mp) = *slot else { continue };
+            if atlas.mps[&mp].bad {
+                continue;
+            }
+            if !atlas.mps[&mp].obs.contains_key(&kf) {
+                let a = &mut *atlas;
+                let k = &a.kfs[&kf];
+                a.mps.get_mut(&mp).unwrap().add_observation(k, i);
+                crate::orb3rs::mapdata::mp_update_normal_and_depth(a, mp);
+                let kfs = &a.kfs;
+                a.mps.get_mut(&mp).unwrap().compute_distinctive_descriptors(kfs);
+            } else {
+                // 추적이 넣은 새 깊이 점
+                recent.push(mp);
+            }
+        }
+        let map = atlas.kfs[&kf].map;
+        crate::orb3rs::mapdata::kf_update_connections(atlas, kf, true);
+        // Atlas::AddKeyFrame(지금 지도 집합)
+        if let Some(mi) = atlas.maps.iter_mut().find(|x| x.id == map) {
+            mi.add_keyframe(kf);
+        }
+    }
 
-
-
+/// LocalMapping::SearchInNeighbors(단안 · 관성 아님). mnFuseTargetForKF · mnFuseCandidateForKF 표시는 이 호출 안의 집합.
+/// `abort` = mbAbortBA
+pub fn search_in_neighbors(atlas: &mut Atlas, kf: KfId, abort: &dyn Fn() -> bool) {
+        let mut marked = std::collections::BTreeSet::new();
+        let mut targets: Vec<KfId> = Vec::new();
+        for k in best_covisibles(&atlas.kfs[&kf], 10) {
+            if atlas.kfs[&k].bad || marked.contains(&k) {
+                continue;
+            }
+            targets.push(k);
+            marked.insert(k);
+        }
+        let n1 = targets.len();
+        for i in 0..n1 {
+            for k2 in best_covisibles(&atlas.kfs[&targets[i]], 20) {
+                if atlas.kfs[&k2].bad || marked.contains(&k2) || k2 == kf {
+                    continue;
+                }
+                targets.push(k2);
+                marked.insert(k2);
+            }
+            if abort() {
+                break;
+            }
+        }
+        let m = Matcher::new(0.6, true);
+        let cur_pts = atlas.kfs[&kf].map_points.clone();
+        let mut touched: Vec<MpId> = cur_pts.iter().flatten().copied().collect();
+        for &t in &targets {
+            m.fuse(t, &mut atlas.kfs, &cur_pts, &mut atlas.mps, 3.0);
+        }
+        if abort() {
+            return;
+        }
+        let mut cand_set = std::collections::HashSet::new();
+        let mut cands: Vec<Option<MpId>> = Vec::new();
+        for &t in &targets {
+            for p in atlas.kfs[&t].map_points.iter().flatten() {
+                if atlas.mps[p].bad || !cand_set.insert(*p) {
+                    continue;
+                }
+                cands.push(Some(*p));
+            }
+        }
+        m.fuse(kf, &mut atlas.kfs, &cands, &mut atlas.mps, 3.0);
+        touched.extend(cands.iter().flatten());
+        for p in atlas.kfs[&kf].map_points.clone().into_iter().flatten() {
+            if !atlas.mps[&p].bad {
+                let a = &mut *atlas;
+                let kfs = &a.kfs;
+                a.mps.get_mut(&p).unwrap().compute_distinctive_descriptors(kfs);
+                crate::orb3rs::mapdata::mp_update_normal_and_depth(a, p);
+            }
+            touched.push(p);
+        }
+        let map = atlas.kfs[&kf].map;
+        crate::orb3rs::mapdata::kf_update_connections(atlas, kf, true);
+    }

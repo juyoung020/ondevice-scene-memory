@@ -18,20 +18,35 @@
   같은 무게 키프레임의 순서(예: (2,41) · (3,41)). Rust 는 통합판 약속대로 id 순.
 - 덤프 UNDP · UCON 은 주소도 기록해 두 경우를 나눠 셈.
 
-## 기준 원본 = 결정성 패치판(opt/pose-parb 73c48c5, WSL ~/slam-bench/orb3-parb)
-- 덤프 도구 빌드: `ORB=~/slam-bench/orb3-parb ORB_INC=~/slam-bench/orb3-parb/include/OrderById.h OUT=track_dump_parb bash build.sh`,
-  실행 `ORB=~/slam-bench/orb3-parb DUMP=track_dump_parb bash runall.sh 태그 [장면...]`. 재생 도구의 키프레임 순서도 id 순.
-- p2(6 장면): UpdateNormalAndDepth 9,913,752/9,913,752 · UpdateConnections 4,891/4,891 (주소 순 ≠ id 순 0), 나머지 표 전부 같음.
-  예외 NeedNewKeyFrame 4 건(ds 1 · room 3, 원본 false · rust true, 도중 입력 바뀜 표시 없음) — room 을 다시 돌리면 0 이라 지역 지도 스레드 경합으로 봄, 미해결.
+## 기준 원본 = ~/opt/orb3_refid(-ffp-contract=off + 번호 순 비교자, 공통 기준)
+- 한 번에: `bash slam/tools/orb3_track_dump/go.sh 태그 [장면...]` — 재생 도구 · 덤프 도구를 저장소 판으로 다시 빌드(기준 빌드에 링크)하고
+  6 장면(또는 고른 장면)을 돌려 `${OUTD:-~/orbtrack_out}/result_태그.txt`. `TAGS=` 로 덤프 태그를 고름(UNDP · UCON 은 덤프가 수 GB 라 빼고 돌림),
+  `SLP_EVERY`(TrackWithMotionModel · SearchLocalPoints · TrackLocalMap 표본 장면 간격, 기본 8) · `NB_EVERY`(PNKF · SINB 표본 키프레임 간격, 기본 16).
+- Rust 산술은 곱합 합치기 없이 원본 연산 순서(track.rs · localmap.rs 의 mul_add 를 모두 뺌).
+
+## Tracking 단계(`orb3rs::track`, RustSystem 에 엮음 — `rsys::HOLES` 비움)
+- check_replaced_in_last_frame · track_reference_keyframe · track_with_motion_model(UpdateLastFrame 포함) · search_local_points ·
+  track_local_map(UpdateLocalMap → SearchLocalPoints → PoseOptimization(OPT 판 `reloc::pose_optimization_frame`) → track_local_map_finish) ·
+  stereo_initialization · create_new_keyframe(new_kf_map_point) · update_motion_and_clean(속도 · VO 짝 정리).
+- RustSystem: 흐름(track_flow)이 Tracker 를 쥐고 있어 하위 단계는 흐름 시작 판 + Edits(기준 키프레임 · 맞은 수 · 지역 키프레임/점 · 첫 키프레임)를 보고 끝에 넣음.
+  Track 끝(바깥점 칸 비움 · mpReferenceKF · mlRelativeFramePoses.back())은 track_tail. mVelocity 는 RustSystem.velocity.
+- t4(6 장면 합): CheckReplacedInLastFrame 8,407/8,407 · TrackReferenceKeyFrame 52/52(점 칸 52/52) · TrackWithMotionModel 1,048/1,048(점 칸 같음) ·
+  SearchLocalPoints 1,048/1,048(점 시야 칸 같음) · TrackLocalMap(자세 최적화 · 맞은 수 · 판단) 1,048/1,048 · StereoInitialization 43/43(새 점 14,248/14,248 위치 · 법선 · 거리 · 기술자) ·
+  CreateNewKeyFrame 새 점 2,333/2,333 · Track 흐름 8,524/8,524 · UpdateLocalKeyFrames · UpdateLocalPoints 전부 같음.
+- 덤프 한계: TrackReferenceKeyFrame 의 ComputeBoW 는 원본 FeatureVector 를 받아 씀(BoW 변환 자체는 LOOP 비교 몫). TrackLocalMap 은 SearchLocalPoints 뒤 장면에서 시작(앞 단계는 ULKF · ULMP · SLPT 로 따로).
+
+## LocalMapping 단계 통째(PNKF · SINB)
+- `localmap::process_new_keyframe` · `localmap::search_in_neighbors` 로 빼서 RsSteps 가 부름. 덤프는 단계 앞뒤 지도 조각(중심 키프레임 · 점 · 점을 보는 키프레임 통째, 참조만 되는 키프레임은 짧게)을 기록.
+- t4(6 장면, 16 번째 키프레임마다): ProcessNewKeyFrame 148/148(키프레임 연결 · 순서 · 부모 · 자식 · 점, 점 법선 · 거리 · 기술자 · 관측 · nObs, 최근 점 목록, 지도 넣기) ·
+  SearchInNeighbors 148/148(같은 칸 + 교체 · 나쁨). 도중 mbAbortBA 가 선 호출 0.
+- 삼각측량 · 컬링(곱합 합치기 뺀 뒤, t5 6 장면): CreateNewMapPoints · Triangulate · MapPointCulling · KeyFrameCulling 전부 같음, 삼각측량 새 점 94,376/94,376(ds 83,054). 통합 시험 orb3sys_cnmp(desk2) 통과.
+
+## NeedNewKeyFrame 불일치(원본 false · Rust true, ds · room · desk2 · rpy 에서 장면당 0–1 건)
+- 원인: 원본 LocalMapping::Run 이 일이 없어도 3 ms 마다 `SetAcceptKeyFrames(false)` … `SetAcceptKeyFrames(true)` 를 되풀이함(LocalMapping.cc Run 8 · 210 줄).
+  덤프한 입력으로 계산하면 c1b(idle) · c2 가 참이라 true 가 나와야 하고(예: rpy 장면 330, 기준 점 296 × 0.75 = 222 > 맞은 수 218, 마지막 KF 323),
+  false 가 되는 길은 원본 호출 순간 AcceptKeyFrames 가 false 인 경우뿐 — 짧은 창이라 입력 해시(앞뒤)에도 안 잡힘. Rust 지도 스레드는 이 깜빡임이 없음.
+  원본 쪽 경합이라 Rust 는 고치지 않음.
 
 ## 통합판 연결(`slam/src/orb3sys/rsys.rs` RsSteps)
-- MapPointCulling · CreateNewMapPoints · KeyFrameCulling: 통합 담당이 연결(삼각측량 · 컬링은 위 덤프로 비트 동일)
-- ProcessNewKeyFrame(ComputeBoW · 관측 추가 · UpdateNormalAndDepth · ComputeDistinctiveDescriptors · UpdateConnections · AddKeyFrame),
-  SearchInNeighbors(1 · 2 차 이웃, Fuse 양방향, 점 갱신, UpdateConnections): 포터 TRACK 이 채움. 부품은 비트 확인, 두 단계를 통째로 원본과 비교하는 덤프는 아직
-- Fuse 는 MapPoint::n_obs 만 바꾸므로 단계 끝에 TrackExt::mp_nobs 를 맞춤
-- 남음: Tracking 빈자리(StereoInitialization · CheckReplacedInLastFrame · TrackReferenceKeyFrame · TrackWithMotionModel · TrackLocalMap · CreateNewKeyFrame),
-  ComputeDistinctiveDescriptors 관측 순서(id 순 vs 원본 주소 순) 덤프 확인
-
-## 통합 담당 알림(11-25 저녁)
-- 지도 자료 메서드를 `orb3rs::mapdata` 하나로 모음: localmap 의 update_normal_and_depth · update_connections · add_connection · update_best_covisibles · mp_set_bad · mp_erase_observation · kf_set_bad 는 지웠고, `TrackExt` 의 mp_nobs · kf_not_erase · map_init_kf 칸도 지움(MapPoint.n_obs · KeyFrame.not_erase · Map.init_kf_id 를 씀). 재생 도구도 맞춤.
-- 덤프 도구가 `~/slam-bench/src/ORB_SLAM3`(FMA 합치기 빌드)에 링크돼 있음 — 기준은 `~/opt/orb3_ref`(-ffp-contract=off). 모은 mapdata 는 기준 빌드와 비트 동일이라 지금 재생에서 UpdateNormalAndDepth 끝자리가 다르게 나옴 → 덤프 도구를 기준 빌드에 다시 링크해 주세요.
+- MapPointCulling · CreateNewMapPoints · KeyFrameCulling: 통합 담당이 연결
+- ProcessNewKeyFrame(ComputeBoW 는 RsSteps, 나머지 localmap::process_new_keyframe) · SearchInNeighbors(localmap::search_in_neighbors): 포터 TRACK

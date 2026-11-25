@@ -9,4 +9,4 @@ mkdir -p ~/opt/orb3_track_bg && cd ~/opt/orb3_track_bg
 cp $S/tools/orb3_track_dump/{track_dump.cc,build.sh,runall.sh} .
 ORB=$REF ORB_INC=$REF/include/OrderById.h OUT=track_dump_ref bash build.sh 2>&1 | grep -E " error|error:" || true
 YDIR=$HOME/slam-bench/orb3-parb DUMP_TAGS=${TAGS:-CRLF,TRKF,TWMM,SLPT,TLMP,SINI,NNKF,CNKF,ULKF,ULMP} ORB=$REF DUMP=track_dump_ref bash runall.sh "$@"
-cat ~/orbtrack_out/result_$1.txt
+cat ${OUTD:-~/orbtrack_out}/result_$1.txt

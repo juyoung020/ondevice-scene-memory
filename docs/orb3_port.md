@@ -105,6 +105,20 @@ WSL 사본: `~/slam-bench/orb3-nopango`(빌드됨). 비트 비교 기준 빌드(
 
 ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 전용이라 뺌).
 
+## 통합 상태(opt/orb3-rust, 11-25)
+
+- 받은 브랜치: LOOP(4b1e3ff까지) · OPT(a4fbc75) · CV(e805fef) · TRACK(dac48f1) · ORT(a79d7f1). 공통 `types.rs` 는 통합판을 유지(TRACK 판은 그 부분집합이라 그대로 빌드됨).
+- 빌드: `ORB_SLAM3_DIR=~/slam-bench/orb3-nopango`(화면 제거 패치판, PANGOLIN_DIR 불필요).
+- 병합 뒤 확인: 짝짓기 하네스(`~/opt/orb3_match` rs · rs3) 50 쌍 전부 비트 동일, LOOP 시험 9 개 통과(`ORBLOOP_DUMPS=~/orbloop_ref:~/orbloop_out2`), OPT 덤프 4,216 호출 비트 동일. TRACK 재생(`examples/orb3rs_track_replay`)은 지금 남은 덤프 `~/orbtrack_out/ds.bin` 이 TRACK 포터의 새 덤프 형식이라 대조 못 함(그쪽 결과 기록 `result_v2.txt`: tum_desk2 전 항목 비트 동일).
+- 공통 함정(LOOP): 기준 빌드(`-ffp-contract=off`)에서도 Eigen 이 명시적으로 부르는 pmadd(`_mm*_fmadd_ps`)는 FMA 로 남음 — Hessenberg applyHouseholderOnTheRight 행렬 곱 · 고유벡터 되돌리기 행렬 곱 등 Eigen 동적 행렬 곱을 옮길 때는 `mul_add`.
+- 원본 버그(포팅판에서 고칠 것): `*Loop detected` → `Local Mapping STOP` 뒤 멈추는 교착 — 원본 · 화면 제거판 둘 다 재현. 포팅판의 루프 닫기 · 지도 스레드 정지 신호에서 고친다.
+- 받은 브랜치(2 차): CV cd4e91f(Map::PreSave EraseObservation), LOOP cd2fb9c(통합판을 받은 병합뿐). 병합 뒤 LOOP 시험 9 개 통과, 작업 공간 빌드 통과.
+- System 자리 `slam/src/orb3sys/`: `orb3_backend` 는 trait `Orb3System`(track · map_changed · keyframes · graft · wait_idle · kf_now)만 보고 `orb3sys::open` 으로 연다 — 지금은 원본 `orb3::System` 이 그 구현. 원본 C++ 와 Rust 판은 지도 자료(KeyFrame* 대 `orb3rs::types::Atlas`)가 따로라, 한 실행 안에서 함수 하나씩 원본으로 대신 부르려면 호출마다 자료를 양쪽으로 옮겨야 함(TRACK 재생의 `TrackOps` 가 덤프 값으로 하는 방식). 그래서 실제 실행에서 바꿔 끼우는 단위는 System 통째: Rust 판은 BA · LoopClosing 흐름 · Relocalization 이 들어온 뒤 `Orb3System` 구현으로 붙인다.
+- 스레드 · 잠금 `orb3sys::threads`(교착을 구조로 없앤 판, CV 포터의 스레드 설계와 맞출 기준안): 원본 멈춤 신호의 세 문제 — ① `RequestStop` 깃발 하나에 `Release` 를 누가 부르든 함께 내림(루프 닫기와 옮겨 붙이기가 같이 세우면 먼저 끝난 쪽이 다른 쪽 작업 중에 지도 스레드를 다시 돌림) ② `usleep` 바쁜 대기 ③ 지도 갱신 잠금을 쥔 채 멈춤을 기다리는 자리(패치 DoPendingGraft 는 Track() 안, 지역 BA 는 같은 잠금을 잡으러 감). 이 판: 멈춤은 `StopToken` 세는 표(마지막 토큰이 놓일 때만 다시 돎), 기다림은 모두 Condvar(끝도 깨움), 지도 갱신 잠금은 `MapUpdate` 로만 잡고 쥔 채 멈춤 · 한가함 · 대기열을 기다리면 바로 패닉. 결과에 닿는 순서는 원본대로(대기열을 먼저 비우고 멈춤, 멈춘 뒤 SetNotStop(true) 거절, Release 때 대기열 비움, 새 키프레임이 오면 BA 중단 깃발). 시험 4 개(`cargo test -p slam --lib orb3sys`): 토큰 둘 · 대기열 먼저 · 잠금 쥔 기다림 패닉 · 세 스레드 3,000 장면 섞어 돌리기 시간 안에 끝남.
+- TRACK 재생 길이 문제: 새 덤프(`~/orbtrack_out/ds.bin`, 1.5 GB, CNMP · TRIA 등 새 칸)를 읽는 재생 도구는 TRACK 작업 트리(`C:\ondevice-orb-track`)에 아직 커밋 전. 커밋된 옛 도구로 읽으면 기록 길이가 안 맞아 패닉 → 릴리스 `panic = "abort"` 라 WSL 이 1.5 GB 코어 덤프를 `wsl-crashes` 에 남김(지움). 큰 덤프를 읽는 시험은 `ulimit -c 0` 을 붙여 돌린다. TRACK 이 새 도구를 커밋하면 받아서 다시 대조.
+- 원본 대조 전체 재생(강의실 녹화)은 Rust System 이 들어온 뒤: 지금 통합판의 System 은 원본 라이브러리 그대로라 같은 것끼리 비교가 됨.
+- 남은 C++ 링크: `orb3.rs` · `cpp/orb3.cc` 가 아직 libORB_SLAM3 를 씀. 다음 단계는 System 흐름(추적 · 지도 · 루프 스레드)을 Rust 모듈로 엮어 `orb3_backend` 를 바꿔 끼우는 것 — 아직 안 옮긴 것: LocalMapping 의 BA 호출부(BA 포터 대기), LoopClosing 흐름 · CorrectLoop · MergeLocal, MLPnPsolver · Relocalization.
+
 ## 정확도 브랜치 따라가기
 
 포터 기준은 `opt/pose-class` e989ca3. 정확도 수정은 `opt/pose-para`(V 자 틀어짐 · 겹침 · 끝 지도 기울기 3 초 평균) · `opt/pose-parb`(실행마다 흔들림)에서 진행 중. 통합 담당이 그쪽의 `slam/cpp/ORB_SLAM3.patch` · `mapmerge.rs` · `refine.rs` · `stitch.rs` · `orb3_backend.rs` 변경을 주기적으로 보고, 확정된 것만 아래 목록에 넣어 해당 모듈 포팅 때 같이 옮긴다(병합하지 않음).
@@ -135,31 +149,13 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 - `~/opt/orb3_geom`: g.cc(SE3 정규화 · 점 · 역 · 곱 · 회전 행렬 · R·p+t · norm · dot, 20 만 건), g3.cc(3×3 곱 · 역 · hat · 극선 F 행렬, 10 만 건). FMA 빌드와는 수만 건씩 달랐고(위 "공통 규칙"), 기준 빌드와는 전부 같음.
 - `~/opt/orb3_match`: ref.cc 가 원본 Frame(RGB-D) 을 만들고 앞 장면(위치 I)의 깊이 있는 점마다 MapPoint(Frame 생성자) → 지금 장면 위치 3 가지(그대로 · 뒤로 0.1 m · 돌림+앞으로 0.1 m: bForward · bBackward · 보통 가지 모두)로 SearchByProjection(th 15) → 짝 덤프. rs 가 같은 회색 · 깊이(float)로 Rust 추출 · Frame · MapPoint · 짝짓기 후 비교. BoW(FeatureVector)는 원본 ORBvoc 로 C++ 가 계산해 덤프(`bow.bin`), Rust 는 그것을 받아 씀(BoW 자체는 LOOP 몫). 같은 쌍에서 지역 지도 투영(isInFrustum 0.5, th 3) · SearchByBoW(0.7) · 재위치 투영(th 10, ORBdist 100) · 삼각측량 짝(0.6, 방향 검사 없음, 위치 돌림+0.1 m)도 비교.
 
-### 포터 CV (11-25)
+- `~/opt/orb3_match/ref3.cc` · `rs3`(11-25): 같은 쌍으로 Sim3 투영(S = 사원수 (0.01, −0.02, 0.005, 1.01), t (0.02, −0.01, 0.1), th 10, 1.5, 키프레임 점 10 개마다 미리 짝), 점 키프레임 판, Fuse(KF, Sim3, th 4), Fuse(KF, 점들, th 3: 앞 점은 짝수만 앞 키프레임 관측 · 뒤 점은 모두 관측 → Replace 두 방향 모두 지남), SearchBySim3(BoW(KF,KF) 0.75 로 미리 짝, S12 따로, th 7.5). Sim3 수학(Tcw = SE3(회전 행렬, t/s) · 역 · 점 곱)도 따로 같음. 사원수←행렬 대각 합은 (m00 + m11) + m22(기준 빌드).
+- 지도에서 지우기(Map::EraseMapPoint)는 Fuse 안에서 하지 않음 — 나쁨 표시 · replaced 만 두고 지도 표 정리는 통합(Atlas) 때.
 
-브랜치 `opt/orb3-rs-cv`(`opt/orb3-rust` 위). 하네스 WSL `~/opt/orb3_cv/`: `ref.cc`(OpenCV 4.6 시스템 판, 입력 · 출력 덤프) · `svd_ref.cc` · `set_ref.cc`(기준 빌드 `cxx.sh` 로 원본 라이브러리 링크), Rust 쪽 `rs/`(`#[path]` 로 `slam/src/orb3cv/*.rs` 를 그대로 끌어와 비교: `cargo run --release -- ../dump` · `--bin svd -- ../svd.bin` · `--bin settings -- ../yaml`). 덤프 · 설정이 없으면 실패.
-
-| 모듈 | 원본 | 비교 | 결과 |
-|---|---|---|---|
-| `orb3cv::img::cvt_gray` | cvtColor RGB/BGR/RGBA/BGRA2GRAY(15 비트 고정소수) | TUM fr1_desk · desk2 18 장 × 4 배치, 2,211 만 칸 | **비트 동일** |
-| `orb3cv::img::depth_to_f32` | `convertTo(CV_32F, 1/DepthMapFactor)` | 같은 18 장 553 만 칸 | **비트 동일** |
-| `orb3cv::img::copy_make_border_reflect101` | copyMakeBorder BORDER_REFLECT_101(19 칸 · 영상보다 넓은 테두리) | 632 만 + 2.5 만 칸 | **비트 동일** |
-| `orb3cv::img::undistort_points` | undistortPoints(K, 왜곡 5 · 8 계수, P = K) — Frame::UndistortKeyPoints | 점 14.3 만 × 2 | **비트 동일** |
-| `orb3cv::svd::jacobi_svd` | Eigen 3.4.0 JacobiSVD(정사각 f32, V · U) | 4×4 20 만(무작위 · 크기 10^±4 섞임 · 계수 부족 · 0 · 같은 행) · 3×3 U·V 10 만 | **비트 동일**(특이값 · V · U · 0 아닌 수) |
-| `orb3cv::svd::triangulate` | GeometricTools::Triangulate | 실제 같은 두 시점 배치 20 만 | **비트 동일** |
-| `orb3cv::settings` | Settings(RGB-D 핀홀) + Tracking::newParameterLoader · Frame 파생 값 | 예제 설정 4 개 + 무작위 40 개(newWidth · 왜곡 · thFarPoints 섞음) | **비트 동일** |
-
-- RGB-D 는 `needToUndistort` 가 단안에서만 참이라 mDistCoef = 0 → undistortPoints 는 실제로 불리지 않음(옮겨는 둠). copyMakeBorder 도 ORB 추출이 테두리를 읽지 않아 쓰는 곳 없음. 남은 OpenCV 쓰임(RGB-D 경로)은 이것으로 끝: cv::resize(System, newWidth 가 있을 때만 — `orb3rs::extract` 의 resize 와 같은 함수) · cv::Mat 그릇.
-- SVD · Rodrigues: 원본 RGB-D 경로에 OpenCV SVD · Rodrigues 는 없음(전부 Eigen). Eigen JacobiSVD 는 LocalMapping 삼각측량(4×4)에만 — 옮김. 단안 초기화 · IMU 쪽 JacobiSVD(TwoViewReconstruction · ImuTypes)는 안 씀.
-- **고친 것**: `orb3rs::frame::Camera::pinhole` 의 `th_depth = bf·ThDepth/fx`(ORB-SLAM2 식)는 원본 3 판(Settings 경로) `mThDepth = b·ThDepth` 와 마지막 비트가 다름(무작위 설정 36 개 중 12 개). 인자를 설정 `b` 로 받게 바꿈(쓰는 곳 없었음). 설정에서 바로: `OrbSettings::parse(..)?.tracking().camera(w, h)`.
-- 화면 제거판 · 원본 TUM 실행(각 3 번, `~/opt/orb3_cv_bg/tum.txt`, ATE m): desk 원본 0.0192 · **멈춤** · 0.0168, 제거판 **멈춤** · 0.0223 · 0.0166 / room 원본 0.0660 · 0.0756 · 0.0739, 제거판 0.0751 · 0.0744 · 0.0632. 900 초 멈춤은 원본(Pangolin 있음)에도 같은 꼴로 나옴(로그 끝 `*Loop detected` → `Local Mapping STOP` 뒤 진행 없음) → 화면 제거 탓 아님, 원본의 루프 닫기 · 지도 스레드 멈춤. 실행마다 흔들림은 `opt/pose-parb` 의 결정성 작업 몫.
-- Atlas 저장 · 불러오기 `orb3cv::atlas_io`: Boost 형식은 읽을 쪽이 없어 우리 이진 형식으로. 남기는 칸 · 버리는 칸은 원본과 같게 — 저장은 id 순 지도마다 나쁘지 않은 키프레임 · 점, 다른 지도 · 나쁜 것을 가리키는 연결 · 자식 · 가장자리 · 점 번호는 빼거나 −1, 키프레임 없는 지도는 버림 / 불러오기는 MapPoint mnVisible · mnFound = 1 · 추적 임시 칸 0, ordered_conn = UpdateBestCovisibles, 그 뒤 새 빈 지도를 현재로(System). 원본 Map::PreSave 의 EraseObservation(살아 있는 지도를 바꿈)은 그 함수가 Rust 에 없어 대신 그런 관측이 있으면 Err. 시험: 무작위 Atlas 저장 → 불러오기 → 다시 저장이 같은 바이트, 저장 칸 비트 같음.
-- System 진입 `orb3cv::system::SystemInit::open(설정, w, h)`: OrbSettings → TrackingParams → Camera · Pyramid(ORBextractor 층 표) · FrameCtx(ComputeImageBounds), System.LoadAtlasFromFile / SaveAtlasToFile(".osa" 붙임), GrabImageRGBD 의 회색 · 깊이 변환. newWidth(영상 줄이기)는 안 씀이라 Err.
-- `orb3rs::frame::depth_to_float` 를 원본 식(1.0f / 값, |값| < 1e-5 면 1)으로(나눗셈 결과는 전과 같음: f64 거쳐 f32 로 바꿔도 이중 반올림 없음).
 ## 포터 LOOP: 장소 인식 · 재위치 · 루프 · Atlas 합치기
 
 코드: `slam/src/orb3loop/`(`dbow2.rs` · `kfdb.rs` · `crand.rs` · `eig4.rs` · `sim3.rs`), 대조 시험: `slam/tests/orb3loop_bit.rs`.
-원본: UZ-SLAMLab/ORB_SLAM3 + `slam/cpp/ORB_SLAM3.patch`, Eigen 3.4.0, GCC 13.3 `-O3 -march=native`(Ryzen 9 9950X).
+원본: UZ-SLAMLab/ORB_SLAM3 + `slam/cpp/ORB_SLAM3.patch`, Eigen 3.4.0, GCC 13.3 `-O3 -march=native -ffp-contract=off`(공통 기준 빌드 `~/opt/orb3_ref`, Ryzen 9 9950X).
 
 ### 비트 대조 결과
 
@@ -172,33 +168,32 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 | 루프 · 합치기 후보 | `DetectNBestCandidates` | 위 BoW + 공시성 · 지도 3 개 · 지움 · 나쁜 지도 · clearMap 시나리오 | 114 / 114 질의 |
 | 재위치 후보(패치판) | `DetectRelocalizationCandidates` | 같은 시나리오, 지도별 | 174 / 174 질의 (후보 390 개) |
 | 질의 뒤 키프레임 상태 | mnPlaceRecognition* · mnReloc* | 같은 시나리오 | 116 / 116 |
-| glibc rand | `rand` · `RandomInt` | 원본 실행이 Sim3 에서 쓴 값 | 753 / 753 호출의 수열 |
-| Hessenberg · Francis QR · 두 행 떼기 · 고유벡터 역대입 | Eigen 내부 함수 | TUM fr1_room 실제 실행(LD_PRELOAD 로 가로챔) | 8,539 · 30,053 · 13,891 · 8,539 모두 같음 |
-| ComputeSim3 | `Sim3Solver::ComputeSim3` | 같은 실행 | 8,539 / 8,539 (R · t · s · T12 · T21) |
-| Sim3 RANSAC | `Sim3Solver::iterate`(5 인자) | 같은 실행(루프 검출 포함) | 753 / 753 (인라이어 · 수렴 · 반복 수 · 행렬 · 투영) |
+| glibc rand | `rand` · `RandomInt` | 원본 실행이 Sim3 에서 쓴 값 | 827 / 827 호출의 수열 |
+| Hessenberg · Francis QR · 두 행 떼기 · 고유벡터 역대입 | Eigen 내부 함수 | TUM fr1_room 기준 빌드 실행(LD_PRELOAD 로 가로챔) | 10,576 · 37,365 · 17,200 · 10,576 모두 같음 |
+| ComputeSim3 | `Sim3Solver::ComputeSim3` | 같은 실행 | 10,576 / 10,576 (R · t · s · T12 · T21) |
+| Sim3Solver 생성자 | `Sim3Solver(pKF1, pKF2, vpMatched12, …)` | 같은 실행(ctor_hook.so) | 499 / 499 (카메라 좌표 · 투영 · 오차 문턱 · 색인 · RANSAC 설정), 호출 중 다른 스레드가 포즈를 바꾼 2 번은 뺌 |
+| Sim3 RANSAC | `Sim3Solver::iterate`(5 인자) | 같은 실행(루프 검출 포함) | 827 / 827 (인라이어 · 수렴 · 반복 수 · 행렬 · 투영) |
 
 ### 맞추며 알게 된 원본 동작
 - ORBvoc.txt 끝 줄바꿈 뒤 빈 줄이 노드 하나(단어 971814)가 된다: 부모는 앞 줄 부모, 무게 0, 설명자 0. 여기로 떨어진 설명자는 BoW 에서 빠진다.
 - KeyFrameDatabase 는 질의 표지 · 단어 수 · 점수를 키프레임 멤버에 남겨 다음 질의에서도 읽는다(문턱 못 넘은 이웃의 지난 점수가 누적에 더해짐). Rust 판은 같은 상태를 키프레임 번호별로 들고 있다. 원본 mRelocScore 는 초기화되지 않으며 Rust 판은 0 으로 시작한다.
 - DetectNBestCandidates 의 `isBad` 분기는 원본에서 무한 반복이 된다(역색인에 나쁜 키프레임이 없어 닿지 않음). Rust 판은 assert.
-- GCC 가 곱셈 · 덧셈을 FMA 로 합친 자리가 자리마다 다르다(예: 3×3 곱의 원소 0..7 과 원소 8 의 순서가 다름). 같은 플래그로 다시 컴파일한 GIMPLE(`-fdump-tree-optimized-lineno`)에서 읽어 `mul_add` 로 그대로 옮겼다.
+- 기준 빌드(-ffp-contract=off)에서도 **Eigen 의 명시적 pmadd(`_mm*_fmadd_ps` 내장 함수)는 FMA 로 남는다**: gemv 커널을 타는 자리(Hessenberg 의 `applyHouseholderOnTheRight` 안 `tmp = right * essential`, 고유벡터 되돌리기 `eivec.leftCols(j+1) * T.col(j)`)는 Rust 에서도 `mul_add`, 나머지(컴파일러가 합치던 스칼라 · 벡터 식, 작은 내적 redux)는 곱한 뒤 더함. 어느 쪽인지는 기준 빌드 덤프로 자리마다 확인했다. 다른 포터도 Eigen 동적 크기 행렬 곱을 옮길 때 같다.
+- 덧셈 묶음 순서는 Eigen 전개 순서(예: 3×3·벡터 = `r0·p0 + (r1·p1 + r2·p2)`), GIMPLE(`-fdump-tree-optimized-lineno`)에서 읽음.
 - Eigen `eigenvectors()` 정규화는 복소 나눗셈이라 실수부가 `(x*s)/(s*s)` 다(`x/s` 와 비트가 다름).
 - RGB-D 는 srand 를 부르지 않아 rand 씨앗 1. 모든 rand 호출자가 한 수열을 같이 쓰므로 통합 때 `GlibcRand` 하나를 나눠 써야 한다.
 
 ### 하네스(저장소 밖, WSL `~/opt/orb3_loop_bg`)
 - `bow_dump`: 원본 어휘 · ORBextractor · transform · score 덤프(`voc.bin` · `bow.bin`).
 - `kfdb_scn`: 원본 `KeyFrameDatabase.cc` 를 가짜 KeyFrame/Map/Frame 헤더로 그대로 컴파일해 시나리오 실행(`kfdb.bin`).
-- `run_tum` + `sim3_hook.so` · `eig_hook.so`(LD_PRELOAD): 뷰어 없는 rgbd_tum 으로 fr1_room 을 돌리며 `Sim3Solver::iterate` · `ComputeSim3` · Eigen 내부 단계 입출력과 rand 값을 가로채 덤프.
-- 시험: `ORBLOOP_DUMPS=~/orbloop_out1:~/orbloop_out2 ORBLOOP_VOC=.../ORBvoc.txt cargo test --release -p slam --test orb3loop_bit`.
+- `ref/run_tum` + `ref/sim3_hook.so` · `ref/eig_hook.so` · `ref/ctor_hook.so`(`build_ref.sh` 로 기준 빌드에 링크, LD_PRELOAD 셋 함께, 덤프 경로 `SIM3_DUMP` · `SIM3C_DUMP` · `EIG_DUMP` · `CTOR_DUMP`, 연관 목록 `/tmp/assoc_room.txt`): 뷰어 없는 rgbd_tum 으로 fr1_room 을 돌리며 Sim3Solver 생성자 · `iterate` · `ComputeSim3` · Eigen 내부 단계 입출력과 rand 값을 가로채 덤프(`~/orbloop_ref`, 약 43 MB).
+- 시험: `ORBLOOP_DUMPS=~/orbloop_ref:~/orbloop_out2 ORBLOOP_VOC=.../ORBvoc.txt cargo test --release -p slam --test orb3loop_bit`.
 
 ### 확인 못 한 것 · 남은 일
 - 크기 자유 Sim3(단안 · IMU 초기화 전)의 scale 경로: 식은 GIMPLE 대로 옮겼으나 RGB-D 실행에선 안 지나가 대조 안 됨.
-- Sim3Solver 생성자(지도 점 → 카메라 좌표 · 오차 문턱), `Tracking::Relocalization` 흐름, `LoopClosing`(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
+- `Tracking::Relocalization` 흐름, `LoopClosing`(DetectCommonRegionsFromBoW · DetectAndReffineSim3FromLastKF · CorrectLoop · MergeLocal), `Atlas`/`Map` 관리, 패치의 지도별 재위치 · GRAFT · 작은 지도 유지: 아직 안 옮김(짝짓기 · BA 몫 인터페이스가 정해지면 이어서).
 - KeyFrameDatabase 대조는 실제 BoW + 만든 공시성 시나리오. 실제 실행 중 질의를 가로챈 대조는 안 함.
 - 강의실 녹화(ds_1118)는 BoW 단계만; Sim3 · 고유 풀이 대조는 TUM fr1_room 실행 하나.
-
-- `~/opt/orb3_match/ref3.cc` · `rs3`(11-25): 같은 쌍으로 Sim3 투영(S = 사원수 (0.01, −0.02, 0.005, 1.01), t (0.02, −0.01, 0.1), th 10, 1.5, 키프레임 점 10 개마다 미리 짝), 점 키프레임 판, Fuse(KF, Sim3, th 4), Fuse(KF, 점들, th 3: 앞 점은 짝수만 앞 키프레임 관측 · 뒤 점은 모두 관측 → Replace 두 방향 모두 지남), SearchBySim3(BoW(KF,KF) 0.75 로 미리 짝, S12 따로, th 7.5). Sim3 수학(Tcw = SE3(회전 행렬, t/s) · 역 · 점 곱)도 따로 같음. 사원수←행렬 대각 합은 (m00 + m11) + m22(기준 빌드).
-- 지도에서 지우기(Map::EraseMapPoint)는 Fuse 안에서 하지 않음 — 나쁨 표시 · replaced 만 두고 지도 표 정리는 통합(Atlas) 때.
 
 ### 포터 OPT: 포즈 최적화 · PnP (`opt/orb3-rs-opt`, 11-25)
 
@@ -228,3 +223,25 @@ ORBmatcher 의 RGB-D 경로는 전부 옮김(SearchForInitialization 은 단안 
 원본 시간은 `libreplay`(한 스레드, 덤프 입력으로 라이브러리 원본 호출), Rust 는 같은 입력 `dump_check`. 둘 다 이 PC(다른 에이전트와 CPU 공유)라 절대값은 흔들림. 원본 대비 빠른 까닭: g2o 그래프 · 블록 행렬 · 동적 할당 · 가상 호출이 없고 6x6 를 고정 크기로 풂 — 연산 순서는 그대로라 비트 같음.
 
 확인 안 한 것: 관측 3 개 미만 · 활성 간선 0 · Hessian 이 양이 아닌 경우(LDLT 실패 뒤 이전 x 재사용) 경로는 덤프에 나온 만큼만 확인(활성 간선 0 은 강의실 덤프에 있음). 보드(aarch64)에서는 `mul_add` 가 fmadd 라 같은 비트가 나와야 하나 보드에서 돌려 보지는 않음(보드 금지).
+
+### 포터 CV (11-25)
+
+브랜치 `opt/orb3-rs-cv`(`opt/orb3-rust` 위). 하네스 WSL `~/opt/orb3_cv/`: `ref.cc`(OpenCV 4.6 시스템 판, 입력 · 출력 덤프) · `svd_ref.cc` · `set_ref.cc`(기준 빌드 `cxx.sh` 로 원본 라이브러리 링크), Rust 쪽 `rs/`(`#[path]` 로 `slam/src/orb3cv/*.rs` 를 그대로 끌어와 비교: `cargo run --release -- ../dump` · `--bin svd -- ../svd.bin` · `--bin settings -- ../yaml`). 덤프 · 설정이 없으면 실패.
+
+| 모듈 | 원본 | 비교 | 결과 |
+|---|---|---|---|
+| `orb3cv::img::cvt_gray` | cvtColor RGB/BGR/RGBA/BGRA2GRAY(15 비트 고정소수) | TUM fr1_desk · desk2 18 장 × 4 배치, 2,211 만 칸 | **비트 동일** |
+| `orb3cv::img::depth_to_f32` | `convertTo(CV_32F, 1/DepthMapFactor)` | 같은 18 장 553 만 칸 | **비트 동일** |
+| `orb3cv::img::copy_make_border_reflect101` | copyMakeBorder BORDER_REFLECT_101(19 칸 · 영상보다 넓은 테두리) | 632 만 + 2.5 만 칸 | **비트 동일** |
+| `orb3cv::img::undistort_points` | undistortPoints(K, 왜곡 5 · 8 계수, P = K) — Frame::UndistortKeyPoints | 점 14.3 만 × 2 | **비트 동일** |
+| `orb3cv::svd::jacobi_svd` | Eigen 3.4.0 JacobiSVD(정사각 f32, V · U) | 4×4 20 만(무작위 · 크기 10^±4 섞임 · 계수 부족 · 0 · 같은 행) · 3×3 U·V 10 만 | **비트 동일**(특이값 · V · U · 0 아닌 수) |
+| `orb3cv::svd::triangulate` | GeometricTools::Triangulate | 실제 같은 두 시점 배치 20 만 | **비트 동일** |
+| `orb3cv::settings` | Settings(RGB-D 핀홀) + Tracking::newParameterLoader · Frame 파생 값 | 예제 설정 4 개 + 무작위 40 개(newWidth · 왜곡 · thFarPoints 섞음) | **비트 동일** |
+
+- RGB-D 는 `needToUndistort` 가 단안에서만 참이라 mDistCoef = 0 → undistortPoints 는 실제로 불리지 않음(옮겨는 둠). copyMakeBorder 도 ORB 추출이 테두리를 읽지 않아 쓰는 곳 없음. 남은 OpenCV 쓰임(RGB-D 경로)은 이것으로 끝: cv::resize(System, newWidth 가 있을 때만 — `orb3rs::extract` 의 resize 와 같은 함수) · cv::Mat 그릇.
+- SVD · Rodrigues: 원본 RGB-D 경로에 OpenCV SVD · Rodrigues 는 없음(전부 Eigen). Eigen JacobiSVD 는 LocalMapping 삼각측량(4×4)에만 — 옮김. 단안 초기화 · IMU 쪽 JacobiSVD(TwoViewReconstruction · ImuTypes)는 안 씀.
+- **고친 것**: `orb3rs::frame::Camera::pinhole` 의 `th_depth = bf·ThDepth/fx`(ORB-SLAM2 식)는 원본 3 판(Settings 경로) `mThDepth = b·ThDepth` 와 마지막 비트가 다름(무작위 설정 36 개 중 12 개). 인자를 설정 `b` 로 받게 바꿈(쓰는 곳 없었음). 설정에서 바로: `OrbSettings::parse(..)?.tracking().camera(w, h)`.
+- 화면 제거판 · 원본 TUM 실행(각 3 번, `~/opt/orb3_cv_bg/tum.txt`, ATE m): desk 원본 0.0192 · **멈춤** · 0.0168, 제거판 **멈춤** · 0.0223 · 0.0166 / room 원본 0.0660 · 0.0756 · 0.0739, 제거판 0.0751 · 0.0744 · 0.0632. 900 초 멈춤은 원본(Pangolin 있음)에도 같은 꼴로 나옴(로그 끝 `*Loop detected` → `Local Mapping STOP` 뒤 진행 없음) → 화면 제거 탓 아님, 원본의 루프 닫기 · 지도 스레드 멈춤. 실행마다 흔들림은 `opt/pose-parb` 의 결정성 작업 몫.
+- Atlas 저장 · 불러오기 `orb3cv::atlas_io`: Boost 형식은 읽을 쪽이 없어 우리 이진 형식으로. 남기는 칸 · 버리는 칸은 원본과 같게 — 저장은 id 순 지도마다 나쁘지 않은 키프레임 · 점, 다른 지도 · 나쁜 것을 가리키는 연결 · 자식 · 가장자리 · 점 번호는 빼거나 −1, 키프레임 없는 지도는 버림 / 불러오기는 MapPoint mnVisible · mnFound = 1 · 추적 임시 칸 0, ordered_conn = UpdateBestCovisibles, 그 뒤 새 빈 지도를 현재로(System). 원본 Map::PreSave 의 EraseObservation(살아 있는 지도를 바꿈)도 Rust 로 옮겨 System 저장이 먼저 부름(cd4e91f). 시험: 무작위 Atlas 저장 → 불러오기 → 다시 저장이 같은 바이트, 저장 칸 비트 같음.
+- System 진입 `orb3cv::system::SystemInit::open(설정, w, h)`: OrbSettings → TrackingParams → Camera · Pyramid(ORBextractor 층 표) · FrameCtx(ComputeImageBounds), System.LoadAtlasFromFile / SaveAtlasToFile(".osa" 붙임), GrabImageRGBD 의 회색 · 깊이 변환. newWidth(영상 줄이기)는 안 씀이라 Err.
+- `orb3rs::frame::depth_to_float` 를 원본 식(1.0f / 값, |값| < 1e-5 면 1)으로(나눗셈 결과는 전과 같음: f64 거쳐 f32 로 바꿔도 이중 반올림 없음).

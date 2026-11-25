@@ -1604,7 +1604,6 @@ version = "0.9.0"
 dependencies = [
  "common",
  "flate2",
- "ort",
  "rayon",
  "serde_json",
  "tokenizers",

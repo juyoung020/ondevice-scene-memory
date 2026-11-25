@@ -13,6 +13,11 @@ impl R<'_> {
     fn i32(&mut self) -> i32 {
         self.u32() as i32
     }
+    fn u64(&mut self) -> u64 {
+        let v = u64::from_le_bytes(self.0[self.1..self.1 + 8].try_into().unwrap());
+        self.1 += 8;
+        v
+    }
     fn f64(&mut self) -> f64 {
         let v = f64::from_le_bytes(self.0[self.1..self.1 + 8].try_into().unwrap());
         self.1 += 8;
@@ -480,6 +485,9 @@ mod eig_stages {
             }
             eprintln!("{d}: Hessenberg {}/{} · Francis {}/{} · 두 행 {}/{} · 고유벡터 {}/{}",
                 cnt[1][1], cnt[1][0] + cnt[1][1], cnt[2][1], cnt[2][0] + cnt[2][1], cnt[3][1], cnt[3][0] + cnt[3][1], cnt[4][1], cnt[4][0] + cnt[4][1]);
+            for t in 1..5 {
+                assert!(cnt[t][1] > 0 && cnt[t][0] == 0, "단계 {t} 다름 {} / {}", cnt[t][0], cnt[t][0] + cnt[t][1]);
+            }
         }
     }
 }
@@ -513,5 +521,99 @@ fn eigen_whole_vs_stage4() {
             k += 1;
         }
         eprintln!("전체 고유 풀이 {k}: U {ok_u}, 고유값 {ok_e}, 정규화 전 벡터 {ok_v}");
+    }
+}
+
+/// Sim3Solver 생성자: ~/opt/orb3_loop_bg/ctor_hook.so 가 원본 생성자 입출력을 덤프(ctor.bin)
+mod sim3_ctor {
+    use super::*;
+    use slam::orb3loop::sim3::*;
+
+    fn bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn sim3_ctor_eq_original() {
+        let mut total = 0;
+        for d in dumps() {
+            let Ok(b) = std::fs::read(format!("{d}/ctor.bin")) else { continue };
+            let mut r = R(&b, 0);
+            let (mut n, mut ok, mut skipped) = (0, 0, 0);
+            while !r.done() {
+                assert_eq!(r.u32(), 0x43544F52);
+                let stable = r.i32() != 0;
+                let fs = r.i32() != 0;
+                let _km = r.i32();
+                let mut pose = || -> ([f32; 4], [f32; 3]) { (std::array::from_fn(|_| r.f32()), std::array::from_fn(|_| r.f32())) };
+                let (_q1, t1) = pose();
+                let (_q2, t2) = pose();
+                let r1: M3 = std::array::from_fn(|_| r.f32());
+                let r2: M3 = std::array::from_fn(|_| r.f32());
+                let nl = r.i32() as usize;
+                let s1: Vec<f32> = (0..nl).map(|_| r.f32()).collect();
+                let s2: Vec<f32> = (0..nl).map(|_| r.f32()).collect();
+                let mut cam = || Pinhole { fx: r.f32(), fy: r.f32(), cx: r.f32(), cy: r.f32() };
+                let (c1, c2) = (cam(), cam());
+                let m = r.i32() as usize;
+                let mut pairs = Vec::with_capacity(m);
+                for _ in 0..m {
+                    let code = r.i32();
+                    let (o1, o2) = (r.i32(), r.i32());
+                    let p1: [f32; 3] = std::array::from_fn(|_| r.f32());
+                    let p2: [f32; 3] = std::array::from_fn(|_| r.f32());
+                    pairs.push(match code {
+                        0 => PairIn::Unmatched,
+                        1 => PairIn::NoMp1,
+                        2 => PairIn::Bad,
+                        3 => PairIn::NoIndex,
+                        _ => PairIn::Use { pos1: p1, pos2: p2, oct1: o1, oct2: o2 },
+                    });
+                }
+                let nn = r.i32() as usize;
+                let mut x1 = vec![];
+                let mut x2 = vec![];
+                let mut i1 = vec![];
+                let mut i2 = vec![];
+                let mut e = vec![];
+                for _ in 0..nn {
+                    x1.extend((0..3).map(|_| r.f32()));
+                    x2.extend((0..3).map(|_| r.f32()));
+                    i1.extend((0..2).map(|_| r.f32()));
+                    i2.extend((0..2).map(|_| r.f32()));
+                    e.extend((0..4).map(|_| r.u64()));
+                }
+                let prob = r.f64();
+                let (mi, mx, nit, nb) = (r.i32(), r.i32(), r.i32(), r.i32());
+                n += 1;
+                if !stable {
+                    skipped += 1;
+                    continue;
+                }
+                let s = Sim3Solver::new(&r1, &t1, &r2, &t2, &s1, &s2, &pairs, c1, c2, fs);
+                let fl = |v: &[[f32; 3]]| v.iter().flatten().copied().collect::<Vec<f32>>();
+                let fl2 = |v: &[[f32; 2]]| v.iter().flatten().copied().collect::<Vec<f32>>();
+                let ee: Vec<u64> = (0..s.n()).flat_map(|i| [s.max_err1[i], s.max_err2[i], s.indices1[i] as u64, s.all_indices[i] as u64]).collect();
+                let good = s.n() == nn
+                    && bits(&fl(&s.x3dc1), &x1)
+                    && bits(&fl(&s.x3dc2), &x2)
+                    && bits(&fl2(&s.p1im1), &i1)
+                    && bits(&fl2(&s.p2im2), &i2)
+                    && ee == e
+                    && s.ransac_prob == prob
+                    && (s.ransac_min_inliers, s.ransac_max_its, s.n_iterations, s.best_inliers_n) == (mi, mx, nit, nb);
+                if good {
+                    ok += 1;
+                } else if n - skipped - ok < 3 {
+                    eprintln!("#{n} 다름: n {}/{nn} x1 {} x2 {} im1 {} im2 {} e {} ransac {:?}/{:?}", s.n(),
+                        bits(&fl(&s.x3dc1), &x1), bits(&fl(&s.x3dc2), &x2), bits(&fl2(&s.p1im1), &i1), bits(&fl2(&s.p2im2), &i2), ee == e,
+                        (s.ransac_min_inliers, s.ransac_max_its, s.n_iterations, s.best_inliers_n), (mi, mx, nit, nb));
+                }
+            }
+            eprintln!("{d}: Sim3Solver 생성자 {ok}/{} (포즈 바뀜 제외 {skipped})", n - skipped);
+            assert_eq!(ok, n - skipped);
+            total += n - skipped;
+        }
+        assert!(total > 0, "ctor.bin 덤프가 ORBLOOP_DUMPS 어디에도 없음");
     }
 }

@@ -1,19 +1,18 @@
 //! ORB-SLAM3 Sim3Solver(Horn 1987 닫힌 해 + RANSAC)를 원본 libORB_SLAM3 이 계산하는 순서 그대로 옮긴 것.
 //! 원본: src/Sim3Solver.cc(SetRansacParameters · iterate(5 인자) · ComputeCentroid · ComputeSim3 · CheckInliers ·
 //! Project · FromCameraToImage), CameraModels/Pinhole.cpp(project), Sophus SO3f::exp, Eigen EigenSolver<Matrix4f>(eig4).
-//! FMA 로 합쳐진 자리는 GCC 13 -O3 -march=native GIMPLE 에서 읽은 그대로(eig4.rs 머리말).
-//! 생성자(키프레임 · 지도 점 → 카메라 좌표)는 공통 자료 구조 몫이라 여기선 이미 만든 대응점 표를 받는다.
+//! 기준 빌드(-ffp-contract=off) 순서: 곱한 뒤 더함, 덧셈 묶음은 GIMPLE 에서 읽은 순서(eig4.rs 머리말).
 
 use super::crand::GlibcRand;
 use super::eig4::eigen_solver4;
 
 #[inline(always)]
-fn fma(a: f32, b: f32, c: f32) -> f32 {
-    a.mul_add(b, c)
+fn madd(a: f32, b: f32, c: f32) -> f32 {
+    a * b + c
 }
 #[inline(always)]
-fn fnma(a: f32, b: f32, c: f32) -> f32 {
-    (-a).mul_add(b, c)
+fn msub(a: f32, b: f32, c: f32) -> f32 {
+    c - a * b
 }
 
 /// 핀홀(Pinhole::project): u = fx*x/z + cx
@@ -232,8 +231,8 @@ impl Sim3Solver {
             let p1im2 = project_t(&self.t21m, self.x3dc1[i], &self.cam2);
             let d1 = [self.p1im1[i][0] - p2im1[0], self.p1im1[i][1] - p2im1[1]];
             let d2 = [p1im2[0] - self.p2im2[i][0], p1im2[1] - self.p2im2[i][1]];
-            let e1 = fma(d1[1], d1[1], d1[0] * d1[0]);
-            let e2 = fma(d2[0], d2[0], d2[1] * d2[1]);
+            let e1 = madd(d1[1], d1[1], d1[0] * d1[0]);
+            let e2 = madd(d2[0], d2[0], d2[1] * d2[1]);
             if e1 < self.max_err1[i] as f32 && e2 < self.max_err2[i] as f32 {
                 self.inl_i[i] = true;
                 self.n_inl_i += 1;
@@ -252,14 +251,14 @@ fn ident4() -> M4 {
     m
 }
 
-/// Project: Rcw*P + tcw (행마다 k=1 곱, k=2 FMA, k=0 FMA, + t) 후 핀홀
+/// Project: Rcw*P + tcw (행마다 k=1 곱, k=2 곱 더함, k=0 곱 더함, + t) 후 핀홀
 #[inline]
 fn project_t(t: &M4, p: [f32; 3], cam: &Pinhole) -> [f32; 2] {
     let mut c = [0f32; 3];
     for r in 0..3 {
         let a = t[r + 4] * p[1];
-        let a = fma(t[r + 8], p[2], a);
-        let a = fma(t[r], p[0], a);
+        let a = madd(t[r + 8], p[2], a);
+        let a = madd(t[r], p[0], a);
         c[r] = a + t[r + 12];
     }
     cam.project(c)
@@ -306,15 +305,15 @@ pub fn compute_sim3(p1: &M3, p2: &M3, fix_scale: bool) -> Sim3Result {
     let e = &es.evec;
     let v = [e[1 + 4 * mi], e[2 + 4 * mi], e[3 + 4 * mi]];
     let e0 = e[4 * mi];
-    let vn = fma(v[0], v[0], fma(v[2], v[2], v[1] * v[1])).sqrt();
+    let vn = madd(v[0], v[0], madd(v[2], v[2], v[1] * v[1])).sqrt();
     let ang2 = vn.atan2(e0) * 2.0;
     let w = [(ang2 * v[0]) / vn, (ang2 * v[1]) / vn, (ang2 * v[2]) / vn];
     // Sophus SO3f::exp
-    let th2 = fma(w[0], w[0], fma(w[2], w[2], w[1] * w[1]));
+    let th2 = madd(w[0], w[0], madd(w[2], w[2], w[1] * w[1]));
     let (imag, real) = if th2 < 1e-5f32 * 1e-5f32 {
         let th4 = th2 * th2;
-        let im = fma(th4, (1.0f64 / 3840.0) as f32, fnma(th2, (1.0f64 / 48.0) as f32, 0.5));
-        let re = fma(th4, (1.0f64 / 384.0) as f32, fnma(th2, 0.125, 1.0));
+        let im = madd(th4, (1.0f64 / 3840.0) as f32, msub(th2, (1.0f64 / 48.0) as f32, 0.5));
+        let re = madd(th4, (1.0f64 / 384.0) as f32, msub(th2, 0.125, 1.0));
         (im, re)
     } else {
         let th = th2.sqrt();
@@ -329,47 +328,47 @@ pub fn compute_sim3(p1: &M3, p2: &M3, fix_scale: bool) -> Sim3Result {
     let tyz = tz * qy;
     let tzz = tz * qz;
     let r00 = 1.0 - (tyy + tzz);
-    let r01 = fnma(tz, qw, txy);
-    let r02 = fma(ty, qw, txz);
-    let r10 = fma(tz, qw, txy);
-    let r11 = 1.0 - fma(tx, qx, tzz);
-    let r12 = fnma(tx, qw, tyz);
-    let r20 = fnma(ty, qw, txz);
-    let r21 = fma(tx, qw, tyz);
-    let r22 = 1.0 - fma(tx, qx, tyy);
+    let r01 = msub(tz, qw, txy);
+    let r02 = madd(ty, qw, txz);
+    let r10 = madd(tz, qw, txy);
+    let r11 = 1.0 - madd(tx, qx, tzz);
+    let r12 = msub(tx, qw, tyz);
+    let r20 = msub(ty, qw, txz);
+    let r21 = madd(tx, qw, tyz);
+    let r22 = 1.0 - madd(tx, qx, tyy);
     let rr: M3 = [r00, r10, r20, r01, r11, r21, r02, r12, r22];
     let rm = |r: usize, c: usize| rr[r + 3 * c];
     let s = if fix_scale {
         1.0f32
     } else {
-        // P3 = R * Pr2 : 원소 0..7 은 k=2 곱 → k=1 FMA → k=0 FMA, 원소 8(2,2) 는 k=1 곱 → k=2 → k=0
+        // P3 = R * Pr2 : 원소 0..7 은 k=2 곱 → k=1 곱 더함 → k=0 곱 더함, 원소 8(2,2) 는 k=1 곱 → k=2 → k=0
         let mut p3 = [0f32; 9];
         for c in 0..3 {
             for r in 0..3 {
                 let b = |k: usize| pr2[k + 3 * c];
                 p3[r + 3 * c] = if r == 2 && c == 2 {
-                    fma(rm(r, 0), b(0), fma(rm(r, 2), b(2), rm(r, 1) * b(1)))
+                    madd(rm(r, 0), b(0), madd(rm(r, 2), b(2), rm(r, 1) * b(1)))
                 } else {
-                    fma(rm(r, 0), b(0), fma(rm(r, 1), b(1), rm(r, 2) * b(2)))
+                    madd(rm(r, 0), b(0), madd(rm(r, 1), b(1), rm(r, 2) * b(2)))
                 };
             }
         }
-        // nom = (Pr1 .* P3).sum(), den = (P3 .* P3).sum() : 4 묶음 두 개 + 수평 합 + 마지막 FMA
+        // nom = (Pr1 .* P3).sum(), den = (P3 .* P3).sum() : 4 묶음 두 개 + 수평 합 + 마지막 곱 더함
         let mut a = [0f32; 4];
         let mut d = [0f32; 4];
         for i in 0..4 {
-            a[i] = fma(p3[4 + i], pr1[4 + i], p3[i] * pr1[i]);
-            d[i] = fma(p3[i], p3[i], p3[4 + i] * p3[4 + i]);
+            a[i] = madd(p3[4 + i], pr1[4 + i], p3[i] * pr1[i]);
+            d[i] = madd(p3[i], p3[i], p3[4 + i] * p3[4 + i]);
         }
-        let nom = fma(pr1[8], p3[8], (a[0] + a[2]) + (a[1] + a[3]));
-        let den = fma(p3[8], p3[8], (d[0] + d[2]) + (d[1] + d[3]));
+        let nom = madd(pr1[8], p3[8], (a[0] + a[2]) + (a[1] + a[3]));
+        let den = madd(p3[8], p3[8], (d[0] + d[2]) + (d[1] + d[3]));
         nom / den
     };
     let sr: M3 = if fix_scale { rr } else { std::array::from_fn(|i| s * rr[i]) };
     let srm = |r: usize, c: usize| sr[r + 3 * c];
     let mut t = [0f32; 3];
     for r in 0..3 {
-        t[r] = o1[r] - fma(o2[0], srm(r, 0), fma(o2[2], srm(r, 2), o2[1] * srm(r, 1)));
+        t[r] = o1[r] - madd(o2[0], srm(r, 0), madd(o2[2], srm(r, 2), o2[1] * srm(r, 1)));
     }
     let mut t12 = ident4();
     for c in 0..3 {
@@ -388,12 +387,12 @@ pub fn compute_sim3(p1: &M3, p2: &M3, fix_scale: bool) -> Sim3Result {
     }
     for r in 0..2 {
         let a = (-sri(r, 2)) * t[2];
-        let a = fnma(sri(r, 1), t[1], a);
-        t21[r + 12] = fnma(sri(r, 0), t[0], a);
+        let a = msub(sri(r, 1), t[1], a);
+        t21[r + 12] = msub(sri(r, 0), t[0], a);
     }
     let a = (-sri(2, 1)) * t[1];
-    let a = fnma(t[2], sri(2, 2), a);
-    t21[2 + 12] = fnma(sri(2, 0), t[0], a);
+    let a = msub(t[2], sri(2, 2), a);
+    t21[2 + 12] = msub(sri(2, 0), t[0], a);
     Sim3Result { r: rr, t, s, t12, t21 }
 }
 
@@ -401,13 +400,13 @@ pub fn compute_sim3(p1: &M3, p2: &M3, fix_scale: bool) -> Sim3Result {
 pub fn n_matrix(p1: &M3, p2: &M3) -> [f32; 16] {
     let (pr1, _) = centroid(p1);
     let (pr2, _) = centroid(p2);
-    // M = Pr2 * Pr1^T : M(i,j) = fma(a0,b0, fma(a2,b2, a1*b1))
+    // M = Pr2 * Pr1^T : M(i,j) = madd(a0,b0, madd(a2,b2, a1*b1))
     let mut m = [0f32; 9];
     for i in 0..3 {
         for j in 0..3 {
             let a = |k: usize| pr2[i + 3 * k];
             let b = |k: usize| pr1[j + 3 * k];
-            m[i + 3 * j] = fma(b(0), a(0), fma(b(2), a(2), b(1) * a(1)));
+            m[i + 3 * j] = madd(b(0), a(0), madd(b(2), a(2), b(1) * a(1)));
         }
     }
     let mm = |r: usize, c: usize| m[r + 3 * c];
@@ -423,4 +422,62 @@ pub fn n_matrix(p1: &M3, p2: &M3) -> [f32; 16] {
     let n44 = (-mm(0, 0) - mm(1, 1)) + mm(2, 2);
     let n: [f32; 16] = [n11, n12, n13, n14, n12, n22, n23, n24, n13, n23, n33, n34, n14, n24, n34, n44];
     n
+}
+
+/// 생성자 입력: 짝 하나(vpMatched12[i1])의 원본 분기 결과
+#[derive(Clone, Copy, Debug)]
+pub enum PairIn {
+    /// vpMatched12[i1] 이 NULL
+    Unmatched,
+    /// pKF1 의 i1 번 지도 점 없음
+    NoMp1,
+    /// 둘 중 하나 isBad
+    Bad,
+    /// GetIndexInKeyFrame 이 -1(pKF2 에 안 보임: 원본은 vpKeyFrameMatchedMP 를 무시하고 늘 pKF2 로 찾는다)
+    NoIndex,
+    /// 쓰는 짝: 두 지도 점 세계 좌표 · 두 키포인트 층
+    Use { pos1: [f32; 3], pos2: [f32; 3], oct1: i32, oct2: i32 },
+}
+
+/// Rcw*X + tcw (생성자 자리, GIMPLE: 행마다 r1·p1 → madd(r2,p2) → madd(r0,p0) → + t)
+#[inline]
+pub fn rot_add(r: &M3, t: &[f32; 3], p: [f32; 3]) -> [f32; 3] {
+    let mut c = [0f32; 3];
+    for i in 0..3 {
+        let a = r[i + 3] * p[1];
+        let a = madd(p[2], r[i + 6], a);
+        let a = madd(p[0], r[i], a);
+        c[i] = t[i] + a;
+    }
+    c
+}
+
+impl Sim3Solver {
+    /// Sim3Solver(pKF1, pKF2, vpMatched12, bFixScale, vpKeyFrameMatchedMP) 생성자.
+    /// r/t = 키프레임 mRcw · mTcw.translation(), sigma2 = mvLevelSigma2, pairs = vpMatched12 순서.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        r1: &M3,
+        t1: &[f32; 3],
+        r2: &M3,
+        t2: &[f32; 3],
+        sigma2_1: &[f32],
+        sigma2_2: &[f32],
+        pairs: &[PairIn],
+        cam1: Pinhole,
+        cam2: Pinhole,
+        fix_scale: bool,
+    ) -> Self {
+        let (mut x1, mut x2, mut e1, mut e2, mut ix) = (vec![], vec![], vec![], vec![], vec![]);
+        for (i1, p) in pairs.iter().enumerate() {
+            if let PairIn::Use { pos1, pos2, oct1, oct2 } = *p {
+                e1.push((9.210f64 * sigma2_1[oct1 as usize] as f64) as u64);
+                e2.push((9.210f64 * sigma2_2[oct2 as usize] as f64) as u64);
+                ix.push(i1);
+                x1.push(rot_add(r1, t1, pos1));
+                x2.push(rot_add(r2, t2, pos2));
+            }
+        }
+        Self::from_matches(x1, x2, e1, e2, ix, pairs.len(), cam1, cam2, fix_scale)
+    }
 }

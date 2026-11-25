@@ -11,5 +11,8 @@ pub mod stdsort;
 pub mod g2o_pose;
 pub mod pinhole;
 pub mod pose_opt;
+// 포터 TRACK: Tracking.cc 판단 · LocalMapping 컬링
+pub mod track;
+pub mod localmap;
 
 pub use types::*;

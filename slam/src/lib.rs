@@ -16,8 +16,13 @@ pub mod app;
 pub mod backend;
 // ORB-SLAM3 RGB-D 위치(같은 프로세스 처리 루프의 백엔드)
 pub mod orb3;
-pub mod orb3_backend;
 pub mod orb3rs;
+pub mod orb3_backend;
+// ORB-SLAM3 System 흐름(백엔드가 보는 자리 · 스레드 신호)
+pub mod orb3sys;
+// ORB-SLAM3 장소 인식 · 루프 · 합치기 Rust 포팅(포터 LOOP)
+pub mod orb3loop;
+pub mod orb3cv;
 pub mod stitch;
 pub mod mapmerge;
 pub mod refine;

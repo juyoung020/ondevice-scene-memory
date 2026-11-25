@@ -63,50 +63,22 @@ pub fn default_min(q: &str) -> f32 {
 
 #[cfg(feature = "search")]
 pub struct TextEnc {
-    net: Net,
+    net: crate::textnet::TextNet,
     tok: tokenizers::Tokenizer,
     cache: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     /// word vectors read from a file (`--vocab`): never dropped, never computed
     known: std::sync::OnceLock<HashMap<String, Arc<Vec<f32>>>>,
 }
 
-/// The text encoder runner: plain Rust (`textnet`, weights from `text_model_fp16.onnx`), or ONNX Runtime (`search-onnx` builds)
-#[cfg(feature = "search")]
-enum Net {
-    Rust(crate::textnet::TextNet),
-    #[cfg(feature = "search-onnx")]
-    Onnx(Mutex<ort::session::Session>),
-}
-
 #[cfg(feature = "search")]
 impl TextEnc {
-    /// `dir` holds `tokenizer.json` and `text_model_fp16.onnx` (or `text_model.onnx` for ONNX Runtime).
-    /// `onnx`: run it with ONNX Runtime instead of the Rust encoder (`search-onnx` builds)
+    /// `dir` holds `tokenizer.json` and `text_model_fp16.onnx` (weights read by the Rust encoder `textnet` on the first query)
     pub fn load(dir: &Path) -> Result<TextEnc, String> {
-        // PC(search-onnx): ONNX Runtime 이 Rust 인코더보다 2.2 배 빠르다(docs/npu_models.md "글 인코더")
-        Self::load_with(dir, cfg!(feature = "search-onnx"))
-    }
-
-    pub fn load_with(dir: &Path, onnx: bool) -> Result<TextEnc, String> {
-        let net = Self::open_net(dir, onnx)?;
+        let net = crate::textnet::TextNet::load(&dir.join("text_model_fp16.onnx"))?;
         let mut tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         tok.with_truncation(Some(tokenizers::TruncationParams { max_length: TOKENS, ..Default::default() })).map_err(|e| e.to_string())?;
         tok.with_padding(Some(tokenizers::PaddingParams { strategy: tokenizers::PaddingStrategy::Fixed(TOKENS), pad_id: 0, pad_token: "<pad>".into(), ..Default::default() }));
         Ok(TextEnc { net, tok, cache: Mutex::new(HashMap::new()), known: std::sync::OnceLock::new() })
-    }
-
-    fn open_net(dir: &Path, onnx: bool) -> Result<Net, String> {
-        #[cfg(feature = "search-onnx")]
-        if onnx {
-            let model = ["text_model_fp16.onnx", "text_model.onnx"].iter().map(|n| dir.join(n)).find(|p| p.exists())
-                .ok_or_else(|| format!("no text_model*.onnx in {}", dir.display()))?;
-            let sess = ort::session::Session::builder(common::ort::env()).map_err(|e| e.to_string())?
-                .with_intra_threads(4).map_err(|e| e.to_string())?
-                .commit_from_file(&model).map_err(|e| format!("{}: {e}", model.display()))?;
-            return Ok(Net::Onnx(Mutex::new(sess)));
-        }
-        let _ = onnx;
-        Ok(Net::Rust(crate::textnet::TextNet::load(&dir.join("text_model_fp16.onnx"))?))
     }
 
     /// Hand over word vectors made ahead of time (`read_vocab`): those words are answered without running the model
@@ -150,47 +122,38 @@ impl TextEnc {
     pub fn run(&self, text: &str) -> Result<Vec<f32>, String> {
         let enc = self.tok.encode(text, true).map_err(|e| e.to_string())?;
         let ids = enc.get_ids();
-        match &self.net {
-            Net::Rust(n) => n.run(ids),
-            #[cfg(feature = "search-onnx")]
-            Net::Onnx(sess) => {
-                let ids: Vec<i64> = ids.iter().map(|&i| i as i64).collect();
-                let inp = ort::value::TensorRef::from_array_view(([1usize, ids.len()], &ids[..])).map_err(|e| e.to_string())?;
-                let mut sess = sess.lock().unwrap();
-                let out = sess.run(ort::inputs![inp]).map_err(|e| e.to_string())?;
-                let (_, v) = out["pooler_output"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-                Ok(v.to_vec())
-            }
-        }
+        self.net.run(ids)
     }
 }
 
-/// Rust encoder ↔ ONNX Runtime on the same texts: SGVIEW_TEXT_CHECK=<model dir> SGVIEW_TEXT_LIST=<texts, one a line>
-#[cfg(all(test, feature = "search-onnx"))]
+/// Rust encoder ↔ ONNX Runtime reference vectors made outside the repository (`~/opt/ort_bg`, f32 LE, 768 per text):
+/// SGVIEW_TEXT_CHECK=<model dir> SGVIEW_TEXT_LIST=<texts, one a line> SGVIEW_TEXT_REF=<vectors> [SGVIEW_TEXT_OUT=<this encoder's vectors>]
+#[cfg(all(test, feature = "search"))]
 mod rust_vs_onnx {
     #[test]
     fn same_vectors() {
-        let (Ok(dir), Ok(list)) = (std::env::var("SGVIEW_TEXT_CHECK"), std::env::var("SGVIEW_TEXT_LIST")) else { return };
-        let dir = std::path::Path::new(&dir);
-        let r = super::TextEnc::load_with(dir, false).unwrap();
-        let o = super::TextEnc::load_with(dir, true).unwrap();
+        let (Ok(dir), Ok(list), Ok(rf)) = (std::env::var("SGVIEW_TEXT_CHECK"), std::env::var("SGVIEW_TEXT_LIST"), std::env::var("SGVIEW_TEXT_REF")) else { return };
+        let r = super::TextEnc::load(std::path::Path::new(&dir)).unwrap();
         let texts = std::fs::read_to_string(list).unwrap();
         let texts: Vec<String> = texts.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
-        let (mut tr, mut to, mut worst, mut maxd) = (0f64, 0f64, 1f32, 0f32);
-        for t in &texts {
+        let refv: Vec<f32> = std::fs::read(rf).unwrap().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(refv.len(), texts.len() * 768);
+        r.run(&texts[0]).unwrap(); // weights read
+        let (mut tt, mut worst, mut maxd, mut mine) = (vec![], 1f32, 0f32, vec![]);
+        for (t, b) in texts.iter().zip(refv.chunks_exact(768)) {
             let t0 = std::time::Instant::now();
             let a = r.run(t).unwrap();
-            tr += t0.elapsed().as_secs_f64();
-            let t0 = std::time::Instant::now();
-            let b = o.run(t).unwrap();
-            to += t0.elapsed().as_secs_f64();
+            tt.push(t0.elapsed().as_secs_f64());
             let (na, nb) = (a.iter().map(|x| x * x).sum::<f32>().sqrt(), b.iter().map(|x| x * x).sum::<f32>().sqrt());
-            let c = a.iter().zip(&b).map(|(x, y)| x * y).sum::<f32>() / (na * nb);
-            worst = worst.min(c);
-            maxd = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(maxd, f32::max);
+            worst = worst.min(a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() / (na * nb));
+            maxd = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(maxd, f32::max);
+            mine.extend(a);
         }
-        let n = texts.len() as f64;
-        println!("texts {}: min cosine {worst:.7}, max |diff| {maxd:.2e}, rust {:.1} ms, onnx {:.1} ms per text", texts.len(), tr / n * 1e3, to / n * 1e3);
+        if let Ok(o) = std::env::var("SGVIEW_TEXT_OUT") {
+            std::fs::write(o, mine.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        }
+        tt.sort_by(f64::total_cmp);
+        println!("texts {}: min cosine {worst:.7}, max |diff| {maxd:.2e}, rust median {:.2} ms per text", texts.len(), tt[tt.len() / 2] * 1e3);
         assert!(worst > 0.9999);
     }
 }
